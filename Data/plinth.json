@@ -1,0 +1,57 @@
+[
+  {
+    "chainage": 6,
+    "ground": 0,
+    "plinth": 0
+  },
+  {
+    "chainage": 37,
+    "ground": 10,
+    "plinth": 9.36
+  },
+  {
+    "chainage": 62,
+    "ground": 21,
+    "plinth": 17.03
+  },
+  {
+    "chainage": 92,
+    "ground": 28,
+    "plinth": 26.24
+  },
+  {
+    "chainage": 101,
+    "ground": 29,
+    "plinth": 29
+  },
+  {
+    "chainage": 116,
+    "ground": 29,
+    "plinth": 29
+  },
+  {
+    "chainage": 131,
+    "ground": 26,
+    "plinth": 21.62
+  },
+  {
+    "chainage": 146,
+    "ground": 18,
+    "plinth": 14.24
+  },
+  {
+    "chainage": 155,
+    "ground": 14,
+    "plinth": 9.81
+  },
+  {
+    "chainage": 166,
+    "ground": 6,
+    "plinth": 4.4
+  },
+  {
+    "chainage": 174,
+    "ground": 0,
+    "plinth": 0
+  }
+]

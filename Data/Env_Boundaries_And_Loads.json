@@ -1,0 +1,22 @@
+[
+    {
+        "Boundary": "BedrockFoundation",
+        "Value": 0,
+        "Type": "Fixed Base (No move)"
+    },
+    {
+        "Boundary": "Gravity",
+        "Value": -9.81,
+        "Type": "Vertical (Z-Axis)"
+    },
+    {
+        "Boundary": "MaximumWaterHeight",
+        "Value": 29,
+        "Type": "Meters"
+    },
+    {
+        "Boundary": "Peak Water Pressure",
+        "Value": 284490,
+        "Type": "Pa"
+    }
+]

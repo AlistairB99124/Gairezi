@@ -1,0 +1,12 @@
+[
+    {
+        "Mesh Control": "Global Element Size",
+        "Client Value": 0.5,
+        "Meaning": "Meters between mesh nodes"
+    },
+    {
+        "Mesh Control": "Local Corner Refinement",
+        "Client Value": 0.1,
+        "Meaning": "Meters at high-stress tabs"
+    }
+]

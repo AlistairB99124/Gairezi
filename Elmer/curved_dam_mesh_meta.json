@@ -1,0 +1,21 @@
+{
+  "station_count": 335,
+  "vertical_layers": 32,
+  "arch_subdivisions": 3,
+  "wall_thickness_m": 4.0,
+  "wall_height_above_plinth_m": 29.0,
+  "wall_radius_m": 80.0,
+  "wedge_angle_deg": 60.0,
+  "plinth_upstream_offset_m": 1.0,
+  "plinth_downstream_offset_m": 2.0,
+  "plinth_width_m": 7.0,
+  "plinth_base_width_m": 7.0,
+  "dam_height_m": 30.0,
+  "mesh_size_m": 0.5,
+  "target_block_size_m": 0.5,
+  "thickness_layers": 8,
+  "crest_detail_height_m": 0.0,
+  "crest_extra_thickness_m": 0.0,
+  "abutment_segment_count": 6,
+  "geometry_mode": "v2"
+}

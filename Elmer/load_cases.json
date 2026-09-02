@@ -1,0 +1,29 @@
+{
+  "material": {
+    "density": 2400,
+    "youngs_modulus": 3.5e10,
+    "poisson_ratio": 0.2,
+    "tensile_strength": 2.0e6,
+    "nonlinear_concrete_damage": true
+  },
+  "geometry": {
+    "radius_upstream_face": 80.0,
+    "thickness": 4.0,
+    "flat_segment_start": 51.0,
+    "flat_segment_end": 56.0,
+    "chainage_span": 132.0
+  },
+  "loads": {
+    "gravity": -9.81,
+    "water_height": 29.0,
+    "overflow_head": 2.0,
+    "overflow_water_level": 31.0,
+    "water_density": 1000.0,
+    "bedrock_support": "rigid_fixed"
+  },
+  "outputs": {
+    "max_displacement": true,
+    "max_tensile_stress": true,
+    "cracking_risk": true
+  }
+}

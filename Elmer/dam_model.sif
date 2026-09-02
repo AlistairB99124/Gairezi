@@ -1,0 +1,117 @@
+Header
+  CHECK KEYWORDS Warn
+  Mesh DB "mesh" "/"
+  Include Path ""
+  Results Directory "results"
+End
+
+Simulation
+  Max Output Level = 5
+  Coordinate System = Cartesian 3D
+  Simulation Type = Steady State
+  Steady State Max Iterations = 1
+  Output Intervals = 1
+End
+
+Constants
+  Gravity(4) = Real 0 0 -1 9.81
+  Stefan Boltzmann = 5.670374419e-8
+End
+
+Body 1
+  Name = "DamBody"
+  Equation = 1
+  Material = 1
+  Body Force = 1
+End
+
+Body Force 1
+  ! Gravity load from Data/Env_Boundaries_And_Loads.json: 2400 * -9.81 = -23544 N/m^3
+  Stress Bodyforce 3 = Real -23544.0
+End
+
+Equation 1
+  Name = "Elasticity"
+  Active Solvers(2) = 1 2
+End
+
+Solver 1
+  Equation = "StressSolve"
+  Procedure = "StressSolve" "StressSolver"
+  Variable = "Displacement"
+  Variable DOFs = 3
+  Calculate Stresses = Logical True
+  Calculate Principal = Logical True
+  Nonlinear System Max Iterations = 1
+  Linear System Solver = Iterative
+  Linear System Iterative Method = BiCGStabl
+  Linear System Preconditioning = ILU1
+  Linear System Max Iterations = 6000
+  Linear System Convergence Tolerance = 1.0e-10
+End
+
+Material 1
+  Name = "Concrete"
+  Youngs Modulus = 3.5e10
+  Poisson Ratio = 0.2
+  Density = 2400
+  ! For a realistic cracking assessment, replace this starter elastic material with a nonlinear concrete-damage model.
+End
+
+Boundary Condition 1
+  Name = "BedrockBase"
+  Target Boundaries(1) = 1
+  ! Bedrock is modeled as fixed no-move per project boundary assumption.
+  Displacement 1 = Real 0.0
+  Displacement 2 = Real 0.0
+  Displacement 3 = Real 0.0
+End
+
+Boundary Condition 2
+  Name = "UpstreamHydrostaticPressure"
+  Target Boundaries(1) = 2
+  ! The rebuilt mesh places the crest at z = 0. The reservoir free surface is
+  ! 2 m above crest, giving 304110 Pa at the deepest z = -29 m foundation.
+  Normal Force = Variable Coordinate 3
+    Real MATC "-1000.0 * 9.81 * (2.0 - tx) * (tx < 2.0) * 1.0"
+End
+
+Boundary Condition 3
+  Name = "DownstreamTailwater"
+  Target Boundaries(1) = 3
+  ! The configured 2 m tailwater head is measured from the deepest z = -29 m
+  ! foundation, placing its free surface at z = -27 m.
+  Normal Force = Variable Coordinate 3
+    Real MATC "-1000.0 * 9.81 * (-27.0 - tx) * (tx < -27.0) * 1.0"
+End
+
+Boundary Condition 4
+  Name = "CrestOverflowSurcharge"
+  Target Boundaries(1) = 4
+  ! Two metres of water above the crest: rho * g * h = 19620 Pa.
+  Normal Force = Real -19620.0
+End
+
+Boundary Condition 5
+  Name = "LeftAbutmentSpring"
+  Target Boundaries(1) = 5
+  Spring 1 = Real 1.0e11
+  Spring 2 = Real 1.0e11
+  Spring 3 = Real 5.0e10
+End
+
+Boundary Condition 6
+  Name = "RightAbutmentSpring"
+  Target Boundaries(1) = 6
+  Spring 1 = Real 1.0e11
+  Spring 2 = Real 1.0e11
+  Spring 3 = Real 5.0e10
+End
+
+Solver 2
+  Equation = "ResultOutput"
+  Procedure = "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = "dam_results"
+  Vtu Format = Logical True
+End
+

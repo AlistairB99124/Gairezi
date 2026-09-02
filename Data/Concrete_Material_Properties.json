@@ -1,0 +1,22 @@
+[
+    {
+        "Parameter Name": "Concrete Density",
+        "Client Input": 2400,
+        "Units": "kg/m^3"
+    },
+    {
+        "Parameter Name": "Young's Modulus (E)",
+        "Client Input": 35000000000,
+        "Units": "Pa"
+    },
+    {
+        "Parameter Name": "Poisson's Ratio (v)",
+        "Client Input": 0.2,
+        "Units": ""
+    },
+    {
+        "Parameter Name": "Concrete Tensile Strength",
+        "Client Input": 2000000,
+        "Units": "Pa"
+    }
+]

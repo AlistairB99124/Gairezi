@@ -1,0 +1,28 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Elmer: Run solver",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "cd \"${workspaceFolder}/Elmer\" && if command -v ElmerSolver >/dev/null 2>&1; then ElmerSolver dam_model.sif; else printf '%s\\n' \"ElmerSolver not found on PATH. Install Elmer or add it to PATH before running this task.\"; exit 1; fi"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Runs the Elmer solver against the local dam model and writes VTU output into the Elmer/results directory."
+    }
+  ]
+}
