@@ -1,6 +1,9 @@
 {
   "station_count": 335,
-  "vertical_layers": 32,
+  "vertical_layers": 15,
+  "junction_min_element_size_m": 0.1,
+  "junction_transition_distance_m": 4.0,
+  "main_body_element_size_m": 3.0,
   "arch_subdivisions": 3,
   "wall_thickness_m": 4.0,
   "wall_height_above_plinth_m": 29.0,

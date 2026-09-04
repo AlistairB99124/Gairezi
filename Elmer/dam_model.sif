@@ -36,10 +36,11 @@ Equation 1
 End
 
 Solver 1
-  Equation = "StressSolve"
-  Procedure = "StressSolve" "StressSolver"
+  Equation = "Elasticity"
+  Procedure = "ElasticSolve" "ElasticSolver"
   Variable = "Displacement"
   Variable DOFs = 3
+  ! Native nodal stress recovery also writes the vonMises field.
   Calculate Stresses = Logical True
   Calculate Principal = Logical True
   Nonlinear System Max Iterations = 1
@@ -48,6 +49,7 @@ Solver 1
   Linear System Preconditioning = ILU1
   Linear System Max Iterations = 6000
   Linear System Convergence Tolerance = 1.0e-10
+  Linear System Abort Not Converged = Logical True
 End
 
 Material 1

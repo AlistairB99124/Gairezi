@@ -335,7 +335,16 @@ if len(points) < 2:
 assign_normals(points)
 local_heights = [point["crest_z"] - point["base_z"] for point in points]
 average_height = sum(local_heights) / len(local_heights)
-vertical_layers = max(1, int(round(average_height / target_block_size)))
+junction_min_element_size_m = 0.1
+junction_transition_distance_m = 4.0
+main_body_element_size_m = 3.0
+junction_layer_distances_m = [0.0, 0.1, 0.3, 0.7, 1.5, 2.7, 4.0]
+maximum_wall_height_m = max(local_heights)
+main_body_layer_count = max(
+    1,
+    int(math.ceil((maximum_wall_height_m - junction_transition_distance_m) / main_body_element_size_m)),
+)
+vertical_layers = len(junction_layer_distances_m) - 1 + main_body_layer_count
 
 csv_path = out_dir / "curved_dam_centerline.csv"
 with csv_path.open("w", newline="") as fh:
@@ -472,6 +481,9 @@ with geo_path.open("w") as fh:
     fh.write(f"damHeight = {dam_height};\n")
     fh.write(f"archSubdivisions = {arch_subdivisions};\n")
     fh.write(f"verticalLayers = {vertical_layers};\n")
+    fh.write(f"junctionMinElementSize = {junction_min_element_size_m};\n")
+    fh.write(f"junctionTransitionDistance = {junction_transition_distance_m};\n")
+    fh.write(f"mainBodyElementSize = {main_body_element_size_m};\n")
     fh.write(f"thicknessLayers = {thickness_layers};\n")
     fh.write(f"crestDetailHeight = {crest_detail_height};\n")
     fh.write(f"crestExtraThickness = {crest_extra_thickness};\n")
@@ -513,6 +525,18 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             + 1
         )
 
+    def junction_distance(local_transition_height, level_index):
+        target_distance = junction_layer_distances_m[level_index]
+        if level_index == 0:
+            return 0.0
+        if level_index == 1:
+            return min(junction_min_element_size_m, local_transition_height)
+        return junction_min_element_size_m + (
+            local_transition_height - junction_min_element_size_m
+        ) * (target_distance - junction_min_element_size_m) / (
+            junction_transition_distance_m - junction_min_element_size_m
+        )
+
     plinth_thickness_layers = int(round(plinth_width_m / target_block_size))
     wall_start_in_plinth = int(round(plinth_upstream_offset_m / target_block_size))
     wall_end_in_plinth = wall_start_in_plinth + thickness_layers
@@ -527,18 +551,23 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             plinth_active_stations[index] = True
             plinth_active_stations[index + 1] = True
 
-    wedge_interface_layer = max(1, min(vertical_layers - 1, int(round(wedge_vertical_height_m / target_block_size))))
+    wedge_interface_layer = len(junction_layer_distances_m) - 1
     wedge_active_stations = [point["base_z"] <= -wedge_start_below_crest_m for point in points]
 
     nodes = []
     for station_index, point in enumerate(points):
         for level_index in range(vertical_layers + 1):
             if wedge_active_stations[station_index] and level_index <= wedge_interface_layer:
-                z_value = point["base_z"] + level_index / wedge_interface_layer * (-wedge_start_below_crest_m - point["base_z"])
+                local_transition_height = -wedge_start_below_crest_m - point["base_z"]
+                z_value = point["base_z"] + junction_distance(local_transition_height, level_index)
             elif wedge_active_stations[station_index]:
                 z_value = -wedge_start_below_crest_m + (level_index - wedge_interface_layer) / (vertical_layers - wedge_interface_layer) * wedge_start_below_crest_m
             else:
-                fraction = level_index / vertical_layers
+                transition_fraction = junction_transition_distance_m / maximum_wall_height_m
+                if level_index <= wedge_interface_layer:
+                    fraction = transition_fraction * junction_layer_distances_m[level_index] / junction_transition_distance_m
+                else:
+                    fraction = transition_fraction + (1.0 - transition_fraction) * (level_index - wedge_interface_layer) / (vertical_layers - wedge_interface_layer)
                 z_value = point["base_z"] + fraction * (point["crest_z"] - point["base_z"])
             for thickness_index in range(thickness_layers + 1):
                 offset = -0.5 * wall_thickness + wall_thickness * thickness_index / thickness_layers
@@ -865,6 +894,9 @@ meta_path.write_text(
         {
             "station_count": len(points),
             "vertical_layers": vertical_layers,
+            "junction_min_element_size_m": junction_min_element_size_m,
+            "junction_transition_distance_m": junction_transition_distance_m,
+            "main_body_element_size_m": main_body_element_size_m,
             "arch_subdivisions": arch_subdivisions,
             "wall_thickness_m": wall_thickness,
             "wall_height_above_plinth_m": wall_height_above_plinth_m,
