@@ -41,20 +41,25 @@ def get_grid_control_value(control_name):
             return float(row["Client Value"])
     raise ValueError(f"Missing mesh control '{control_name}' in {grid_controls_path}")
 
-radius = float(config.get("wall_radius_m", 80.0))
 wall_thickness = float(config.get("wall_thickness_m", 4.0))
+upstream_radius = float(config.get("wall_upstream_radius_m", config.get("wall_radius_m", 80.0)))
+radius = float(config.get("wall_centerline_radius_m", upstream_radius - 0.5 * wall_thickness))
+downstream_radius = float(config.get("wall_downstream_radius_m", upstream_radius - wall_thickness))
+if not math.isclose(upstream_radius - downstream_radius, wall_thickness, abs_tol=1.0e-8):
+    raise ValueError("Upstream and downstream wall radii must differ by the wall thickness")
+if not math.isclose(radius, 0.5 * (upstream_radius + downstream_radius), abs_tol=1.0e-8):
+    raise ValueError("Wall centreline radius must lie midway between the wall-face radii")
 wall_height_above_plinth_m = float(config.get("wall_height_above_plinth_m", 29.0))
-# This revision is plinth-only. The wedge has been intentionally disabled to avoid the
-# geometry ambiguity that was persisting in the solver output.
-wedge_angle_deg = float(config.get("wedge_angle_deg", 60.0))
-wedge_angle_rad = math.radians(wedge_angle_deg)
-wedge_start_below_crest_m = float(config.get("wedge_start_below_crest_m", 25.54))
-wedge_run_m = 0.0
-wedge_vertical_height_m = 3.46
-wedge_angle_from_wall_deg = float(config.get("wedge_angle_from_vertical_deg", 30.0))
-wedge_angle_from_wall_rad = math.radians(wedge_angle_from_wall_deg)
-wedge_angle_from_horizontal_deg = 0.0
-wedge_angle_from_horizontal_rad = math.radians(wedge_angle_from_horizontal_deg)
+wedge_enabled = bool(config.get("wedge_enabled", True))
+wedge_anchor_radius = float(config.get("wedge_anchor_radius_m", downstream_radius))
+wedge_top_elevation = float(config.get("wedge_top_elevation_m", -25.54))
+wedge_max_vertical_height = float(config.get("wedge_max_vertical_height_m", 3.46))
+wedge_projection = float(config.get("wedge_downstream_projection_m", 2.0))
+wedge_end_clearance_m = float(config.get("wedge_end_clearance_m", 0.5))
+if not math.isclose(wedge_anchor_radius, downstream_radius, abs_tol=1.0e-8):
+    raise ValueError("The wedge anchor radius must coincide with the downstream wall face")
+if not math.isclose(wedge_anchor_radius - wedge_projection, 74.0, abs_tol=1.0e-8):
+    raise ValueError("The configured wedge projection must place the toe at radius 74 m")
 plinth_upstream_offset_m = 1.0
 plinth_downstream_offset_m = 2.0
 plinth_base_width_m = wall_thickness + plinth_upstream_offset_m + plinth_downstream_offset_m
@@ -330,6 +335,55 @@ points = [
     for point in points
     if point["crest_z"] - point["base_z"] > 1.0e-8
 ]
+
+
+def insert_station(points, station):
+    for point in points:
+        if math.isclose(point["station"], station, abs_tol=1.0e-9):
+            return
+    for index, start in enumerate(points[:-1]):
+        end = points[index + 1]
+        if start["station"] < station < end["station"]:
+            fraction = (station - start["station"]) / (end["station"] - start["station"])
+            inserted = {
+                key: start[key] + fraction * (end[key] - start[key])
+                for key in ("theta", "base_z", "crest_z", "ground_z", "plinth_z")
+            }
+            inserted["station"] = station
+            inserted["x"] = radius * math.sin(inserted["theta"])
+            inserted["y"] = radius * math.cos(inserted["theta"])
+            points.insert(index + 1, inserted)
+            return
+    raise ValueError(f"Wedge station {station:.9f} lies outside the dam profile")
+
+
+def find_level_crossings(points, level):
+    crossings = []
+    for start, end in zip(points, points[1:]):
+        start_delta = start["base_z"] - level
+        end_delta = end["base_z"] - level
+        if start_delta * end_delta < 0.0:
+            fraction = -start_delta / (end_delta - start_delta)
+            crossings.append(start["station"] + fraction * (end["station"] - start["station"]))
+    return crossings
+
+
+wedge_level_crossings = find_level_crossings(points, wedge_top_elevation) if wedge_enabled else []
+if wedge_enabled:
+    if len(wedge_level_crossings) != 2:
+        raise ValueError("The level wedge requires exactly two plinth-top intersections")
+    wedge_start_station_m = wedge_level_crossings[0] + wedge_end_clearance_m
+    wedge_end_station_m = wedge_level_crossings[1] - wedge_end_clearance_m
+    if wedge_start_station_m >= wedge_end_station_m:
+        raise ValueError("Wedge end clearance leaves no active wedge length")
+    insert_station(points, wedge_level_crossings[0])
+    for offset in (index * 0.05 for index in range(1, 40)):
+        insert_station(points, wedge_start_station_m - offset)
+    insert_station(points, wedge_start_station_m)
+    insert_station(points, wedge_end_station_m)
+    for offset in (index * 0.05 for index in range(1, 40)):
+        insert_station(points, wedge_end_station_m + offset)
+    insert_station(points, wedge_level_crossings[1])
 if len(points) < 2:
     raise ValueError("The plinth profile must contain at least two non-zero wall-height stations")
 assign_normals(points)
@@ -477,7 +531,9 @@ with geo_path.open("w") as fh:
     fh.write(f"meshSize = {mesh_size};\n")
     fh.write(f"wallThick = {wall_thickness};\n")
     fh.write(f"wallHeightAbovePlinth = {wall_height_above_plinth_m};\n")
-    fh.write(f"wallRadius = {radius};\n")
+    fh.write(f"wallUpstreamRadius = {upstream_radius};\n")
+    fh.write(f"wallCentrelineRadius = {radius};\n")
+    fh.write(f"wallDownstreamRadius = {downstream_radius};\n")
     fh.write(f"damHeight = {dam_height};\n")
     fh.write(f"archSubdivisions = {arch_subdivisions};\n")
     fh.write(f"verticalLayers = {vertical_layers};\n")
@@ -552,23 +608,37 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             plinth_active_stations[index + 1] = True
 
     wedge_interface_layer = len(junction_layer_distances_m) - 1
-    wedge_active_stations = [point["base_z"] <= -wedge_start_below_crest_m for point in points]
+    wedge_active_stations = [
+        wedge_enabled
+        and wedge_start_station_m - 1.0e-8 <= point["station"] <= wedge_end_station_m + 1.0e-8
+        for point in points
+    ]
+
+    def ordinary_wall_z(point, level_index):
+        transition_fraction = junction_transition_distance_m / maximum_wall_height_m
+        if level_index <= wedge_interface_layer:
+            fraction = transition_fraction * junction_layer_distances_m[level_index] / junction_transition_distance_m
+        else:
+            fraction = transition_fraction + (1.0 - transition_fraction) * (
+                level_index - wedge_interface_layer
+            ) / (vertical_layers - wedge_interface_layer)
+        return point["base_z"] + fraction * (point["crest_z"] - point["base_z"])
+
+    def wedge_wall_z(point, level_index):
+        local_transition_height = wedge_top_elevation - point["base_z"]
+        if level_index <= wedge_interface_layer:
+            if local_transition_height <= junction_min_element_size_m:
+                return point["base_z"] + local_transition_height * level_index / wedge_interface_layer
+            return point["base_z"] + junction_distance(local_transition_height, level_index)
+        return wedge_top_elevation + (level_index - wedge_interface_layer) / (
+            vertical_layers - wedge_interface_layer
+        ) * -wedge_top_elevation
 
     nodes = []
     for station_index, point in enumerate(points):
         for level_index in range(vertical_layers + 1):
-            if wedge_active_stations[station_index] and level_index <= wedge_interface_layer:
-                local_transition_height = -wedge_start_below_crest_m - point["base_z"]
-                z_value = point["base_z"] + junction_distance(local_transition_height, level_index)
-            elif wedge_active_stations[station_index]:
-                z_value = -wedge_start_below_crest_m + (level_index - wedge_interface_layer) / (vertical_layers - wedge_interface_layer) * wedge_start_below_crest_m
-            else:
-                transition_fraction = junction_transition_distance_m / maximum_wall_height_m
-                if level_index <= wedge_interface_layer:
-                    fraction = transition_fraction * junction_layer_distances_m[level_index] / junction_transition_distance_m
-                else:
-                    fraction = transition_fraction + (1.0 - transition_fraction) * (level_index - wedge_interface_layer) / (vertical_layers - wedge_interface_layer)
-                z_value = point["base_z"] + fraction * (point["crest_z"] - point["base_z"])
+            ordinary_z_value = ordinary_wall_z(point, level_index)
+            z_value = wedge_wall_z(point, level_index) if wedge_active_stations[station_index] else ordinary_z_value
             for thickness_index in range(thickness_layers + 1):
                 offset = -0.5 * wall_thickness + wall_thickness * thickness_index / thickness_layers
                 nodes.append((node_id(station_index, level_index, thickness_index), *point_on_local_section(point, offset, z_value)))
@@ -598,27 +668,26 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         plinth_bottom_node_ids[station_index] = bottom_ids
         plinth_top_node_ids[station_index] = top_ids
 
-    wedge_toe_node_ids = [None] * len(points)
-    wedge_toe_bottom_node_ids = [None] * len(points)
+    wedge_base_node_ids = [None] * len(points)
     wedge_slope_node_ids = [[None] * (wedge_interface_layer + 1) for _ in points]
+    wedge_center_node_ids = [None] * len(points)
     for station_index, point in enumerate(points):
         if not wedge_active_stations[station_index]:
             continue
-        wedge_height = -wedge_start_below_crest_m - point["base_z"]
-        wedge_run = wedge_height / math.tan(wedge_angle_rad)
-        wedge_toe_node_ids[station_index] = next_node_id
-        nodes.append((
-            next_node_id,
-            *point_on_local_section(point, 0.5 * wall_thickness + wedge_run, point["base_z"]),
-        ))
-        next_node_id += 1
-        wedge_toe_bottom_node_ids[station_index] = next_node_id
-        nodes.append((
-            next_node_id,
-            *point_on_local_section(point, 0.5 * wall_thickness + wedge_run, point["ground_z"]),
-        ))
-        next_node_id += 1
-        wedge_slope_node_ids[station_index][0] = wedge_toe_node_ids[station_index]
+        if plinth_active_stations[station_index]:
+            wedge_base_node_ids[station_index] = plinth_top_node_ids[station_index][wall_end_in_plinth:]
+        else:
+            wedge_base_node_ids[station_index] = []
+            for base_index in range(plinth_thickness_layers - wall_end_in_plinth + 1):
+                fraction = base_index / (plinth_thickness_layers - wall_end_in_plinth)
+                wedge_base_node_ids[station_index].append(next_node_id)
+                nodes.append((next_node_id, *point_on_local_section(
+                    point,
+                    0.5 * wall_thickness + fraction * wedge_projection,
+                    point["ground_z"],
+                )))
+                next_node_id += 1
+        wedge_slope_node_ids[station_index][0] = wedge_base_node_ids[station_index][-1]
         wedge_slope_node_ids[station_index][-1] = node_id(station_index, wedge_interface_layer, thickness_layers)
         for layer_index in range(1, wedge_interface_layer):
             fraction = layer_index / wedge_interface_layer
@@ -627,11 +696,21 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                 next_node_id,
                 *point_on_local_section(
                     point,
-                    0.5 * wall_thickness + (1.0 - fraction) * wedge_run,
-                    point["base_z"] + fraction * (-wedge_start_below_crest_m - point["base_z"]),
+                    0.5 * wall_thickness + (1.0 - fraction) * wedge_projection,
+                    point["base_z"] + fraction * (wedge_top_elevation - point["base_z"]),
                 ),
             ))
             next_node_id += 1
+        wedge_center_node_ids[station_index] = next_node_id
+        nodes.append((
+            next_node_id,
+            *point_on_local_section(
+                point,
+                0.5 * wall_thickness + wedge_projection / 3.0,
+                point["base_z"] + (wedge_top_elevation - point["base_z"]) / 3.0,
+            ),
+        ))
+        next_node_id += 1
 
     elements = []
     element_id = 1
@@ -728,63 +807,21 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     top_start[thickness_index + 1],
                 ])
 
-        if wedge_active_stations[station_index] and wedge_active_stations[station_index + 1]:
-            toe_top_start = wedge_toe_node_ids[station_index]
-            toe_top_end = wedge_toe_node_ids[station_index + 1]
-            toe_bottom_start = wedge_toe_bottom_node_ids[station_index]
-            toe_bottom_end = wedge_toe_bottom_node_ids[station_index + 1]
-            downstream_bottom_start = bottom_start[-1]
-            downstream_bottom_end = bottom_end[-1]
-            downstream_top_start = top_start[-1]
-            downstream_top_end = top_end[-1]
-            wall_top_start = top_start[wall_end_in_plinth]
-            wall_top_end = top_end[wall_end_in_plinth]
-            wall_bottom_start = bottom_start[wall_end_in_plinth]
-            wall_bottom_end = bottom_end[wall_end_in_plinth]
-
+        for thickness_index in range(wall_end_in_plinth, plinth_thickness_layers):
             add_element(5, 1, [
-                wall_bottom_start, toe_bottom_start, toe_top_start, wall_top_start,
-                wall_bottom_end, toe_bottom_end, toe_top_end, wall_top_end,
-            ])
-            add_element(5, 1, [
-                toe_bottom_start, downstream_bottom_start, downstream_top_start, toe_top_start,
-                toe_bottom_end, downstream_bottom_end, downstream_top_end, toe_top_end,
+                bottom_start[thickness_index], bottom_end[thickness_index],
+                bottom_end[thickness_index + 1], bottom_start[thickness_index + 1],
+                top_start[thickness_index], top_end[thickness_index],
+                top_end[thickness_index + 1], top_start[thickness_index + 1],
             ])
             add_element(3, 1, [
-                wall_bottom_start, wall_top_start, wall_top_end, wall_bottom_end,
+                bottom_start[thickness_index], bottom_start[thickness_index + 1],
+                bottom_end[thickness_index + 1], bottom_end[thickness_index],
             ])
-            add_element(3, 1, [
-                toe_bottom_start, toe_bottom_end, downstream_bottom_end, downstream_bottom_start,
-            ])
-            add_element(3, 7, [
-                toe_top_start, downstream_top_start, downstream_top_end, toe_top_end,
-            ])
-            add_element(3, 7, [
-                wall_top_start, toe_top_start, toe_top_end, wall_top_end,
-            ])
-        else:
-            for thickness_index in range(wall_end_in_plinth, plinth_thickness_layers):
-                add_element(5, 1, [
-                    bottom_start[thickness_index],
-                    bottom_end[thickness_index],
-                    bottom_end[thickness_index + 1],
-                    bottom_start[thickness_index + 1],
-                    top_start[thickness_index],
-                    top_end[thickness_index],
-                    top_end[thickness_index + 1],
-                    top_start[thickness_index + 1],
-                ])
-                add_element(3, 1, [
-                    bottom_start[thickness_index],
-                    bottom_start[thickness_index + 1],
-                    bottom_end[thickness_index + 1],
-                    bottom_end[thickness_index],
-                ])
+            if not (wedge_active_stations[station_index] and wedge_active_stations[station_index + 1]):
                 add_element(3, 7, [
-                    top_start[thickness_index],
-                    top_end[thickness_index],
-                    top_end[thickness_index + 1],
-                    top_start[thickness_index + 1],
+                    top_start[thickness_index], top_end[thickness_index],
+                    top_end[thickness_index + 1], top_start[thickness_index + 1],
                 ])
 
         if station_index == 0 or not plinth_active_segments[station_index - 1]:
@@ -804,38 +841,49 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     top_end[thickness_index],
                 ])
 
+    def wedge_cross_section(station_index):
+        return (
+            wedge_base_node_ids[station_index]
+            + wedge_slope_node_ids[station_index][1:]
+            + [node_id(station_index, level_index, thickness_layers)
+             for level_index in range(wedge_interface_layer - 1, 0, -1)]
+        )
+
     for station_index in range(len(points) - 1):
         if not (wedge_active_stations[station_index] and wedge_active_stations[station_index + 1]):
             continue
-        wedge_toe_start = wedge_toe_node_ids[station_index]
-        wedge_toe_end = wedge_toe_node_ids[station_index + 1]
-        for layer_index in range(wedge_interface_layer):
-            wall_base_start = node_id(station_index, layer_index, thickness_layers)
-            wall_base_end = node_id(station_index + 1, layer_index, thickness_layers)
-            wall_top_start = node_id(station_index, layer_index + 1, thickness_layers)
-            wall_top_end = node_id(station_index + 1, layer_index + 1, thickness_layers)
-            if layer_index == wedge_interface_layer - 1:
-                add_element(6, 1, [
-                    wall_base_start, wedge_slope_node_ids[station_index][layer_index], wall_top_start,
-                    wall_base_end, wedge_slope_node_ids[station_index + 1][layer_index], wall_top_end,
-                ])
+        start_ring = wedge_cross_section(station_index)
+        end_ring = wedge_cross_section(station_index + 1)
+        for ring_index in range(len(start_ring)):
+            next_ring_index = (ring_index + 1) % len(start_ring)
+            add_element(6, 1, [
+                wedge_center_node_ids[station_index], start_ring[ring_index], start_ring[next_ring_index],
+                wedge_center_node_ids[station_index + 1], end_ring[ring_index], end_ring[next_ring_index],
+            ])
+            if ring_index < plinth_thickness_layers - wall_end_in_plinth:
+                if not (plinth_active_segments[station_index]):
+                    add_element(3, 1, [
+                        start_ring[ring_index], start_ring[next_ring_index],
+                        end_ring[next_ring_index], end_ring[ring_index],
+                    ])
+            elif ring_index < plinth_thickness_layers - wall_end_in_plinth + wedge_interface_layer:
                 add_element(3, 3, [
-                    wedge_slope_node_ids[station_index][layer_index],
-                    wedge_slope_node_ids[station_index + 1][layer_index],
-                    wall_top_end,
-                    wall_top_start,
+                    start_ring[ring_index], start_ring[next_ring_index],
+                    end_ring[next_ring_index], end_ring[ring_index],
                 ])
-            else:
-                add_element(5, 1, [
-                    wall_base_start, wedge_slope_node_ids[station_index][layer_index], wedge_slope_node_ids[station_index][layer_index + 1], wall_top_start,
-                    wall_base_end, wedge_slope_node_ids[station_index + 1][layer_index], wedge_slope_node_ids[station_index + 1][layer_index + 1], wall_top_end,
-                ])
-                add_element(3, 3, [
-                    wedge_slope_node_ids[station_index][layer_index],
-                    wedge_slope_node_ids[station_index + 1][layer_index],
-                    wedge_slope_node_ids[station_index + 1][layer_index + 1],
-                    wedge_slope_node_ids[station_index][layer_index + 1],
-                ])
+
+    for station_index, wedge_is_active in enumerate(wedge_active_stations):
+        starts_wedge = wedge_is_active and (station_index == 0 or not wedge_active_stations[station_index - 1])
+        ends_wedge = wedge_is_active and (
+            station_index == len(wedge_active_stations) - 1 or not wedge_active_stations[station_index + 1]
+        )
+        if not (starts_wedge or ends_wedge):
+            continue
+        ring = wedge_cross_section(station_index)
+        for ring_index in range(len(ring)):
+            add_element(2, 7, [
+                wedge_center_node_ids[station_index], ring[ring_index], ring[(ring_index + 1) % len(ring)],
+            ])
 
     for level_index in range(vertical_layers):
         for thickness_index in range(thickness_layers):
@@ -882,8 +930,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             fh.write(f"{identifier} {element_type} 2 {physical_id} {physical_id} {' '.join(map(str, node_ids))}\n")
         fh.write("$EndElements\n")
 
-    volume_element_count = (len(points) - 1) * vertical_layers * thickness_layers
-    volume_element_count += sum(plinth_active_segments) * plinth_thickness_layers
+    volume_element_count = sum(1 for _, element_type, _, _ in elements if element_type in (4, 5, 6))
     return volume_element_count, len(elements) - volume_element_count
 
 
@@ -900,8 +947,17 @@ meta_path.write_text(
             "arch_subdivisions": arch_subdivisions,
             "wall_thickness_m": wall_thickness,
             "wall_height_above_plinth_m": wall_height_above_plinth_m,
-            "wall_radius_m": radius,
-            "wedge_angle_deg": wedge_angle_deg,
+            "wall_upstream_radius_m": upstream_radius,
+            "wall_centerline_radius_m": radius,
+            "wall_downstream_radius_m": downstream_radius,
+            "wedge_enabled": wedge_enabled,
+            "wedge_anchor_radius_m": wedge_anchor_radius,
+            "wedge_top_elevation_m": wedge_top_elevation,
+            "wedge_max_vertical_height_m": wedge_max_vertical_height,
+            "wedge_downstream_projection_m": wedge_projection,
+            "wedge_end_clearance_m": wedge_end_clearance_m,
+            "wedge_start_station_m": wedge_start_station_m,
+            "wedge_end_station_m": wedge_end_station_m,
             "plinth_upstream_offset_m": plinth_upstream_offset_m,
             "plinth_downstream_offset_m": plinth_downstream_offset_m,
             "plinth_width_m": plinth_width_m,
@@ -929,4 +985,4 @@ print(f"Wrote {bedrock_illustration_path}")
 print(f"Wrote {plinth_preview_path}")
 print(f"Wrote {mesh_path}")
 print(f"Wrote {meta_path}")
-print(f"Generated {len(points)} stations, {volume_count} hex elements, and {boundary_count} boundary faces")
+print(f"Generated {len(points)} stations, {volume_count} volume elements, and {boundary_count} boundary faces")
