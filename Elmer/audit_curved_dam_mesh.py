@@ -23,6 +23,7 @@ face_templates = {
     4: ((0, 1, 2), (0, 3, 1), (1, 3, 2), (2, 3, 0)),
     5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
     6: ((0, 1, 2), (3, 5, 4), (0, 3, 4, 1), (1, 4, 5, 2), (2, 5, 3, 0)),
+        7: ((0, 1, 2, 3), (0, 4, 1), (1, 4, 2), (2, 4, 3), (3, 4, 0)),
 }
 
 
@@ -43,6 +44,8 @@ def volume(element_type, node_ids):
         return tetra_volume(*node_ids)
     if element_type == 6:
         return sum(tetra_volume(*(node_ids[index] for index in tetra)) for tetra in ((0, 1, 2, 3), (1, 2, 3, 4), (2, 3, 4, 5)))
+        if element_type == 7:
+            return sum(tetra_volume(*(node_ids[index] for index in tetra)) for tetra in ((0, 1, 2, 4), (0, 2, 3, 4)))
     if element_type == 5:
         return sum(tetra_volume(*(node_ids[index] for index in tetra)) for tetra in (
             (0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6),
@@ -78,17 +81,27 @@ boundary_faces = {
     if element_type in (2, 3)
 }
 internal_boundary_faces = boundary_faces & {face for face, count in volume_faces.items() if count == 2}
+collapsed_wall_edges = []
+for element_type, node_ids in elements:
+    if element_type != 5:
+        continue
+    for first_index, second_index in ((0, 4), (1, 5), (2, 6), (3, 7)):
+        first = nodes[node_ids[first_index]]
+        second = nodes[node_ids[second_index]]
+        if sum((first[axis] - second[axis]) ** 2 for axis in range(3)) <= 1.0e-16:
+            collapsed_wall_edges.append((node_ids[first_index], node_ids[second_index]))
 unmatched_wedge_bases = [
     face for face in wedge_base_faces
     if volume_faces[face] == 1 and face not in boundary_faces
 ]
 invalid_wedge_bases = [face for face in wedge_base_faces if volume_faces[face] not in (1, 2)]
 
-if zero_volume_elements or internal_boundary_faces or unmatched_wedge_bases or invalid_wedge_bases or not wedge_base_faces:
+if zero_volume_elements or internal_boundary_faces or collapsed_wall_edges or unmatched_wedge_bases or invalid_wedge_bases or not wedge_base_faces:
     raise SystemExit(
         "Mesh audit failed: "
         f"zero-volume={len(zero_volume_elements)}, "
         f"internal-2D-boundaries={len(internal_boundary_faces)}, "
+        f"collapsed-wall-edges={len(collapsed_wall_edges)}, "
         f"unmatched-wedge-bases={len(unmatched_wedge_bases)}, "
         f"invalid-wedge-base-incidence={len(invalid_wedge_bases)}, "
         f"wedge-base-faces={len(wedge_base_faces)}"

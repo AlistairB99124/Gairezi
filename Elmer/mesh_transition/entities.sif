@@ -1,0 +1,30 @@
+!------ Skeleton for body section -----
+Body 1
+  Name = DamBody
+End
+
+!------ Skeleton for boundary section -----
+Boundary Condition 1
+  Name = BedrockBase
+End
+
+Boundary Condition 2
+  Name = UpstreamHydrostaticPressure
+End
+
+Boundary Condition 3
+  Name = DownstreamTailwater
+End
+
+Boundary Condition 4
+  Name = CrestOverflowSurcharge
+End
+
+Boundary Condition 5
+  Name = LeftAbutmentSpring
+End
+
+Boundary Condition 6
+  Name = RightAbutmentSpring
+End
+

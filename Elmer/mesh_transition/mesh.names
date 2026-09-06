@@ -1,0 +1,9 @@
+! ----- names for bodies -----
+$ DamBody = 1
+! ----- names for boundaries -----
+$ BedrockBase = 1
+$ UpstreamHydrostaticPressure = 2
+$ DownstreamTailwater = 3
+$ CrestOverflowSurcharge = 4
+$ LeftAbutmentSpring = 5
+$ RightAbutmentSpring = 6
