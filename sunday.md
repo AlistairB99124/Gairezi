@@ -8,17 +8,21 @@ The governing design inputs are in `Data/plinth.json`, `Data/Computational_Grid_
 
 ## Geometry Rules Implemented
 
-The downstream wedge is generated from the local plinth value at each chainage:
+The downstream wedge is generated from the local plinth depth at each chainage. The
+depth values are positive distances below the crest (`z = 0`); the corresponding
+mesh elevations are negative (`p = 29` means `z = -29`). The integer depth threshold
+and slope angle are the current design inputs:
 
 $$
-wedgeZLength = plinth - 25.54\,m
+wedgeZLength = plinth - 25\,m
 $$
 
 $$
-wedgeXLength = wedgeZLength\tan(30^\circ)
+wedgeXLength = wedgeZLength\tan(26.57^\circ)
 $$
 
-The wedge is only active where `wedgeZLength > 0`. It starts and ends at the plinth-derived threshold crossings:
+The wedge is only active where `plinth >= 25 m` (`wedgeZLength >= 0`). It starts and
+ends at the plinth-derived threshold crossings:
 
 - Start chainage: `89.719870 m`
 - End chainage: `123.032520 m`

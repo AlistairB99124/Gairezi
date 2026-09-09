@@ -85,12 +85,12 @@ def main() -> None:
 
     # mark the exact section dimensions from the sketch
     crest_z = 0.0
-    wedge_start_z = crest_z - 25.54
+    wedge_start_z = crest_z - 25.0
     base_z = crest_z - 29.0
-    run = math.tan(math.radians(30.0)) * (wedge_start_z - base_z)
+    run = math.tan(math.radians(26.57)) * (wedge_start_z - base_z)
     ax.plot([x_down[0], x_down[-1]], [z_down[0], z_down[-1]], "r-", linewidth=2.4)
     ax.axhline(0.0, color="0.6", linestyle="--", linewidth=0.8)
-    ax.text(x_down[0] + 0.5, (crest_z + wedge_start_z) / 2, "25.54 m", color="black", fontsize=9)
+    ax.text(x_down[0] + 0.5, (crest_z + wedge_start_z) / 2, "25 m", color="black", fontsize=9)
     ax.text(x_down[-1] + 0.7, (base_z + wedge_start_z) / 2, "3.46 m", color="black", fontsize=9)
     ax.text((x_down[-1] + x_down[0]) / 2, base_z - 0.7, f"{run:.2f} m run", color="black", fontsize=9)
 

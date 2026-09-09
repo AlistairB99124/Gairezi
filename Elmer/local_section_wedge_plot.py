@@ -52,13 +52,13 @@ def main() -> None:
 
     # Use the explicit local section geometry from the sketch, not the global arch coordinates.
     # Upstream face is the left edge of the wall. The wall thickness is 4.0 m. The
-    # downstream wedge is defined by a 30° angle to the wall face, so the run varies with
-    # the local base depth; the 2.0 m run is only the limiting case for a 3.46 m drop.
+    # downstream wedge is defined by a 26.57° angle to the wall face, so the run varies with
+    # the local base depth; the run is based on the local drop below the 25 m threshold.
     crest_z = 0.0
-    top_wedge_z = -25.54
+    top_wedge_z = -25.0
     base_z = -29.0
     wall_thickness_m = 4.0
-    wedge_run = math.tan(math.radians(30.0)) * (top_wedge_z - base_z)
+    wedge_run = math.tan(math.radians(26.57)) * (top_wedge_z - base_z)
 
     upstream_x = 0.0
     downstream_vertical_x = upstream_x + wall_thickness_m
@@ -75,30 +75,31 @@ def main() -> None:
     ax.set_ylabel("Elevation (m)")
     ax.grid(True, color="0.85", linewidth=0.7)
 
-    # Draw the wall, the 1 m upstream / 2 m downstream plinth, and the wedge.
-    plinth_base_z = base_z - 3.46
+    # At the maximum depth the plinth is absent: z=-29 is the bedrock interface.
+    bedrock_base_z = base_z - 3.46
     ax.fill(
         [upstream_x - 1.0, downstream_vertical_x + 2.0, downstream_vertical_x + 2.0, upstream_x - 1.0],
-        [plinth_base_z, plinth_base_z, base_z, base_z],
+        [bedrock_base_z, bedrock_base_z, base_z, base_z],
         color="#c7c7c7",
         alpha=0.7,
-        label="concrete plinth",
+        label="bedrock below z = -29 m",
     )
     ax.plot([upstream_face_top[0], upstream_face_bottom[0]], [upstream_face_top[1], upstream_face_bottom[1]], "k-", linewidth=2.0, label="upstream face")
     ax.plot([downstream_face_top[0], downstream_face_bottom[0]], [downstream_face_top[1], downstream_face_bottom[1]], "b-", linewidth=2.0, label="downstream face")
+    ax.plot([wedge_top[0], wedge_top[0]], [wedge_top[1], wedge_base[1]], "b-", linewidth=2.4, label="wedge wall face: z=-25 to -29")
     ax.plot([wedge_top[0], wedge_base[0], downstream_face_bottom[0], wedge_top[0]], [wedge_top[1], wedge_base[1], downstream_face_bottom[1], wedge_top[1]], "r-", linewidth=2.5, label="wedge face")
 
     # Add section labels.
     ax.axhline(0.0, color="0.6", linestyle="--", linewidth=0.8)
     ax.axhline(top_wedge_z, color="0.6", linestyle=":", linewidth=0.8)
     ax.axhline(base_z, color="0.6", linestyle=":", linewidth=0.8)
-    ax.text((wedge_top[0] + wedge_base[0]) / 2.0 + 0.35, (wedge_top[1] + wedge_base[1]) / 2.0, "3.46 m", fontsize=9)
+    ax.text((wedge_top[0] + wedge_base[0]) / 2.0 + 0.35, (wedge_top[1] + wedge_base[1]) / 2.0, "63.43°", fontsize=9, rotation=-26.57)
     ax.text((wedge_base[0] + downstream_face_bottom[0]) / 2.0 + 0.2, base_z - 0.4, f"{wedge_run:.2f} m", fontsize=9)
-    ax.text((downstream_face_top[0] + downstream_face_bottom[0]) / 2.0 + 0.15, (downstream_face_top[1] + downstream_face_bottom[1]) / 2.0, "25.54 m", fontsize=9)
+    ax.text((downstream_face_top[0] + downstream_face_bottom[0]) / 2.0 + 0.15, (downstream_face_top[1] + downstream_face_bottom[1]) / 2.0, "25 m", fontsize=9)
 
     ax.legend(frameon=False)
     ax.set_xlim(-1.5, 7.0)
-    ax.set_ylim(plinth_base_z - 1.0, crest_z + 2.0)
+    ax.set_ylim(bedrock_base_z - 1.0, crest_z + 2.0)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
