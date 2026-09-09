@@ -1,7 +1,7 @@
 {
   "wall_thickness_m": 4.0,
   "wall_height_above_plinth_m": 29.0,
-  "wedge_enabled": true,
+  "wedge_enabled": false,
   "wedge_angle_deg": 60.0,
   "wall_upstream_radius_m": 80.0,
   "wall_centerline_radius_m": 78.0,

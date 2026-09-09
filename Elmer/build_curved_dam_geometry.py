@@ -359,10 +359,14 @@ def find_wedge_start_crossings(points):
 
 
 wedge_start_crossings = find_wedge_start_crossings(points) if wedge_enabled else []
+wedge_start_station_m = None
+wedge_end_station_m = None
+wedge_width_m = 0.0
 if wedge_enabled:
     if len(wedge_start_crossings) != 2:
         raise ValueError("The plinth-derived wedge requires exactly two start-threshold intersections")
     wedge_start_station_m, wedge_end_station_m = wedge_start_crossings
+    wedge_width_m = wedge_end_station_m - wedge_start_station_m
     insert_station(points, wedge_start_station_m)
     wedge_station = wedge_start_station_m + target_block_size
     while wedge_station < wedge_end_station_m:
@@ -375,8 +379,12 @@ assign_normals(points)
 local_heights = [point["crest_z"] - point["base_z"] for point in points]
 average_height = sum(local_heights) / len(local_heights)
 maximum_wall_height_m = max(local_heights)
-maximum_wedge_z_length = max(wedge_z_length(point) for point in points)
-wedge_interface_layer = max(1, int(math.ceil(maximum_wedge_z_length / target_block_size)))
+maximum_wedge_z_length = max(wedge_z_length(point) for point in points) if wedge_enabled else 0.0
+wedge_interface_layer = (
+    max(1, int(math.ceil(maximum_wedge_z_length / target_block_size)))
+    if wedge_enabled
+    else 0
+)
 maximum_plinth_height_m = max(
     abs(point["base_z"] - point["ground_z"])
     for point in points
@@ -384,7 +392,9 @@ maximum_plinth_height_m = max(
 plinth_vertical_layers = max(1, int(math.ceil(maximum_plinth_height_m / target_block_size)))
 vertical_layers = max(
     int(math.ceil(maximum_wall_height_m / target_block_size)),
-    wedge_interface_layer + int(math.ceil(wedge_start_below_crest_m / target_block_size)),
+    wedge_interface_layer + int(math.ceil(wedge_start_below_crest_m / target_block_size))
+    if wedge_enabled
+    else 0,
 )
 
 csv_path = out_dir / "curved_dam_centerline.csv"
@@ -626,14 +636,15 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         return offsets
 
     def ordinary_wall_z(point, level_index):
-        lower_block_height = wedge_z_length(point)
-        if lower_block_height > 1.0e-8:
-            wedge_top_z = point["base_z"] + lower_block_height
-            if level_index <= wedge_interface_layer:
-                return point["base_z"] + lower_block_height * level_index / wedge_interface_layer
-            return wedge_top_z + (level_index - wedge_interface_layer) / (
-                vertical_layers - wedge_interface_layer
-            ) * (point["crest_z"] - wedge_top_z)
+        if wedge_enabled:
+            lower_block_height = wedge_z_length(point)
+            if lower_block_height > 1.0e-8:
+                wedge_top_z = point["base_z"] + lower_block_height
+                if level_index <= wedge_interface_layer:
+                    return point["base_z"] + lower_block_height * level_index / wedge_interface_layer
+                return wedge_top_z + (level_index - wedge_interface_layer) / (
+                    vertical_layers - wedge_interface_layer
+                ) * (point["crest_z"] - wedge_top_z)
         return point["base_z"] + level_index / vertical_layers * (
             point["crest_z"] - point["base_z"]
         )

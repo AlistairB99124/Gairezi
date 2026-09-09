@@ -5,6 +5,13 @@ import sys
 
 mesh_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).with_name("curved_dam_mesh.msh")
 lines = mesh_path.read_text().splitlines()
+metadata_path = mesh_path.with_name(f"{mesh_path.stem}_meta.json")
+metadata = {}
+if metadata_path.exists():
+    import json
+
+    metadata = json.loads(metadata_path.read_text())
+wedge_enabled = bool(metadata.get("wedge_enabled", True))
 
 
 def section_rows(name):
@@ -96,7 +103,7 @@ unmatched_wedge_bases = [
 ]
 invalid_wedge_bases = [face for face in wedge_base_faces if volume_faces[face] not in (1, 2)]
 
-if zero_volume_elements or internal_boundary_faces or collapsed_wall_edges or unmatched_wedge_bases or invalid_wedge_bases or not wedge_base_faces:
+if zero_volume_elements or internal_boundary_faces or collapsed_wall_edges or unmatched_wedge_bases or invalid_wedge_bases or (wedge_enabled and not wedge_base_faces):
     raise SystemExit(
         "Mesh audit failed: "
         f"zero-volume={len(zero_volume_elements)}, "
@@ -113,5 +120,6 @@ print(
     "Mesh audit passed: "
     f"wedge base faces={len(wedge_base_faces)} "
     f"(shared plinth={shared_wedge_bases}, exposed bedrock={exposed_wedge_bases}); "
-    f"zero-volume elements=0; internal 2D boundary faces=0."
+    f"zero-volume elements=0; internal 2D boundary faces=0; "
+    f"wedge_enabled={wedge_enabled}."
 )
