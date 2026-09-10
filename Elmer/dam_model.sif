@@ -46,9 +46,9 @@ Solver 1
   Nonlinear System Max Iterations = 1
   Linear System Solver = Iterative
   Linear System Iterative Method = BiCGStabl
-  Linear System Preconditioning = ILU1
-  Linear System Max Iterations = 6000
-  Linear System Convergence Tolerance = 1.0e-10
+  Linear System Preconditioning = ILU2
+  Linear System Max Iterations = 12000
+  Linear System Convergence Tolerance = 1.0e-8
   Linear System Abort Not Converged = Logical True
 End
 
