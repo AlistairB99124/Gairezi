@@ -52,9 +52,19 @@ if not math.isclose(radius, 0.5 * (upstream_radius + downstream_radius), abs_tol
 wall_height_above_plinth_m = float(config.get("wall_height_above_plinth_m", 29.0))
 wedge_enabled = bool(config.get("wedge_enabled", True))
 wedge_anchor_radius = float(config.get("wedge_anchor_radius_m", downstream_radius))
-wedge_start_below_crest_m = float(config.get("wedge_start_below_crest_m", 25.54))
-wedge_angle_from_vertical_deg = float(config.get("wedge_angle_from_vertical_deg", 30.0))
-wedge_tangent = math.tan(math.radians(wedge_angle_from_vertical_deg))
+wedge_start_below_crest_m = float(config.get("wedge_start_below_crest_m", 25.0))
+if "wedge_ratio_opposite_m" in config and "wedge_ratio_adjacent_m" in config:
+    wedge_ratio_opposite = float(config["wedge_ratio_opposite_m"])
+    wedge_ratio_adjacent = float(config["wedge_ratio_adjacent_m"])
+    wedge_tangent = wedge_ratio_opposite / wedge_ratio_adjacent
+    wedge_angle_from_vertical_deg = math.degrees(math.atan(wedge_tangent))
+elif "wedge_angle_from_vertical_deg" in config:
+    wedge_angle_from_vertical_deg = float(config["wedge_angle_from_vertical_deg"])
+    wedge_tangent = math.tan(math.radians(wedge_angle_from_vertical_deg))
+else:
+    wedge_tangent = 0.5
+    wedge_angle_from_vertical_deg = math.degrees(math.atan(wedge_tangent))
+
 if not math.isclose(wedge_anchor_radius, downstream_radius, abs_tol=1.0e-8):
     raise ValueError("The wedge anchor radius must coincide with the downstream wall face")
 if not 0.0 < wedge_start_below_crest_m:

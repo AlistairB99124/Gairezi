@@ -2,11 +2,13 @@
   "wall_thickness_m": 4.0,
   "wall_height_above_plinth_m": 29.0,
   "wedge_enabled": true,
-  "wedge_angle_deg": 60.0,
+  "wedge_angle_deg": 64,
   "wall_upstream_radius_m": 80.0,
   "wall_centerline_radius_m": 78.0,
   "wall_downstream_radius_m": 76.0,
   "wedge_anchor_radius_m": 76.0,
-  "wedge_start_below_crest_m": 25.54,
-  "wedge_angle_from_vertical_deg": 30.0
+  "wedge_start_below_crest_m": 25.0,
+  "wedge_ratio_opposite_m": 2.0,
+  "wedge_ratio_adjacent_m": 4.0,
+  "wedge_angle_from_vertical_deg": 26.56505117707799
 }

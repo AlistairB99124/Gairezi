@@ -1,6 +1,6 @@
 {
-  "station_count": 403,
-  "vertical_layers": 59,
+  "station_count": 409,
+  "vertical_layers": 58,
   "arch_subdivisions": 3,
   "wall_thickness_m": 4.0,
   "wall_height_above_plinth_m": 29.0,
@@ -9,14 +9,14 @@
   "wall_downstream_radius_m": 76.0,
   "wedge_enabled": true,
   "wedge_anchor_radius_m": 76.0,
-  "wedge_start_below_crest_m": 25.54,
-  "wedge_angle_from_vertical_deg": 30.0,
+  "wedge_start_below_crest_m": 25.0,
+  "wedge_angle_from_vertical_deg": 26.565051177077994,
   "wedge_element_size_m": 0.5,
-  "wedge_start_station_m": 89.7198697068404,
-  "wedge_end_station_m": 123.03252032520325,
+  "wedge_start_station_m": 87.96091205211727,
+  "wedge_end_station_m": 124.130081300813,
   "wedge_transition_station_boundaries_m": [
-    89.7198697068404,
-    123.03252032520325
+    87.96091205211727,
+    124.130081300813
   ],
   "plinth_upstream_offset_m": 1.0,
   "plinth_downstream_offset_m": 2.0,
