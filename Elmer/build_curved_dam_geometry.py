@@ -52,9 +52,13 @@ if not math.isclose(radius, 0.5 * (upstream_radius + downstream_radius), abs_tol
 wall_height_above_plinth_m = float(config.get("wall_height_above_plinth_m", 29.0))
 wedge_enabled = bool(config.get("wedge_enabled", True))
 wedge_anchor_radius = float(config.get("wedge_anchor_radius_m", downstream_radius))
-wedge_start_below_crest_m = float(config.get("wedge_start_below_crest_m", 25.54))
-wedge_angle_from_vertical_deg = float(config.get("wedge_angle_from_vertical_deg", 30.0))
-wedge_tangent = math.tan(math.radians(wedge_angle_from_vertical_deg))
+wedge_start_below_crest_m = float(config.get("wedge_start_below_crest_m", 25.0))
+wedge_ratio_horizontal_m = float(config.get("wedge_ratio_horizontal_m", 2.0))
+wedge_ratio_vertical_m = float(config.get("wedge_ratio_vertical_m", 4.0))
+if wedge_ratio_horizontal_m <= 0.0 or wedge_ratio_vertical_m <= 0.0:
+    raise ValueError("Wedge horizontal and vertical ratio dimensions must be positive")
+wedge_tangent = wedge_ratio_horizontal_m / wedge_ratio_vertical_m
+wedge_angle_from_vertical_deg = math.degrees(math.atan(wedge_ratio_horizontal_m / wedge_ratio_vertical_m))
 if not math.isclose(wedge_anchor_radius, downstream_radius, abs_tol=1.0e-8):
     raise ValueError("The wedge anchor radius must coincide with the downstream wall face")
 if not 0.0 < wedge_start_below_crest_m:
@@ -626,17 +630,10 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         return offsets
 
     def ordinary_wall_z(point, level_index):
-        lower_block_height = wedge_z_length(point)
-        if lower_block_height > 1.0e-8:
-            wedge_top_z = point["base_z"] + lower_block_height
-            if level_index <= wedge_interface_layer:
-                return point["base_z"] + lower_block_height * level_index / wedge_interface_layer
-            return wedge_top_z + (level_index - wedge_interface_layer) / (
-                vertical_layers - wedge_interface_layer
-            ) * (point["crest_z"] - wedge_top_z)
-        return point["base_z"] + level_index / vertical_layers * (
-            point["crest_z"] - point["base_z"]
-        )
+        # Use the global element-size ladder so every corresponding wall row
+        # is horizontal. The last local boundary cell may be shorter at bedrock.
+        global_z = point["crest_z"] - (vertical_layers - level_index) * target_block_size
+        return max(point["base_z"], min(global_z, point["crest_z"]))
 
     def wedge_wall_z(point, level_index):
         local_transition_height = wedge_z_length(point)
@@ -743,6 +740,10 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
 
     def add_element(element_type, physical_id, node_ids):
         nonlocal element_id
+        if element_type == 6:
+            coordinates = [nodes[node_id - 1][1:] for node_id in node_ids]
+            if len({tuple(round(value, 12) for value in coordinate) for coordinate in coordinates}) < 6:
+                return
         elements.append((element_id, element_type, physical_id, node_ids))
         element_id += 1
 
@@ -766,10 +767,13 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     node_id(station_index + 1, level_index + 1, thickness_index + 1),
                     node_id(station_index, level_index + 1, thickness_index + 1),
                 ]
-                if transition_wall_segments[station_index]:
-                    add_transition_tetrahedra(wall_cell_node_ids)
-                else:
-                    add_element(5, 1, wall_cell_node_ids)
+                start_lower_z = ordinary_wall_z(points[station_index], level_index)
+                start_upper_z = ordinary_wall_z(points[station_index], level_index + 1)
+                end_lower_z = ordinary_wall_z(points[station_index + 1], level_index)
+                end_upper_z = ordinary_wall_z(points[station_index + 1], level_index + 1)
+                if start_upper_z - start_lower_z <= 1.0e-9 or end_upper_z - end_lower_z <= 1.0e-9:
+                    continue
+                add_element(5, 1, wall_cell_node_ids)
 
                 if level_index == 0 and not plinth_active_segments[station_index]:
                     add_element(3, 1, [
@@ -930,6 +934,38 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                 node_id(len(points) - 1, level_index + 1, thickness_index),
             ])
 
+    # A prism at a wedge transition can lose its neighboring prism when the
+    # global wall ladder clamps to a local base. Expose that surviving base as
+    # a proper quadrilateral boundary instead of leaving an unpaired face.
+    volume_faces = {}
+    boundary_faces = set()
+    for _, element_type, physical_id, node_ids in elements:
+        if element_type == 5:
+            face_templates = (
+                (0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+                (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0),
+            )
+        elif element_type == 6:
+            face_templates = (
+                (0, 1, 2), (3, 5, 4), (0, 3, 4, 1),
+                (1, 4, 5, 2), (2, 5, 3, 0),
+            )
+        else:
+            face_templates = ()
+        if element_type in (2, 3):
+            boundary_faces.add(tuple(sorted(node_ids)))
+        for template in face_templates:
+            face = tuple(sorted(node_ids[index] for index in template))
+            volume_faces[face] = volume_faces.get(face, 0) + 1
+    for _, element_type, physical_id, node_ids in list(elements):
+        if element_type != 6:
+            continue
+        base = [node_ids[1], node_ids[2], node_ids[5], node_ids[4]]
+        face = tuple(sorted(base))
+        if volume_faces.get(face) == 1 and face not in boundary_faces:
+            add_element(3, 1, base)
+            boundary_faces.add(face)
+
     used_node_ids = {
         node_identifier
         for _, _, _, node_ids in elements
@@ -980,6 +1016,9 @@ meta_path.write_text(
             "wedge_enabled": wedge_enabled,
             "wedge_anchor_radius_m": wedge_anchor_radius,
             "wedge_start_below_crest_m": wedge_start_below_crest_m,
+            "wedge_ratio_horizontal_m": wedge_ratio_horizontal_m,
+            "wedge_ratio_vertical_m": wedge_ratio_vertical_m,
+            "wedge_max_sloping_length_m": math.hypot(wedge_ratio_horizontal_m, wedge_ratio_vertical_m),
             "wedge_angle_from_vertical_deg": wedge_angle_from_vertical_deg,
             "wedge_element_size_m": target_block_size,
             "wedge_start_station_m": wedge_start_station_m,
