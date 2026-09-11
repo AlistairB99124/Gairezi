@@ -375,6 +375,19 @@ if wedge_enabled:
     insert_station(points, wedge_end_station_m)
 if len(points) < 2:
     raise ValueError("The plinth profile must contain at least two non-zero wall-height stations")
+
+# Ensure each Y/chainage wall tip contains exactly three global-size cells.
+# The existing wall loop then supplies eight 0.5 m thickness cells for every
+# retained Z interval, using the same horizontal wall faces as the bulk mesh.
+wall_tip_length_m = 1.5
+for tip_start, tip_end in (
+    (points[0]["station"], points[0]["station"] + wall_tip_length_m),
+    (points[-1]["station"] - wall_tip_length_m, points[-1]["station"]),
+):
+    tip_station = tip_start
+    while tip_station <= tip_end + 1.0e-9:
+        insert_station(points, tip_station)
+        tip_station += target_block_size
 assign_normals(points)
 local_heights = [point["crest_z"] - point["base_z"] for point in points]
 average_height = sum(local_heights) / len(local_heights)
@@ -1035,6 +1048,9 @@ meta_path.write_text(
             "dam_height_m": dam_height,
             "mesh_size_m": mesh_size,
             "target_block_size_m": target_block_size,
+            "wall_tip_length_m": wall_tip_length_m,
+            "wall_tip_cells_along_y": int(round(wall_tip_length_m / target_block_size)),
+            "wall_tip_cells_across_x": thickness_layers,
             "maximum_bulk_hex_edge_m": target_block_size,
             "thickness_layers": thickness_layers,
             "crest_detail_height_m": crest_detail_height,
