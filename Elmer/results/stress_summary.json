@@ -1,37 +1,37 @@
 {
-  "source_vtu": "Elmer/results/dam_results_t0001.vtu",
-  "element_count": 243880,
+  "source_vtu": "/Users/alistairdavies/Projects/Gairezi/Elmer/results/dam_results_t0001.vtu",
+  "element_count": 119868,
   "max_tensile_principal_stress_pa": {
-    "element_id": 227503,
-    "value_pa": 10717415.046218822,
+    "element_id": 8,
+    "value_pa": 35807693.65363598,
     "centroid_xyz_m": [
-      79.74836888662577,
-      -0.5051862154880108,
-      -25.66167343170737
+      6.589273904065516,
+      75.96517664983908,
+      -0.11928512878365716
     ]
   },
   "max_compressive_principal_stress_pa": {
-    "element_id": 227512,
-    "value_pa": -17793544.035478745,
+    "element_id": 1,
+    "value_pa": -162845558.56073934,
     "centroid_xyz_m": [
-      75.80921751625343,
-      -0.4803001706653284,
-      -25.66194759409629
+      6.887775963323092,
+      79.45305587403286,
+      -0.11874595547155868
     ]
   },
   "independent_affine_check": {
     "max_tensile_principal_stress_pa": {
-      "element_id": 227503,
-      "value_pa": 10717415.046218822
+      "element_id": 8,
+      "value_pa": 35807693.65363598
     },
     "max_compressive_principal_stress_pa": {
-      "element_id": 227512,
-      "value_pa": -17793544.035478745
+      "element_id": 1,
+      "value_pa": -162845558.56073934
     }
   },
   "note": "Positive principal stress indicates tension. Negative principal stress indicates compression.",
   "tensile_strength_pa": 2000000.0,
-  "tension_utilization": 5.358707523109411,
+  "tension_utilization": 17.90384682681799,
   "client_expected_tension_mpa": 1.2,
   "client_expected_compression_mpa": -3.33,
   "detailing_assessment": {

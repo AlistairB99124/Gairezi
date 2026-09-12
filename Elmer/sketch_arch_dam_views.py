@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
+import csv
 import json
+import math
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -55,31 +57,40 @@ def split_stations(
 
 def extract_downstream_face(mesh_path: Path) -> list[tuple[float, float, float]]:
     metadata = read_mesh_metadata(mesh_path)
-    nodes = read_gmsh_nodes(mesh_path)
     vertical_layers = int(metadata.get("vertical_layers", 1))
-    thickness_layers = int(metadata.get("thickness_layers", 1))
-    station_count = int(metadata.get("station_count", 0))
-    nodes_per_level = thickness_layers + 1
-    nodes_per_station = (vertical_layers + 1) * nodes_per_level
     face: list[tuple[float, float, float]] = []
-    for station_offset in range(0, station_count * nodes_per_station, nodes_per_station):
-        station = nodes[station_offset : station_offset + nodes_per_station]
+    for station in load_station_edges(mesh_path):
+        base_z = station["outer_base"][2]
+        crest_z = station["outer_top"][2]
         for layer in range(vertical_layers + 1):
-            base = layer * nodes_per_level
-            downstream = station[base + thickness_layers]
-            face.append(downstream)
+            fraction = layer / vertical_layers
+            x_value, y_value, _ = station["outer_base"]
+            face.append((x_value, y_value, base_z + fraction * (crest_z - base_z)))
     return face
 
 
 def load_station_edges(mesh_path: Path) -> list[dict[str, tuple[float, float, float]]]:
     metadata = read_mesh_metadata(mesh_path)
-    nodes = read_gmsh_nodes(mesh_path)
-    return split_stations(
-        nodes,
-        int(metadata.get("station_count", 0)),
-        int(metadata.get("vertical_layers", 1)),
-        int(metadata.get("thickness_layers", 1)),
-    )
+    centerline_path = mesh_path.with_name("curved_dam_centerline.csv")
+    upstream_radius = float(metadata["wall_upstream_radius_m"])
+    downstream_radius = float(metadata["wall_downstream_radius_m"])
+    stations: list[dict[str, tuple[float, float, float]]] = []
+    with centerline_path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            theta = math.atan2(float(row["x"]), float(row["y"]))
+            sin_theta = math.sin(theta)
+            cos_theta = math.cos(theta)
+            base_z = float(row["z_base"])
+            crest_z = float(row["z_crest"])
+            stations.append(
+                {
+                    "inner_base": (upstream_radius * sin_theta, upstream_radius * cos_theta, base_z),
+                    "outer_base": (downstream_radius * sin_theta, downstream_radius * cos_theta, base_z),
+                    "inner_top": (upstream_radius * sin_theta, upstream_radius * cos_theta, crest_z),
+                    "outer_top": (downstream_radius * sin_theta, downstream_radius * cos_theta, crest_z),
+                }
+            )
+    return stations
 
 
 def xyz(points: list[tuple[float, float, float]]) -> tuple[list[float], list[float], list[float]]:

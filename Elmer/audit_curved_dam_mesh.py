@@ -65,8 +65,9 @@ wedge_ids = markers["wedge_element_ids"]
 transition_ids = markers["transition_element_ids"]
 wedge_bottom_faces = [tuple(sorted(face)) for face in markers["wedge_bottom_faces"]]
 wedge_wall_faces = [tuple(sorted(face)) for face in markers["wedge_wall_faces"]]
+wedge_outer_faces = [tuple(sorted(face)) for face in markers.get("wedge_outer_faces", [])]
 marker_errors = (
-    not wedge_ids or not transition_ids or not wedge_bottom_faces or not wedge_wall_faces
+    not wedge_ids or not transition_ids or not wedge_bottom_faces or not wedge_wall_faces or not wedge_outer_faces
     or any(elements.get(element_id, (None, None, ()))[0] != 4 for element_id in wedge_ids + transition_ids)
 )
 shared_bottom_faces = [face for face in wedge_bottom_faces if volume_faces[face] == 2]
@@ -83,26 +84,30 @@ invalid_wall_faces = [
     if volume_faces[face] != 2
     or any(not math.isclose(math.hypot(nodes[node_id][0], nodes[node_id][1]), 76.0, abs_tol=1.0e-8) for node_id in face)
 ]
-wedge_node_ids = {node_id for element_id in wedge_ids for node_id in elements[element_id][2]}
-wedge_nodes = [nodes[node_id] for node_id in wedge_node_ids]
-z_values = [node[2] for node in wedge_nodes]
-radii = [math.hypot(node[0], node[1]) for node in wedge_nodes]
-outer_nodes = [node for node in wedge_nodes if math.hypot(node[0], node[1]) < 76.0 - 1.0e-8]
+wall_ladder_errors = [
+    marker for marker in markers.get("ordinary_wall_ladder", [])
+    if not math.isclose(nodes[marker["node_id"]][2], marker["expected_z"], abs_tol=1.0e-8)
+]
+outer_node_ids = {node_id for face in wedge_outer_faces for node_id in face}
+outer_nodes = [nodes[node_id] for node_id in outer_node_ids]
+z_values = [node[2] for node in outer_nodes]
+radii = [math.hypot(node[0], node[1]) for node in outer_nodes]
 invalid_outer_nodes = [
     node for node in outer_nodes
     if not math.isclose(math.hypot(node[0], node[1]), 76.0 - (-25.0 - node[2]) / 2.0, abs_tol=1.0e-7)
 ]
 dimension_errors = bool(
-    not wedge_nodes or not math.isclose(max(z_values), -25.0, abs_tol=1.0e-8)
+    not outer_nodes or not math.isclose(max(z_values), -25.0, abs_tol=1.0e-8)
     or min(radii) < 74.0 - 1.0e-8 or not outer_nodes or invalid_outer_nodes
 )
 
-if zero_volume or internal_boundaries or marker_errors or invalid_bottom_faces or invalid_wall_faces or dimension_errors:
+if zero_volume or internal_boundaries or marker_errors or invalid_bottom_faces or invalid_wall_faces or wall_ladder_errors or dimension_errors:
     raise SystemExit(
         "Mesh audit failed: "
         f"zero-volume={len(zero_volume)}, internal-explicit-boundaries={len(internal_boundaries)}, "
         f"marker-errors={int(marker_errors)}, wedge-bottom-errors={len(invalid_bottom_faces)}, "
-        f"wall-face-errors={len(invalid_wall_faces)}, dimension-errors={int(dimension_errors)}"
+        f"wall-face-errors={len(invalid_wall_faces)}, wall-ladder-errors={len(wall_ladder_errors)}, "
+        f"dimension-errors={int(dimension_errors)}"
     )
 
 print(
@@ -110,7 +115,7 @@ print(
     f"wedge-tets={len(wedge_ids)}, transition-tets={len(transition_ids)}, "
     f"wedge-bottom-faces={len(wedge_bottom_faces)} (shared-plinth={len(shared_bottom_faces)}, bedrock={len(bedrock_bottom_faces)}), "
     f"wall-shared-faces={len(wedge_wall_faces)}, zero-volume=0, internal-explicit-boundaries=0; "
-    f"wedge-z={min(z_values):.6f}..{max(z_values):.6f}; wedge-r={min(radii):.6f}..{max(radii):.6f}."
+    f"ordinary-wall-ladder-errors=0; wedge-z={min(z_values):.6f}..{max(z_values):.6f}; wedge-r={min(radii):.6f}..{max(radii):.6f}."
 )
 '''
 from collections import Counter
