@@ -392,7 +392,7 @@ if len(points) < 2:
     raise ValueError("The plinth profile must contain at least two non-zero wall-height stations")
 
 wedge_end_taper_length_m = 2.0
-wedge_end_taper_station_spacing_m = 0.25
+wedge_end_taper_station_spacing_m = target_block_size
 if wedge_enabled:
     for endpoint, direction in ((wedge_start_station_m, 1.0), (wedge_end_station_m, -1.0)):
         station = endpoint + direction * wedge_end_taper_station_spacing_m

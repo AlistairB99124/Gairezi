@@ -77,10 +77,10 @@ End
 Boundary Condition 2
   Name = "UpstreamHydrostaticPressure"
   Target Boundaries(1) = 2
-  ! The rebuilt mesh places the crest at z = 0. The reservoir free surface is
-  ! 2 m above crest, giving 304110 Pa at the deepest z = -29 m foundation.
+  ! The reservoir free surface is at the z = 0 crest elevation, giving the
+  ! configured 284490 Pa peak pressure at the z = -29 m foundation.
   Normal Force = Variable Coordinate 3
-    Real MATC "-1000.0 * 9.81 * (2.0 - tx) * (tx < 2.0) * 1.0"
+    Real MATC "-1000.0 * 9.81 * (0.0 - tx) * (tx < 0.0) * 1.0"
 End
 
 Boundary Condition 3

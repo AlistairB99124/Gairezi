@@ -184,13 +184,13 @@ if (
 
 print(
     "Mesh audit passed: "
-    f"wedge-tets={len(wedge_ids)}, transition-tets={len(transition_ids)}, "
+    f"wedge-hexes={len(wedge_ids)}, transition-tets={len(transition_ids)}, "
     f"wedge-bottom-faces={len(wedge_bottom)} (shared-plinth={len(shared_bottom)}, bedrock={len(bedrock_bottom)}), "
     f"wall-shared-faces={len(wedge_wall)}, zero-volume=0, internal-explicit-boundaries=0; "
     f"ordinary-wall-ladder-errors=0; tip-fine-hexes={len(tip_hex_ids)}, "
     f"tip-transition-elements={len(tip_transition_ids)}, "
     f"wedge-plinth-hexes={len(wedge_plinth_hex_ids)}, "
-    f"wedge-plinth-boundary-tets={len(wedge_plinth_boundary_ids)}, "
+    f"wedge-plinth-boundary-hexes={len(wedge_plinth_boundary_ids)}, "
     f"tip-unbonded-faces=0, tip-plinth-unbonded-faces=0, "
     f"wall-plinth-faces={len(wall_plinth)}, wall-plinth-unbonded-faces=0, "
     f"tip-x-max={max(tip_x_edges):.6f}, tip-y-range={min(tip_y_edges):.6f}..{max(tip_y_edges):.6f}, "
