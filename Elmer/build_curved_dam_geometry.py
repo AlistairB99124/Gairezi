@@ -1389,7 +1389,26 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         if element_type in (2, 3)
     }
 
+    bedrock_node_ids = {
+        node_id(station_index, 0, thickness_index)
+        for station_index in range(len(points))
+        for thickness_index in range(thickness_layers + 1)
+    }
+    bedrock_node_ids.update(
+        tip_node_ids[station_index, 0, thickness_index]
+        for station_index in tip_station_indices
+        for thickness_index in range(tip_thickness_layers + 1)
+    )
+    bedrock_node_ids.update(
+        node_identifier
+        for station_levels in plinth_node_ids
+        if station_levels is not None
+        for node_identifier in station_levels[0]
+    )
+
     def transition_boundary_id(face_node_ids):
+        if all(node_identifier in bedrock_node_ids for node_identifier in face_node_ids):
+            return 1
         coordinates = [nodes[node_identifier - 1][1:] for node_identifier in face_node_ids]
         radii = [math.hypot(coordinate[0], coordinate[1]) for coordinate in coordinates]
         if all(math.isclose(radius_value, upstream_radius, abs_tol=1.0e-7) for radius_value in radii):
@@ -1398,11 +1417,11 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             return 3
         if all(math.isclose(coordinate[2], crest_elevation, abs_tol=1.0e-7) for coordinate in coordinates):
             return 4
-        return 1
+        return 7
 
     # The sloping tip bases can leave triangular perimeter facets where the local
     # 0.1 m ladder clamps before its 0.5 m neighbour. Tag every exposed transition
-    # face explicitly so it receives either its face load or the fixed bedrock BC.
+    # face explicitly so only true foundation faces receive the bedrock support.
     for transition_element_id in tip_transition_element_ids:
         _, element_type, _, cell_node_ids = elements[transition_element_id - 1]
         for face in volume_face_templates[element_type]:
@@ -1412,6 +1431,15 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             add_element(2 if len(face_node_ids) == 3 else 3, transition_boundary_id(face_node_ids), list(face_node_ids))
             explicit_boundary_faces.add(face_node_ids)
 
+    # Only retain boundary facets owned by a single volume cell. Some taper
+    # construction candidates have no adjacent volume and would otherwise
+    # export free nodes with zero-stiffness displacement rows.
+    elements = [
+        element
+        for element in elements
+        if element[1] not in (2, 3)
+        or volume_face_incidence.get(tuple(sorted(element[3]))) == 1
+    ]
 
     used_node_ids = {
         node_identifier

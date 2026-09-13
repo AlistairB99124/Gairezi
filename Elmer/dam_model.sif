@@ -44,10 +44,12 @@ Solver 1
   Calculate Stresses = Logical True
   Calculate Principal = Logical True
   Nonlinear System Max Iterations = 1
+  ! Threshold ILU handles the contrast between foundation and concrete stiffness.
   Linear System Solver = Iterative
   Linear System Iterative Method = BiCGStabl
-  Linear System Preconditioning = ILU1
-  Linear System Max Iterations = 6000
+  Linear System Preconditioning = ILUT
+  Linear System ILUT Tolerance = 1.0e-4
+  Linear System Max Iterations = 1500
   Linear System Convergence Tolerance = 1.0e-10
   Linear System Abort Not Converged = Logical True
 End
@@ -63,10 +65,13 @@ End
 Boundary Condition 1
   Name = "BedrockBase"
   Target Boundaries(1) = 1
-  ! Bedrock is modeled as fixed no-move per project boundary assumption.
-  Displacement 1 = Real 0.0
-  Displacement 2 = Real 0.0
-  Displacement 3 = Real 0.0
+  ! Distributed elastic foundation, in N/m^3 (traction per displacement).
+  ! Representative granite rock mass: E = 35 GPa, nu = 0.25, G = 14 GPa.
+  ! Elastic half-space estimate over 7 m plinth width:
+  ! k_h = 8G / ((2 - nu) B) = 9.1e9 N/m^3; k_v = 4G / ((1 - nu) B) = 1.07e10 N/m^3.
+  Spring 1 = Real 9.1e9
+  Spring 2 = Real 9.1e9
+  Spring 3 = Real 1.07e10
 End
 
 Boundary Condition 2

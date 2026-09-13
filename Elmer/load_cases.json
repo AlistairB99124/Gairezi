@@ -19,7 +19,14 @@
     "overflow_head": 2.0,
     "overflow_water_level": 31.0,
     "water_density": 1000.0,
-    "bedrock_support": "rigid_fixed"
+    "bedrock_support": {
+      "model": "distributed_elastic_granite_half_space",
+      "rock_mass_youngs_modulus_pa": 35000000000.0,
+      "poisson_ratio": 0.25,
+      "influence_width_m": 7.0,
+      "horizontal_stiffness_n_per_m3": 9100000000.0,
+      "vertical_stiffness_n_per_m3": 10700000000.0
+    }
   },
   "outputs": {
     "max_displacement": true,
