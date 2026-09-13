@@ -400,12 +400,21 @@ if wedge_enabled:
             insert_station(points, station)
             station += direction * wedge_end_taper_station_spacing_m
 
+# Keep the mathematical zero of each end taper one local station beyond its
+# wall/plinth alignment plane. This gives each aligned end cap finite volume
+# instead of silently moving it 0.25 m into the wedge span.
+wedge_taper_start_station_m = wedge_start_station_m - wedge_end_taper_station_spacing_m
+wedge_taper_end_station_m = wedge_end_station_m + wedge_end_taper_station_spacing_m
+
 
 def wedge_z_length(point):
     raw_length = raw_wedge_z_length(point)
     if not wedge_enabled:
         return raw_length
-    distance_to_end = min(point["station"] - wedge_start_station_m, wedge_end_station_m - point["station"])
+    distance_to_end = min(
+        point["station"] - wedge_taper_start_station_m,
+        wedge_taper_end_station_m - point["station"],
+    )
     taper_fraction = max(0.0, min(1.0, distance_to_end / wedge_end_taper_length_m))
     return raw_length * math.sin(0.5 * math.pi * taper_fraction)
 

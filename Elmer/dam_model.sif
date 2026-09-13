@@ -37,7 +37,7 @@ End
 
 Solver 1
   Equation = "Elasticity"
-  Procedure = "ElasticSolve" "ElasticSolver"
+  Procedure = "StressSolve" "StressSolver"
   Variable = "Displacement"
   Variable DOFs = 3
   ! Native nodal stress recovery also writes the vonMises field.

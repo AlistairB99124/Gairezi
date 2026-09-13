@@ -30,7 +30,7 @@ class DataArraySpec:
     components: int
 
 
-def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
     data = path.read_bytes()
     appended_tag = b'<AppendedData encoding="raw">'
     appended_start = data.index(appended_tag)
@@ -75,11 +75,11 @@ def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
     offsets = read_array(arrays["offsets"])
     cell_types = read_array(arrays["types"])
 
-    cells: list[np.ndarray] = []
+    cells: list[tuple[int, np.ndarray]] = []
     start = 0
     for end, cell_type in zip(offsets.tolist(), cell_types.tolist()):
-        if cell_type == 12:
-            cells.append(connectivity[start:end])
+        if cell_type in (10, 12, 14):  # VTK tetrahedron, hexahedron, pyramid
+            cells.append((cell_type, connectivity[start:end]))
         start = end
 
     return points, displacement, cells
@@ -424,7 +424,7 @@ def analyze(
     expected_compression_mpa: float | None,
     exclude_below_z: float | None = None,
 ) -> tuple[Path, Path, Path, Path, Path]:
-    points, displacement, hex_cells = parse_vtu(vtu_path)
+    points, displacement, volume_cells = parse_vtu(vtu_path)
     material_matrix = constitutive_matrix(youngs_modulus, poisson_ratio)
 
     element_rows: list[dict[str, float]] = []
@@ -433,11 +433,15 @@ def analyze(
     max_tension_affine = {"element_id": -1, "value_pa": float("-inf")}
     max_compression_affine = {"element_id": -1, "value_pa": float("inf")}
 
-    for element_id, node_ids in enumerate(hex_cells, start=1):
+    for element_id, (cell_type, node_ids) in enumerate(volume_cells, start=1):
         coords = points[node_ids]
         element_displacements = displacement[node_ids]
-        stress = brick_center_stress(coords, element_displacements, material_matrix)
         affine_stress = affine_fit_stress(coords, element_displacements, material_matrix)
+        stress = (
+            brick_center_stress(coords, element_displacements, material_matrix)
+            if cell_type == 12
+            else affine_stress
+        )
         affine_principal = np.linalg.eigvalsh(stress_tensor(affine_stress))
         centroid = coords.mean(axis=0)
 
