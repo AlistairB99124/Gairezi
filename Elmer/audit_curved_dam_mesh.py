@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+from itertools import combinations
 import json
 import math
 from pathlib import Path
@@ -140,7 +141,27 @@ tip_plinth_unbonded_faces = [
     if elements.get(element_id, (None, None, ()))[0] == 5
     and face_incidence[tuple(sorted(elements[element_id][2][index] for index in (0, 1, 2, 3)))] != 2
 ]
-wall_plinth_unbonded_faces = [face for face in wall_plinth if face_incidence[face] != 2]
+
+
+def is_wall_plinth_face_bonded(face):
+    """A quad face may legitimately bond to two tetrahedron triangles instead
+    of a matching quad (the standard hex/pyramid-to-tet transition). Accept
+    either a direct quad match or a triangle-pair covering the same 4 nodes."""
+    if face_incidence[face] == 2:
+        return True
+    if len(face) != 4 or face_incidence[face] != 1:
+        return False
+    triangles = list(combinations(face, 3))
+    for first_index in range(len(triangles)):
+        for second_index in range(first_index + 1, len(triangles)):
+            first_triangle = tuple(sorted(triangles[first_index]))
+            second_triangle = tuple(sorted(triangles[second_index]))
+            if face_incidence[first_triangle] >= 1 and face_incidence[second_triangle] >= 1:
+                return True
+    return False
+
+
+wall_plinth_unbonded_faces = [face for face in wall_plinth if not is_wall_plinth_face_bonded(face)]
 tip_marker_errors = (
     not tip_hex_ids
     or tip_prism_ids

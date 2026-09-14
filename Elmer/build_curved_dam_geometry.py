@@ -978,7 +978,20 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
     for station_index in range(len(points) - 1):
         if station_index in tip_segment_indices or station_index in tip_transition_segments:
             continue
+        smoothing_segment = (
+            plinth_active_segments[station_index]
+            and not wedge_active_stations[station_index]
+            and not wedge_active_stations[station_index + 1]
+        )
+        smoothing_level = (
+            ordinary_wall_segment_base_level(points[station_index], points[station_index + 1])
+            if smoothing_segment else None
+        )
         for level_index in range(vertical_layers):
+            if smoothing_segment and level_index == smoothing_level:
+                # This band is covered by the sloped plinth-to-wall smoothing hex
+                # instead (bonded directly to each station's own true wall base).
+                continue
             for thickness_index in range(thickness_layers):
                 wall_cell_node_ids = [
                     node_id(station_index, level_index, thickness_index),
@@ -1083,8 +1096,15 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         lower_edges = ((lower_quad[0], lower_quad[1]), (lower_quad[1], lower_quad[2]),
                        (lower_quad[2], lower_quad[3]), (lower_quad[3], lower_quad[0]))
         for upper_edge, lower_edge in zip(boundary_edges, lower_edges):
-            add_element(4, 1, [upper_edge[0], upper_edge[1], lower_edge[1], core_node_id])
-            add_element(4, 1, [upper_edge[0], lower_edge[1], lower_edge[0], core_node_id])
+            # A shared corner between the upper and lower quads (e.g. the shallow
+            # end of a tapering wedge) collapses one of these tetrahedra to zero
+            # volume; skip it rather than emitting a degenerate element.
+            first_tetrahedron = (upper_edge[0], upper_edge[1], lower_edge[1], core_node_id)
+            if len(set(first_tetrahedron)) == 4:
+                add_element(4, 1, list(first_tetrahedron))
+            second_tetrahedron = (upper_edge[0], lower_edge[1], lower_edge[0], core_node_id)
+            if len(set(second_tetrahedron)) == 4:
+                add_element(4, 1, list(second_tetrahedron))
 
     def add_tip_plinth_transition(lower_start, lower_end, station_index, thickness_index):
         """Fill one coarse plinth-top cell below five fine wall-base quads."""
@@ -1220,23 +1240,58 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                             ),
                         )
                         continue
-                    if vertical_index == plinth_vertical_layers - 1 and wall_start_in_plinth <= thickness_index < wall_end_in_plinth:
-                        wall_level_index = ordinary_wall_segment_base_level(
-                            points[station_index], points[station_index + 1],
-                        )
-                        upper_quad = (
-                            node_id(station_index, wall_level_index, thickness_index - wall_start_in_plinth),
-                            node_id(station_index + 1, wall_level_index, thickness_index - wall_start_in_plinth),
-                            node_id(station_index + 1, wall_level_index, thickness_index + 1 - wall_start_in_plinth),
-                            node_id(station_index, wall_level_index, thickness_index + 1 - wall_start_in_plinth),
+                    if (
+                        vertical_index == plinth_vertical_layers - 1
+                        and wall_start_in_plinth <= thickness_index < wall_end_in_plinth
+                        and wedge_active_stations[station_index] != wedge_active_stations[station_index + 1]
+                    ):
+                        # Mixed wedge-boundary segment: the wedge-active station's own
+                        # wall attachment is governed by the wedge mechanism, not the
+                        # plinth ladder, so fall back to the pyramid+prism transition
+                        # instead of the smoothing hex used for ordinary segments.
+                        level_a = ordinary_wall_base_level(points[station_index])
+                        level_b = ordinary_wall_base_level(points[station_index + 1])
+                        left_thickness = thickness_index - wall_start_in_plinth
+                        right_thickness = thickness_index + 1 - wall_start_in_plinth
+                        attachment_quad = (
+                            node_id(station_index, level_a, left_thickness),
+                            node_id(station_index + 1, level_b, left_thickness),
+                            node_id(station_index + 1, level_b, right_thickness),
+                            node_id(station_index, level_a, right_thickness),
                         )
                         add_wall_plinth_transition(
-                            [upper_quad],
+                            [attachment_quad],
                             (
                                 lower_start[thickness_index], lower_end[thickness_index],
                                 lower_end[thickness_index + 1], lower_start[thickness_index + 1],
                             ),
                         )
+                        if level_a != level_b:
+                            segment_level = max(level_a, level_b)
+                            deep_station, deep_level = (
+                                (station_index + 1, level_b) if level_a == segment_level else (station_index, level_a)
+                            )
+                            left_triangle = (
+                                node_id(station_index, segment_level, left_thickness),
+                                node_id(station_index + 1, segment_level, left_thickness),
+                                node_id(deep_station, deep_level, left_thickness),
+                            )
+                            right_triangle = (
+                                node_id(station_index, segment_level, right_thickness),
+                                node_id(station_index + 1, segment_level, right_thickness),
+                                node_id(deep_station, deep_level, right_thickness),
+                            )
+                            add_prism_tetrahedra(left_triangle, right_triangle)
+                            add_element(3, 7, [
+                                node_id(deep_station, segment_level, left_thickness),
+                                node_id(deep_station, deep_level, left_thickness),
+                                node_id(deep_station, deep_level, right_thickness),
+                                node_id(deep_station, segment_level, right_thickness),
+                            ])
+                            if left_thickness == 0:
+                                add_element(2, 2, list(left_triangle))
+                            if right_thickness == thickness_layers:
+                                add_element(2, 3, list(right_triangle))
                         continue
                     plinth_cell_node_ids = [
                         lower_start[thickness_index], lower_end[thickness_index],
@@ -1274,6 +1329,60 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                 if vertical_index == plinth_vertical_layers - 1 and transition_segment:
                     for _, upper_triangle in triangles[2:]:
                         add_element(2, 7, list(upper_triangle))
+
+        if (
+            not transition_segment
+            and station_index not in tip_segment_indices
+            and station_index not in tip_transition_segments
+            and not wedge_active_stations[station_index]
+            and not wedge_active_stations[station_index + 1]
+        ):
+            # Bond the plinth directly to the wall with a single, continuously
+            # sloped hex per thickness column: bottom follows each station's own
+            # true wall base (no discrete stepping), top is one shared ladder
+            # level above the taller requirement, guaranteeing strictly positive
+            # height everywhere and eliminating the reentrant-corner notch.
+            segment_level = ordinary_wall_segment_base_level(points[station_index], points[station_index + 1])
+            level_a = ordinary_wall_base_level(points[station_index])
+            level_b = ordinary_wall_base_level(points[station_index + 1])
+            for thickness_index in range(thickness_layers):
+                smoothing_cell_node_ids = [
+                    node_id(station_index, level_a, thickness_index),
+                    node_id(station_index + 1, level_b, thickness_index),
+                    node_id(station_index + 1, level_b, thickness_index + 1),
+                    node_id(station_index, level_a, thickness_index + 1),
+                    node_id(station_index, segment_level + 1, thickness_index),
+                    node_id(station_index + 1, segment_level + 1, thickness_index),
+                    node_id(station_index + 1, segment_level + 1, thickness_index + 1),
+                    node_id(station_index, segment_level + 1, thickness_index + 1),
+                ]
+                add_element(5, 1, smoothing_cell_node_ids)
+                wall_plinth_faces.append((
+                    node_id(station_index, level_a, thickness_index),
+                    node_id(station_index + 1, level_b, thickness_index),
+                    node_id(station_index + 1, level_b, thickness_index + 1),
+                    node_id(station_index, level_a, thickness_index + 1),
+                ))
+                wall_plinth_faces.append((
+                    node_id(station_index, segment_level + 1, thickness_index),
+                    node_id(station_index + 1, segment_level + 1, thickness_index),
+                    node_id(station_index + 1, segment_level + 1, thickness_index + 1),
+                    node_id(station_index, segment_level + 1, thickness_index + 1),
+                ))
+                if thickness_index == 0:
+                    add_element(3, 2, [
+                        node_id(station_index, level_a, thickness_index),
+                        node_id(station_index + 1, level_b, thickness_index),
+                        node_id(station_index + 1, segment_level + 1, thickness_index),
+                        node_id(station_index, segment_level + 1, thickness_index),
+                    ])
+                if thickness_index == thickness_layers - 1:
+                    add_element(3, 3, [
+                        node_id(station_index, level_a, thickness_index + 1),
+                        node_id(station_index, segment_level + 1, thickness_index + 1),
+                        node_id(station_index + 1, segment_level + 1, thickness_index + 1),
+                        node_id(station_index + 1, level_b, thickness_index + 1),
+                    ])
 
         if station_index == 0 or not plinth_active_segments[station_index - 1]:
             for vertical_index in range(plinth_vertical_layers):
