@@ -355,11 +355,18 @@ def raw_wedge_z_length(point):
     return point["crest_z"] - point["base_z"] - wedge_start_below_crest_m
 
 
+# The wedge is only activated where its own natural (unmodified) triangle is at
+# least this tall/wide, so every activated station already presents a clean,
+# non-degenerate 2:1 (height:width) triangular cross-section -- matching the
+# side ribs' fixed 2m x 1m size -- with no separate tip/edge cutoff needed.
+wedge_activation_margin_m = 2.0
+
+
 def find_wedge_start_crossings(points):
     crossings = []
     for start, end in zip(points, points[1:]):
-        start_delta = raw_wedge_z_length(start)
-        end_delta = raw_wedge_z_length(end)
+        start_delta = raw_wedge_z_length(start) - wedge_activation_margin_m
+        end_delta = raw_wedge_z_length(end) - wedge_activation_margin_m
         if start_delta * end_delta < 0.0:
             fraction = -start_delta / (end_delta - start_delta)
             crossings.append(start["station"] + fraction * (end["station"] - start["station"]))
@@ -372,15 +379,13 @@ if wedge_enabled:
         raise ValueError("The plinth-derived wedge requires exactly two start-threshold intersections")
     raw_wedge_start_station_m, raw_wedge_end_station_m = wedge_start_crossings
 
-    # Keep both wedge end caps inside the zero-height intersections, then use
-    # existing wall-grid stations so the new wedge can share its Y-direction nodes.
-    wedge_end_trim_m = 2.0 * target_block_size
-    trimmed_start = raw_wedge_start_station_m + wedge_end_trim_m
-    trimmed_end = raw_wedge_end_station_m - wedge_end_trim_m
-    wedge_start_station_m = min(points, key=lambda point: abs(point["station"] - trimmed_start))["station"]
-    wedge_end_station_m = min(points, key=lambda point: abs(point["station"] - trimmed_end))["station"]
+    # Snap directly to the nearest existing wall-grid station at the activation
+    # margin crossing -- no further inward trim/easing, so the end cap sits
+    # right where the wedge is already a clean 2:1 triangle.
+    wedge_start_station_m = min(points, key=lambda point: abs(point["station"] - raw_wedge_start_station_m))["station"]
+    wedge_end_station_m = min(points, key=lambda point: abs(point["station"] - raw_wedge_end_station_m))["station"]
     if wedge_end_station_m <= wedge_start_station_m:
-        raise ValueError("The inward-trimmed wedge span must contain at least one wall-grid segment")
+        raise ValueError("The activation-margin wedge span must contain at least one wall-grid segment")
 
     insert_station(points, wedge_start_station_m)
     wedge_station = wedge_start_station_m + target_block_size
@@ -408,15 +413,10 @@ wedge_taper_end_station_m = wedge_end_station_m + wedge_end_taper_station_spacin
 
 
 def wedge_z_length(point):
-    raw_length = raw_wedge_z_length(point)
-    if not wedge_enabled:
-        return raw_length
-    distance_to_end = min(
-        point["station"] - wedge_taper_start_station_m,
-        wedge_taper_end_station_m - point["station"],
-    )
-    taper_fraction = max(0.0, min(1.0, distance_to_end / wedge_end_taper_length_m))
-    return raw_length * math.sin(0.5 * math.pi * taper_fraction)
+    # No chainage-direction easing: the wedge is either fully at its own
+    # natural (unmodified) size, or inactive -- an abrupt, open 2:1 face at
+    # each end rather than a smoothed/filleted transition.
+    return raw_wedge_z_length(point)
 
 # Refine the retained 2 m wall tips only in X and Y. Each tip cell spans the
 # entire local wall height in Z, avoiding thin cells at the sloping plinth.
@@ -1654,7 +1654,8 @@ meta_path.write_text(
             "wedge_element_size_m": target_block_size,
             "wedge_start_station_m": wedge_start_station_m,
             "wedge_end_station_m": wedge_end_station_m,
-            "wedge_end_taper_length_m": wedge_end_taper_length_m,
+            "wedge_activation_margin_m": wedge_activation_margin_m,
+            "wedge_end_taper_length_m": 0.0,
             "wedge_end_taper_station_spacing_m": wedge_end_taper_station_spacing_m,
             "wedge_transition_station_boundaries_m": [
                 wedge_start_station_m,
