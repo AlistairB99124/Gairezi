@@ -352,6 +352,53 @@ def main():
     all_coords = dict(nodes)
     all_coords.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
 
+    # Add the small triangular prism above each full-height wedge section. The
+    # lower wall and slope vertices reuse the refined wedge lattice; the third
+    # vertex sits 0.5 m above the wedge top. The outer taper is excluded because
+    # it cannot contain the specified 0.5 m-down slope point until it reaches
+    # the full 2 m section.
+    def add_secondary_wedge(sections, stations):
+        nonlocal next_node_id
+        secondary_sections = {}
+        for station in stations:
+            p0_z, _, _, _ = p0_buckets[station]
+            top_node_id = sections[station][0, wedge_subdivisions]
+            slope_node_id = sections[station][1, wedge_subdivisions - 1]
+            top_coordinates = all_coords[top_node_id]
+            slope_coordinates = all_coords[slope_node_id]
+            if not (
+                math.isclose(top_coordinates[2] - p0_z, HEIGHT_LEG_LENGTH, abs_tol=1.0e-8)
+                and math.isclose(top_coordinates[2] - slope_coordinates[2], WEDGE_ELEMENT_SIZE, abs_tol=1.0e-8)
+            ):
+                continue
+            wall_above_coordinates = (
+                top_coordinates[0],
+                top_coordinates[1],
+                top_coordinates[2] + WEDGE_ELEMENT_SIZE,
+            )
+            wall_above, next_node_id = find_or_add_node(
+                wall_above_coordinates, node_lookup, all_new_node_lines, next_node_id
+            )
+            secondary_sections[station] = {
+                (0, 0): top_node_id,
+                (1, 0): wall_above,
+                (0, 1): slope_node_id,
+            }
+        full_stations = sorted(secondary_sections)
+        if len(full_stations) >= 2:
+            all_new_tetras.extend(
+                build_segment_tetras(
+                    secondary_sections, full_stations, [((0, 0), (1, 0), (0, 1))]
+                )
+            )
+
+    add_secondary_wedge(low_sections, low_stations)
+    add_secondary_wedge(center_sections, center_stations)
+    add_secondary_wedge(high_sections, high_stations)
+
+    all_coords = dict(nodes)
+    all_coords.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
+
     zero_volume = 0
     min_abs_vol = None
     for tet in all_new_tetras:
@@ -361,13 +408,18 @@ def main():
         if min_abs_vol is None or abs(vol) < min_abs_vol:
             min_abs_vol = abs(vol)
 
-    center_bedrock_faces = []
     tetra_faces = ((0, 1, 2), (0, 3, 1), (1, 3, 2), (2, 3, 0))
+    bedrock_face_counts = {}
     for tetrahedron in all_new_tetras:
         for face_indices in tetra_faces:
             face = tuple(tetrahedron[index] for index in face_indices)
             if all(math.isclose(all_coords[node_id][2], BEDROCK_Z, abs_tol=1.0e-8) for node_id in face):
-                center_bedrock_faces.append(face)
+                face_key = tuple(sorted(face))
+                bedrock_face_counts[face_key] = bedrock_face_counts.get(face_key, 0) + 1
+    center_bedrock_faces = [
+        face for face, count in bedrock_face_counts.items()
+        if count == 1
+    ]
 
     print(f"Wedge lattice: {wedge_subdivisions} x {wedge_subdivisions} at {WEDGE_ELEMENT_SIZE:.1f}m")
     print(f"New nodes: {len(all_new_node_lines)}")
