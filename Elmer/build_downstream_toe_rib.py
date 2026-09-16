@@ -1,10 +1,11 @@
 """Add a bedrock-founded centre wedge and two joined side wedges along the
-downstream wall/plinth corner. Every wedge has a 2m height by 2m width 1:1
-right-triangular section.
+downstream wall/plinth corner. Every wedge has a 2m height by 2m width
+flat-topped trapezoidal section.
 
 Geometry per station:
   P0 = existing wall/plinth corner node (r=76.0, the shared wall-base/plinth-top node)
     P1 = point 2m up the wall face from P0 (r=76.0, z = P0.z + 2m) -- new node
+    P3 = point 0.4m downstream from P1, forming the flat top of the trapezoid
     P2 = point 2m along the plinth top downstream of P0 (r=74.0, z = P0.z) -- existing
        plinth-top node, reused directly so the rib bonds to the plinth mesh
 
@@ -28,6 +29,7 @@ WALL_R = 76.0
 PLINTH_LEG_R = 74.0  # 2m downstream of the wall face (width leg)
 HEIGHT_LEG_LENGTH = 2.0  # up the wall face
 WIDTH_LEG_LENGTH = 2.0  # along the plinth top
+TOP_LEDGE_LENGTH = 0.4
 TAPER_LENGTH = 8.0
 STATION_STEP = 0.5
 BEDROCK_Z = -29.0
@@ -138,18 +140,12 @@ def tetra_volume(nodes, a, b, c, d):
     return dot / 6.0
 
 
-def build_triangular_lattice(wedge_subdivisions):
-    triangles = []
-    for radial_index in range(wedge_subdivisions):
-        for vertical_index in range(wedge_subdivisions - radial_index):
-            lower = (radial_index, vertical_index)
-            radial = (radial_index + 1, vertical_index)
-            vertical = (radial_index, vertical_index + 1)
-            triangles.append((lower, radial, vertical))
-            if radial_index + vertical_index < wedge_subdivisions - 1:
-                diagonal = (radial_index + 1, vertical_index + 1)
-                triangles.append((radial, diagonal, vertical))
-    return triangles
+def hexahedron_volume(nodes, node_ids):
+    tetrahedra = (
+        (0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6),
+        (0, 7, 4, 6), (0, 4, 5, 6), (0, 5, 1, 6),
+    )
+    return sum(abs(tetra_volume(nodes, *(node_ids[index] for index in tetrahedron))) for tetrahedron in tetrahedra)
 
 
 def find_or_add_node(coordinates, node_lookup, new_nodes, next_node_id):
@@ -163,16 +159,23 @@ def find_or_add_node(coordinates, node_lookup, new_nodes, next_node_id):
     return node_id, node_id + 1
 
 
-def build_wedge_section(p0, p1, p2, wedge_subdivisions, node_lookup, new_nodes, next_node_id):
+def build_trapezoid_section(p0, p1, p2, wedge_subdivisions, node_lookup, new_nodes, next_node_id):
+    """Build a structured lattice in the explicit P0-P1-P3-P2 trapezoid."""
+    top_fraction = TOP_LEDGE_LENGTH / WIDTH_LEG_LENGTH
+    p3 = tuple(p1[axis] + top_fraction * (p2[axis] - p1[axis]) for axis in range(3))
     section_nodes = {}
-    for radial_index in range(wedge_subdivisions + 1):
-        for vertical_index in range(wedge_subdivisions + 1 - radial_index):
+    for vertical_index in range(wedge_subdivisions + 1):
+        vertical_fraction = vertical_index / wedge_subdivisions
+        wall_point = tuple(
+            p0[axis] + vertical_fraction * (p1[axis] - p0[axis]) for axis in range(3)
+        )
+        slope_point = tuple(
+            p2[axis] + vertical_fraction * (p3[axis] - p2[axis]) for axis in range(3)
+        )
+        for radial_index in range(wedge_subdivisions + 1):
             radial_fraction = radial_index / wedge_subdivisions
-            vertical_fraction = vertical_index / wedge_subdivisions
             coordinates = tuple(
-                p0[axis]
-                + radial_fraction * (p2[axis] - p0[axis])
-                + vertical_fraction * (p1[axis] - p0[axis])
+                wall_point[axis] + radial_fraction * (slope_point[axis] - wall_point[axis])
                 for axis in range(3)
             )
             node_id, next_node_id = find_or_add_node(
@@ -182,24 +185,96 @@ def build_wedge_section(p0, p1, p2, wedge_subdivisions, node_lookup, new_nodes, 
     return section_nodes, next_node_id
 
 
-def build_segment_tetras(section_nodes, stations, triangles):
-    tetras = []
+def build_segment_hexahedra(section_nodes, stations, wedge_subdivisions, transition_segments=()):
+    hexahedra = []
+    transition_segments = set(transition_segments)
     for i in range(len(stations) - 1):
         s0, s1 = stations[i], stations[i + 1]
-        for triangle in triangles:
-            a0, a1, a2 = (section_nodes[s0][index] for index in triangle)
-            b0, b1, b2 = (section_nodes[s1][index] for index in triangle)
-            if len({a0, a1, a2, b0, b1, b2}) == 1:
+        for vertical_index in range(wedge_subdivisions):
+            if i in transition_segments and vertical_index == 0:
                 continue
-            if a0 == a1 == a2:
-                tetras.append((a0, b0, b1, b2))
-            elif b0 == b1 == b2:
-                tetras.append((a0, a1, a2, b0))
-            else:
-                tetras.append((a0, a1, a2, b0))
-                tetras.append((a1, a2, b0, b1))
-                tetras.append((a2, b0, b1, b2))
-    return tetras
+            for radial_index in range(wedge_subdivisions):
+                a0 = section_nodes[s0][radial_index, vertical_index]
+                b0 = section_nodes[s0][radial_index + 1, vertical_index]
+                c0 = section_nodes[s0][radial_index + 1, vertical_index + 1]
+                d0 = section_nodes[s0][radial_index, vertical_index + 1]
+                a1 = section_nodes[s1][radial_index, vertical_index]
+                b1 = section_nodes[s1][radial_index + 1, vertical_index]
+                c1 = section_nodes[s1][radial_index + 1, vertical_index + 1]
+                d1 = section_nodes[s1][radial_index, vertical_index + 1]
+                if len({a0, b0, c0, d0, a1, b1, c1, d1}) == 8:
+                    hexahedra.append((a0, b0, c0, d0, a1, b1, c1, d1))
+    return hexahedra
+
+
+def build_plinth_transition_tetrahedra(
+    section_nodes,
+    stations,
+    transition_segments,
+    p0_buckets,
+    p2_buckets,
+    nodes,
+    new_nodes,
+    next_node_id,
+):
+    """Bridge each coarse plinth-top quad to four fine wedge columns."""
+    tetrahedra = []
+    consumed_plinth_faces = set()
+    for segment_index in transition_segments:
+        start_station = stations[segment_index]
+        end_station = stations[segment_index + 1]
+        lower = (
+            p0_buckets[start_station][1],
+            p2_buckets[start_station][1],
+            p2_buckets[end_station][1],
+            p0_buckets[end_station][1],
+        )
+        top = [
+            section_nodes[start_station][radial_index, 1]
+            for radial_index in range(5)
+        ]
+        top_end = [
+            section_nodes[end_station][radial_index, 1]
+            for radial_index in range(5)
+        ]
+        surfaces = [
+            (lower[0], lower[1], lower[2]),
+            (lower[0], lower[2], lower[3]),
+        ]
+        for radial_index in range(4):
+            surfaces.extend((
+                (top[radial_index], top_end[radial_index], top_end[radial_index + 1]),
+                (top[radial_index], top_end[radial_index + 1], top[radial_index + 1]),
+            ))
+        for lower_start, lower_end, upper_start, upper_end in (
+            (lower[0], lower[3], top[0], top_end[0]),
+            (lower[1], lower[2], top[4], top_end[4]),
+        ):
+            surfaces.extend((
+                (lower_start, lower_end, upper_end),
+                (lower_start, upper_end, upper_start),
+            ))
+        for lower_start, lower_end, upper in (
+            (lower[0], lower[1], top),
+            (lower[3], lower[2], top_end),
+        ):
+            surfaces.append((lower_start, lower_end, upper[4]))
+            for radial_index in range(4, 0, -1):
+                surfaces.append((lower_start, upper[radial_index], upper[radial_index - 1]))
+
+        boundary_node_ids = {node_id for face in surfaces for node_id in face}
+        core_coordinates = tuple(
+            sum(nodes[node_id][axis] for node_id in boundary_node_ids) / len(boundary_node_ids)
+            for axis in range(3)
+        )
+        core_node_id = next_node_id
+        next_node_id += 1
+        nodes[core_node_id] = core_coordinates
+        new_nodes.append((core_node_id, *core_coordinates))
+        for face in surfaces:
+            tetrahedra.append((*face, core_node_id))
+        consumed_plinth_faces.add(tuple(sorted(lower)))
+    return tetrahedra, consumed_plinth_faces, next_node_id
 
 
 def center_wedge_corners(stations, p0_candidates, p0_buckets):
@@ -213,7 +288,9 @@ def center_wedge_corners(stations, p0_candidates, p0_buckets):
             key=lambda candidate: abs(candidate[0] - (p0_z + HEIGHT_LEG_LENGTH)),
         )
         if not math.isclose(p1_z, p0_z + HEIGHT_LEG_LENGTH, abs_tol=1.0e-8):
-            raise ValueError(f"No wall node 2m above the bedrock wedge at station {station}")
+            raise ValueError(
+                f"No wall node {HEIGHT_LEG_LENGTH:g}m above the bedrock wedge at station {station}"
+            )
         sections[station] = (
             (p0_x, p0_y, p0_z),
             (p1_x, p1_y, p1_z),
@@ -291,16 +368,19 @@ def main():
 
     next_node_id = max_node_id + 1
     all_new_node_lines = []
-    all_new_tetras = []
+    all_new_hexahedra = []
+    all_new_tetrahedra = []
+    consumed_plinth_faces = set()
 
-    wedge_subdivisions = int(round(WIDTH_LEG_LENGTH / WEDGE_ELEMENT_SIZE))
+    wedge_subdivisions = int(round(HEIGHT_LEG_LENGTH / WEDGE_ELEMENT_SIZE))
     if wedge_subdivisions < 1 or not math.isclose(
-        wedge_subdivisions * WEDGE_ELEMENT_SIZE, WIDTH_LEG_LENGTH, abs_tol=1.0e-9
-    ) or not math.isclose(
         wedge_subdivisions * WEDGE_ELEMENT_SIZE, HEIGHT_LEG_LENGTH, abs_tol=1.0e-9
+    ) or not math.isclose(
+        round(WIDTH_LEG_LENGTH / WEDGE_ELEMENT_SIZE) * WEDGE_ELEMENT_SIZE,
+        WIDTH_LEG_LENGTH,
+        abs_tol=1.0e-9,
     ):
         raise ValueError("Wedge height and width must be whole multiples of the global element size")
-    triangles = build_triangular_lattice(wedge_subdivisions)
     node_lookup = {
         tuple(round(value, 9) for value in coordinates): node_id
         for node_id, coordinates in nodes.items()
@@ -309,10 +389,12 @@ def main():
     center_corners = center_wedge_corners(center_stations, p0_candidates, p0_buckets)
     center_sections = {}
     for station in center_stations:
-        center_sections[station], next_node_id = build_wedge_section(
+        center_sections[station], next_node_id = build_trapezoid_section(
             *center_corners[station], wedge_subdivisions, node_lookup, all_new_node_lines, next_node_id
         )
-    all_new_tetras.extend(build_segment_tetras(center_sections, center_stations, triangles))
+    all_new_hexahedra.extend(
+        build_segment_hexahedra(center_sections, center_stations, wedge_subdivisions)
+    )
 
     # The shared end sections use the same lattice node IDs as the centre wedge.
     low_corners = side_wedge_corners(
@@ -327,10 +409,34 @@ def main():
         if station in center_sections:
             low_sections[station] = center_sections[station]
         else:
-            low_sections[station], next_node_id = build_wedge_section(
+            low_sections[station], next_node_id = build_trapezoid_section(
                 *low_corners[station], wedge_subdivisions, node_lookup, all_new_node_lines, next_node_id
             )
-    all_new_tetras.extend(build_segment_tetras(low_sections, low_stations, triangles))
+    nodes.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
+    def transition_section_is_noncollapsed(section, station):
+        return len({
+            section[station][radial_index, vertical_index]
+            for radial_index in range(wedge_subdivisions + 1)
+            for vertical_index in (0, 1)
+        }) == 2 * (wedge_subdivisions + 1)
+
+    low_transition_segments = [
+        index for index, station in enumerate(low_stations[:-1])
+        if (
+            station not in center_sections
+            and low_stations[index + 1] not in center_sections
+            and transition_section_is_noncollapsed(low_sections, station)
+            and transition_section_is_noncollapsed(low_sections, low_stations[index + 1])
+        )
+    ]
+    all_new_tetrahedra, low_consumed_faces, next_node_id = build_plinth_transition_tetrahedra(
+        low_sections, low_stations, low_transition_segments, p0_buckets, p2_buckets,
+        nodes, all_new_node_lines, next_node_id,
+    )
+    consumed_plinth_faces.update(low_consumed_faces)
+    all_new_hexahedra.extend(
+        build_segment_hexahedra(low_sections, low_stations, wedge_subdivisions, low_transition_segments)
+    )
 
     high_corners = side_wedge_corners(
         [station for station in high_stations if station not in center_sections],
@@ -344,86 +450,79 @@ def main():
         if station in center_sections:
             high_sections[station] = center_sections[station]
         else:
-            high_sections[station], next_node_id = build_wedge_section(
+            high_sections[station], next_node_id = build_trapezoid_section(
                 *high_corners[station], wedge_subdivisions, node_lookup, all_new_node_lines, next_node_id
             )
-    all_new_tetras.extend(build_segment_tetras(high_sections, high_stations, triangles))
+    nodes.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
+    high_transition_segments = [
+        index for index, station in enumerate(high_stations[:-1])
+        if (
+            station not in center_sections
+            and high_stations[index + 1] not in center_sections
+            and transition_section_is_noncollapsed(high_sections, station)
+            and transition_section_is_noncollapsed(high_sections, high_stations[index + 1])
+        )
+    ]
+    high_tetrahedra, high_consumed_faces, next_node_id = build_plinth_transition_tetrahedra(
+        high_sections, high_stations, high_transition_segments, p0_buckets, p2_buckets,
+        nodes, all_new_node_lines, next_node_id,
+    )
+    all_new_tetrahedra.extend(high_tetrahedra)
+    consumed_plinth_faces.update(high_consumed_faces)
+    all_new_hexahedra.extend(
+        build_segment_hexahedra(high_sections, high_stations, wedge_subdivisions, high_transition_segments)
+    )
 
     all_coords = dict(nodes)
     all_coords.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
 
-    # Add the small triangular prism above each full-height wedge section. The
-    # lower wall and slope vertices reuse the refined wedge lattice; the third
-    # vertex sits 0.5 m above the wedge top. The outer taper is excluded because
-    # it cannot contain the specified 0.5 m-down slope point until it reaches
-    # the full 2 m section.
-    def add_secondary_wedge(sections, stations):
-        nonlocal next_node_id
-        secondary_sections = {}
-        for station in stations:
-            p0_z, _, _, _ = p0_buckets[station]
-            top_node_id = sections[station][0, wedge_subdivisions]
-            slope_node_id = sections[station][1, wedge_subdivisions - 1]
-            top_coordinates = all_coords[top_node_id]
-            slope_coordinates = all_coords[slope_node_id]
-            if not (
-                math.isclose(top_coordinates[2] - p0_z, HEIGHT_LEG_LENGTH, abs_tol=1.0e-8)
-                and math.isclose(top_coordinates[2] - slope_coordinates[2], WEDGE_ELEMENT_SIZE, abs_tol=1.0e-8)
-            ):
-                continue
-            wall_above_coordinates = (
-                top_coordinates[0],
-                top_coordinates[1],
-                top_coordinates[2] + WEDGE_ELEMENT_SIZE,
-            )
-            wall_above, next_node_id = find_or_add_node(
-                wall_above_coordinates, node_lookup, all_new_node_lines, next_node_id
-            )
-            secondary_sections[station] = {
-                (0, 0): top_node_id,
-                (1, 0): wall_above,
-                (0, 1): slope_node_id,
-            }
-        full_stations = sorted(secondary_sections)
-        if len(full_stations) >= 2:
-            all_new_tetras.extend(
-                build_segment_tetras(
-                    secondary_sections, full_stations, [((0, 0), (1, 0), (0, 1))]
-                )
-            )
-
-    add_secondary_wedge(low_sections, low_stations)
-    add_secondary_wedge(center_sections, center_stations)
-    add_secondary_wedge(high_sections, high_stations)
-
+    used_new_node_ids = {
+        node_id
+        for element in [*all_new_hexahedra, *all_new_tetrahedra]
+        for node_id in element
+    }
+    all_new_node_lines = [
+        node for node in all_new_node_lines if node[0] in used_new_node_ids
+    ]
     all_coords = dict(nodes)
     all_coords.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
 
     zero_volume = 0
     min_abs_vol = None
-    for tet in all_new_tetras:
-        vol = tetra_volume(all_coords, *tet)
+    for hexahedron in all_new_hexahedra:
+        vol = hexahedron_volume(all_coords, hexahedron)
         if abs(vol) < 1.0e-9:
             zero_volume += 1
         if min_abs_vol is None or abs(vol) < min_abs_vol:
             min_abs_vol = abs(vol)
+    for tetrahedron in all_new_tetrahedra:
+        vol = abs(tetra_volume(all_coords, *tetrahedron))
+        if vol < 1.0e-9:
+            zero_volume += 1
+        if min_abs_vol is None or vol < min_abs_vol:
+            min_abs_vol = vol
 
-    tetra_faces = ((0, 1, 2), (0, 3, 1), (1, 3, 2), (2, 3, 0))
+    hexahedron_base_face = (0, 1, 5, 4)
     bedrock_face_counts = {}
-    for tetrahedron in all_new_tetras:
-        for face_indices in tetra_faces:
-            face = tuple(tetrahedron[index] for index in face_indices)
-            if all(math.isclose(all_coords[node_id][2], BEDROCK_Z, abs_tol=1.0e-8) for node_id in face):
-                face_key = tuple(sorted(face))
-                bedrock_face_counts[face_key] = bedrock_face_counts.get(face_key, 0) + 1
+    for hexahedron in all_new_hexahedra:
+        face = tuple(hexahedron[index] for index in hexahedron_base_face)
+        if all(math.isclose(all_coords[node_id][2], BEDROCK_Z, abs_tol=1.0e-8) for node_id in face):
+            face_key = tuple(sorted(face))
+            bedrock_face_counts[face_key] = bedrock_face_counts.get(face_key, 0) + 1
     center_bedrock_faces = [
         face for face, count in bedrock_face_counts.items()
         if count == 1
     ]
 
-    print(f"Wedge lattice: {wedge_subdivisions} x {wedge_subdivisions} at {WEDGE_ELEMENT_SIZE:.1f}m")
+    print(
+        f"Trapezoid lattice: {wedge_subdivisions} x {wedge_subdivisions} "
+        f"(height {HEIGHT_LEG_LENGTH:.1f}m, base {WIDTH_LEG_LENGTH:.1f}m, top {TOP_LEDGE_LENGTH:.1f}m)"
+    )
     print(f"New nodes: {len(all_new_node_lines)}")
-    print(f"New tetrahedra: {len(all_new_tetras)} (zero-volume: {zero_volume}, min |vol|: {min_abs_vol:.6g})")
+    print(
+        f"New cells: {len(all_new_hexahedra)} hexahedra, {len(all_new_tetrahedra)} tetrahedra "
+        f"(zero-volume: {zero_volume}, min |vol|: {min_abs_vol:.6g})"
+    )
     print(f"Centre bedrock boundary triangles: {len(center_bedrock_faces)}")
 
     if not BACKUP_PATH.exists():
@@ -443,23 +542,53 @@ def main():
     element_count_index, element_end_index = element_section
     element_count_index += shift
     element_end_index += shift
-    old_element_count = int(lines[element_count_index].strip())
+
+    hexahedron_faces = (
+        (0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+        (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0),
+    )
+    new_wedge_faces = {
+        tuple(sorted(hexahedron[index] for index in face))
+        for hexahedron in all_new_hexahedra
+        for face in hexahedron_faces
+    }
+    old_element_lines = lines[element_count_index + 1:element_end_index]
+    retained_element_lines = []
+    superseded_boundary_count = 0
+    for line in old_element_lines:
+        fields = line.split()
+        element_type = int(fields[1])
+        tag_count = int(fields[2])
+        node_ids = tuple(sorted(map(int, fields[3 + tag_count:])))
+        if element_type in (2, 3) and (node_ids in new_wedge_faces or node_ids in consumed_plinth_faces):
+            superseded_boundary_count += 1
+            continue
+        retained_element_lines.append(line)
+    lines[element_count_index + 1:element_end_index] = retained_element_lines
+    element_end_index = element_count_index + 1 + len(retained_element_lines)
+    old_element_count = len(retained_element_lines)
 
     # Determine next element id by scanning the existing block's last id.
     last_element_line = lines[element_end_index - 1].split()
     next_element_id = int(last_element_line[0]) + 1
 
     element_insert_lines = []
-    for tet in all_new_tetras:
-        n1, n2, n3, n4 = tet
+    for hexahedron in all_new_hexahedra:
+        n1, n2, n3, n4, n5, n6, n7, n8 = hexahedron
         element_insert_lines.append(
-            f"{next_element_id} 4 2 1 1 {n1} {n2} {n3} {n4}\n"
+            f"{next_element_id} 5 2 1 1 {n1} {n2} {n3} {n4} {n5} {n6} {n7} {n8}\n"
+        )
+        next_element_id += 1
+
+    for tetrahedron in all_new_tetrahedra:
+        element_insert_lines.append(
+            f"{next_element_id} 4 2 1 1 {' '.join(map(str, tetrahedron))}\n"
         )
         next_element_id += 1
 
     for face in center_bedrock_faces:
         element_insert_lines.append(
-            f"{next_element_id} 2 2 1 1 {' '.join(map(str, face))}\n"
+            f"{next_element_id} 3 2 1 1 {' '.join(map(str, face))}\n"
         )
         next_element_id += 1
 
@@ -468,6 +597,7 @@ def main():
     lines[element_end_index:element_end_index] = element_insert_lines
 
     MESH_PATH.write_text("".join(lines))
+    print(f"Removed {superseded_boundary_count} base boundary faces covered by wedge hexahedra")
     print(f"Wrote {MESH_PATH} ({new_node_count} nodes, {new_element_count} elements)")
 
 

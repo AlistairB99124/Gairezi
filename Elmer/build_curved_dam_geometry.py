@@ -92,6 +92,7 @@ thickness_layers = max(1, int(round(wall_thickness / target_block_size)))
 crest_detail_height = 0.0
 crest_extra_thickness = 0.0
 abutment_segment_count = 6
+BEDROCK_PROFILE_BLEND_LENGTH_M = 2.0
 
 
 def interpolate_profile_points(profile_points, subdivisions):
@@ -171,6 +172,66 @@ def interpolate_profile_points_by_target_spacing(profile_points, target_spacing_
         )
 
     return refined
+
+
+def smooth_centre_bedrock_transitions(points, center_start, center_end, blend_length):
+    """Apply C1 elevation blends into and out of the flat centre bedrock reach.
+
+    The same profile adjustment is applied to the wall base, plinth top, and
+    ground, preserving their shared-node monolithic construction.
+    """
+    station_index = {round(point["station"], 9): index for index, point in enumerate(points)}
+
+    def index_at(station):
+        key = round(station, 9)
+        if key not in station_index:
+            raise ValueError(f"Missing station {station:g} for bedrock profile blend")
+        return station_index[key]
+
+    low_start = center_start - blend_length
+    high_end = center_end + blend_length
+    low_start_index = index_at(low_start)
+    center_start_index = index_at(center_start)
+    center_end_index = index_at(center_end)
+    high_end_index = index_at(high_end)
+    if low_start_index == 0 or high_end_index == len(points) - 1:
+        raise ValueError("Bedrock profile blend requires stations beyond both blend ends")
+
+    def slope(key, first_index, second_index):
+        first = points[first_index]
+        second = points[second_index]
+        return (second[key] - first[key]) / (second["station"] - first["station"])
+
+    def hermite(first_value, first_slope, second_value, second_slope, fraction, span):
+        h00 = 2.0 * fraction**3 - 3.0 * fraction**2 + 1.0
+        h10 = fraction**3 - 2.0 * fraction**2 + fraction
+        h01 = -2.0 * fraction**3 + 3.0 * fraction**2
+        h11 = fraction**3 - fraction**2
+        return (
+            h00 * first_value
+            + h10 * span * first_slope
+            + h01 * second_value
+            + h11 * span * second_slope
+        )
+
+    for key in ("base_z", "plinth_z", "ground_z"):
+        low_slope = slope(key, low_start_index - 1, low_start_index)
+        high_slope = slope(key, high_end_index, high_end_index + 1)
+        low_start_value = points[low_start_index][key]
+        center_start_value = points[center_start_index][key]
+        center_end_value = points[center_end_index][key]
+        high_end_value = points[high_end_index][key]
+
+        for index in range(low_start_index + 1, center_start_index):
+            fraction = (points[index]["station"] - low_start) / blend_length
+            points[index][key] = hermite(
+                low_start_value, low_slope, center_start_value, 0.0, fraction, blend_length
+            )
+        for index in range(center_end_index + 1, high_end_index):
+            fraction = (points[index]["station"] - center_end) / blend_length
+            points[index][key] = hermite(
+                center_end_value, 0.0, high_end_value, high_slope, fraction, blend_length
+            )
 
 
 def assign_normals(profile_points):
@@ -338,6 +399,22 @@ points = [
     for point in points
     if point["crest_z"] - point["base_z"] > 1.0e-8
 ]
+center_bedrock_stations = [
+    point["station"]
+    for point in points
+    if all(
+        math.isclose(point[key], -29.0, abs_tol=1.0e-8)
+        for key in ("base_z", "plinth_z", "ground_z")
+    )
+]
+if len(center_bedrock_stations) < 2:
+    raise ValueError("The profile requires a flat z=-29 centre bedrock interval")
+smooth_centre_bedrock_transitions(
+    points,
+    center_bedrock_stations[0],
+    center_bedrock_stations[-1],
+    BEDROCK_PROFILE_BLEND_LENGTH_M,
+)
 
 
 def insert_station(points, station):
