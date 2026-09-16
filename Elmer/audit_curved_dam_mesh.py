@@ -82,7 +82,8 @@ wedge_bottom = [tuple(sorted(face)) for face in markers["wedge_bottom_faces"]]
 wedge_wall = [tuple(sorted(face)) for face in markers["wedge_wall_faces"]]
 wedge_outer = [tuple(sorted(face)) for face in markers["wedge_outer_faces"]]
 wall_plinth = [tuple(sorted(face)) for face in markers.get("wall_plinth_faces", [])]
-marker_errors = not all((wedge_ids, transition_ids, wedge_bottom, wedge_wall, wedge_outer))
+center_wedge_enabled = bool(metadata["wedge_enabled"])
+marker_errors = center_wedge_enabled and not all((wedge_ids, transition_ids, wedge_bottom, wedge_wall, wedge_outer))
 marker_errors |= any(elements.get(element_id, (None, None, ()))[0] != 4 for element_id in wedge_ids + transition_ids)
 shared_bottom = [face for face in wedge_bottom if face_incidence[face] == 2]
 bedrock_bottom = [face for face in wedge_bottom if face_incidence[face] == 1 and 1 in boundary_ids[face]]
@@ -169,8 +170,9 @@ tip_marker_errors = (
     or any(elements.get(element_id, (None, None, ()))[0] not in (4, 7) for element_id in tip_transition_ids)
 )
 wedge_plinth_marker_errors = (
+    center_wedge_enabled and (
     not wedge_plinth_hex_ids
-    or not wedge_plinth_boundary_ids
+    or not wedge_plinth_boundary_ids)
     or any(elements.get(element_id, (None, None, ()))[0] != 5 for element_id in wedge_plinth_hex_ids)
     or any(elements.get(element_id, (None, None, ()))[0] != 4 for element_id in wedge_plinth_boundary_ids)
 )
@@ -187,7 +189,7 @@ tip_unbonded_faces = [
 
 if (
     zero_volume or internal_boundaries or marker_errors or invalid_bottom or invalid_wall
-    or ladder_errors or not outer_nodes or outer_errors or tip_marker_errors or tip_hex_errors
+    or ladder_errors or (center_wedge_enabled and (not outer_nodes or outer_errors)) or tip_marker_errors or tip_hex_errors
     or wedge_plinth_marker_errors or tip_unbonded_faces or tip_plinth_unbonded_faces
     or not wall_plinth or wall_plinth_unbonded_faces
 ):

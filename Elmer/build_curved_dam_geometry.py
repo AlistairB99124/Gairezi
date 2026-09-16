@@ -56,8 +56,11 @@ wedge_anchor_radius = float(config.get("wedge_anchor_radius_m", downstream_radiu
 wedge_start_below_crest_m = float(config.get("wedge_start_below_crest_m", 25.0))
 wedge_ratio_horizontal_m = float(config.get("wedge_ratio_horizontal_m", 2.0))
 wedge_ratio_vertical_m = float(config.get("wedge_ratio_vertical_m", 4.0))
+wedge_y_extension_m = float(config.get("wedge_y_extension_m", 0.0))
 if wedge_ratio_horizontal_m <= 0.0 or wedge_ratio_vertical_m <= 0.0:
     raise ValueError("Wedge horizontal and vertical ratio dimensions must be positive")
+if wedge_y_extension_m < 0.0:
+    raise ValueError("Wedge Y extension must not be negative")
 wedge_tangent = wedge_ratio_horizontal_m / wedge_ratio_vertical_m
 wedge_angle_from_vertical_deg = math.degrees(math.atan(wedge_ratio_horizontal_m / wedge_ratio_vertical_m))
 if not math.isclose(wedge_anchor_radius, downstream_radius, abs_tol=1.0e-8):
@@ -77,6 +80,12 @@ target_block_size = mesh_size
 local_corner_size = get_grid_control_value("Local Corner Refinement")
 if not 0.0 < local_corner_size <= target_block_size:
     raise ValueError("Local Corner Refinement must be positive and no larger than Global Element Size")
+if not math.isclose(
+    wedge_y_extension_m / target_block_size,
+    round(wedge_y_extension_m / target_block_size),
+    abs_tol=1.0e-9,
+):
+    raise ValueError("Wedge Y extension must be a whole number of global mesh cells")
 arch_subdivisions = 3
 vertical_layers = 4
 thickness_layers = max(1, int(round(wall_thickness / target_block_size)))
@@ -355,10 +364,8 @@ def raw_wedge_z_length(point):
     return point["crest_z"] - point["base_z"] - wedge_start_below_crest_m
 
 
-# The wedge is only activated where its own natural (unmodified) triangle is at
-# least this tall/wide, so every activated station already presents a clean,
-# non-degenerate 2:1 (height:width) triangular cross-section -- matching the
-# side ribs' fixed 2m x 1m size -- with no separate tip/edge cutoff needed.
+# The base activation margin selects clean 2m x 1m end sections. The configured
+# Y extension then continues the same natural 2:1 profile outward at each end.
 wedge_activation_margin_m = 2.0
 
 
@@ -373,43 +380,12 @@ def find_wedge_start_crossings(points):
     return crossings
 
 
-wedge_start_crossings = find_wedge_start_crossings(points) if wedge_enabled else []
-if wedge_enabled:
-    if len(wedge_start_crossings) != 2:
-        raise ValueError("The plinth-derived wedge requires exactly two start-threshold intersections")
-    raw_wedge_start_station_m, raw_wedge_end_station_m = wedge_start_crossings
-
-    # Snap directly to the nearest existing wall-grid station at the activation
-    # margin crossing -- no further inward trim/easing, so the end cap sits
-    # right where the wedge is already a clean 2:1 triangle.
-    wedge_start_station_m = min(points, key=lambda point: abs(point["station"] - raw_wedge_start_station_m))["station"]
-    wedge_end_station_m = min(points, key=lambda point: abs(point["station"] - raw_wedge_end_station_m))["station"]
-    if wedge_end_station_m <= wedge_start_station_m:
-        raise ValueError("The activation-margin wedge span must contain at least one wall-grid segment")
-
-    insert_station(points, wedge_start_station_m)
-    wedge_station = wedge_start_station_m + target_block_size
-    while wedge_station < wedge_end_station_m:
-        insert_station(points, wedge_station)
-        wedge_station += target_block_size
-    insert_station(points, wedge_end_station_m)
+side_wedge_join_station_m = 0.5 * (points[0]["station"] + points[-1]["station"])
+insert_station(points, side_wedge_join_station_m)
 if len(points) < 2:
     raise ValueError("The plinth profile must contain at least two non-zero wall-height stations")
 
-wedge_end_taper_length_m = 2.0
 wedge_end_taper_station_spacing_m = target_block_size
-if wedge_enabled:
-    for endpoint, direction in ((wedge_start_station_m, 1.0), (wedge_end_station_m, -1.0)):
-        station = endpoint + direction * wedge_end_taper_station_spacing_m
-        while abs(station - endpoint) < wedge_end_taper_length_m - 1.0e-9:
-            insert_station(points, station)
-            station += direction * wedge_end_taper_station_spacing_m
-
-# Keep the mathematical zero of each end taper one local station beyond its
-# wall/plinth alignment plane. This gives each aligned end cap finite volume
-# instead of silently moving it 0.25 m into the wedge span.
-wedge_taper_start_station_m = wedge_start_station_m - wedge_end_taper_station_spacing_m
-wedge_taper_end_station_m = wedge_end_station_m + wedge_end_taper_station_spacing_m
 
 
 def wedge_z_length(point):
@@ -643,12 +619,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             plinth_active_stations[index] = True
             plinth_active_stations[index + 1] = True
 
-    wedge_active_stations = [
-        wedge_enabled
-        and wedge_start_station_m - 1.0e-9 <= point["station"] <= wedge_end_station_m + 1.0e-9
-        and wedge_z_length(point) > 1.0e-8
-        for point in points
-    ]
+    wedge_active_stations = [False] * len(points)
     transition_wall_segments = [
         wedge_active_stations[index] != wedge_active_stations[index + 1]
         for index in range(len(points) - 1)
@@ -1644,23 +1615,12 @@ meta_path.write_text(
             "wall_upstream_radius_m": upstream_radius,
             "wall_centerline_radius_m": radius,
             "wall_downstream_radius_m": downstream_radius,
-            "wedge_enabled": wedge_enabled,
+            "wedge_enabled": False,
             "wedge_anchor_radius_m": wedge_anchor_radius,
             "wedge_start_below_crest_m": wedge_start_below_crest_m,
             "wedge_ratio_horizontal_m": wedge_ratio_horizontal_m,
             "wedge_ratio_vertical_m": wedge_ratio_vertical_m,
-            "wedge_max_sloping_length_m": math.hypot(wedge_ratio_horizontal_m, wedge_ratio_vertical_m),
-            "wedge_angle_from_vertical_deg": wedge_angle_from_vertical_deg,
-            "wedge_element_size_m": target_block_size,
-            "wedge_start_station_m": wedge_start_station_m,
-            "wedge_end_station_m": wedge_end_station_m,
-            "wedge_activation_margin_m": wedge_activation_margin_m,
-            "wedge_end_taper_length_m": 0.0,
-            "wedge_end_taper_station_spacing_m": wedge_end_taper_station_spacing_m,
-            "wedge_transition_station_boundaries_m": [
-                wedge_start_station_m,
-                wedge_end_station_m,
-            ],
+            "side_wedge_join_station_m": side_wedge_join_station_m,
             "plinth_upstream_offset_m": plinth_upstream_offset_m,
             "plinth_downstream_offset_m": plinth_downstream_offset_m,
             "plinth_width_m": plinth_width_m,
