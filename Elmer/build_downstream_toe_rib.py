@@ -411,11 +411,9 @@ def main():
             *center_corners[station], vertical_subdivisions, radial_subdivisions,
             node_lookup, all_new_node_lines, next_node_id
         )
-    all_new_hexahedra.extend(
-        build_segment_hexahedra(center_sections, center_stations, vertical_subdivisions, radial_subdivisions)
-    )
-
-    # The shared end sections use the same lattice node IDs as the centre wedge.
+    # The side and centre sections are assembled into one ordered lattice below.
+    # Centre nodes are reused at both joins so the resulting wedge has no
+    # side/centre interface or separate wedge-volume boundary.
     low_corners = side_wedge_corners(
         [station for station in low_stations if station not in center_sections],
         low_outer,
@@ -432,33 +430,12 @@ def main():
                 *low_corners[station], vertical_subdivisions, radial_subdivisions,
                 node_lookup, all_new_node_lines, next_node_id
             )
-    nodes.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
     def transition_section_is_noncollapsed(section, station):
         return len({
             section[station][radial_index, vertical_index]
             for radial_index in range(radial_subdivisions + 1)
             for vertical_index in (0, 1)
         }) == 2 * (radial_subdivisions + 1)
-
-    low_transition_segments = [
-        index for index, station in enumerate(low_stations[:-1])
-        if (
-            station not in center_sections
-            and low_stations[index + 1] not in center_sections
-            and transition_section_is_noncollapsed(low_sections, station)
-            and transition_section_is_noncollapsed(low_sections, low_stations[index + 1])
-        )
-    ]
-    all_new_tetrahedra, low_consumed_faces, next_node_id = build_plinth_transition_tetrahedra(
-        low_sections, low_stations, low_transition_segments, radial_subdivisions, p0_buckets, p2_buckets,
-        nodes, all_new_node_lines, next_node_id,
-    )
-    consumed_plinth_faces.update(low_consumed_faces)
-    all_new_hexahedra.extend(
-        build_segment_hexahedra(
-            low_sections, low_stations, vertical_subdivisions, radial_subdivisions, low_transition_segments
-        )
-    )
 
     high_corners = side_wedge_corners(
         [station for station in high_stations if station not in center_sections],
@@ -477,24 +454,29 @@ def main():
                 node_lookup, all_new_node_lines, next_node_id
             )
     nodes.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
-    high_transition_segments = [
-        index for index, station in enumerate(high_stations[:-1])
+    wedge_stations = [*low_stations, *center_stations[1:], *high_stations[1:]]
+    wedge_sections = {**low_sections, **center_sections, **high_sections}
+    if any(
+        not math.isclose(end - start, STATION_STEP, abs_tol=1.0e-8)
+        for start, end in zip(wedge_stations, wedge_stations[1:])
+    ):
+        raise ValueError("The unified wedge stations must form one contiguous half-metre grid")
+    transition_segments = [
+        index for index, station in enumerate(wedge_stations[:-1])
         if (
             station not in center_sections
-            and high_stations[index + 1] not in center_sections
-            and transition_section_is_noncollapsed(high_sections, station)
-            and transition_section_is_noncollapsed(high_sections, high_stations[index + 1])
+            and wedge_stations[index + 1] not in center_sections
+            and transition_section_is_noncollapsed(wedge_sections, station)
+            and transition_section_is_noncollapsed(wedge_sections, wedge_stations[index + 1])
         )
     ]
-    high_tetrahedra, high_consumed_faces, next_node_id = build_plinth_transition_tetrahedra(
-        high_sections, high_stations, high_transition_segments, radial_subdivisions, p0_buckets, p2_buckets,
+    all_new_tetrahedra, consumed_plinth_faces, next_node_id = build_plinth_transition_tetrahedra(
+        wedge_sections, wedge_stations, transition_segments, radial_subdivisions, p0_buckets, p2_buckets,
         nodes, all_new_node_lines, next_node_id,
     )
-    all_new_tetrahedra.extend(high_tetrahedra)
-    consumed_plinth_faces.update(high_consumed_faces)
     all_new_hexahedra.extend(
         build_segment_hexahedra(
-            high_sections, high_stations, vertical_subdivisions, radial_subdivisions, high_transition_segments
+            wedge_sections, wedge_stations, vertical_subdivisions, radial_subdivisions, transition_segments
         )
     )
 

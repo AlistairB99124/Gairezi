@@ -92,7 +92,8 @@ thickness_layers = max(1, int(round(wall_thickness / target_block_size)))
 crest_detail_height = 0.0
 crest_extra_thickness = 0.0
 abutment_segment_count = 6
-BEDROCK_PROFILE_BLEND_LENGTH_M = 2.0
+CENTRE_PLINTH_STEP_HEIGHT_M = 0.5
+CENTRE_PLINTH_TRANSITION_FRACTION = 0.5
 
 
 def interpolate_profile_points(profile_points, subdivisions):
@@ -174,64 +175,33 @@ def interpolate_profile_points_by_target_spacing(profile_points, target_spacing_
     return refined
 
 
-def smooth_centre_bedrock_transitions(points, center_start, center_end, blend_length):
-    """Apply C1 elevation blends into and out of the flat centre bedrock reach.
+def introduce_centre_plinth_steps(points, center_start, center_end, step_height):
+    """Create a mesh-aligned plinth shoulder on each side of centre bedrock.
 
-    The same profile adjustment is applied to the wall base, plinth top, and
-    ground, preserving their shared-node monolithic construction.
+    The two adjacent sections retain a plinth of ``step_height`` above the
+    flat bedrock. The following centre sections remain zero-thickness, letting
+    the bonded wedge bridge each intended step instead of a smooth runout.
     """
     station_index = {round(point["station"], 9): index for index, point in enumerate(points)}
 
     def index_at(station):
         key = round(station, 9)
         if key not in station_index:
-            raise ValueError(f"Missing station {station:g} for bedrock profile blend")
+            raise ValueError(f"Missing station {station:g} for centre plinth step")
         return station_index[key]
 
-    low_start = center_start - blend_length
-    high_end = center_end + blend_length
-    low_start_index = index_at(low_start)
     center_start_index = index_at(center_start)
     center_end_index = index_at(center_end)
-    high_end_index = index_at(high_end)
-    if low_start_index == 0 or high_end_index == len(points) - 1:
-        raise ValueError("Bedrock profile blend requires stations beyond both blend ends")
+    if center_start_index == 0 or center_end_index == len(points) - 1:
+        raise ValueError("Centre plinth steps require sections on both sides of centre bedrock")
 
-    def slope(key, first_index, second_index):
-        first = points[first_index]
-        second = points[second_index]
-        return (second[key] - first[key]) / (second["station"] - first["station"])
-
-    def hermite(first_value, first_slope, second_value, second_slope, fraction, span):
-        h00 = 2.0 * fraction**3 - 3.0 * fraction**2 + 1.0
-        h10 = fraction**3 - 2.0 * fraction**2 + fraction
-        h01 = -2.0 * fraction**3 + 3.0 * fraction**2
-        h11 = fraction**3 - fraction**2
-        return (
-            h00 * first_value
-            + h10 * span * first_slope
-            + h01 * second_value
-            + h11 * span * second_slope
-        )
-
-    for key in ("base_z", "plinth_z", "ground_z"):
-        low_slope = slope(key, low_start_index - 1, low_start_index)
-        high_slope = slope(key, high_end_index, high_end_index + 1)
-        low_start_value = points[low_start_index][key]
-        center_start_value = points[center_start_index][key]
-        center_end_value = points[center_end_index][key]
-        high_end_value = points[high_end_index][key]
-
-        for index in range(low_start_index + 1, center_start_index):
-            fraction = (points[index]["station"] - low_start) / blend_length
-            points[index][key] = hermite(
-                low_start_value, low_slope, center_start_value, 0.0, fraction, blend_length
-            )
-        for index in range(center_end_index + 1, high_end_index):
-            fraction = (points[index]["station"] - center_end) / blend_length
-            points[index][key] = hermite(
-                center_end_value, 0.0, high_end_value, high_slope, fraction, blend_length
-            )
+    bedrock_z = points[center_start_index]["ground_z"]
+    if not math.isclose(points[center_end_index]["ground_z"], bedrock_z, abs_tol=1.0e-8):
+        raise ValueError("Centre bedrock ends must have the same elevation")
+    for index in (center_start_index - 1, center_end_index + 1):
+        points[index]["ground_z"] = bedrock_z
+        points[index]["base_z"] = bedrock_z + step_height
+        points[index]["plinth_z"] = bedrock_z + step_height
 
 
 def assign_normals(profile_points):
@@ -409,11 +379,11 @@ center_bedrock_stations = [
 ]
 if len(center_bedrock_stations) < 2:
     raise ValueError("The profile requires a flat z=-29 centre bedrock interval")
-smooth_centre_bedrock_transitions(
+introduce_centre_plinth_steps(
     points,
     center_bedrock_stations[0],
     center_bedrock_stations[-1],
-    BEDROCK_PROFILE_BLEND_LENGTH_M,
+    CENTRE_PLINTH_STEP_HEIGHT_M,
 )
 
 
@@ -435,6 +405,34 @@ def insert_station(points, station):
             points.insert(index + 1, inserted)
             return
     raise ValueError(f"Wedge station {station:.9f} lies outside the dam profile")
+
+
+def refine_centre_plinth_handoffs(points, center_start, center_end):
+    """Insert one bedrock section halfway across each plinth shoulder handoff.
+
+    The added planes split the parent wall and plinth faces as well as the
+    downstream wedge, so a local sloping transition can remain conforming.
+    """
+    for shoulder, direction in (
+        (center_start - target_block_size, +1.0),
+        (center_end + target_block_size, -1.0),
+    ):
+        station = shoulder + direction * target_block_size * CENTRE_PLINTH_TRANSITION_FRACTION
+        insert_station(points, station)
+        point = next(
+            point for point in points
+            if math.isclose(point["station"], station, abs_tol=1.0e-9)
+        )
+        point["base_z"] = -29.0
+        point["plinth_z"] = -29.0
+        point["ground_z"] = -29.0
+
+
+refine_centre_plinth_handoffs(
+    points,
+    center_bedrock_stations[0],
+    center_bedrock_stations[-1],
+)
 
 
 def raw_wedge_z_length(point):
@@ -1124,7 +1122,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         node_id(station_index + 1, level_index, thickness_index + 1),
                     ])
 
-    def add_wall_plinth_transition(upper_faces, lower_quad, material_id=2):
+    def add_wall_plinth_transition(upper_faces, lower_quad, material_id=1):
         """Fill a wall-to-plinth transition volume with bonded pyramids."""
         nonlocal next_node_id
         coordinates = [nodes[node_identifier - 1][1:] for face in upper_faces for node_identifier in face]
@@ -1195,7 +1193,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         upper_start[thickness_index], upper_end[thickness_index],
                         upper_end[thickness_index + 1], upper_start[thickness_index + 1],
                     ]
-                    add_element(5, 2, plinth_cell_node_ids)
+                    add_element(5, 1, plinth_cell_node_ids)
                     wedge_plinth_hex_element_ids.append(element_id - 1)
                     if vertical_index == 0:
                         add_element(3, 1, [
@@ -1347,7 +1345,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         upper_start[thickness_index], upper_end[thickness_index],
                         upper_end[thickness_index + 1], upper_start[thickness_index + 1],
                     ]
-                    add_element(5, 2, plinth_cell_node_ids)
+                    add_element(5, 1, plinth_cell_node_ids)
                     if vertical_index == 0:
                         add_element(3, 1, [
                             lower_start[thickness_index], lower_start[thickness_index + 1],
@@ -1404,7 +1402,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     node_id(station_index + 1, segment_level + 1, thickness_index + 1),
                     node_id(station_index, segment_level + 1, thickness_index + 1),
                 ]
-                add_element(5, 2, smoothing_cell_node_ids)
+                add_element(5, 1, smoothing_cell_node_ids)
                 wall_plinth_faces.append((
                     node_id(station_index, level_a, thickness_index),
                     node_id(station_index + 1, level_b, thickness_index),
