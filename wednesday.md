@@ -58,3 +58,23 @@ The transition repair reduced peak tensile stress by 1.274552 MPa, but the hotsp
 The nonconforming wedge-to-plinth interface was real and is now repaired, but it was not the sole cause of the stress concentration. The remaining governing feature is likely the abrupt change in the actual foundation geometry and reaction path as the plinth underside transitions into the flat z=-29 m founded reach near station 101 m.
 
 Do not alter the foundation spring stiffness simply to lower the reported peak. The next useful model change is a longer, physically continuous plinth/foundation-underside transition into the flat bedrock plane, then a new solve comparing stress at fixed offsets from station 100.25 m.
+
+## Rock-Equivalent Plinth Proof Case
+
+For an additional causality check, the plinth and wall-plinth transition cells were assigned to Body 2, `RockEquivalentPlinth`, while retaining shared nodes with the concrete wall and wedge. Material 2 uses the granite elastic assumption documented for the foundation spring:
+
+- Young's modulus: 35 GPa
+- Poisson ratio: 0.25
+- Density: 2400 kg/m3, deliberately unchanged from concrete to avoid changing gravity load
+
+This is a material-substitution proof case, not a finite-bedrock-volume model. The actual bedrock remains represented by the Boundary ID 1 distributed springs.
+
+The two-body mesh passed compilation, ElmerGrid conversion, and the topology audit. ElmerSolver loaded two bodies and two materials and completed successfully. Mesh volume-element counts were Body 1: 93,108 and Body 2: 48,804.
+
+| Quantity | Concrete plinth | Rock-equivalent plinth | Change |
+| --- | ---: | ---: | ---: |
+| Maximum tensile principal stress | +8.067448 MPa | +8.250576 MPa | +0.183128 MPa (+2.27%) |
+| Maximum compressive principal stress | -12.734387 MPa | -12.900589 MPa | -0.166202 MPa (1.30% greater magnitude) |
+| Peak station | 100.25 m | 100.25 m | unchanged |
+
+Conclusion: assigning the plinth the available rock-equivalent elastic properties does not relieve or relocate the stress concentration. It modestly increases both peak magnitudes, so plinth material mismatch is not the primary cause. The physical foundation-geometry/support transition remains the leading hypothesis.

@@ -25,6 +25,13 @@ Body 1
   Body Force = 1
 End
 
+Body 2
+  Name = "RockEquivalentPlinth"
+  Equation = 1
+  Material = 2
+  Body Force = 1
+End
+
 Body Force 1
   ! Gravity load from Data/Env_Boundaries_And_Loads.json: 2400 * -9.81 = -23544 N/m^3
   Stress Bodyforce 3 = Real -23544.0
@@ -60,6 +67,15 @@ Material 1
   Poisson Ratio = 0.2
   Density = 2400
   ! For a realistic cracking assessment, replace this starter elastic material with a nonlinear concrete-damage model.
+End
+
+Material 2
+  ! Proof case only: use the granite elastic assumption that underlies BC 1.
+  ! Density is kept equal to concrete so the gravity load does not confound this comparison.
+  Name = "RockEquivalent"
+  Youngs Modulus = 8.0e10
+  Poisson Ratio = 0.25
+  Density = 2800
 End
 
 Boundary Condition 1

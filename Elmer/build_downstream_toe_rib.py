@@ -34,6 +34,7 @@ TAPER_LENGTH = 8.0
 STATION_STEP = 0.5
 BEDROCK_Z = -29.0
 WEDGE_ELEMENT_SIZE = 0.5
+WEDGE_RADIAL_SUBDIVISIONS = 2
 
 METADATA_PATH = MESH_PATH.with_name("curved_dam_mesh_meta.json")
 
@@ -159,21 +160,30 @@ def find_or_add_node(coordinates, node_lookup, new_nodes, next_node_id):
     return node_id, node_id + 1
 
 
-def build_trapezoid_section(p0, p1, p2, wedge_subdivisions, node_lookup, new_nodes, next_node_id):
+def build_trapezoid_section(
+    p0,
+    p1,
+    p2,
+    vertical_subdivisions,
+    radial_subdivisions,
+    node_lookup,
+    new_nodes,
+    next_node_id,
+):
     """Build a structured lattice in the explicit P0-P1-P3-P2 trapezoid."""
     top_fraction = TOP_LEDGE_LENGTH / WIDTH_LEG_LENGTH
     p3 = tuple(p1[axis] + top_fraction * (p2[axis] - p1[axis]) for axis in range(3))
     section_nodes = {}
-    for vertical_index in range(wedge_subdivisions + 1):
-        vertical_fraction = vertical_index / wedge_subdivisions
+    for vertical_index in range(vertical_subdivisions + 1):
+        vertical_fraction = vertical_index / vertical_subdivisions
         wall_point = tuple(
             p0[axis] + vertical_fraction * (p1[axis] - p0[axis]) for axis in range(3)
         )
         slope_point = tuple(
             p2[axis] + vertical_fraction * (p3[axis] - p2[axis]) for axis in range(3)
         )
-        for radial_index in range(wedge_subdivisions + 1):
-            radial_fraction = radial_index / wedge_subdivisions
+        for radial_index in range(radial_subdivisions + 1):
+            radial_fraction = radial_index / radial_subdivisions
             coordinates = tuple(
                 wall_point[axis] + radial_fraction * (slope_point[axis] - wall_point[axis])
                 for axis in range(3)
@@ -185,15 +195,21 @@ def build_trapezoid_section(p0, p1, p2, wedge_subdivisions, node_lookup, new_nod
     return section_nodes, next_node_id
 
 
-def build_segment_hexahedra(section_nodes, stations, wedge_subdivisions, transition_segments=()):
+def build_segment_hexahedra(
+    section_nodes,
+    stations,
+    vertical_subdivisions,
+    radial_subdivisions,
+    transition_segments=(),
+):
     hexahedra = []
     transition_segments = set(transition_segments)
     for i in range(len(stations) - 1):
         s0, s1 = stations[i], stations[i + 1]
-        for vertical_index in range(wedge_subdivisions):
+        for vertical_index in range(vertical_subdivisions):
             if i in transition_segments and vertical_index == 0:
                 continue
-            for radial_index in range(wedge_subdivisions):
+            for radial_index in range(radial_subdivisions):
                 a0 = section_nodes[s0][radial_index, vertical_index]
                 b0 = section_nodes[s0][radial_index + 1, vertical_index]
                 c0 = section_nodes[s0][radial_index + 1, vertical_index + 1]
@@ -211,6 +227,7 @@ def build_plinth_transition_tetrahedra(
     section_nodes,
     stations,
     transition_segments,
+    radial_subdivisions,
     p0_buckets,
     p2_buckets,
     nodes,
@@ -231,24 +248,24 @@ def build_plinth_transition_tetrahedra(
         )
         top = [
             section_nodes[start_station][radial_index, 1]
-            for radial_index in range(5)
+            for radial_index in range(radial_subdivisions + 1)
         ]
         top_end = [
             section_nodes[end_station][radial_index, 1]
-            for radial_index in range(5)
+            for radial_index in range(radial_subdivisions + 1)
         ]
         surfaces = [
             (lower[0], lower[1], lower[2]),
             (lower[0], lower[2], lower[3]),
         ]
-        for radial_index in range(4):
+        for radial_index in range(radial_subdivisions):
             surfaces.extend((
                 (top[radial_index], top_end[radial_index], top_end[radial_index + 1]),
                 (top[radial_index], top_end[radial_index + 1], top[radial_index + 1]),
             ))
         for lower_start, lower_end, upper_start, upper_end in (
             (lower[0], lower[3], top[0], top_end[0]),
-            (lower[1], lower[2], top[4], top_end[4]),
+            (lower[1], lower[2], top[radial_subdivisions], top_end[radial_subdivisions]),
         ):
             surfaces.extend((
                 (lower_start, lower_end, upper_end),
@@ -258,8 +275,8 @@ def build_plinth_transition_tetrahedra(
             (lower[0], lower[1], top),
             (lower[3], lower[2], top_end),
         ):
-            surfaces.append((lower_start, lower_end, upper[4]))
-            for radial_index in range(4, 0, -1):
+            surfaces.append((lower_start, lower_end, upper[radial_subdivisions]))
+            for radial_index in range(radial_subdivisions, 0, -1):
                 surfaces.append((lower_start, upper[radial_index], upper[radial_index - 1]))
 
         boundary_node_ids = {node_id for face in surfaces for node_id in face}
@@ -372,15 +389,16 @@ def main():
     all_new_tetrahedra = []
     consumed_plinth_faces = set()
 
-    wedge_subdivisions = int(round(HEIGHT_LEG_LENGTH / WEDGE_ELEMENT_SIZE))
-    if wedge_subdivisions < 1 or not math.isclose(
-        wedge_subdivisions * WEDGE_ELEMENT_SIZE, HEIGHT_LEG_LENGTH, abs_tol=1.0e-9
+    vertical_subdivisions = int(round(HEIGHT_LEG_LENGTH / WEDGE_ELEMENT_SIZE))
+    radial_subdivisions = WEDGE_RADIAL_SUBDIVISIONS
+    if vertical_subdivisions < 1 or radial_subdivisions < 1 or not math.isclose(
+        vertical_subdivisions * WEDGE_ELEMENT_SIZE, HEIGHT_LEG_LENGTH, abs_tol=1.0e-9
     ) or not math.isclose(
-        round(WIDTH_LEG_LENGTH / WEDGE_ELEMENT_SIZE) * WEDGE_ELEMENT_SIZE,
-        WIDTH_LEG_LENGTH,
+        WIDTH_LEG_LENGTH / radial_subdivisions,
+        round(WIDTH_LEG_LENGTH / radial_subdivisions),
         abs_tol=1.0e-9,
     ):
-        raise ValueError("Wedge height and width must be whole multiples of the global element size")
+        raise ValueError("Wedge height and radial subdivision width must be whole metres")
     node_lookup = {
         tuple(round(value, 9) for value in coordinates): node_id
         for node_id, coordinates in nodes.items()
@@ -390,10 +408,11 @@ def main():
     center_sections = {}
     for station in center_stations:
         center_sections[station], next_node_id = build_trapezoid_section(
-            *center_corners[station], wedge_subdivisions, node_lookup, all_new_node_lines, next_node_id
+            *center_corners[station], vertical_subdivisions, radial_subdivisions,
+            node_lookup, all_new_node_lines, next_node_id
         )
     all_new_hexahedra.extend(
-        build_segment_hexahedra(center_sections, center_stations, wedge_subdivisions)
+        build_segment_hexahedra(center_sections, center_stations, vertical_subdivisions, radial_subdivisions)
     )
 
     # The shared end sections use the same lattice node IDs as the centre wedge.
@@ -410,15 +429,16 @@ def main():
             low_sections[station] = center_sections[station]
         else:
             low_sections[station], next_node_id = build_trapezoid_section(
-                *low_corners[station], wedge_subdivisions, node_lookup, all_new_node_lines, next_node_id
+                *low_corners[station], vertical_subdivisions, radial_subdivisions,
+                node_lookup, all_new_node_lines, next_node_id
             )
     nodes.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
     def transition_section_is_noncollapsed(section, station):
         return len({
             section[station][radial_index, vertical_index]
-            for radial_index in range(wedge_subdivisions + 1)
+            for radial_index in range(radial_subdivisions + 1)
             for vertical_index in (0, 1)
-        }) == 2 * (wedge_subdivisions + 1)
+        }) == 2 * (radial_subdivisions + 1)
 
     low_transition_segments = [
         index for index, station in enumerate(low_stations[:-1])
@@ -430,12 +450,14 @@ def main():
         )
     ]
     all_new_tetrahedra, low_consumed_faces, next_node_id = build_plinth_transition_tetrahedra(
-        low_sections, low_stations, low_transition_segments, p0_buckets, p2_buckets,
+        low_sections, low_stations, low_transition_segments, radial_subdivisions, p0_buckets, p2_buckets,
         nodes, all_new_node_lines, next_node_id,
     )
     consumed_plinth_faces.update(low_consumed_faces)
     all_new_hexahedra.extend(
-        build_segment_hexahedra(low_sections, low_stations, wedge_subdivisions, low_transition_segments)
+        build_segment_hexahedra(
+            low_sections, low_stations, vertical_subdivisions, radial_subdivisions, low_transition_segments
+        )
     )
 
     high_corners = side_wedge_corners(
@@ -451,7 +473,8 @@ def main():
             high_sections[station] = center_sections[station]
         else:
             high_sections[station], next_node_id = build_trapezoid_section(
-                *high_corners[station], wedge_subdivisions, node_lookup, all_new_node_lines, next_node_id
+                *high_corners[station], vertical_subdivisions, radial_subdivisions,
+                node_lookup, all_new_node_lines, next_node_id
             )
     nodes.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
     high_transition_segments = [
@@ -464,13 +487,15 @@ def main():
         )
     ]
     high_tetrahedra, high_consumed_faces, next_node_id = build_plinth_transition_tetrahedra(
-        high_sections, high_stations, high_transition_segments, p0_buckets, p2_buckets,
+        high_sections, high_stations, high_transition_segments, radial_subdivisions, p0_buckets, p2_buckets,
         nodes, all_new_node_lines, next_node_id,
     )
     all_new_tetrahedra.extend(high_tetrahedra)
     consumed_plinth_faces.update(high_consumed_faces)
     all_new_hexahedra.extend(
-        build_segment_hexahedra(high_sections, high_stations, wedge_subdivisions, high_transition_segments)
+        build_segment_hexahedra(
+            high_sections, high_stations, vertical_subdivisions, radial_subdivisions, high_transition_segments
+        )
     )
 
     all_coords = dict(nodes)
@@ -515,7 +540,7 @@ def main():
     ]
 
     print(
-        f"Trapezoid lattice: {wedge_subdivisions} x {wedge_subdivisions} "
+        f"Trapezoid lattice: {radial_subdivisions} radial x {vertical_subdivisions} vertical "
         f"(height {HEIGHT_LEG_LENGTH:.1f}m, base {WIDTH_LEG_LENGTH:.1f}m, top {TOP_LEDGE_LENGTH:.1f}m)"
     )
     print(f"New nodes: {len(all_new_node_lines)}")

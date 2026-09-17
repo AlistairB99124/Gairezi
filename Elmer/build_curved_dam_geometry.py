@@ -1124,7 +1124,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         node_id(station_index + 1, level_index, thickness_index + 1),
                     ])
 
-    def add_wall_plinth_transition(upper_faces, lower_quad):
+    def add_wall_plinth_transition(upper_faces, lower_quad, material_id=2):
         """Fill a wall-to-plinth transition volume with bonded pyramids."""
         nonlocal next_node_id
         coordinates = [nodes[node_identifier - 1][1:] for face in upper_faces for node_identifier in face]
@@ -1133,9 +1133,9 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         nodes.append((core_node_id, *(sum(coordinate[axis] for coordinate in coordinates) / len(coordinates) for axis in range(3))))
         next_node_id += 1
         for face in upper_faces:
-            add_element(4 if len(face) == 3 else 7, 1, [*face, core_node_id])
+            add_element(4 if len(face) == 3 else 7, material_id, [*face, core_node_id])
             wall_plinth_faces.append(face)
-        add_element(7, 1, [*lower_quad, core_node_id])
+        add_element(7, material_id, [*lower_quad, core_node_id])
 
         perimeter = []
         for face in upper_faces:
@@ -1149,10 +1149,10 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             # volume; skip it rather than emitting a degenerate element.
             first_tetrahedron = (upper_edge[0], upper_edge[1], lower_edge[1], core_node_id)
             if len(set(first_tetrahedron)) == 4:
-                add_element(4, 1, list(first_tetrahedron))
+                add_element(4, material_id, list(first_tetrahedron))
             second_tetrahedron = (upper_edge[0], lower_edge[1], lower_edge[0], core_node_id)
             if len(set(second_tetrahedron)) == 4:
-                add_element(4, 1, list(second_tetrahedron))
+                add_element(4, material_id, list(second_tetrahedron))
 
     def add_tip_plinth_transition(lower_start, lower_end, station_index, thickness_index):
         """Fill one coarse plinth-top cell below five fine wall-base quads."""
@@ -1195,7 +1195,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         upper_start[thickness_index], upper_end[thickness_index],
                         upper_end[thickness_index + 1], upper_start[thickness_index + 1],
                     ]
-                    add_element(5, 1, plinth_cell_node_ids)
+                    add_element(5, 2, plinth_cell_node_ids)
                     wedge_plinth_hex_element_ids.append(element_id - 1)
                     if vertical_index == 0:
                         add_element(3, 1, [
@@ -1347,7 +1347,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         upper_start[thickness_index], upper_end[thickness_index],
                         upper_end[thickness_index + 1], upper_start[thickness_index + 1],
                     ]
-                    add_element(5, 1, plinth_cell_node_ids)
+                    add_element(5, 2, plinth_cell_node_ids)
                     if vertical_index == 0:
                         add_element(3, 1, [
                             lower_start[thickness_index], lower_start[thickness_index + 1],
@@ -1404,7 +1404,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     node_id(station_index + 1, segment_level + 1, thickness_index + 1),
                     node_id(station_index, segment_level + 1, thickness_index + 1),
                 ]
-                add_element(5, 1, smoothing_cell_node_ids)
+                add_element(5, 2, smoothing_cell_node_ids)
                 wall_plinth_faces.append((
                     node_id(station_index, level_a, thickness_index),
                     node_id(station_index + 1, level_b, thickness_index),
