@@ -73,9 +73,6 @@ plinth_upstream_offset_m = 1.0
 plinth_downstream_offset_m = 2.0
 plinth_base_width_m = wall_thickness + plinth_upstream_offset_m + plinth_downstream_offset_m
 plinth_width_m = plinth_base_width_m
-CENTER_FOUNDATION_LOW_EXTENSION_CELLS = 3
-CENTER_FOUNDATION_HIGH_EXTENSION_CELLS = 2
-CENTER_FOUNDATION_HEIGHT_M = 0.5
 
 dam_height = 30.0
 mesh_size = get_grid_control_value("Global Element Size")
@@ -341,30 +338,28 @@ points = [
     for point in points
     if point["crest_z"] - point["base_z"] > 1.0e-8
 ]
-center_bedrock_stations = [
+wall_tip_trim_m = 2.0 * target_block_size
+original_start_station = points[0]["station"]
+original_end_station = points[-1]["station"]
+wall_active_stations = [
+    (
+        point["station"] >= original_start_station + wall_tip_trim_m - 1.0e-9
+        and point["station"] <= original_end_station - wall_tip_trim_m + 1.0e-9
+    )
+    for point in points
+]
+if sum(wall_active_stations) < 2:
+    raise ValueError("Wall-tip trimming removed all retained wall stations")
+center_plinth_stations = [
     point["station"]
     for point in points
-    if all(
-        math.isclose(point[key], -29.0, abs_tol=1.0e-8)
-        for key in ("base_z", "plinth_z", "ground_z")
-    )
+    if math.isclose(point["ground_z"], -29.0, abs_tol=1.0e-8)
+    and math.isclose(point["base_z"], -28.5, abs_tol=1.0e-8)
 ]
-if len(center_bedrock_stations) < 2:
-    raise ValueError("The profile requires a flat z=-29 centre bedrock interval")
-flat_center_foundation_start_station_m = min(center_bedrock_stations)
-flat_center_foundation_end_station_m = max(center_bedrock_stations)
-center_wedge_start_station_m = flat_center_foundation_start_station_m - (
-    CENTER_FOUNDATION_LOW_EXTENSION_CELLS * target_block_size
-)
-center_wedge_end_station_m = flat_center_foundation_end_station_m + (
-    CENTER_FOUNDATION_HIGH_EXTENSION_CELLS * target_block_size
-)
-if not math.isclose(
-    (center_wedge_end_station_m - center_wedge_start_station_m) / target_block_size,
-    round((center_wedge_end_station_m - center_wedge_start_station_m) / target_block_size),
-    abs_tol=1.0e-9,
-):
-    raise ValueError("Centre wedge ends must lie on the global station grid")
+if len(center_plinth_stations) < 2:
+    raise ValueError("The plinth profile requires a flat 0.5 m centre plinth interval")
+center_plinth_start_station_m = min(center_plinth_stations)
+center_plinth_end_station_m = max(center_plinth_stations)
 
 def insert_station(points, station):
     for point in points:
@@ -420,15 +415,6 @@ def wedge_z_length(point):
     # each end rather than a smoothed/filleted transition.
     return raw_wedge_z_length(point)
 
-# Refine the retained 2 m wall tips only in X and Y. Each tip cell spans the
-# entire local wall height in Z, avoiding thin cells at the sloping plinth.
-wall_tip_refined_length_m = 4.0 * target_block_size
-wall_tip_refined_cells = int(round(wall_tip_refined_length_m / local_corner_size))
-if not math.isclose(wall_tip_refined_cells * local_corner_size, wall_tip_refined_length_m, abs_tol=1.0e-9):
-    raise ValueError("Local Corner Refinement must divide the two-metre wall tip length exactly")
-for endpoint, direction in ((points[0]["station"], 1.0), (points[-1]["station"], -1.0)):
-    for cell_index in range(1, wall_tip_refined_cells + 1):
-        insert_station(points, endpoint + direction * cell_index * local_corner_size)
 assign_normals(points)
 local_heights = [point["crest_z"] - point["base_z"] for point in points]
 average_height = sum(local_heights) / len(local_heights)
@@ -639,20 +625,16 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         and points[index + 1]["base_z"] - points[index + 1]["ground_z"] > 1.0e-8
         for index in range(len(points) - 1)
     ]
-    # The centre foundation replaces the final three low-side and two high-side
-    # plinth cells as one continuous course. Its non-flat end cells are emitted
-    # separately with lower faces following this unchanged surveyed contour.
-    for index, (start, end) in enumerate(zip(points, points[1:])):
-        if (
-            start["station"] >= center_wedge_start_station_m - 1.0e-9
-            and end["station"] <= center_wedge_end_station_m + 1.0e-9
-        ):
-            plinth_active_segments[index] = False
     plinth_active_stations = [False] * len(points)
     for index, active in enumerate(plinth_active_segments):
         if active:
             plinth_active_stations[index] = True
             plinth_active_stations[index + 1] = True
+    central_plinth_stations = [
+        math.isclose(point["ground_z"], -29.0, abs_tol=1.0e-8)
+        and math.isclose(point["base_z"], -28.5, abs_tol=1.0e-8)
+        for point in points
+    ]
 
     wedge_active_stations = [False] * len(points)
     transition_wall_segments = [
@@ -690,32 +672,30 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                 return level_index
         raise ValueError("Wall segment has no positive-height element")
 
-    # The source end stations have no wall height, so the retained endpoints are
-    # the first and last non-zero stations. Their first 2 m is fine in X/Y and
-    # uses one full-height Z element.
-    tip_start_station = points[0]["station"]
-    tip_end_station = points[-1]["station"]
-    tip_segment_indices = {
-        index
-        for index, (start, end) in enumerate(zip(points, points[1:]))
-        if end["station"] <= tip_start_station + wall_tip_refined_length_m + 1.0e-9
-        or start["station"] >= tip_end_station - wall_tip_refined_length_m - 1.0e-9
-    }
-    tip_transition_segments = {
-        next(index for index, point in enumerate(points[:-1]) if math.isclose(point["station"], tip_start_station + wall_tip_refined_length_m, abs_tol=1.0e-9)),
-        next(index for index, point in enumerate(points[:-1]) if math.isclose(points[index + 1]["station"], tip_end_station - wall_tip_refined_length_m, abs_tol=1.0e-9)),
-    }
+    def plinth_z_levels(point):
+        """Return exact contour bounds together with interior 0.5 m rows."""
+        lower_z = point["ground_z"]
+        upper_z = point["base_z"]
+        first_grid_index = math.ceil((lower_z + 1.0e-9) / target_block_size)
+        last_grid_index = math.floor((upper_z - 1.0e-9) / target_block_size)
+        return [
+            lower_z,
+            *(grid_index * target_block_size for grid_index in range(first_grid_index, last_grid_index + 1)),
+            upper_z,
+        ]
+
+    # The ordinary ladder now continues to both retained abutment stations.
+    # A former 0.1 m endpoint patch introduced full-height cells and a drooping
+    # transition fan at the wall ends.
+    tip_segment_indices = set()
+    tip_transition_segments = set()
     tip_thickness_layers = int(round(wall_thickness / local_corner_size))
     if not math.isclose(tip_thickness_layers * local_corner_size, wall_thickness, abs_tol=1.0e-9):
         raise ValueError("Local Corner Refinement must divide the wall thickness exactly")
-    tip_vertical_layers = 1
+    tip_vertical_layers = vertical_layers
 
     def tip_wall_z(point, level_index):
-        if level_index == 0:
-            return point["base_z"]
-        if level_index == tip_vertical_layers:
-            return point["crest_z"]
-        raise ValueError("The full-height tip mesh has exactly one Z layer")
+        return ordinary_wall_z(point, level_index)
 
     nodes = []
     for station_index, point in enumerate(points):
@@ -752,15 +732,19 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             continue
 
         station_levels = []
-        for vertical_index in range(plinth_vertical_layers + 1):
-            fraction = vertical_index / plinth_vertical_layers
-            z_value = point["ground_z"] + fraction * (point["base_z"] - point["ground_z"])
+        for z_value in plinth_z_levels(point):
             level_ids = []
             for thickness_index, offset in enumerate(plinth_offsets()):
                 if (
-                    vertical_index == plinth_vertical_layers
+                    math.isclose(z_value, point["base_z"], abs_tol=1.0e-9)
                     and wall_start_in_plinth <= thickness_index <= wall_end_in_plinth
+                    and wall_active_stations[station_index]
                 ):
+                    if station_index in tip_station_indices:
+                        level_ids.append(tip_node_ids[
+                            station_index, 0, (thickness_index - wall_start_in_plinth) * 5,
+                        ])
+                        continue
                     wall_level_index = (
                         0 if wedge_active_stations[station_index]
                         else ordinary_wall_base_level(point)
@@ -794,9 +778,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         # Carry the wedge's outer line through the plinth so its top node can
         # be shared exactly with both the wedge and its tetrahedral transition.
         transition_levels = []
-        for vertical_index in range(plinth_vertical_layers + 1):
-            fraction = vertical_index / plinth_vertical_layers
-            z_value = point["ground_z"] + fraction * (point["base_z"] - point["ground_z"])
+        for z_value in plinth_z_levels(point):
             transition_levels.append(next_node_id)
             nodes.append((
                 next_node_id,
@@ -984,6 +966,8 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
     for station_index in range(len(points) - 1):
         if station_index in tip_segment_indices or station_index in tip_transition_segments:
             continue
+        if not (wall_active_stations[station_index] and wall_active_stations[station_index + 1]):
+            continue
         smoothing_segment = (
             plinth_active_segments[station_index]
             and not wedge_active_stations[station_index]
@@ -1127,6 +1111,91 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         )
         add_wall_plinth_transition(upper_faces, lower_quad)
 
+    def add_plinth_zipper_transition(station_index, start_levels, end_levels):
+        """Fill a contour-following plinth segment from its 0.5 m Z ladders."""
+        start_columns = [[level[thickness_index] for level in start_levels] for thickness_index in range(len(start_levels[0]))]
+        end_columns = [[level[thickness_index] for level in end_levels] for thickness_index in range(len(end_levels[0]))]
+        wedge_segment = wedge_active_stations[station_index] and wedge_active_stations[station_index + 1]
+        if wedge_segment:
+            start_columns = [
+                *start_columns[:wall_end_in_plinth + 1],
+                wedge_transition_node_ids[station_index],
+                *start_columns[wall_end_in_plinth + 1:],
+            ]
+            end_columns = [
+                *end_columns[:wall_end_in_plinth + 1],
+                wedge_transition_node_ids[station_index + 1],
+                *end_columns[wall_end_in_plinth + 1:],
+            ]
+        for thickness_index, (start_left, start_right, end_left, end_right) in enumerate(zip(
+            start_columns, start_columns[1:], end_columns, end_columns[1:]
+        )):
+            tip_wall_strip = (
+                station_index in tip_segment_indices
+                and wall_start_in_plinth <= thickness_index < wall_end_in_plinth
+            )
+            if tip_wall_strip:
+                start_left, start_right = start_left[:-1], start_right[:-1]
+                end_left, end_right = end_left[:-1], end_right[:-1]
+            wall_covers_top = (
+                wall_active_stations[station_index]
+                and wall_active_stations[station_index + 1]
+                and wall_start_in_plinth <= thickness_index < wall_end_in_plinth
+            )
+            if not wedge_segment and len(start_left) == len(end_left):
+                # Equal ladder counts form an ordinary contour-following hex.
+                # Reserve zipper tetrahedra for actual row-count transitions.
+                for level_index in range(len(start_left) - 1):
+                    add_element(5, 1, [
+                        start_left[level_index], end_left[level_index],
+                        end_right[level_index], start_right[level_index],
+                        start_left[level_index + 1], end_left[level_index + 1],
+                        end_right[level_index + 1], start_right[level_index + 1],
+                    ])
+                    if level_index == 0:
+                        add_element(3, 1, [
+                            start_left[level_index], start_right[level_index],
+                            end_right[level_index], end_left[level_index],
+                        ])
+                    if level_index == len(start_left) - 2 and not wall_covers_top:
+                        add_element(3, 7, [
+                            start_left[level_index + 1], end_left[level_index + 1],
+                            end_right[level_index + 1], start_right[level_index + 1],
+                        ])
+                    if thickness_index == 0:
+                        add_element(3, 7, [
+                            start_left[level_index], end_left[level_index],
+                            end_left[level_index + 1], start_left[level_index + 1],
+                        ])
+                    if thickness_index == len(start_columns) - 2:
+                        add_element(3, 7, [
+                            start_right[level_index], start_right[level_index + 1],
+                            end_right[level_index + 1], end_right[level_index],
+                        ])
+                continue
+            left_triangles = zipper_strip_triangles(start_left, end_left)
+            right_triangles = zipper_strip_triangles(start_right, end_right)
+            if len(left_triangles) != len(right_triangles):
+                raise ValueError("Plinth zipper transition faces do not match")
+            for left_triangle, right_triangle in zip(left_triangles, right_triangles):
+                add_prism_tetrahedra(left_triangle, right_triangle)
+            add_element(3, 1, [start_left[0], start_right[0], end_right[0], end_left[0]])
+            top_exposed = not wall_covers_top
+            if wedge_segment and thickness_index == wall_end_in_plinth:
+                top_exposed = False
+            if top_exposed:
+                add_element(3, 7, [start_left[-1], end_left[-1], end_right[-1], start_right[-1]])
+            if thickness_index == 0:
+                for triangle in left_triangles:
+                    add_element(2, 7, list(triangle))
+            if thickness_index == plinth_segment_count - 1:
+                for triangle in right_triangles:
+                    add_element(2, 7, list(triangle))
+            if tip_wall_strip:
+                add_tip_plinth_transition(
+                    start_levels[-2], end_levels[-2], station_index, thickness_index,
+                )
+
     for station_index, active in enumerate(plinth_active_segments):
         if not active:
             continue
@@ -1138,11 +1207,22 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             wedge_active_stations[station_index]
             and wedge_active_stations[station_index + 1]
         )
-        for vertical_index in range(plinth_vertical_layers):
-            lower_start = start_levels[vertical_index]
-            lower_end = end_levels[vertical_index]
-            upper_start = start_levels[vertical_index + 1]
-            upper_end = end_levels[vertical_index + 1]
+        thin_center_segment = False
+        thin_transition_segment = True
+        add_plinth_zipper_transition(station_index, start_levels, end_levels)
+        vertical_pairs = (
+            [(0, plinth_vertical_layers)]
+            if thin_center_segment
+            else [] if thin_transition_segment
+            else [(index, index + 1) for index in range(plinth_vertical_layers)]
+        )
+        for lower_index, upper_index in vertical_pairs:
+            lower_start = start_levels[lower_index]
+            lower_end = end_levels[lower_index]
+            upper_start = start_levels[upper_index]
+            upper_end = end_levels[upper_index]
+            is_bottom_layer = lower_index == 0
+            is_top_layer = upper_index == plinth_vertical_layers
             if transition_segment:
                 # The wedge only intersects the downstream wall cell. Retain
                 # the regular hexahedral plinth through the inner footprint.
@@ -1155,7 +1235,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     ]
                     add_element(5, 1, plinth_cell_node_ids)
                     wedge_plinth_hex_element_ids.append(element_id - 1)
-                    if vertical_index == 0:
+                    if is_bottom_layer:
                         add_element(3, 1, [
                             lower_start[thickness_index], lower_start[thickness_index + 1],
                             lower_end[thickness_index + 1], lower_end[thickness_index],
@@ -1165,7 +1245,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                             lower_start[thickness_index], lower_end[thickness_index],
                             upper_end[thickness_index], upper_start[thickness_index],
                         ])
-                    if vertical_index == plinth_vertical_layers - 1 and thickness_index < wall_start_in_plinth:
+                    if is_top_layer and thickness_index < wall_start_in_plinth:
                         add_element(3, 7, [
                             upper_start[thickness_index], upper_end[thickness_index],
                             upper_end[thickness_index + 1], upper_start[thickness_index + 1],
@@ -1215,14 +1295,14 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             else:
                 for thickness_index in range(plinth_segment_count):
                     if (
-                        vertical_index == plinth_vertical_layers - 1
+                        is_top_layer
                         and station_index in tip_segment_indices
                         and wall_start_in_plinth <= thickness_index < wall_end_in_plinth
                     ):
                         add_tip_plinth_transition(lower_start, lower_end, station_index, thickness_index)
                         continue
                     if (
-                        vertical_index == plinth_vertical_layers - 1
+                        is_top_layer
                         and station_index in tip_transition_segments
                         and wall_start_in_plinth <= thickness_index < wall_end_in_plinth
                     ):
@@ -1247,7 +1327,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         )
                         continue
                     if (
-                        vertical_index == plinth_vertical_layers - 1
+                        is_top_layer
                         and wall_start_in_plinth <= thickness_index < wall_end_in_plinth
                         and wedge_active_stations[station_index] != wedge_active_stations[station_index + 1]
                     ):
@@ -1306,7 +1386,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         upper_end[thickness_index + 1], upper_start[thickness_index + 1],
                     ]
                     add_element(5, 1, plinth_cell_node_ids)
-                    if vertical_index == 0:
+                    if is_bottom_layer:
                         add_element(3, 1, [
                             lower_start[thickness_index], lower_start[thickness_index + 1],
                             lower_end[thickness_index + 1], lower_end[thickness_index],
@@ -1321,18 +1401,18 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                             lower_start[thickness_index + 1], upper_start[thickness_index + 1],
                             upper_end[thickness_index + 1], lower_end[thickness_index + 1],
                         ])
-                    if vertical_index == plinth_vertical_layers - 1:
+                    if is_top_layer:
                         wall_face = wall_start_in_plinth <= thickness_index < wall_end_in_plinth
                         if not wall_face:
                             add_element(3, 7, [
                                 upper_start[thickness_index], upper_end[thickness_index],
                                 upper_end[thickness_index + 1], upper_start[thickness_index + 1],
                             ])
-                if vertical_index == 0:
+                if is_bottom_layer:
                     if transition_segment:
                         for lower_triangle, _ in triangles:
                             add_element(2, 1, list(lower_triangle))
-                if vertical_index == plinth_vertical_layers - 1 and transition_segment:
+                if is_top_layer and transition_segment:
                     for _, upper_triangle in triangles[2:]:
                         add_element(2, 7, list(upper_triangle))
 
@@ -1342,6 +1422,8 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
             and station_index not in tip_transition_segments
             and not wedge_active_stations[station_index]
             and not wedge_active_stations[station_index + 1]
+            and wall_active_stations[station_index]
+            and wall_active_stations[station_index + 1]
         ):
             # Bond the plinth directly to the wall with a single, continuously
             # sloped hex per thickness column: bottom follows each station's own
@@ -1369,12 +1451,13 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     node_id(station_index + 1, level_b, thickness_index + 1),
                     node_id(station_index, level_a, thickness_index + 1),
                 ))
-                wall_plinth_faces.append((
-                    node_id(station_index, segment_level + 1, thickness_index),
-                    node_id(station_index + 1, segment_level + 1, thickness_index),
-                    node_id(station_index + 1, segment_level + 1, thickness_index + 1),
-                    node_id(station_index, segment_level + 1, thickness_index + 1),
-                ))
+                if segment_level + 1 == vertical_layers:
+                    add_element(3, 4, [
+                        node_id(station_index, segment_level + 1, thickness_index),
+                        node_id(station_index + 1, segment_level + 1, thickness_index),
+                        node_id(station_index + 1, segment_level + 1, thickness_index + 1),
+                        node_id(station_index, segment_level + 1, thickness_index + 1),
+                    ])
                 if thickness_index == 0:
                     add_element(3, 2, [
                         node_id(station_index, level_a, thickness_index),
@@ -1391,7 +1474,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                     ])
 
         if station_index == 0 or not plinth_active_segments[station_index - 1]:
-            for vertical_index in range(plinth_vertical_layers):
+            for vertical_index in range(len(start_levels) - 1):
                 lower_start = start_levels[vertical_index]
                 upper_start = start_levels[vertical_index + 1]
                 for thickness_index in range(plinth_segment_count):
@@ -1400,7 +1483,7 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
                         upper_start[thickness_index + 1], lower_start[thickness_index + 1],
                     ])
         if station_index == len(plinth_active_segments) - 1 or not plinth_active_segments[station_index + 1]:
-            for vertical_index in range(plinth_vertical_layers):
+            for vertical_index in range(len(end_levels) - 1):
                 lower_end = end_levels[vertical_index]
                 upper_end = end_levels[vertical_index + 1]
                 for thickness_index in range(plinth_segment_count):
@@ -1480,21 +1563,30 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         outer = wedge_outer_node_ids[station_index][0]
         add_element(2, 7, [base, outer, top])
 
+    first_wall_station_index = next(index for index, active in enumerate(wall_active_stations) if active)
+    last_wall_station_index = next(
+        index for index in range(len(wall_active_stations) - 1, -1, -1) if wall_active_stations[index]
+    )
     for level_index in range(vertical_layers):
         for thickness_index in range(thickness_layers):
-            if 0 in tip_station_indices or len(points) - 1 in tip_station_indices:
+            if (
+                ordinary_wall_z(points[first_wall_station_index], level_index + 1)
+                <= ordinary_wall_z(points[first_wall_station_index], level_index) + 1.0e-9
+                or ordinary_wall_z(points[last_wall_station_index], level_index + 1)
+                <= ordinary_wall_z(points[last_wall_station_index], level_index) + 1.0e-9
+            ):
                 continue
             add_element(3, 5, [
-                node_id(0, level_index, thickness_index),
-                node_id(0, level_index + 1, thickness_index),
-                node_id(0, level_index + 1, thickness_index + 1),
-                node_id(0, level_index, thickness_index + 1),
+                node_id(first_wall_station_index, level_index, thickness_index),
+                node_id(first_wall_station_index, level_index + 1, thickness_index),
+                node_id(first_wall_station_index, level_index + 1, thickness_index + 1),
+                node_id(first_wall_station_index, level_index, thickness_index + 1),
             ])
             add_element(3, 6, [
-                node_id(len(points) - 1, level_index, thickness_index),
-                node_id(len(points) - 1, level_index, thickness_index + 1),
-                node_id(len(points) - 1, level_index + 1, thickness_index + 1),
-                node_id(len(points) - 1, level_index + 1, thickness_index),
+                node_id(last_wall_station_index, level_index, thickness_index),
+                node_id(last_wall_station_index, level_index, thickness_index + 1),
+                node_id(last_wall_station_index, level_index + 1, thickness_index + 1),
+                node_id(last_wall_station_index, level_index + 1, thickness_index),
             ])
 
     volume_face_templates = {
@@ -1661,22 +1753,12 @@ meta_path.write_text(
             "plinth_width_m": plinth_width_m,
             "plinth_base_width_m": plinth_base_width_m,
             "plinth_vertical_layers": plinth_vertical_layers,
-            "flat_center_foundation_start_station_m": flat_center_foundation_start_station_m,
-            "flat_center_foundation_end_station_m": flat_center_foundation_end_station_m,
-            "center_wedge_start_station_m": center_wedge_start_station_m,
-            "center_wedge_end_station_m": center_wedge_end_station_m,
-            "center_foundation_height_m": CENTER_FOUNDATION_HEIGHT_M,
+            "center_plinth_start_station_m": center_plinth_start_station_m,
+            "center_plinth_end_station_m": center_plinth_end_station_m,
             "dam_height_m": dam_height,
             "mesh_size_m": mesh_size,
             "target_block_size_m": target_block_size,
             "local_corner_size_m": local_corner_size,
-            "wall_tip_refined_length_m": wall_tip_refined_length_m,
-            "wall_tip_cells_across_x": int(round(wall_thickness / local_corner_size)),
-            "wall_tip_cells_vertical_z": 1,
-            "wall_tip_retained_station_ranges_m": [
-                [points[0]["station"], points[0]["station"] + wall_tip_refined_length_m],
-                [points[-1]["station"] - wall_tip_refined_length_m, points[-1]["station"]],
-            ],
             "maximum_bulk_hex_edge_m": target_block_size,
             "tip_hex_target_size_m": local_corner_size,
             "thickness_layers": thickness_layers,

@@ -164,9 +164,8 @@ def is_wall_plinth_face_bonded(face):
 
 wall_plinth_unbonded_faces = [face for face in wall_plinth if not is_wall_plinth_face_bonded(face)]
 tip_marker_errors = (
-    not tip_hex_ids
+    bool(tip_hex_ids) != bool(tip_transition_ids)
     or tip_prism_ids
-    or not tip_transition_ids
     or any(elements.get(element_id, (None, None, ()))[0] not in (4, 7) for element_id in tip_transition_ids)
 )
 wedge_plinth_marker_errors = (
@@ -205,6 +204,11 @@ if (
         f"wall-plinth-unbonded-faces={len(wall_plinth_unbonded_faces)}"
     )
 
+tip_size_summary = (
+    f"tip-x-max={max(tip_x_edges):.6f}, tip-y-range={min(tip_y_edges):.6f}..{max(tip_y_edges):.6f}, "
+    f"tip-z-range={min(tip_z_edges):.6f}..{max(tip_z_edges):.6f}."
+    if tip_hex_ids else "tip refinement disabled."
+)
 print(
     "Mesh audit passed: "
     f"wedge-hexes={len(wedge_ids)}, transition-tets={len(transition_ids)}, "
@@ -215,7 +219,5 @@ print(
     f"wedge-plinth-hexes={len(wedge_plinth_hex_ids)}, "
     f"wedge-plinth-boundary-hexes={len(wedge_plinth_boundary_ids)}, "
     f"tip-unbonded-faces=0, tip-plinth-unbonded-faces=0, "
-    f"wall-plinth-faces={len(wall_plinth)}, wall-plinth-unbonded-faces=0, "
-    f"tip-x-max={max(tip_x_edges):.6f}, tip-y-range={min(tip_y_edges):.6f}..{max(tip_y_edges):.6f}, "
-    f"tip-z-range={min(tip_z_edges):.6f}..{max(tip_z_edges):.6f}."
+    f"wall-plinth-faces={len(wall_plinth)}, wall-plinth-unbonded-faces=0, {tip_size_summary}"
 )

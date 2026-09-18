@@ -1,17 +1,17 @@
-"""Add a bedrock-founded centre wedge and two joined side wedges along the
-downstream wall/plinth corner. Every wedge has a 2m height by 2m width
-right-triangular section.
+"""Add a centre wedge and two joined side wedges along the
+downstream wall/plinth corner. Every wedge has a 1.5m high by 2m wide
+quadrilateral section with a 0.5m top shelf and a 1:1 outer slope.
 
 Geometry per station:
   P0 = existing wall/plinth corner node (r=76.0, the shared wall-base/plinth-top node)
-    P1 = point 2m up the wall face from P0 (r=76.0, z = P0.z + 2m) -- new node
+        P1 = point 1.5m up the wall face from P0 (r=76.0, z = P0.z + 1.5m) -- new node
     P2 = point 2m along the plinth top downstream of P0 (r=74.0, z = P0.z) -- existing
        plinth-top node, reused directly so the rib bonds to the plinth mesh
 
-Right angle sits at P0. The centre wedge exists only on the flat z=-29 bedrock
-reach, where P0/P1 reuse wall nodes and P2 is a new bedrock node. The side wedges
-run from the z=-10 outer stations to the corresponding centre-wedge end face,
-sharing all three nodes at each join. Their z=-10 outer ends taper over 8m.
+Right angle sits at P0. The centre wedge attaches directly to the 0.5m-thick
+central plinth defined in Data/plinth.json. The side wedges run from the z=-10
+outer stations to the corresponding centre-wedge end face, sharing all three
+nodes at each join. Their z=-10 outer ends taper over 8m.
 """
 from pathlib import Path
 import json
@@ -26,34 +26,42 @@ ELMER_MESH_DIR = Path(__file__).resolve().parent / "mesh"
 RADIUS_CENTERLINE = 78.0
 WALL_R = 76.0
 PLINTH_LEG_R = 74.0  # 2m downstream of the wall face (width leg)
-HEIGHT_LEG_LENGTH = 2.0  # up the wall face
+HEIGHT_LEG_LENGTH = 1.5  # up the wall face
 WIDTH_LEG_LENGTH = 2.0  # along the plinth top
 TAPER_LENGTH = 8.0
 STATION_STEP = 0.5
 BEDROCK_Z = -29.0
 WEDGE_ELEMENT_SIZE = 0.5
 WEDGE_RADIAL_SUBDIVISIONS = 4
-FOUNDATION_HEIGHT = 0.5
-CENTER_FOUNDATION_LOW_EXTENSION_CELLS = 3
-CENTER_FOUNDATION_HIGH_EXTENSION_CELLS = 2
 WEDGE_NODE_SNAP_TOLERANCE = 1.0e-8
 
 METADATA_PATH = MESH_PATH.with_name("curved_dam_mesh_meta.json")
-PLINTH_PROFILE_PATH = MESH_PATH.parent.parent / "Data" / "plinth.json"
 
 
-def surveyed_ground_z(station):
-    """Interpolate the unchanged surveyed bedrock elevation at one station."""
-    profile = json.loads(PLINTH_PROFILE_PATH.read_text())
-    for start, end in zip(profile, profile[1:]):
-        start_station = float(start["chainage"])
-        end_station = float(end["chainage"])
-        if start_station - 1.0e-9 <= station <= end_station + 1.0e-9:
-            fraction = (station - start_station) / (end_station - start_station)
-            start_ground = float(start["ground"] if "ground" in start else start["groundLevel"])
-            end_ground = float(end["ground"] if "ground" in end else end["groundLevel"])
-            return -(start_ground + fraction * (end_ground - start_ground))
-    raise ValueError(f"Foundation station {station:g} lies outside the surveyed plinth profile")
+def resolve_elmergrid():
+    for candidate in (
+        shutil.which("ElmerGrid"),
+        "/usr/local/bin/ElmerGrid",
+        "/Users/alistairdavies/elmerfem/bin/ElmerGrid",
+        "/Users/alistairdavies/Library/Application Support/Code/User/globalStorage/github.copilot-chat/debugCommand/ElmerGrid",
+    ):
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def convert_to_elmer_mesh():
+    elmergrid = resolve_elmergrid()
+    if not elmergrid:
+        raise RuntimeError("ElmerGrid was not found; cannot update the solver mesh with the downstream wedge")
+    if ELMER_MESH_DIR.exists():
+        shutil.rmtree(ELMER_MESH_DIR)
+    subprocess.run(
+        [elmergrid, "14", "2", str(MESH_PATH), "-out", str(ELMER_MESH_DIR)],
+        check=True,
+        cwd=MESH_PATH.parent,
+    )
+    print(f"Converted {MESH_PATH} -> {ELMER_MESH_DIR}")
 
 
 def parse_msh(path):
@@ -101,12 +109,12 @@ def build_station_buckets(nodes):
     for nid, (x, y, z) in nodes.items():
         r = math.hypot(x, y)
         if PLINTH_LEG_R - 0.05 < r < PLINTH_LEG_R + 0.05:
-            key = round(station_of(x, y), 1)
+            key = round(station_of(x, y), 6)
             cur = p2_candidates.get(key)
             if cur is None or z > cur[0]:
                 p2_candidates[key] = (z, nid, x, y)
         elif 75.95 < r < 76.05:
-            key = round(station_of(x, y), 1)
+            key = round(station_of(x, y), 6)
             p0_candidates.setdefault(key, []).append((z, nid, x, y))
     return p0_candidates, p2_candidates
 
@@ -186,15 +194,21 @@ def build_triangle_section(
     new_nodes,
     next_node_id,
 ):
-    """Build a 0.5m lattice in the exact P0-P1-P2 right triangle."""
-    subdivisions = int(round(HEIGHT_LEG_LENGTH / WEDGE_ELEMENT_SIZE))
-    if subdivisions != radial_subdivisions:
-        raise ValueError("The triangular wedge requires equal 0.5m radial and vertical subdivisions")
+    """Build the 0.5m lattice in the specified four-sided wedge profile."""
+    vertical_subdivisions = int(round(HEIGHT_LEG_LENGTH / WEDGE_ELEMENT_SIZE))
+    if (
+        vertical_subdivisions != 3
+        or radial_subdivisions != 4
+        or not math.isclose(vertical_subdivisions * WEDGE_ELEMENT_SIZE, HEIGHT_LEG_LENGTH, abs_tol=1.0e-9)
+        or not math.isclose(radial_subdivisions * WEDGE_ELEMENT_SIZE, WIDTH_LEG_LENGTH, abs_tol=1.0e-9)
+    ):
+        raise ValueError("The quadrilateral wedge dimensions must align with the global 0.5m mesh")
     section_nodes = {}
-    for vertical_index in range(subdivisions + 1):
-        for radial_index in range(subdivisions - vertical_index + 1):
-            radial_fraction = radial_index / subdivisions
-            vertical_fraction = vertical_index / subdivisions
+    for vertical_index in range(vertical_subdivisions + 1):
+        row_width_cells = radial_subdivisions - vertical_index
+        for radial_index in range(row_width_cells + 1):
+            radial_fraction = radial_index / radial_subdivisions
+            vertical_fraction = vertical_index / vertical_subdivisions
             coordinates = tuple(
                 p0[axis]
                 + radial_fraction * (p2[axis] - p0[axis])
@@ -204,11 +218,23 @@ def build_triangle_section(
             section_nodes[radial_index, vertical_index], next_node_id = find_or_add_node(
                 coordinates, node_lookup, new_nodes, next_node_id
             )
-    return section_nodes, next_node_id
+    triangles = []
+    for vertical_index in range(vertical_subdivisions):
+        row_width_cells = radial_subdivisions - vertical_index
+        for radial_index in range(row_width_cells):
+            lower_left = radial_index, vertical_index
+            lower_right = radial_index + 1, vertical_index
+            upper_left = radial_index, vertical_index + 1
+            triangles.append((lower_left, lower_right, upper_left))
+            if radial_index > 0:
+                upper_right = radial_index - 1, vertical_index + 1
+                triangles.append((lower_left, upper_left, upper_right))
+    return section_nodes, triangles, next_node_id
 
 
 def build_segment_tetrahedra(
     section_nodes,
+    triangles,
     stations,
     nodes,
 ):
@@ -217,105 +243,24 @@ def build_segment_tetrahedra(
         s0, s1 = stations[i], stations[i + 1]
         start = section_nodes[s0]
         end = section_nodes[s1]
-        subdivisions = max(radial_index + vertical_index for radial_index, vertical_index in start)
-        for vertical_index in range(subdivisions):
-            for radial_index in range(subdivisions - vertical_index):
-                triangles = [(radial_index, vertical_index), (radial_index + 1, vertical_index), (radial_index, vertical_index + 1)]
-                if radial_index + vertical_index < subdivisions - 1:
-                    triangles.append((radial_index + 1, vertical_index + 1))
-                for triangle in (triangles[:3], (triangles[1], triangles[3], triangles[2])) if len(triangles) == 4 else (triangles[:3],):
-                    a, b, c = (start[index] for index in triangle)
-                    A, B, C = (end[index] for index in triangle)
-                    for tetrahedron in ((a, b, c, C), (a, b, B, C), (a, A, B, C)):
-                        if len(set(tetrahedron)) == 4 and abs(tetra_volume(nodes, *tetrahedron)) >= 1.0e-9:
-                            tetrahedra.append(tetrahedron)
+        for triangle in triangles:
+            a, b, c = (start[index] for index in triangle)
+            A, B, C = (end[index] for index in triangle)
+            for tetrahedron in ((a, b, c, C), (a, b, B, C), (a, A, B, C)):
+                if len(set(tetrahedron)) == 4 and abs(tetra_volume(nodes, *tetrahedron)) >= 1.0e-9:
+                    tetrahedra.append(tetrahedron)
     return tetrahedra
 
 
-def build_center_foundation(
-    stations,
-    radial_subdivisions,
-    vertical_subdivisions,
-    flat_start_station,
-    flat_end_station,
-    p0_buckets,
-    p0_candidates,
-    node_lookup,
-    new_nodes,
-    next_node_id,
-):
-    """Create the 2 m wide by 0.5 m thick centre plinth-foundation course."""
+def center_wedge_corners(stations, p0_buckets, p2_buckets, p0_candidates):
+    """Return the three physical corners of each centre-plinth wedge section."""
     sections = {}
     for station in stations:
-        if flat_start_station - 1.0e-8 <= station <= flat_end_station + 1.0e-8:
-            base_z = BEDROCK_Z
-            top_z = BEDROCK_Z + FOUNDATION_HEIGHT
-        else:
-            top_z, _, _, _ = p0_buckets[station]
-            base_z = surveyed_ground_z(station)
-            if base_z > top_z - 1.0e-8:
-                raise ValueError(f"Foundation has no positive depth at station {station:g}")
-        levels = []
-        for vertical_index in range(vertical_subdivisions + 1):
-            theta = station / RADIUS_CENTERLINE
-            z = base_z + vertical_index * (top_z - base_z) / vertical_subdivisions
-            level = []
-            for radial_index in range(radial_subdivisions + 1):
-                radius = WALL_R - radial_index * WIDTH_LEG_LENGTH / radial_subdivisions
-                node, next_node_id = find_or_add_node(
-                    (radius * math.sin(theta), radius * math.cos(theta), z),
-                    node_lookup, new_nodes, next_node_id,
-                )
-                level.append(node)
-            levels.append(level)
-        sections[station] = {"levels": levels, "bottom": levels[0], "top": levels[-1]}
-
-    tetrahedra = []
-    for index in range(len(stations) - 1):
-        start = sections[stations[index]]
-        end = sections[stations[index + 1]]
-        for vertical_index in range(vertical_subdivisions):
-            for radial_index in range(radial_subdivisions):
-                cell = (
-                    start["levels"][vertical_index][radial_index],
-                    start["levels"][vertical_index][radial_index + 1],
-                    start["levels"][vertical_index + 1][radial_index + 1],
-                    start["levels"][vertical_index + 1][radial_index],
-                    end["levels"][vertical_index][radial_index],
-                    end["levels"][vertical_index][radial_index + 1],
-                    end["levels"][vertical_index + 1][radial_index + 1],
-                    end["levels"][vertical_index + 1][radial_index],
-                )
-                tetrahedra.extend((
-                    (cell[0], cell[1], cell[2], cell[6]),
-                    (cell[0], cell[2], cell[3], cell[6]),
-                    (cell[0], cell[3], cell[7], cell[6]),
-                    (cell[0], cell[7], cell[4], cell[6]),
-                    (cell[0], cell[4], cell[5], cell[6]),
-                    (cell[0], cell[5], cell[1], cell[6]),
-                ))
-    return sections, tetrahedra, next_node_id
-
-
-def center_wedge_corners(stations, foundation_sections, p0_candidates, p2_buckets, nodes):
-    """Return the three physical corners of each bedrock-founded centre section."""
-    sections = {}
-    for station in stations:
-        if station in foundation_sections:
-            p0_id = foundation_sections[station]["top"][0]
-            p0_x, p0_y, p0_z = nodes[p0_id]
-            p2 = nodes[foundation_sections[station]["top"][-1]]
-        else:
-            p0_z, _, p0_x, p0_y = min(
-                p0_candidates[station],
-                key=lambda candidate: abs(candidate[0] - (BEDROCK_Z + FOUNDATION_HEIGHT)),
-            )
-            p2_z, _, p2_x, p2_y = p2_buckets[station]
-            if not math.isclose(p0_z, BEDROCK_Z + FOUNDATION_HEIGHT, abs_tol=1.0e-8) or not math.isclose(
-                p2_z, p0_z, abs_tol=1.0e-8
-            ):
-                raise ValueError(f"No matching cut-back plinth section at station {station:g}")
-            p2 = (p2_x, p2_y, p2_z)
+        p0_z, _, p0_x, p0_y = p0_buckets[station]
+        p2_z, _, p2_x, p2_y = p2_buckets[station]
+        if not math.isclose(p2_z, p0_z, abs_tol=1.0e-8):
+            raise ValueError(f"No matching central plinth section at station {station:g}")
+        p2 = (p2_x, p2_y, p2_z)
         wall_candidates = p0_candidates[station]
         p1_z, _, p1_x, p1_y = min(
             wall_candidates,
@@ -372,40 +317,33 @@ def main():
     p0_candidates, p2_buckets = build_station_buckets(nodes)
     p0_buckets = resolve_p0(p0_candidates, p2_buckets)
 
-    center_start = float(metadata["flat_center_foundation_start_station_m"])
-    center_end = float(metadata["flat_center_foundation_end_station_m"])
-    foundation_start = float(metadata["center_wedge_start_station_m"])
-    foundation_end = float(metadata["center_wedge_end_station_m"])
+    center_start = float(metadata["center_plinth_start_station_m"])
+    center_end = float(metadata["center_plinth_end_station_m"])
     center_stations = [
         round(center_start + index * STATION_STEP, 9)
         for index in range(int(round((center_end - center_start) / STATION_STEP)) + 1)
     ]
-    if any(station not in p0_candidates for station in center_stations):
-        raise ValueError("The parent mesh is missing a flat-centre foundation corner section")
-    for station in center_stations:
-        p0_buckets[station] = min(
-            p0_candidates[station],
-            key=lambda candidate: abs(candidate[0] - (BEDROCK_Z + FOUNDATION_HEIGHT)),
-        )
-
-    foundation_stations = [
-        round(foundation_start + index * STATION_STEP, 9)
-        for index in range(int(round((foundation_end - foundation_start) / STATION_STEP)) + 1)
-    ]
-    if any(station not in p0_candidates for station in foundation_stations):
-        raise ValueError("The parent mesh is missing a wall-base section for the centre foundation")
-    for station in foundation_stations:
-        if station in p0_buckets:
-            continue
-        p0_buckets[station] = min(p0_candidates[station], key=lambda candidate: candidate[0])
+    if any(station not in p0_buckets for station in center_stations):
+        raise ValueError("The parent mesh is missing a central plinth corner section")
 
     # Locate the z=-10 crossing station on each side of the wedge by scanning the
     # true wall/plinth corner elevation profile (p0_buckets), moving away from the
     # wedge until the elevation profile passes -10 m.
     raised_center_start = center_stations[0]
     raised_center_end = center_stations[-1]
-    low_candidates = sorted(s for s in p0_buckets if s <= raised_center_start)
-    high_candidates = sorted(s for s in p0_buckets if s >= raised_center_end)
+    wedge_lattice_stations = (
+        station for station in p0_buckets
+        if math.isclose(
+            station / STATION_STEP,
+            round(station / STATION_STEP),
+            abs_tol=1.0e-8,
+        )
+    )
+    low_candidates = sorted(s for s in wedge_lattice_stations if s <= raised_center_start)
+    high_candidates = sorted(s for s in p0_buckets if (
+        s >= raised_center_end
+        and math.isclose(s / STATION_STEP, round(s / STATION_STEP), abs_tol=1.0e-8)
+    ))
 
     def nearest_to_minus10(candidate_stations):
         return min(candidate_stations, key=lambda s: abs(p0_buckets[s][0] + 10.0))
@@ -415,10 +353,9 @@ def main():
 
     print(f"Low-side outer tip station: {low_outer} (corner z={p0_buckets[low_outer][0]:.3f})")
     print(f"High-side outer tip station: {high_outer} (corner z={p0_buckets[high_outer][0]:.3f})")
-    print(f"Centre wedge bedrock span: {center_start} to {center_end} (z={BEDROCK_Z:.1f})")
     print(
-        f"Raised centre wedge span: {center_stations[0]} to {center_stations[-1]} "
-        f"(z={BEDROCK_Z + FOUNDATION_HEIGHT:.1f})"
+        f"Centre wedge plinth span: {center_stations[0]} to {center_stations[-1]} "
+        f"(z={p0_buckets[center_stations[0]][0]:.1f})"
     )
 
     low_stations = [s for s in low_candidates if low_outer <= s <= raised_center_start]
@@ -428,46 +365,30 @@ def main():
     all_new_node_lines = []
     all_new_hexahedra = []
     all_new_tetrahedra = []
-    foundation_boundary_faces = []
 
     vertical_subdivisions = int(round(HEIGHT_LEG_LENGTH / WEDGE_ELEMENT_SIZE))
     radial_subdivisions = WEDGE_RADIAL_SUBDIVISIONS
     if vertical_subdivisions < 1 or radial_subdivisions < 1 or not math.isclose(
         vertical_subdivisions * WEDGE_ELEMENT_SIZE, HEIGHT_LEG_LENGTH, abs_tol=1.0e-9
-    ) or not math.isclose(
-        WIDTH_LEG_LENGTH / radial_subdivisions,
-        WEDGE_ELEMENT_SIZE,
-        abs_tol=1.0e-9,
-    ):
-        raise ValueError("Wedge height and radial subdivision width must match the configured element size")
+    ) or WIDTH_LEG_LENGTH / radial_subdivisions > WEDGE_ELEMENT_SIZE + 1.0e-9:
+        raise ValueError("Wedge subdivisions must not exceed the configured element size")
     node_lookup = {
         tuple(round(value, 7) for value in coordinates): node_id
         for node_id, coordinates in nodes.items()
     }
 
-    foundation_sections, foundation_tetrahedra, next_node_id = build_center_foundation(
-        foundation_stations, radial_subdivisions, int(metadata["plinth_vertical_layers"]),
-        center_start, center_end,
-        p0_buckets, p0_candidates,
-        node_lookup, all_new_node_lines, next_node_id,
-    )
-    all_new_tetrahedra.extend(foundation_tetrahedra)
-    nodes.update({node_id: (x, y, z) for node_id, x, y, z in all_new_node_lines})
-    for station, section in foundation_sections.items():
-        p0_id = section["top"][0]
-        p2_id = section["top"][-1]
-        p0_buckets[station] = (nodes[p0_id][2], p0_id, nodes[p0_id][0], nodes[p0_id][1])
-        p2_buckets[station] = (nodes[p2_id][2], p2_id, nodes[p2_id][0], nodes[p2_id][1])
-
     center_corners = center_wedge_corners(
-        center_stations, foundation_sections, p0_candidates, p2_buckets, nodes
+        center_stations, p0_buckets, p2_buckets, p0_candidates
     )
     center_sections = {}
+    wedge_triangles = None
     for station in center_stations:
-        center_sections[station], next_node_id = build_triangle_section(
+        center_sections[station], section_triangles, next_node_id = build_triangle_section(
             *center_corners[station], radial_subdivisions,
             node_lookup, all_new_node_lines, next_node_id
         )
+        if wedge_triangles is None:
+            wedge_triangles = section_triangles
     # The side and centre sections are assembled into one ordered lattice below.
     # Centre nodes are reused at both joins so the resulting wedge has no
     # side/centre interface or separate wedge-volume boundary.
@@ -484,7 +405,7 @@ def main():
         if station in center_sections:
             low_sections[station] = center_sections[station]
         else:
-            low_sections[station], next_node_id = build_triangle_section(
+            low_sections[station], _, next_node_id = build_triangle_section(
                 *low_corners[station], radial_subdivisions,
                 node_lookup, all_new_node_lines, next_node_id
             )
@@ -501,7 +422,7 @@ def main():
         if station in center_sections:
             high_sections[station] = center_sections[station]
         else:
-            high_sections[station], next_node_id = build_triangle_section(
+            high_sections[station], _, next_node_id = build_triangle_section(
                 *high_corners[station], radial_subdivisions,
                 node_lookup, all_new_node_lines, next_node_id
             )
@@ -514,7 +435,7 @@ def main():
     ):
         raise ValueError("The unified wedge stations must form one contiguous half-metre grid")
     all_new_tetrahedra.extend(
-        build_segment_tetrahedra(wedge_sections, wedge_stations, nodes)
+        build_segment_tetrahedra(wedge_sections, wedge_triangles, wedge_stations, nodes)
     )
 
     all_coords = dict(nodes)
@@ -557,10 +478,9 @@ def main():
         if count == 1
     ]
 
-    print(f"Right-triangle wedge: {HEIGHT_LEG_LENGTH:.1f}m high x {WIDTH_LEG_LENGTH:.1f}m wide")
     print(
-        f"Centre foundation: {foundation_stations[0]:.1f} to {foundation_stations[-1]:.1f}m, "
-        f"r={WALL_R:.1f} to {PLINTH_LEG_R:.1f}m, z={BEDROCK_Z:.1f} to {BEDROCK_Z + FOUNDATION_HEIGHT:.1f}m"
+        f"Quadrilateral wedge: {HEIGHT_LEG_LENGTH:.1f}m wall height, 0.5m top shelf, "
+        f"1:1 slope, {WIDTH_LEG_LENGTH:.1f}m base"
     )
     print(f"New nodes: {len(all_new_node_lines)}")
     print(
@@ -713,6 +633,7 @@ def main():
     MESH_PATH.write_text("".join(lines))
     print(f"Removed {superseded_boundary_count} base boundary faces covered by wedge hexahedra")
     print(f"Wrote {MESH_PATH} ({new_node_count} nodes, {new_element_count} elements)")
+    convert_to_elmer_mesh()
 
 
 if __name__ == "__main__":
