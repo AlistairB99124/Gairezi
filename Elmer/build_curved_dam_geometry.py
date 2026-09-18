@@ -73,6 +73,9 @@ plinth_upstream_offset_m = 1.0
 plinth_downstream_offset_m = 2.0
 plinth_base_width_m = wall_thickness + plinth_upstream_offset_m + plinth_downstream_offset_m
 plinth_width_m = plinth_base_width_m
+CENTER_FOUNDATION_LOW_EXTENSION_CELLS = 3
+CENTER_FOUNDATION_HIGH_EXTENSION_CELLS = 2
+CENTER_FOUNDATION_HEIGHT_M = 0.5
 
 dam_height = 30.0
 mesh_size = get_grid_control_value("Global Element Size")
@@ -92,8 +95,6 @@ thickness_layers = max(1, int(round(wall_thickness / target_block_size)))
 crest_detail_height = 0.0
 crest_extra_thickness = 0.0
 abutment_segment_count = 6
-CENTRE_PLINTH_STEP_HEIGHT_M = 0.5
-CENTRE_PLINTH_TRANSITION_FRACTION = 0.5
 
 
 def interpolate_profile_points(profile_points, subdivisions):
@@ -173,35 +174,6 @@ def interpolate_profile_points_by_target_spacing(profile_points, target_spacing_
         )
 
     return refined
-
-
-def introduce_centre_plinth_steps(points, center_start, center_end, step_height):
-    """Create a mesh-aligned plinth shoulder on each side of centre bedrock.
-
-    The two adjacent sections retain a plinth of ``step_height`` above the
-    flat bedrock. The following centre sections remain zero-thickness, letting
-    the bonded wedge bridge each intended step instead of a smooth runout.
-    """
-    station_index = {round(point["station"], 9): index for index, point in enumerate(points)}
-
-    def index_at(station):
-        key = round(station, 9)
-        if key not in station_index:
-            raise ValueError(f"Missing station {station:g} for centre plinth step")
-        return station_index[key]
-
-    center_start_index = index_at(center_start)
-    center_end_index = index_at(center_end)
-    if center_start_index == 0 or center_end_index == len(points) - 1:
-        raise ValueError("Centre plinth steps require sections on both sides of centre bedrock")
-
-    bedrock_z = points[center_start_index]["ground_z"]
-    if not math.isclose(points[center_end_index]["ground_z"], bedrock_z, abs_tol=1.0e-8):
-        raise ValueError("Centre bedrock ends must have the same elevation")
-    for index in (center_start_index - 1, center_end_index + 1):
-        points[index]["ground_z"] = bedrock_z
-        points[index]["base_z"] = bedrock_z + step_height
-        points[index]["plinth_z"] = bedrock_z + step_height
 
 
 def assign_normals(profile_points):
@@ -379,13 +351,20 @@ center_bedrock_stations = [
 ]
 if len(center_bedrock_stations) < 2:
     raise ValueError("The profile requires a flat z=-29 centre bedrock interval")
-introduce_centre_plinth_steps(
-    points,
-    center_bedrock_stations[0],
-    center_bedrock_stations[-1],
-    CENTRE_PLINTH_STEP_HEIGHT_M,
+flat_center_foundation_start_station_m = min(center_bedrock_stations)
+flat_center_foundation_end_station_m = max(center_bedrock_stations)
+center_wedge_start_station_m = flat_center_foundation_start_station_m - (
+    CENTER_FOUNDATION_LOW_EXTENSION_CELLS * target_block_size
 )
-
+center_wedge_end_station_m = flat_center_foundation_end_station_m + (
+    CENTER_FOUNDATION_HIGH_EXTENSION_CELLS * target_block_size
+)
+if not math.isclose(
+    (center_wedge_end_station_m - center_wedge_start_station_m) / target_block_size,
+    round((center_wedge_end_station_m - center_wedge_start_station_m) / target_block_size),
+    abs_tol=1.0e-9,
+):
+    raise ValueError("Centre wedge ends must lie on the global station grid")
 
 def insert_station(points, station):
     for point in points:
@@ -405,34 +384,6 @@ def insert_station(points, station):
             points.insert(index + 1, inserted)
             return
     raise ValueError(f"Wedge station {station:.9f} lies outside the dam profile")
-
-
-def refine_centre_plinth_handoffs(points, center_start, center_end):
-    """Insert one bedrock section halfway across each plinth shoulder handoff.
-
-    The added planes split the parent wall and plinth faces as well as the
-    downstream wedge, so a local sloping transition can remain conforming.
-    """
-    for shoulder, direction in (
-        (center_start - target_block_size, +1.0),
-        (center_end + target_block_size, -1.0),
-    ):
-        station = shoulder + direction * target_block_size * CENTRE_PLINTH_TRANSITION_FRACTION
-        insert_station(points, station)
-        point = next(
-            point for point in points
-            if math.isclose(point["station"], station, abs_tol=1.0e-9)
-        )
-        point["base_z"] = -29.0
-        point["plinth_z"] = -29.0
-        point["ground_z"] = -29.0
-
-
-refine_centre_plinth_handoffs(
-    points,
-    center_bedrock_stations[0],
-    center_bedrock_stations[-1],
-)
 
 
 def raw_wedge_z_length(point):
@@ -688,6 +639,15 @@ def generate_curved_wall_mesh(points, output_mesh: Path) -> tuple[int, int]:
         and points[index + 1]["base_z"] - points[index + 1]["ground_z"] > 1.0e-8
         for index in range(len(points) - 1)
     ]
+    # The centre foundation replaces the final three low-side and two high-side
+    # plinth cells as one continuous course. Its non-flat end cells are emitted
+    # separately with lower faces following this unchanged surveyed contour.
+    for index, (start, end) in enumerate(zip(points, points[1:])):
+        if (
+            start["station"] >= center_wedge_start_station_m - 1.0e-9
+            and end["station"] <= center_wedge_end_station_m + 1.0e-9
+        ):
+            plinth_active_segments[index] = False
     plinth_active_stations = [False] * len(points)
     for index, active in enumerate(plinth_active_segments):
         if active:
@@ -1701,6 +1661,11 @@ meta_path.write_text(
             "plinth_width_m": plinth_width_m,
             "plinth_base_width_m": plinth_base_width_m,
             "plinth_vertical_layers": plinth_vertical_layers,
+            "flat_center_foundation_start_station_m": flat_center_foundation_start_station_m,
+            "flat_center_foundation_end_station_m": flat_center_foundation_end_station_m,
+            "center_wedge_start_station_m": center_wedge_start_station_m,
+            "center_wedge_end_station_m": center_wedge_end_station_m,
+            "center_foundation_height_m": CENTER_FOUNDATION_HEIGHT_M,
             "dam_height_m": dam_height,
             "mesh_size_m": mesh_size,
             "target_block_size_m": target_block_size,
