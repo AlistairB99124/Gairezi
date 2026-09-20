@@ -1,0 +1,79 @@
+Header
+    CHECK KEYWORDS Warn
+    Mesh DB "mesh" "/"
+    Results Directory "results"
+End
+
+Simulation
+    Max Output Level = 5
+    Coordinate System = Cartesian 3D
+    Simulation Type = Steady State
+    Steady State Max Iterations = 1
+    Output Intervals = 1
+End
+
+Constants
+    Gravity(4) = Real 0 0 -1 9.81
+End
+
+Body 1
+    Name = "CombinedDamBody"
+    Equation = 1
+    Material = 1
+    Body Force = 1
+End
+
+Body Force 1
+    Stress Bodyforce 3 = Real -23544
+End
+
+Equation 1
+    Name = "LinearElasticity"
+    Active Solvers(2) = 1 2
+End
+
+Solver 1
+    Equation = "Elasticity"
+    Procedure = "StressSolve" "StressSolver"
+    Variable = "Displacement"
+    Variable DOFs = 3
+    Calculate Stresses = Logical True
+    Calculate Principal = Logical True
+    Nonlinear System Max Iterations = 1
+    Linear System Solver = Iterative
+    Linear System Iterative Method = BiCGStabl
+    Linear System Preconditioning = ILUT
+    Linear System ILUT Tolerance = 1.0e-4
+    Linear System Max Iterations = 2000
+    Linear System Convergence Tolerance = 1.0e-10
+    Linear System Abort Not Converged = Logical True
+End
+
+Solver 2
+    Equation = "ResultOutput"
+    Procedure = "ResultOutputSolve" "ResultOutputSolver"
+    Output File Name = "combined_results"
+    Vtu Format = Logical True
+End
+
+Material 1
+    Name = "Concrete"
+    Youngs Modulus = Real 35000000000
+    Poisson Ratio = Real 0.2
+    Density = Real 2400
+End
+
+Boundary Condition 1
+    Name = "FixedBedrockFoundation"
+    Target Boundaries(1) = 1
+    Displacement 1 = Real 0.0
+    Displacement 2 = Real 0.0
+    Displacement 3 = Real 0.0
+End
+
+Boundary Condition 2
+    Name = "UpstreamHydrostaticPressure"
+    Target Boundaries(1) = 2
+    Normal Force = Variable Coordinate 3
+        Real MATC "-9810 * (0.0 - tx) * (tx < 0.0)"
+End

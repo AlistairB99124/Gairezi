@@ -26,6 +26,29 @@
         "clear": true
       },
       "detail": "Runs the Elmer solver against the local dam model and writes VTU output into the Elmer/results directory."
+    },
+    {
+      "label": "Elmer: Run combined solver",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "cd \"${workspaceFolder}/Elmer\" && python3 structure_assembly.py combined-solve"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "ELMER_HOME": "/usr/local"
+        }
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Builds the combined mesh, runs the Elmer stress solver, and writes the result VTU into Elmer/structure_output/combined_solver/results."
     }
   ]
 }

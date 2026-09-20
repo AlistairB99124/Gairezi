@@ -78,7 +78,7 @@ def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, list[tuple[int, np.nd
     cells: list[tuple[int, np.ndarray]] = []
     start = 0
     for end, cell_type in zip(offsets.tolist(), cell_types.tolist()):
-        if cell_type in (10, 12, 14):  # VTK tetrahedron, hexahedron, pyramid
+        if cell_type in (10, 12, 13, 14):  # VTK tetrahedron, hexahedron, wedge, pyramid
             cells.append((cell_type, connectivity[start:end]))
         start = end
 
