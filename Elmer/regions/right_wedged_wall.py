@@ -7,7 +7,8 @@ from pathlib import Path
 from regions.left_wedged_wall import (
     DOWNSTREAM_WALL_RADIUS_M,
     UPSTREAM_RADIUS_M,
-    WEDGE_SIZE_M,
+    WEDGE_HEIGHT_M,
+    WEDGE_WIDTH_M,
     WEDGE_TOE_RADIUS_M,
     LeftWedgedWallMesh,
     build_wedged_wall,
@@ -39,7 +40,8 @@ def audit_right_wedged_wall(mesh: LeftWedgedWallMesh) -> dict[str, object]:
         "plinth_z_m": [-28.5, -17.03],
         "wall_radius_m": [DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M],
         "wedge_radius_m": [WEDGE_TOE_RADIUS_M, DOWNSTREAM_WALL_RADIUS_M],
-        "wedge_size_m": WEDGE_SIZE_M,
+        "wedge_height_m": WEDGE_HEIGHT_M,
+        "wedge_width_m": WEDGE_WIDTH_M,
         "element_size_m": mesh.element_size_m,
     }
 

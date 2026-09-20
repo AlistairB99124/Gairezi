@@ -6,6 +6,7 @@ from pathlib import Path
 
 from regions.center_wall import write_gmsh, write_vtu
 from regions.left_wedged_wall_transition import (
+    FULL_WEDGE_HEIGHT_M,
     LeftWedgedWallTransitionMesh,
     build_wedged_wall_transition,
 )
@@ -17,7 +18,7 @@ from regions.uniform_wall import (
 
 
 WEDGE_END_CHAINAGE_M = 140.37597894015022
-WEDGE_HEIGHT_M = 2.0
+WEDGE_HEIGHT_M = FULL_WEDGE_HEIGHT_M
 
 
 def transition_end_chainage(contours, target_z_m: float) -> float:
@@ -47,13 +48,14 @@ def audit_right_wedged_wall_transition(mesh: LeftWedgedWallTransitionMesh) -> di
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
+        "tetrahedra": element_counts[4],
         "hexahedra": element_counts[5],
         "triangular_prisms": element_counts[6],
         "boundary_faces": dict(sorted(boundary_counts.items())),
         "chainage_m": [mesh.chainages_m[0], mesh.chainages_m[-1]],
         "wall_radius_m": [DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M],
         "wall_thickness_m": UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M,
-        "fixed_reference_z_m": mesh.base_levels_m[0] + WEDGE_HEIGHT_M,
+        "fixed_reference_z_m": mesh.wedge_top_z_m,
         "wedge_removed": True,
         "element_size_m": mesh.element_size_m,
     }

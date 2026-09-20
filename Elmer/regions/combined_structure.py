@@ -13,7 +13,7 @@ from regions.center_wall import START_CHAINAGE_M as CENTER_START_CHAINAGE_M
 from regions.left_wall import build_left_wall
 from regions.left_wedged_wall import build_left_wedged_wall, build_wedged_wall
 from regions.left_wedged_wall_transition import build_left_wedged_wall_transition
-from regions.plinth import build_plinth
+from regions.plinth import build_conforming_plinth, build_plinth
 from regions.right_wall import build_right_wall
 from regions.right_wedged_wall import build_right_wedged_wall
 from regions.right_wedged_wall_transition import build_right_wedged_wall_transition
@@ -33,6 +33,8 @@ REGION_BUILDERS = (
     (7, "right_wedged_wall_transition", build_right_wedged_wall_transition),
     (8, "right_wall", build_right_wall),
 )
+
+STRUCTURAL_REGION_BUILDERS = REGION_BUILDERS[1:]
 
 
 @dataclass(frozen=True)
@@ -99,8 +101,14 @@ def build_combined_structure(root: Path) -> CombinedStructure:
     boundary_faces: dict[tuple[int, ...], list[tuple[int, tuple[int, ...]]]] = {}
     region_cell_counts: dict[str, int] = {}
 
-    for region_id, region_name, builder in REGION_BUILDERS:
-        mesh = builder(root)
+    structural_regions = [
+        (region_id, region_name, builder(root))
+        for region_id, region_name, builder in STRUCTURAL_REGION_BUILDERS
+    ]
+    plinth = build_conforming_plinth(root, [mesh for _, _, mesh in structural_regions])
+    regions = [(1, "plinth", plinth), *structural_regions]
+
+    for region_id, region_name, mesh in regions:
         local_to_global: dict[int, int] = {}
         for local_id, coordinate in enumerate(mesh.nodes, start=1):
             key = tuple(round(value, 9) for value in coordinate)
@@ -190,7 +198,7 @@ def write_combined_vtu(mesh: CombinedStructure, path: Path) -> None:
     for _, cell in mesh.cells:
         offset += len(cell)
         offsets.append(offset)
-    vtk_cell_types = {4: 10, 5: 12, 6: 13}
+    vtk_cell_types = {4: 10, 5: 12, 6: 13, 7: 14}
     cell_types = [vtk_cell_types[element_type] for element_type, _ in mesh.cells]
     points = [coordinate for point in mesh.nodes for coordinate in point]
     pressure_traction = [component for vector in mesh.water_pressure_traction_pa for component in vector]
@@ -271,11 +279,42 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         raise ValueError("Combined cell arrays do not preserve all regional cells")
     if len({tuple(round(value, 9) for value in point) for point in mesh.nodes}) != len(mesh.nodes):
         raise ValueError("Combined structure contains duplicate coordinates")
+    face_patterns = {
+        4: ((0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)),
+        5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
+        6: ((0, 1, 2), (3, 5, 4), (0, 3, 4, 1), (1, 4, 5, 2), (2, 5, 3, 0)),
+        7: ((0, 1, 2, 3), (0, 4, 1), (1, 4, 2), (2, 4, 3), (3, 4, 0)),
+    }
+    parents = list(range(len(mesh.cells)))
+
+    def find(cell_index: int) -> int:
+        while parents[cell_index] != cell_index:
+            parents[cell_index] = parents[parents[cell_index]]
+            cell_index = parents[cell_index]
+        return cell_index
+
+    face_owners: dict[tuple[int, ...], int] = {}
+    for cell_index, (element_type, cell) in enumerate(mesh.cells):
+        for pattern in face_patterns[element_type]:
+            face = tuple(sorted(cell[index] for index in pattern))
+            if face in face_owners:
+                first_root = find(cell_index)
+                second_root = find(face_owners[face])
+                if first_root != second_root:
+                    parents[second_root] = first_root
+            else:
+                face_owners[face] = cell_index
+    component_count = len({find(cell_index) for cell_index in range(len(mesh.cells))})
+    if component_count != 1:
+        raise ValueError(f"Combined structure has {component_count} face-connected components")
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
+        "tetrahedra": element_counts[4],
         "hexahedra": element_counts[5],
         "triangular_prisms": element_counts[6],
+        "pyramids": element_counts[7],
+        "face_connected_components": component_count,
         "boundary_faces": dict(sorted(Counter(boundary_id for boundary_id, _ in mesh.boundaries).items())),
         "regions": mesh.region_cell_counts,
         "fixed_base_nodes": sum(mesh.fixed_base),

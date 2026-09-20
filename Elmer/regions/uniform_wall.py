@@ -7,13 +7,13 @@ import json
 import math
 from pathlib import Path
 
-from regions.left_wedged_wall import _upper_wall_levels
+from regions.left_wedged_wall import WEDGE_HEIGHT_M, _upper_wall_levels
 from regions.plinth import _monotone_values, _prism_orientation, load_contours, load_global_element_size
 
 
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
-REFERENCE_LAYER_HEIGHT_M = 2.0
+REFERENCE_LAYER_HEIGHT_M = WEDGE_HEIGHT_M
 CREST_Z_M = 0.0
 BASE_BOUNDARY_ID = 1
 UPSTREAM_BOUNDARY_ID = 2

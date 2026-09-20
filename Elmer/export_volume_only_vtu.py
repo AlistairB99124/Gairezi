@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import re
 import struct
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 SOURCE_PATH = RESULTS_DIR / "dam_results_t0001.vtu"
 OUTPUT_PATH = RESULTS_DIR / "dam_results_volume_t0001.vtu"
-VOLUME_CELL_TYPES = {12, 13}  # VTK_HEXAHEDRON and VTK_WEDGE
+VOLUME_CELL_TYPES = {10, 12, 13, 14}  # tetrahedron, hexahedron, wedge, and pyramid
 
 
 def read_chunk(appended: bytes, offset: int) -> bytes:
@@ -16,8 +17,8 @@ def read_chunk(appended: bytes, offset: int) -> bytes:
     return appended[offset : offset + 4 + length]
 
 
-def main() -> None:
-    data = SOURCE_PATH.read_bytes()
+def export_volume_only(source_path: Path, output_path: Path) -> None:
+    data = source_path.read_bytes()
     appended_tag = b'<AppendedData encoding="raw">'
     header_end = data.index(appended_tag)
     appended_start = data.index(b"_", header_end) + 1
@@ -106,8 +107,16 @@ def main() -> None:
         "  </UnstructuredGrid>",
         '  <AppendedData encoding="raw">',
     ]).encode("utf-8")
-    OUTPUT_PATH.write_bytes(xml + b"_" + b"".join(output_chunks) + b"\n</AppendedData>\n</VTKFile>\n")
-    print(f"Wrote {OUTPUT_PATH} with {len(volume_types)} volume cells")
+    output_path.write_bytes(xml + b"_" + b"".join(output_chunks) + b"\n</AppendedData>\n</VTKFile>\n")
+    print(f"Wrote {output_path} with {len(volume_types)} volume cells")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Remove boundary cells from an Elmer VTU result file.")
+    parser.add_argument("--source", type=Path, default=SOURCE_PATH)
+    parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
+    args = parser.parse_args()
+    export_volume_only(args.source, args.output)
 
 
 if __name__ == "__main__":

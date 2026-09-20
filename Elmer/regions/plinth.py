@@ -37,6 +37,10 @@ class PlinthMesh:
     element_size_m: float
 
 
+def _coordinate_key(point: tuple[float, float, float]) -> tuple[float, float, float]:
+    return tuple(round(value, 9) for value in point)
+
+
 def load_contours(path: Path) -> list[ContourPoint]:
     rows = json.loads(path.read_text())
     contours = [
@@ -102,17 +106,14 @@ def _chainages(contours: list[ContourPoint], element_size_m: float) -> list[floa
 
 
 def _vertical_levels(bottom_z_m: float, top_z_m: float, element_size_m: float) -> list[float]:
-    tolerance = 1.0e-9
+    boundary_clearance_m = 0.5 * element_size_m
     levels = [bottom_z_m]
-    first_index = math.floor(bottom_z_m / element_size_m) + 1
-    last_index = math.ceil(top_z_m / element_size_m) - 1
-    levels.extend(
-        index * element_size_m
-        for index in range(first_index, last_index + 1)
-        if bottom_z_m + tolerance < index * element_size_m < top_z_m - tolerance
-    )
+    layer_index = 1
+    while top_z_m - layer_index * element_size_m >= bottom_z_m + boundary_clearance_m:
+        levels.append(top_z_m - layer_index * element_size_m)
+        layer_index += 1
     levels.append(top_z_m)
-    return list(dict.fromkeys(round(level, 9) for level in levels))
+    return sorted(set(round(level, 9) for level in levels))
 
 
 def _triangulate_convex_polygon(vertices: list[tuple[int, int]]) -> list[tuple[tuple[int, int], ...]]:
@@ -158,6 +159,29 @@ def _section_faces(left_levels: list[float], right_levels: list[float]) -> list[
         + [(1, index) for index in range(len(right_levels) - 1, -1, -1) if right_levels[index] >= upper_z_m]
     )
     faces.extend(_triangulate_convex_polygon(upper_polygon))
+    return faces
+
+
+def _top_aligned_section_faces(
+    left_levels: list[float],
+    right_levels: list[float],
+) -> list[tuple[tuple[int, int], ...]]:
+    left_extra = max(len(left_levels) - len(right_levels), 0)
+    right_extra = max(len(right_levels) - len(left_levels), 0)
+    faces = _triangulate_convex_polygon(
+        [(0, index) for index in range(left_extra + 1)]
+        + [(1, index) for index in range(right_extra, -1, -1)]
+    )
+    common_level_count = min(len(left_levels), len(right_levels))
+    faces.extend(
+        (
+            (0, left_extra + index),
+            (1, right_extra + index),
+            (1, right_extra + index + 1),
+            (0, left_extra + index + 1),
+        )
+        for index in range(common_level_count - 1)
+    )
     return faces
 
 
@@ -213,7 +237,7 @@ def build_plinth(root: Path) -> PlinthMesh:
 
     cells: list[tuple[int, tuple[int, ...]]] = []
     for station_index in range(len(chainages_m) - 1):
-        faces = _section_faces(section_levels[station_index], section_levels[station_index + 1])
+        faces = _top_aligned_section_faces(section_levels[station_index], section_levels[station_index + 1])
         for radial_index in range(radial_count):
             for face in faces:
                 inner = tuple(node_ids[(station_index + side, vertical_index, radial_index)] for side, vertical_index in face)
@@ -283,6 +307,252 @@ def build_plinth(root: Path) -> PlinthMesh:
     return PlinthMesh(nodes, cells, boundaries, chainages_m, element_size_m)
 
 
+def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> PlinthMesh:
+    contours = load_contours(root / "Data" / "plinth.json")
+    element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
+    config = json.loads((root / "config.json").read_text())
+    centerline_radius_m = float(config["wall_centerline_radius_m"])
+
+    top_faces: dict[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...]] = {}
+    segment_nodes: dict[tuple[float, float], dict[float, list[tuple[float, float, float]]]] = {}
+    for mesh in interface_meshes:
+        for boundary_id, face in mesh.boundaries:
+            if boundary_id != 1:
+                continue
+            coordinates = tuple(mesh.nodes[node_id - 1] for node_id in face)
+            key = tuple(sorted(_coordinate_key(point) for point in coordinates))
+            top_faces[key] = coordinates
+            chainages = sorted({round(centerline_radius_m * math.atan2(x_m, y_m), 9) for x_m, y_m, _ in coordinates})
+            if len(chainages) != 2:
+                raise ValueError("A structural base face must span exactly two chainage stations")
+            stations = segment_nodes.setdefault((chainages[0], chainages[1]), {})
+            for point in coordinates:
+                chainage_m = round(centerline_radius_m * math.atan2(point[0], point[1]), 9)
+                stations.setdefault(chainage_m, []).append(point)
+
+    for (start_m, end_m), stations in segment_nodes.items():
+        if set(stations) != {start_m, end_m}:
+            raise ValueError("Incomplete structural base segment")
+        start_points = stations[start_m]
+        end_points = stations[end_m]
+        start_min = min(math.hypot(x_m, y_m) for x_m, y_m, _ in start_points)
+        end_min = min(math.hypot(x_m, y_m) for x_m, y_m, _ in end_points)
+        start_max = max(math.hypot(x_m, y_m) for x_m, y_m, _ in start_points)
+        end_max = max(math.hypot(x_m, y_m) for x_m, y_m, _ in end_points)
+
+        def top_point(chainage_m: float, radius_m: float) -> tuple[float, float, float]:
+            angle = chainage_m / centerline_radius_m
+            return (
+                radius_m * math.sin(angle),
+                radius_m * math.cos(angle),
+                _monotone_values(contours, "plinth_z_m", chainage_m),
+            )
+
+        strips = []
+        if min(start_min, end_min) > DOWNSTREAM_RADIUS_M + 1.0e-9:
+            strips.append((
+                top_point(start_m, DOWNSTREAM_RADIUS_M),
+                top_point(end_m, DOWNSTREAM_RADIUS_M),
+                top_point(end_m, end_min),
+                top_point(start_m, start_min),
+            ))
+        if max(start_max, end_max) < UPSTREAM_RADIUS_M - 1.0e-9:
+            strips.append((
+                top_point(start_m, start_max),
+                top_point(end_m, end_max),
+                top_point(end_m, UPSTREAM_RADIUS_M),
+                top_point(start_m, UPSTREAM_RADIUS_M),
+            ))
+        for face in strips:
+            key = tuple(sorted(_coordinate_key(point) for point in face))
+            top_faces[key] = face
+
+    chainages_m = sorted({
+        round(centerline_radius_m * math.atan2(x_m, y_m), 9)
+        for face in top_faces.values()
+        for x_m, y_m, _ in face
+    })
+    maximum_thickness_m = max(
+        _monotone_values(contours, "plinth_z_m", chainage_m)
+        - _monotone_values(contours, "bedrock_z_m", chainage_m)
+        for chainage_m in chainages_m
+    )
+    layer_count = max(1, math.ceil(maximum_thickness_m / element_size_m))
+
+    nodes: list[tuple[float, float, float]] = []
+    coordinate_nodes: dict[tuple[float, float, float], int] = {}
+    bedrock_by_top_node = {
+        _coordinate_key(point): _monotone_values(
+            contours,
+            "bedrock_z_m",
+            centerline_radius_m * math.atan2(point[0], point[1]),
+        )
+        for face in top_faces.values()
+        for point in face
+    }
+
+    def node_id(point: tuple[float, float, float], layer_index: int) -> int:
+        x_m, y_m, top_z_m = point
+        bedrock_z_m = bedrock_by_top_node[_coordinate_key(point)]
+        candidate_z_m = top_z_m - layer_index * element_size_m
+        if layer_index > 0 and (
+            layer_index == layer_count
+            or candidate_z_m <= bedrock_z_m + 0.5 * element_size_m
+        ):
+            candidate_z_m = bedrock_z_m
+        coordinate = (x_m, y_m, max(candidate_z_m, bedrock_z_m))
+        key = _coordinate_key(coordinate)
+        if key not in coordinate_nodes:
+            coordinate_nodes[key] = len(nodes) + 1
+            nodes.append(coordinate)
+        return coordinate_nodes[key]
+
+    cells: list[tuple[int, tuple[int, ...]]] = []
+
+    def append_prism(first: tuple[int, int, int], second: tuple[int, int, int]) -> None:
+        cell = first + second
+        if _prism_orientation(nodes, cell) < 0.0:
+            cell = (cell[0], cell[2], cell[1], cell[3], cell[5], cell[4])
+        cells.append((6, cell))
+
+    def append_tetrahedron(cell: tuple[int, int, int, int]) -> None:
+        points = [nodes[value - 1] for value in cell]
+        vectors = [
+            tuple(points[index][axis] - points[0][axis] for axis in range(3))
+            for index in range(1, 4)
+        ]
+        determinant = _determinant(*vectors)
+        if abs(determinant) < 1.0e-12:
+            raise ValueError("Zero-volume tetrahedron in conforming plinth")
+        if determinant < 0.0:
+            cell = (cell[0], cell[2], cell[1], cell[3])
+        cells.append((4, cell))
+
+    def append_pyramid(base: tuple[int, int, int, int], apex: int) -> None:
+        points = [nodes[value - 1] for value in base + (apex,)]
+        volume_sign = _determinant(
+            tuple(points[1][axis] - points[0][axis] for axis in range(3)),
+            tuple(points[2][axis] - points[0][axis] for axis in range(3)),
+            tuple(points[4][axis] - points[0][axis] for axis in range(3)),
+        ) + _determinant(
+            tuple(points[2][axis] - points[0][axis] for axis in range(3)),
+            tuple(points[3][axis] - points[0][axis] for axis in range(3)),
+            tuple(points[4][axis] - points[0][axis] for axis in range(3)),
+        )
+        if abs(volume_sign) < 1.0e-12:
+            raise ValueError("Zero-volume pyramid in conforming plinth")
+        if volume_sign < 0.0:
+            base = (base[0], base[3], base[2], base[1])
+        cells.append((7, base + (apex,)))
+
+    for face in top_faces.values():
+        for layer_index in range(layer_count):
+            upper = tuple(node_id(point, layer_index) for point in face)
+            lower = tuple(node_id(point, layer_index + 1) for point in face)
+            unique_nodes = len(set(upper + lower))
+            if len(face) == 3 and unique_nodes == 6:
+                append_prism(upper, lower)
+            elif len(face) == 3 and unique_nodes == 5:
+                collapsed_index = next(
+                    index for index, (upper_id, lower_id) in enumerate(zip(upper, lower))
+                    if upper_id == lower_id
+                )
+                active_indices = [index for index in range(3) if index != collapsed_index]
+                base = (
+                    upper[active_indices[0]],
+                    upper[active_indices[1]],
+                    lower[active_indices[1]],
+                    lower[active_indices[0]],
+                )
+                append_pyramid(base, upper[collapsed_index])
+            elif len(face) == 3 and unique_nodes == 4:
+                collapsed_indices = [
+                    index for index, (upper_id, lower_id) in enumerate(zip(upper, lower))
+                    if upper_id == lower_id
+                ]
+                active_index = next(index for index in range(3) if index not in collapsed_indices)
+                append_tetrahedron((
+                    upper[collapsed_indices[0]],
+                    upper[collapsed_indices[1]],
+                    upper[active_index],
+                    lower[active_index],
+                ))
+            elif len(face) == 3 and unique_nodes == 3:
+                continue
+            elif len(face) == 4 and unique_nodes == 8:
+                cell = upper + lower
+                if _hex_orientation(nodes, cell) < 0.0:
+                    cell = (cell[0], cell[3], cell[2], cell[1], cell[4], cell[7], cell[6], cell[5])
+                cells.append((5, cell))
+            elif len(face) == 4 and unique_nodes == 6:
+                collapsed = [index for index, (upper_id, lower_id) in enumerate(zip(upper, lower)) if upper_id == lower_id]
+                if len(collapsed) != 2:
+                    raise ValueError("Unsupported collapsed plinth quadrilateral")
+                triangles = []
+                for collapsed_index in collapsed:
+                    adjacent = [
+                        (collapsed_index - 1) % 4,
+                        (collapsed_index + 1) % 4,
+                    ]
+                    active_index = next(index for index in adjacent if upper[index] != lower[index])
+                    triangles.append((upper[collapsed_index], upper[active_index], lower[active_index]))
+                append_prism(triangles[0], triangles[1])
+            elif len(face) == 4 and unique_nodes == 4:
+                continue
+            else:
+                raise ValueError(
+                    f"Unsupported conforming plinth extrusion: {len(face)}-node face, {unique_nodes} unique nodes"
+                )
+
+    face_patterns = {
+        4: ((0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)),
+        5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
+        6: ((0, 1, 2), (3, 5, 4), (0, 3, 4, 1), (1, 4, 5, 2), (2, 5, 3, 0)),
+        7: ((0, 1, 2, 3), (0, 4, 1), (1, 4, 2), (2, 4, 3), (3, 4, 0)),
+    }
+    face_counts: Counter[tuple[int, ...]] = Counter()
+    oriented_faces: dict[tuple[int, ...], tuple[int, ...]] = {}
+    for element_type, cell in cells:
+        for pattern in face_patterns[element_type]:
+            face = tuple(cell[index] for index in pattern)
+            key = tuple(sorted(face))
+            face_counts[key] += 1
+            oriented_faces[key] = face
+
+    boundaries = []
+    tolerance = 1.0e-6
+    for key, count in face_counts.items():
+        if count != 1:
+            continue
+        face = oriented_faces[key]
+        coordinates = [nodes[value - 1] for value in face]
+        radii_m = [math.hypot(x_m, y_m) for x_m, y_m, _ in coordinates]
+        stations_m = [centerline_radius_m * math.atan2(x_m, y_m) for x_m, y_m, _ in coordinates]
+        if max(abs(radius_m - UPSTREAM_RADIUS_M) for radius_m in radii_m) < tolerance:
+            boundary_id = UPSTREAM_BOUNDARY_ID
+        elif max(abs(radius_m - DOWNSTREAM_RADIUS_M) for radius_m in radii_m) < tolerance:
+            boundary_id = DOWNSTREAM_BOUNDARY_ID
+        elif max(abs(station_m - chainages_m[0]) for station_m in stations_m) < tolerance:
+            boundary_id = LEFT_END_BOUNDARY_ID
+        elif max(abs(station_m - chainages_m[-1]) for station_m in stations_m) < tolerance:
+            boundary_id = RIGHT_END_BOUNDARY_ID
+        elif all(
+            abs(z_m - _monotone_values(contours, "bedrock_z_m", station_m)) < tolerance
+            for station_m, (_, _, z_m) in zip(stations_m, coordinates)
+        ):
+            boundary_id = FOUNDATION_BOUNDARY_ID
+        elif all(
+            abs(z_m - _monotone_values(contours, "plinth_z_m", station_m)) < tolerance
+            for station_m, (_, _, z_m) in zip(stations_m, coordinates)
+        ):
+            boundary_id = TOP_BOUNDARY_ID
+        else:
+            boundary_id = OTHER_BOUNDARY_ID
+        boundaries.append((boundary_id, face))
+
+    return PlinthMesh(nodes, cells, boundaries, chainages_m, element_size_m)
+
+
 def write_gmsh(mesh: PlinthMesh, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as stream:
@@ -311,7 +581,8 @@ def write_vtu(mesh: PlinthMesh, path: Path) -> None:
     for _, cell in mesh.cells:
         offset += len(cell)
         offsets.append(offset)
-    cell_types = [13 if element_type == 6 else 12 for element_type, _ in mesh.cells]
+    vtk_cell_types = {4: 10, 5: 12, 6: 13, 7: 14}
+    cell_types = [vtk_cell_types[element_type] for element_type, _ in mesh.cells]
     points = [coordinate for point in mesh.nodes for coordinate in point]
     chunks = [
         struct.pack(f"<I{len(points)}d", 8 * len(points), *points),
@@ -367,8 +638,10 @@ def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
+        "tetrahedra": element_counts[4],
         "hexahedra": element_counts[5],
         "boundary_prisms": element_counts[6],
+        "pyramids": element_counts[7],
         "boundary_faces": dict(sorted(boundary_counts.items())),
         "chainage_segments": len(mesh.chainages_m) - 1,
         "radial_cells": expected_radial_cells,

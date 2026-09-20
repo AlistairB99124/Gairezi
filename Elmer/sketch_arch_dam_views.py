@@ -72,6 +72,10 @@ def extract_downstream_face(mesh_path: Path) -> list[tuple[float, float, float]]
 def load_station_edges(mesh_path: Path) -> list[dict[str, tuple[float, float, float]]]:
     metadata = read_mesh_metadata(mesh_path)
     centerline_path = mesh_path.with_name("curved_dam_centerline.csv")
+    if "wall_upstream_radius_m" not in metadata or "wall_downstream_radius_m" not in metadata:
+        metadata = json.loads((Path(__file__).resolve().parent / "curved_dam_mesh_meta.json").read_text())
+    if not centerline_path.exists():
+        centerline_path = Path(__file__).resolve().parent / "curved_dam_centerline.csv"
     upstream_radius = float(metadata["wall_upstream_radius_m"])
     downstream_radius = float(metadata["wall_downstream_radius_m"])
     stations: list[dict[str, tuple[float, float, float]]] = []
