@@ -32,6 +32,24 @@ from regions.left_wedged_wall_transition import (
     write_vtu as write_left_wedged_wall_transition_vtu,
 )
 from regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
+from regions.right_wall import (
+    audit_right_wall,
+    build_right_wall,
+    write_gmsh as write_right_wall_gmsh,
+    write_vtu as write_right_wall_vtu,
+)
+from regions.right_wedged_wall import (
+    audit_right_wedged_wall,
+    build_right_wedged_wall,
+    write_gmsh as write_right_wedged_wall_gmsh,
+    write_vtu as write_right_wedged_wall_vtu,
+)
+from regions.right_wedged_wall_transition import (
+    audit_right_wedged_wall_transition,
+    build_right_wedged_wall_transition,
+    write_gmsh as write_right_wedged_wall_transition_gmsh,
+    write_vtu as write_right_wedged_wall_transition_vtu,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -119,13 +137,57 @@ def build_left_wedged_wall_transition_region() -> dict[str, object]:
     return report
 
 
+def build_right_wedged_wall_region() -> dict[str, object]:
+    mesh = build_right_wedged_wall(ROOT)
+    mesh_path = OUTPUT_DIR / "right_wedged_wall.msh"
+    preview_path = OUTPUT_DIR / "right_wedged_wall.vtu"
+    write_right_wedged_wall_gmsh(mesh, mesh_path)
+    write_right_wedged_wall_vtu(mesh, preview_path)
+    report = audit_right_wedged_wall(mesh)
+    report["gmsh_path"] = str(mesh_path)
+    report["paraview_path"] = str(preview_path)
+    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "right_wedged_wall_mesh")
+    return report
+
+
+def build_right_wedged_wall_transition_region() -> dict[str, object]:
+    mesh = build_right_wedged_wall_transition(ROOT)
+    mesh_path = OUTPUT_DIR / "right_wedged_wall_transition.msh"
+    preview_path = OUTPUT_DIR / "right_wedged_wall_transition.vtu"
+    write_right_wedged_wall_transition_gmsh(mesh, mesh_path)
+    write_right_wedged_wall_transition_vtu(mesh, preview_path)
+    report = audit_right_wedged_wall_transition(mesh)
+    report["gmsh_path"] = str(mesh_path)
+    report["paraview_path"] = str(preview_path)
+    report["elmer_conversion"] = convert_with_elmergrid(
+        mesh_path, OUTPUT_DIR / "right_wedged_wall_transition_mesh"
+    )
+    return report
+
+
+def build_right_wall_region() -> dict[str, object]:
+    mesh = build_right_wall(ROOT)
+    mesh_path = OUTPUT_DIR / "right_wall.msh"
+    preview_path = OUTPUT_DIR / "right_wall.vtu"
+    write_right_wall_gmsh(mesh, mesh_path)
+    write_right_wall_vtu(mesh, preview_path)
+    report = audit_right_wall(mesh)
+    report["gmsh_path"] = str(mesh_path)
+    report["paraview_path"] = str(preview_path)
+    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "right_wall_mesh")
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "region",
         nargs="?",
         default="plinth",
-        choices=("plinth", "center_wall", "left_wall", "left_wedged_wall", "left_wedged_wall_transition"),
+        choices=(
+            "plinth", "center_wall", "left_wall", "left_wedged_wall", "left_wedged_wall_transition",
+            "right_wedged_wall", "right_wedged_wall_transition", "right_wall",
+        ),
     )
     args = parser.parse_args()
     if args.region == "plinth":
@@ -138,6 +200,12 @@ def main() -> None:
         print(json.dumps(build_left_wedged_wall_region(), indent=2))
     elif args.region == "left_wedged_wall_transition":
         print(json.dumps(build_left_wedged_wall_transition_region(), indent=2))
+    elif args.region == "right_wedged_wall":
+        print(json.dumps(build_right_wedged_wall_region(), indent=2))
+    elif args.region == "right_wedged_wall_transition":
+        print(json.dumps(build_right_wedged_wall_transition_region(), indent=2))
+    elif args.region == "right_wall":
+        print(json.dumps(build_right_wall_region(), indent=2))
 
 
 if __name__ == "__main__":

@@ -35,9 +35,12 @@ class LeftWedgedWallMesh:
     element_size_m: float
 
 
-def _chainages(element_size_m: float) -> list[float]:
-    count = round((END_CHAINAGE_M - START_CHAINAGE_M) / element_size_m)
-    return [START_CHAINAGE_M + index * element_size_m for index in range(count + 1)]
+def _chainages(element_size_m: float, start_chainage_m: float = START_CHAINAGE_M, end_chainage_m: float = END_CHAINAGE_M) -> list[float]:
+    count = round((end_chainage_m - start_chainage_m) / element_size_m)
+    return [
+        start_chainage_m + (end_chainage_m - start_chainage_m) * index / count
+        for index in range(count + 1)
+    ]
 
 
 def _upper_wall_levels(base_z_m: float, element_size_m: float) -> list[float]:
@@ -53,12 +56,12 @@ def _upper_wall_levels(base_z_m: float, element_size_m: float) -> list[float]:
     return list(dict.fromkeys(levels))
 
 
-def build_left_wedged_wall(root: Path) -> LeftWedgedWallMesh:
+def build_wedged_wall(root: Path, start_chainage_m: float, end_chainage_m: float) -> LeftWedgedWallMesh:
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
     contours = load_contours(root / "Data" / "plinth.json")
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
-    chainages_m = _chainages(element_size_m)
+    chainages_m = _chainages(element_size_m, start_chainage_m, end_chainage_m)
     base_levels_m = [_monotone_values(contours, "plinth_z_m", chainage_m) for chainage_m in chainages_m]
     wall_radii_m = [
         DOWNSTREAM_WALL_RADIUS_M + index * element_size_m
@@ -158,9 +161,9 @@ def build_left_wedged_wall(root: Path) -> LeftWedgedWallMesh:
             boundary_id = UPSTREAM_BOUNDARY_ID
         elif max(abs(z_m - CREST_Z_M) for z_m in z_values_m) < tolerance:
             boundary_id = CREST_BOUNDARY_ID
-        elif max(abs(station_m - START_CHAINAGE_M) for station_m in stations_m) < tolerance:
+        elif max(abs(station_m - start_chainage_m) for station_m in stations_m) < tolerance:
             boundary_id = LEFT_END_BOUNDARY_ID
-        elif max(abs(station_m - END_CHAINAGE_M) for station_m in stations_m) < tolerance:
+        elif max(abs(station_m - end_chainage_m) for station_m in stations_m) < tolerance:
             boundary_id = RIGHT_END_BOUNDARY_ID
         elif all(abs(z_m - _monotone_values(contours, "plinth_z_m", station_m)) < tolerance for station_m, z_m in zip(stations_m, z_values_m)):
             boundary_id = BASE_BOUNDARY_ID
@@ -169,6 +172,10 @@ def build_left_wedged_wall(root: Path) -> LeftWedgedWallMesh:
         boundaries.append((boundary_id, face))
 
     return LeftWedgedWallMesh(nodes, cells, boundaries, element_size_m)
+
+
+def build_left_wedged_wall(root: Path) -> LeftWedgedWallMesh:
+    return build_wedged_wall(root, START_CHAINAGE_M, END_CHAINAGE_M)
 
 
 def audit_left_wedged_wall(mesh: LeftWedgedWallMesh) -> dict[str, object]:
@@ -191,4 +198,4 @@ def audit_left_wedged_wall(mesh: LeftWedgedWallMesh) -> dict[str, object]:
     }
 
 
-__all__ = ["audit_left_wedged_wall", "build_left_wedged_wall", "write_gmsh", "write_vtu"]
+__all__ = ["audit_left_wedged_wall", "build_left_wedged_wall", "build_wedged_wall", "write_gmsh", "write_vtu"]
