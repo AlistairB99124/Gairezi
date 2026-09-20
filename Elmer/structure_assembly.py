@@ -137,6 +137,7 @@ End
 
 Constants
     Gravity(4) = Real 0 0 -1 {abs(mesh.loads.gravity_z_m_s2):.12g}
+    Stefan Boltzmann = 5.670374419e-8
 End
 
 Body 1
@@ -151,7 +152,7 @@ Body Force 1
 End
 
 Equation 1
-    Name = "LinearElasticity"
+    Name = "Elasticity"
     Active Solvers(2) = 1 2
 End
 
@@ -187,11 +188,11 @@ Material 1
 End
 
 Boundary Condition 1
-    Name = "FixedBedrockFoundation"
+    Name = "BedrockBase"
     Target Boundaries(1) = 1
-    Displacement 1 = Real 0.0
-    Displacement 2 = Real 0.0
-    Displacement 3 = Real 0.0
+    Displacement 1 = 0.0
+    Displacement 2 = 0.0
+    Displacement 3 = 0.0
 End
 
 Boundary Condition 2
@@ -199,6 +200,12 @@ Boundary Condition 2
     Target Boundaries(1) = 2
     Normal Force = Variable Coordinate 3
         Real MATC "-{pressure_gradient:.12g} * (0.0 - tx) * (tx < 0.0)"
+End
+Boundary Condition 3
+    Name = "DownstreamTailwater"
+    Target Boundaries(1) = 3
+    Normal Force = Variable Coordinate 3
+        Real MATC "-1000.0 * 9.81 * (-27.0 - tx) * (tx < -27.0) * 1.0"
 End
 ''')
 

@@ -67,15 +67,45 @@ def _chainages(start_m: float, end_m: float, target_size_m: float) -> list[float
     return [start_m + (end_m - start_m) * index / segment_count for index in range(segment_count + 1)]
 
 
-def build_left_wedged_wall_transition(root: Path) -> LeftWedgedWallTransitionMesh:
+def _chainage_at_elevation(contours, target_z_m: float, start_m: float, end_m: float) -> float:
+    lower_m, upper_m = sorted((start_m, end_m))
+    lower_delta = _monotone_values(contours, "plinth_z_m", lower_m) - target_z_m
+    upper_delta = _monotone_values(contours, "plinth_z_m", upper_m) - target_z_m
+    if lower_delta * upper_delta > 0.0:
+        raise ValueError(f"Elevation {target_z_m:g} is not bracketed by the transition")
+    for _ in range(80):
+        midpoint_m = 0.5 * (lower_m + upper_m)
+        midpoint_delta = _monotone_values(contours, "plinth_z_m", midpoint_m) - target_z_m
+        if lower_delta * midpoint_delta <= 0.0:
+            upper_m = midpoint_m
+        else:
+            lower_m = midpoint_m
+            lower_delta = midpoint_delta
+    return 0.5 * (lower_m + upper_m)
+
+
+def build_wedged_wall_transition(
+    root: Path,
+    full_wedge_chainage_m: float,
+    intersection_chainage_m: float,
+) -> LeftWedgedWallTransitionMesh:
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
     contours = load_contours(root / "Data" / "plinth.json")
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
-    full_wedge_base_z_m = _monotone_values(contours, "plinth_z_m", FULL_WEDGE_CHAINAGE_M)
+    full_wedge_base_z_m = _monotone_values(contours, "plinth_z_m", full_wedge_chainage_m)
     wedge_top_z_m = full_wedge_base_z_m + FULL_WEDGE_HEIGHT_M
-    intersection_chainage_m = _intersection_chainage(contours, wedge_top_z_m)
-    chainages_m = _chainages(intersection_chainage_m, FULL_WEDGE_CHAINAGE_M, element_size_m)
+    taper_end_chainage_m = _chainage_at_elevation(
+        contours,
+        wedge_top_z_m - element_size_m,
+        full_wedge_chainage_m,
+        intersection_chainage_m,
+    )
+    anchors_m = sorted((intersection_chainage_m, taper_end_chainage_m, full_wedge_chainage_m))
+    chainages_m = []
+    for start_m, end_m in zip(anchors_m, anchors_m[1:]):
+        values = _chainages(start_m, end_m, element_size_m)
+        chainages_m.extend(values if not chainages_m else values[1:])
     base_levels_m = [_monotone_values(contours, "plinth_z_m", value) for value in chainages_m]
     radial_divisions = round((UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M) / element_size_m)
     wall_radii_m = [
@@ -87,12 +117,17 @@ def build_left_wedged_wall_transition(root: Path) -> LeftWedgedWallTransitionMes
         full_wedge_base_z_m + index * element_size_m
         for index in range(lower_layer_count)
     ] + _upper_wall_levels(full_wedge_base_z_m, element_size_m)
-    section_levels_m = []
-    for base_z_m in base_levels_m:
-        section_levels_m.append(
-            [base_z_m]
-            + [level_m for level_m in fixed_levels_m if level_m > base_z_m + 1.0e-9]
+    wedge_heights_m = [wedge_top_z_m - base_z_m for base_z_m in base_levels_m]
+    wedge_divisions = round(FULL_WEDGE_HEIGHT_M / element_size_m)
+    section_levels_m = [
+        (
+            [base_z_m + wedge_height_m * index / wedge_divisions for index in range(wedge_divisions)]
+            + [level_m for level_m in fixed_levels_m if level_m > base_z_m + wedge_height_m - 1.0e-9]
+            if wedge_height_m >= element_size_m - 1.0e-9
+            else [base_z_m] + [level_m for level_m in fixed_levels_m if level_m > base_z_m + 1.0e-9]
         )
+        for base_z_m, wedge_height_m in zip(base_levels_m, wedge_heights_m)
+    ]
 
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}
@@ -127,6 +162,30 @@ def build_left_wedged_wall_transition(root: Path) -> LeftWedgedWallTransitionMes
                         inner[3], inner[2], outer[2], outer[3],
                     )))
 
+        if min(wedge_heights_m[station_index:station_index + 2]) < element_size_m - 1.0e-9:
+            continue
+        for radial_index in range(wedge_divisions):
+            for vertical_index in range(radial_index + 1):
+                triangles = [
+                    ((radial_index, vertical_index), (radial_index + 1, vertical_index), (radial_index + 1, vertical_index + 1)),
+                ]
+                if vertical_index < radial_index:
+                    triangles.append(((radial_index, vertical_index), (radial_index + 1, vertical_index + 1), (radial_index, vertical_index + 1)))
+                for triangle in triangles:
+                    section_faces = []
+                    for side in range(2):
+                        height_m = wedge_heights_m[station_index + side]
+                        base_z_m = base_levels_m[station_index + side]
+                        section_faces.append(tuple(
+                            node_id(
+                                station_index + side,
+                                DOWNSTREAM_WALL_RADIUS_M - height_m + radial * height_m / wedge_divisions,
+                                base_z_m + vertical * height_m / wedge_divisions,
+                            )
+                            for radial, vertical in triangle
+                        ))
+                    cells.append((6, section_faces[0] + section_faces[1]))
+
     face_patterns = {
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
         6: ((0, 1, 2), (3, 5, 4), (0, 3, 4, 1), (1, 4, 5, 2), (2, 5, 3, 0)),
@@ -154,9 +213,9 @@ def build_left_wedged_wall_transition(root: Path) -> LeftWedgedWallTransitionMes
             boundary_id = UPSTREAM_BOUNDARY_ID
         elif max(abs(z_m - CREST_Z_M) for z_m in z_values_m) < tolerance:
             boundary_id = CREST_BOUNDARY_ID
-        elif max(abs(station_m - intersection_chainage_m) for station_m in stations_m) < tolerance:
+        elif max(abs(station_m - chainages_m[0]) for station_m in stations_m) < tolerance:
             boundary_id = LEFT_END_BOUNDARY_ID
-        elif max(abs(station_m - FULL_WEDGE_CHAINAGE_M) for station_m in stations_m) < tolerance:
+        elif max(abs(station_m - chainages_m[-1]) for station_m in stations_m) < tolerance:
             boundary_id = RIGHT_END_BOUNDARY_ID
         elif all(abs(z_m - _monotone_values(contours, "plinth_z_m", station_m)) < tolerance for station_m, z_m in zip(stations_m, z_values_m)):
             boundary_id = BASE_BOUNDARY_ID
@@ -168,6 +227,13 @@ def build_left_wedged_wall_transition(root: Path) -> LeftWedgedWallTransitionMes
         nodes, cells, boundaries, chainages_m, intersection_chainage_m,
         wedge_top_z_m, element_size_m,
     )
+
+
+def build_left_wedged_wall_transition(root: Path) -> LeftWedgedWallTransitionMesh:
+    contours = load_contours(root / "Data" / "plinth.json")
+    full_wedge_base_z_m = _monotone_values(contours, "plinth_z_m", FULL_WEDGE_CHAINAGE_M)
+    intersection_chainage_m = _intersection_chainage(contours, full_wedge_base_z_m + FULL_WEDGE_HEIGHT_M)
+    return build_wedged_wall_transition(root, FULL_WEDGE_CHAINAGE_M, intersection_chainage_m)
 
 
 def audit_left_wedged_wall_transition(mesh: LeftWedgedWallTransitionMesh) -> dict[str, object]:

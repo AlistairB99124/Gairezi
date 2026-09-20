@@ -8,14 +8,19 @@ import math
 from pathlib import Path
 import struct
 
-from regions.center_wall import build_center_wall
+from regions.center_wall import END_CHAINAGE_M as CENTER_END_CHAINAGE_M
+from regions.center_wall import START_CHAINAGE_M as CENTER_START_CHAINAGE_M
 from regions.left_wall import build_left_wall
-from regions.left_wedged_wall import build_left_wedged_wall
+from regions.left_wedged_wall import build_left_wedged_wall, build_wedged_wall
 from regions.left_wedged_wall_transition import build_left_wedged_wall_transition
 from regions.plinth import build_plinth
 from regions.right_wall import build_right_wall
 from regions.right_wedged_wall import build_right_wedged_wall
 from regions.right_wedged_wall_transition import build_right_wedged_wall_transition
+
+
+def build_center_wall(root: Path):
+    return build_wedged_wall(root, CENTER_START_CHAINAGE_M, CENTER_END_CHAINAGE_M)
 
 
 REGION_BUILDERS = (

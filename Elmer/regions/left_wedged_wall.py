@@ -50,7 +50,7 @@ def _upper_wall_levels(base_z_m: float, element_size_m: float) -> list[float]:
     levels.extend(
         index * element_size_m
         for index in range(first_global_index, 1)
-        if index * element_size_m < CREST_Z_M - 1.0e-9
+        if transition_top_z_m + 0.5 * element_size_m <= index * element_size_m < CREST_Z_M - 1.0e-9
     )
     levels.append(CREST_Z_M)
     return list(dict.fromkeys(levels))
