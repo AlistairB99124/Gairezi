@@ -1,4 +1,4 @@
-"""Generate the center wall with the continuous downstream shelf wedge."""
+"""Generate the center wall with both outer element columns flared."""
 from __future__ import annotations
 
 from collections import Counter
@@ -11,13 +11,16 @@ import struct
 
 START_CHAINAGE_M = 101.0
 END_CHAINAGE_M = 116.0
-WEDGE_TOE_RADIUS_M = 74.0
+DOWNSTREAM_WEDGE_TOE_RADIUS_M = 75.0
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
+UPSTREAM_WEDGE_TOE_RADIUS_M = 81.0
 BASE_Z_M = -28.5
-WEDGE_HEIGHT_M = 1.5
-WEDGE_WIDTH_M = 2.0
-WEDGE_SHELF_WIDTH_M = 0.5
+WEDGE_HEIGHT_M = 4.0
+WEDGE_BASE_WIDTH_M = 1.5
+DOWNSTREAM_WEDGE_INNER_RADIUS_M = 76.5
+UPSTREAM_WEDGE_INNER_RADIUS_M = 79.5
+WEDGE_SLOPE_RUN_M = WEDGE_BASE_WIDTH_M - 0.5
 WEDGE_TOP_Z_M = BASE_Z_M + WEDGE_HEIGHT_M
 CREST_Z_M = 0.0
 BODY_ID = 1
@@ -52,32 +55,27 @@ def _levels(start: float, end: float, step: float) -> list[float]:
     return [start + index * step for index in range(count + 1)]
 
 
-def _wedge_section_faces(element_size_m: float) -> list[tuple[tuple[int, int], ...]]:
-    radial_divisions = round(WEDGE_WIDTH_M / element_size_m)
+def _wedge_section_faces(element_size_m: float) -> list[tuple[tuple[float, float], ...]]:
     vertical_divisions = round(WEDGE_HEIGHT_M / element_size_m)
-    slope_width_m = WEDGE_WIDTH_M - WEDGE_SHELF_WIDTH_M
-    if (
-        not math.isclose(radial_divisions * element_size_m, WEDGE_WIDTH_M, abs_tol=1.0e-9)
-        or not math.isclose(vertical_divisions * element_size_m, WEDGE_HEIGHT_M, abs_tol=1.0e-9)
-        or not math.isclose(vertical_divisions * element_size_m, slope_width_m, abs_tol=1.0e-9)
-    ):
-        raise ValueError("Center wedge dimensions must align with the global element grid")
+    if not math.isclose(vertical_divisions * element_size_m, WEDGE_HEIGHT_M, abs_tol=1.0e-9):
+        raise ValueError("Center wedge height must align with the global element grid")
 
-    faces: list[tuple[tuple[int, int], ...]] = []
+    faces = []
     for vertical_index in range(vertical_divisions):
-        upper_start = vertical_index + 1
+        lower_height_m = vertical_index * element_size_m
+        upper_height_m = (vertical_index + 1) * element_size_m
         faces.append((
-            (vertical_index, vertical_index),
-            (upper_start, vertical_index),
-            (upper_start, vertical_index + 1),
+            (DOWNSTREAM_WEDGE_TOE_RADIUS_M + WEDGE_SLOPE_RUN_M * lower_height_m / WEDGE_HEIGHT_M, lower_height_m),
+            (DOWNSTREAM_WEDGE_INNER_RADIUS_M, lower_height_m),
+            (DOWNSTREAM_WEDGE_INNER_RADIUS_M, upper_height_m),
+            (DOWNSTREAM_WEDGE_TOE_RADIUS_M + WEDGE_SLOPE_RUN_M * upper_height_m / WEDGE_HEIGHT_M, upper_height_m),
         ))
-        for radial_index in range(upper_start, radial_divisions):
-            faces.append((
-                (radial_index, vertical_index),
-                (radial_index + 1, vertical_index),
-                (radial_index + 1, vertical_index + 1),
-                (radial_index, vertical_index + 1),
-            ))
+        faces.append((
+            (UPSTREAM_WEDGE_INNER_RADIUS_M, lower_height_m),
+            (UPSTREAM_WEDGE_TOE_RADIUS_M - WEDGE_SLOPE_RUN_M * lower_height_m / WEDGE_HEIGHT_M, lower_height_m),
+            (UPSTREAM_WEDGE_TOE_RADIUS_M - WEDGE_SLOPE_RUN_M * upper_height_m / WEDGE_HEIGHT_M, upper_height_m),
+            (UPSTREAM_WEDGE_INNER_RADIUS_M, upper_height_m),
+        ))
     return faces
 
 
@@ -86,51 +84,48 @@ def build_center_wall(root: Path) -> CenterWallMesh:
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
     chainages_m = _levels(START_CHAINAGE_M, END_CHAINAGE_M, element_size_m)
-    radii_m = _levels(WEDGE_TOE_RADIUS_M, UPSTREAM_RADIUS_M, element_size_m)
+    radii_m = _levels(DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M, element_size_m)
     z_levels_m = _levels(BASE_Z_M, CREST_Z_M, element_size_m)
     wedge_faces = _wedge_section_faces(element_size_m)
 
-    nodes = []
-    node_ids = {}
+    nodes: list[tuple[float, float, float]] = []
+    node_ids: dict[tuple[int, float, float], int] = {}
 
-    def node_id(chainage_index: int, z_index: int, radial_index: int) -> int:
-        key = (chainage_index, z_index, radial_index)
+    def node_id(chainage_index: int, z_m: float, radius_m: float) -> int:
+        key = (chainage_index, round(z_m, 9), round(radius_m, 9))
         if key in node_ids:
             return node_ids[key]
         chainage_m = chainages_m[chainage_index]
-        radius_m = radii_m[radial_index]
-        z_m = z_levels_m[z_index]
         angle = chainage_m / centerline_radius_m
         node_ids[key] = len(nodes) + 1
         nodes.append((radius_m * math.sin(angle), radius_m * math.cos(angle), z_m))
         return node_ids[key]
 
     cells: list[tuple[int, tuple[int, ...]]] = []
-    wall_start_index = round((DOWNSTREAM_WALL_RADIUS_M - WEDGE_TOE_RADIUS_M) / element_size_m)
     for chainage_index in range(len(chainages_m) - 1):
         for z_index in range(len(z_levels_m) - 1):
-            for radial_index in range(wall_start_index, len(radii_m) - 1):
+            within_wedge_height = z_index < round(WEDGE_HEIGHT_M / element_size_m)
+            first_radial_index = 1 if within_wedge_height else 0
+            last_radial_index = len(radii_m) - 2 if within_wedge_height else len(radii_m) - 1
+            for radial_index in range(first_radial_index, last_radial_index):
                 cell = (
-                    node_id(chainage_index, z_index, radial_index),
-                    node_id(chainage_index + 1, z_index, radial_index),
-                    node_id(chainage_index + 1, z_index, radial_index + 1),
-                    node_id(chainage_index, z_index, radial_index + 1),
-                    node_id(chainage_index, z_index + 1, radial_index),
-                    node_id(chainage_index + 1, z_index + 1, radial_index),
-                    node_id(chainage_index + 1, z_index + 1, radial_index + 1),
-                    node_id(chainage_index, z_index + 1, radial_index + 1),
+                    node_id(chainage_index, z_levels_m[z_index], radii_m[radial_index]),
+                    node_id(chainage_index + 1, z_levels_m[z_index], radii_m[radial_index]),
+                    node_id(chainage_index + 1, z_levels_m[z_index], radii_m[radial_index + 1]),
+                    node_id(chainage_index, z_levels_m[z_index], radii_m[radial_index + 1]),
+                    node_id(chainage_index, z_levels_m[z_index + 1], radii_m[radial_index]),
+                    node_id(chainage_index + 1, z_levels_m[z_index + 1], radii_m[radial_index]),
+                    node_id(chainage_index + 1, z_levels_m[z_index + 1], radii_m[radial_index + 1]),
+                    node_id(chainage_index, z_levels_m[z_index + 1], radii_m[radial_index + 1]),
                 )
                 cells.append((5, cell))
         for face in wedge_faces:
-            start_face = tuple(node_id(chainage_index, vertical, radial) for radial, vertical in face)
-            end_face = tuple(node_id(chainage_index + 1, vertical, radial) for radial, vertical in face)
-            if len(face) == 3:
-                cells.append((6, start_face + end_face))
-            else:
-                cells.append((5, (
-                    start_face[0], end_face[0], end_face[1], start_face[1],
-                    start_face[3], end_face[3], end_face[2], start_face[2],
-                )))
+            start_face = tuple(node_id(chainage_index, BASE_Z_M + height_m, radius_m) for radius_m, height_m in face)
+            end_face = tuple(node_id(chainage_index + 1, BASE_Z_M + height_m, radius_m) for radius_m, height_m in face)
+            cells.append((5, (
+                start_face[0], end_face[0], end_face[1], start_face[1],
+                start_face[3], end_face[3], end_face[2], start_face[2],
+            )))
 
     face_patterns = {
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
@@ -240,7 +235,10 @@ def audit_center_wall(mesh: CenterWallMesh) -> dict[str, object]:
     radial_cells = round((UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M) / mesh.element_size_m)
     vertical_cells = round((CREST_Z_M - BASE_Z_M) / mesh.element_size_m)
     wedge_cells_per_section = len(_wedge_section_faces(mesh.element_size_m))
-    expected_cells = chainage_cells * (radial_cells * vertical_cells + wedge_cells_per_section)
+    replaced_wall_cells_per_section = 2 * round(WEDGE_HEIGHT_M / mesh.element_size_m)
+    expected_cells = chainage_cells * (
+        radial_cells * vertical_cells - replaced_wall_cells_per_section + wedge_cells_per_section
+    )
     boundary_counts = Counter(boundary_id for boundary_id, _ in mesh.boundaries)
     if len(mesh.cells) != expected_cells:
         raise ValueError(f"Expected {expected_cells} center-wall cells, found {len(mesh.cells)}")
@@ -257,9 +255,10 @@ def audit_center_wall(mesh: CenterWallMesh) -> dict[str, object]:
         "boundary_faces": dict(sorted(boundary_counts.items())),
         "chainage_m": [START_CHAINAGE_M, END_CHAINAGE_M],
         "wall_radius_m": [DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M],
-        "wedge_radius_m": [WEDGE_TOE_RADIUS_M, DOWNSTREAM_WALL_RADIUS_M],
+        "wedge_radius_m": [DOWNSTREAM_WEDGE_TOE_RADIUS_M, UPSTREAM_WEDGE_TOE_RADIUS_M],
         "wedge_z_m": [BASE_Z_M, WEDGE_TOP_Z_M],
-        "wedge_shelf_width_m": WEDGE_SHELF_WIDTH_M,
+        "wedge_base_width_m": WEDGE_BASE_WIDTH_M,
+        "wall_core_radius_m": [DOWNSTREAM_WEDGE_INNER_RADIUS_M, UPSTREAM_WEDGE_INNER_RADIUS_M],
         "z_m": [BASE_Z_M, CREST_Z_M],
         "element_size_m": mesh.element_size_m,
     }

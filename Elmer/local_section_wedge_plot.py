@@ -1,109 +1,125 @@
+"""Render the lower wall section with both outer columns flared."""
 from __future__ import annotations
 
 from pathlib import Path
-import json
-import math
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon, Rectangle
+
+from regions.left_wedged_wall import (
+    DOWNSTREAM_WALL_RADIUS_M,
+    DOWNSTREAM_WEDGE_INNER_RADIUS_M,
+    DOWNSTREAM_WEDGE_TOE_RADIUS_M,
+    UPSTREAM_RADIUS_M,
+    UPSTREAM_WEDGE_INNER_RADIUS_M,
+    WEDGE_HEIGHT_M,
+    _wedge_section_faces,
+)
+from regions.plinth import DOWNSTREAM_RADIUS_M as PLINTH_DOWNSTREAM_RADIUS_M
+from regions.plinth import UPSTREAM_RADIUS_M as PLINTH_UPSTREAM_RADIUS_M
 
 
-root = Path(__file__).resolve().parent.parent
-mesh_path = Path(__file__).resolve().parent / "curved_dam_mesh.msh"
-meta_path = mesh_path.with_name(f"{mesh_path.stem}_meta.json")
-out_path = Path(__file__).resolve().parent / "results" / "local_section_wedge.png"
-
-
-def read_gmsh_nodes(path: Path):
-    lines = path.read_text().splitlines()
-    start = lines.index("$Nodes")
-    count = int(lines[start + 1])
-    nodes = []
-    for line in lines[start + 2 : start + 2 + count]:
-        parts = line.split()
-        if len(parts) >= 4:
-            nodes.append((float(parts[1]), float(parts[2]), float(parts[3])))
-    return nodes
-
-
-def read_metadata(path: Path):
-    if not path.exists():
-        return {"vertical_layers": 4, "thickness_layers": 1}
-    return json.loads(path.read_text())
-
-
-def station_slice(nodes, station_index, vertical_layers, thickness_layers):
-    nodes_per_station = (vertical_layers + 1) * (thickness_layers + 1)
-    start = station_index * nodes_per_station
-    return nodes[start : start + nodes_per_station]
+OUTPUT_PATH = Path(__file__).resolve().parent / "structure_output" / "paired_wedge_4m_section.png"
+ELEMENT_SIZE_M = 0.5
 
 
 def main() -> None:
-    nodes = read_gmsh_nodes(mesh_path)
-    meta = read_metadata(meta_path)
-    vertical_layers = int(meta.get("vertical_layers", 4))
-    thickness_layers = int(meta.get("thickness_layers", 1))
-    nodes_per_station = (vertical_layers + 1) * (thickness_layers + 1)
+    wedge_faces = _wedge_section_faces(ELEMENT_SIZE_M)
+    figure, axes = plt.subplots(figsize=(8.4, 6.2), dpi=180)
 
-    # pick the station nearest the highest point of the dam where the wedge is most visible
-    station_index = len(nodes) // nodes_per_station // 2
-    station = station_slice(nodes, station_index, vertical_layers, thickness_layers)
+    axes.add_patch(Rectangle(
+        (PLINTH_DOWNSTREAM_RADIUS_M, -ELEMENT_SIZE_M),
+        PLINTH_UPSTREAM_RADIUS_M - PLINTH_DOWNSTREAM_RADIUS_M,
+        ELEMENT_SIZE_M,
+        facecolor="#8e9a9c",
+        edgecolor="#263238",
+        linewidth=1.4,
+        label="Plinth",
+    ))
 
-    # Use the explicit local section geometry from the sketch, not the global arch coordinates.
-    # Upstream face is the left edge of the wall. The wall thickness is 4.0 m. The
-    # downstream wedge is defined by a 30° angle to the wall face, so the run varies with
-    # the local base depth; the 2.0 m run is only the limiting case for a 3.46 m drop.
-    crest_z = 0.0
-    top_wedge_z = -25.54
-    base_z = -29.0
-    wall_thickness_m = 4.0
-    wedge_run = math.tan(math.radians(30.0)) * (top_wedge_z - base_z)
+    for index, face in enumerate(wedge_faces):
+        downstream = max(radius_m for radius_m, _ in face) <= DOWNSTREAM_WEDGE_INNER_RADIUS_M
+        axes.add_patch(Polygon(
+            face,
+            closed=True,
+            facecolor="#d97745" if downstream else "#4f86a8",
+            edgecolor="#263238",
+            linewidth=0.75,
+            label=("Downstream flare" if downstream else "Upstream flare") if index < 2 else None,
+        ))
 
-    upstream_x = 0.0
-    downstream_vertical_x = upstream_x + wall_thickness_m
-    wedge_top = (downstream_vertical_x, top_wedge_z)
-    wedge_base = (downstream_vertical_x + wedge_run, base_z)
-    downstream_face_top = (downstream_vertical_x, crest_z)
-    downstream_face_bottom = (downstream_vertical_x, top_wedge_z)
-    upstream_face_top = (upstream_x, crest_z)
-    upstream_face_bottom = (upstream_x, base_z)
+    radial_divisions = round((UPSTREAM_WEDGE_INNER_RADIUS_M - DOWNSTREAM_WEDGE_INNER_RADIUS_M) / ELEMENT_SIZE_M)
+    vertical_divisions = round(WEDGE_HEIGHT_M / ELEMENT_SIZE_M)
+    for radial_index in range(radial_divisions):
+        for vertical_index in range(vertical_divisions):
+            axes.add_patch(Rectangle(
+                (
+                    DOWNSTREAM_WEDGE_INNER_RADIUS_M + radial_index * ELEMENT_SIZE_M,
+                    vertical_index * ELEMENT_SIZE_M,
+                ),
+                ELEMENT_SIZE_M,
+                ELEMENT_SIZE_M,
+                facecolor="#d8d5cb",
+                edgecolor="#596064",
+                linewidth=0.55,
+            ))
 
-    fig, ax = plt.subplots(figsize=(7.5, 5.0), dpi=180)
-    ax.set_title("Local section through downstream wedge")
-    ax.set_xlabel("Offset from wall centreline (m)")
-    ax.set_ylabel("Elevation (m)")
-    ax.grid(True, color="0.85", linewidth=0.7)
+    axes.add_patch(Rectangle(
+        (DOWNSTREAM_WALL_RADIUS_M, WEDGE_HEIGHT_M),
+        UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M,
+        2.0,
+        facecolor="#d8d5cb",
+        edgecolor="#263238",
+        linewidth=1.4,
+        label="Wall above flare",
+    ))
+    upper_radial_divisions = round((UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M) / ELEMENT_SIZE_M)
+    for radial_index in range(1, upper_radial_divisions):
+        radius_m = DOWNSTREAM_WALL_RADIUS_M + radial_index * ELEMENT_SIZE_M
+        axes.plot([radius_m, radius_m], [WEDGE_HEIGHT_M, WEDGE_HEIGHT_M + 2.0], color="#596064", linewidth=0.55)
+    for vertical_index in range(1, 4):
+        height_m = WEDGE_HEIGHT_M + vertical_index * ELEMENT_SIZE_M
+        axes.plot([DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M], [height_m, height_m], color="#596064", linewidth=0.55)
 
-    # Draw the wall, the 1 m upstream / 2 m downstream plinth, and the wedge.
-    plinth_base_z = base_z - 3.46
-    ax.fill(
-        [upstream_x - 1.0, downstream_vertical_x + 2.0, downstream_vertical_x + 2.0, upstream_x - 1.0],
-        [plinth_base_z, plinth_base_z, base_z, base_z],
-        color="#c7c7c7",
-        alpha=0.7,
-        label="concrete plinth",
+    axes.annotate(
+        "1.0 m downstream overhang",
+        xy=((PLINTH_DOWNSTREAM_RADIUS_M + DOWNSTREAM_WEDGE_TOE_RADIUS_M) / 2.0, -0.25),
+        xytext=(74.0, -1.15),
+        arrowprops={"arrowstyle": "->", "color": "#263238"},
+        fontsize=9,
     )
-    ax.plot([upstream_face_top[0], upstream_face_bottom[0]], [upstream_face_top[1], upstream_face_bottom[1]], "k-", linewidth=2.0, label="upstream face")
-    ax.plot([downstream_face_top[0], downstream_face_bottom[0]], [downstream_face_top[1], downstream_face_bottom[1]], "b-", linewidth=2.0, label="downstream face")
-    ax.plot([wedge_top[0], wedge_base[0], downstream_face_bottom[0], wedge_top[0]], [wedge_top[1], wedge_base[1], downstream_face_bottom[1], wedge_top[1]], "r-", linewidth=2.5, label="wedge face")
+    axes.annotate(
+        "3.0 m vertical core",
+        xy=((DOWNSTREAM_WEDGE_INNER_RADIUS_M + UPSTREAM_WEDGE_INNER_RADIUS_M) / 2.0, 2.0),
+        ha="center",
+        va="center",
+        fontsize=10,
+    )
+    axes.annotate(
+        "4.0 m flare height",
+        xy=(81.25, WEDGE_HEIGHT_M / 2.0),
+        ha="left",
+        va="center",
+        rotation=90,
+        fontsize=9,
+    )
 
-    # Add section labels.
-    ax.axhline(0.0, color="0.6", linestyle="--", linewidth=0.8)
-    ax.axhline(top_wedge_z, color="0.6", linestyle=":", linewidth=0.8)
-    ax.axhline(base_z, color="0.6", linestyle=":", linewidth=0.8)
-    ax.text((wedge_top[0] + wedge_base[0]) / 2.0 + 0.35, (wedge_top[1] + wedge_base[1]) / 2.0, "3.46 m", fontsize=9)
-    ax.text((wedge_base[0] + downstream_face_bottom[0]) / 2.0 + 0.2, base_z - 0.4, f"{wedge_run:.2f} m", fontsize=9)
-    ax.text((downstream_face_top[0] + downstream_face_bottom[0]) / 2.0 + 0.15, (downstream_face_top[1] + downstream_face_bottom[1]) / 2.0, "25.54 m", fontsize=9)
-
-    ax.legend(frameon=False)
-    ax.set_xlim(-1.5, 7.0)
-    ax.set_ylim(plinth_base_z - 1.0, crest_z + 2.0)
-    fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path)
-    plt.close(fig)
-    print(f"Wrote {out_path}")
+    axes.set_title("Lower wall section: paired outer-column flares")
+    axes.set_xlabel("Radius (m), downstream to upstream")
+    axes.set_ylabel("Height above plinth (m)")
+    axes.set_xlim(73.7, 82.0)
+    axes.set_ylim(-1.4, 6.35)
+    axes.set_aspect("equal")
+    axes.grid(False)
+    axes.legend(loc="upper left", frameon=False, ncols=2)
+    figure.tight_layout()
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(OUTPUT_PATH)
+    plt.close(figure)
+    print(f"Wrote {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

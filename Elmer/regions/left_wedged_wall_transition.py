@@ -8,7 +8,14 @@ import math
 from pathlib import Path
 
 from regions.center_wall import write_gmsh, write_vtu
-from regions.left_wedged_wall import HAUNCH_HEIGHT_M, WEDGE_HEIGHT_M, WEDGE_SHELF_WIDTH_M, WEDGE_WIDTH_M, _upper_wall_levels, _wedge_section_faces
+from regions.left_wedged_wall import (
+    DOWNSTREAM_WEDGE_INNER_RADIUS_M,
+    HAUNCH_HEIGHT_M,
+    UPSTREAM_WEDGE_INNER_RADIUS_M,
+    WEDGE_HEIGHT_M,
+    _upper_wall_levels,
+    _wedge_section_faces,
+)
 from regions.plinth import (
     _determinant,
     _monotone_values,
@@ -22,7 +29,6 @@ FULL_WEDGE_CHAINAGE_M = 62.0
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
 FULL_WEDGE_HEIGHT_M = WEDGE_HEIGHT_M
-FULL_WEDGE_WIDTH_M = WEDGE_WIDTH_M
 CREST_Z_M = 0.0
 BODY_ID = 1
 BASE_BOUNDARY_ID = 1
@@ -129,20 +135,22 @@ def build_wedged_wall_transition(
         for base_z_m in base_levels_m
         for height_m in (wedge_top_z_m - base_z_m,)
     ]
-    wedge_radial_divisions = round(FULL_WEDGE_WIDTH_M / element_size_m)
     wedge_vertical_divisions = round(FULL_WEDGE_HEIGHT_M / element_size_m)
     wedge_faces = _wedge_section_faces(element_size_m)
     section_levels_m = [
         (
-            [
-                base_z_m,
-                base_z_m + wedge_height_m / 3.0,
-                base_z_m + 2.0 * wedge_height_m / 3.0,
-                base_z_m + wedge_height_m,
+            [base_z_m + index * wedge_height_m / wedge_vertical_divisions for index in range(wedge_vertical_divisions + 1)]
+            + [
+                level_m
+                for level_m in active_fixed_levels_m
+                if level_m >= base_z_m + wedge_height_m + 0.5 * element_size_m - 1.0e-9
             ]
-            + [level_m for level_m in active_fixed_levels_m if level_m > base_z_m + wedge_height_m + 1.0e-9]
             if wedge_height_m >= element_size_m - 1.0e-9
-            else [base_z_m] + [level_m for level_m in inactive_fixed_levels_m if level_m > base_z_m + 1.0e-9]
+            else [base_z_m] + [
+                level_m
+                for level_m in inactive_fixed_levels_m
+                if level_m >= base_z_m + 0.5 * element_size_m - 1.0e-9
+            ]
         )
         for base_z_m, wedge_height_m in zip(base_levels_m, wedge_heights_m)
     ]
@@ -158,6 +166,16 @@ def build_wedged_wall_transition(
             coordinate_nodes[key] = len(nodes) + 1
             nodes.append(coordinate)
         return coordinate_nodes[key]
+
+    def scaled_wedge_radius(radius_m: float, taper_height_m: float) -> float:
+        scale = taper_height_m / FULL_WEDGE_HEIGHT_M
+        if radius_m <= DOWNSTREAM_WEDGE_INNER_RADIUS_M + 1.0e-9:
+            if math.isclose(radius_m, DOWNSTREAM_WEDGE_INNER_RADIUS_M, abs_tol=1.0e-9):
+                return DOWNSTREAM_WEDGE_INNER_RADIUS_M
+            return DOWNSTREAM_WALL_RADIUS_M - (DOWNSTREAM_WALL_RADIUS_M - radius_m) * scale
+        if math.isclose(radius_m, UPSTREAM_WEDGE_INNER_RADIUS_M, abs_tol=1.0e-9):
+            return UPSTREAM_WEDGE_INNER_RADIUS_M
+        return UPSTREAM_RADIUS_M + (radius_m - UPSTREAM_RADIUS_M) * scale
 
     def append_tetrahedron(node_ids: tuple[int, int, int, int]) -> None:
         points = [nodes[value - 1] for value in node_ids]
@@ -181,11 +199,10 @@ def build_wedged_wall_transition(
         )
         if active_taper:
             wall_faces = [
-                ((0, 0), (1, 0), (1, 1), (0, 1)),
-                ((0, 1), (1, 1), (1, 2), (0, 2)),
-                ((0, 2), (1, 2), (1, 3), (0, 3)),
+                ((0, index), (1, index), (1, index + 1), (0, index + 1))
+                for index in range(wedge_vertical_divisions)
             ]
-            upper_start_index = 3
+            upper_start_index = wedge_vertical_divisions
             wall_faces.extend(
                 tuple((side, upper_start_index + level_index) for side, level_index in face)
                 for face in _section_faces(
@@ -196,8 +213,14 @@ def build_wedged_wall_transition(
         else:
             wall_faces = _section_faces(section_levels_m[station_index], section_levels_m[station_index + 1])
         for face in wall_faces:
-            for radial_index in range(radial_divisions):
-                levels = (section_levels_m[station_index], section_levels_m[station_index + 1])
+            levels = (section_levels_m[station_index], section_levels_m[station_index + 1])
+            below_wedge_top = any(
+                levels[side][level_index] < wedge_top_z_m - 1.0e-9
+                for side, level_index in face
+            )
+            first_radial_index = 1 if (active_taper or terminal_taper) and below_wedge_top else 0
+            last_radial_index = radial_divisions - 1 if (active_taper or terminal_taper) and below_wedge_top else radial_divisions
+            for radial_index in range(first_radial_index, last_radial_index):
                 inner = tuple(
                     node_id(station_index + side, wall_radii_m[radial_index], levels[side][level_index])
                     for side, level_index in face
@@ -219,26 +242,23 @@ def build_wedged_wall_transition(
             active_station_index = station_index + active_side
             zero_station_index = station_index + 1 - active_side
             active_height_m = wedge_heights_m[active_station_index]
-            active_width_m = active_height_m * FULL_WEDGE_WIDTH_M / FULL_WEDGE_HEIGHT_M
             active_base_z_m = base_levels_m[active_station_index]
-            apex = node_id(
-                zero_station_index,
-                DOWNSTREAM_WALL_RADIUS_M,
-                base_levels_m[zero_station_index],
-            )
             for face in wedge_faces:
+                downstream_face = max(radius_m for radius_m, _ in face) <= DOWNSTREAM_WEDGE_INNER_RADIUS_M + 1.0e-9
+                apex = node_id(
+                    zero_station_index,
+                    DOWNSTREAM_WALL_RADIUS_M if downstream_face else UPSTREAM_RADIUS_M,
+                    base_levels_m[zero_station_index],
+                )
                 active_face = tuple(
                     node_id(
                         active_station_index,
-                        DOWNSTREAM_WALL_RADIUS_M - active_width_m + radial * active_width_m / wedge_radial_divisions,
-                        active_base_z_m + vertical * active_height_m / wedge_vertical_divisions,
+                        scaled_wedge_radius(radius_m, active_height_m),
+                        active_base_z_m + height_m * active_height_m / FULL_WEDGE_HEIGHT_M,
                     )
-                    for radial, vertical in face
+                    for radius_m, height_m in face
                 )
-                triangles = (
-                    (active_face,) if len(active_face) == 3
-                    else ((active_face[0], active_face[1], active_face[2]), (active_face[0], active_face[2], active_face[3]))
-                )
+                triangles = ((active_face[0], active_face[1], active_face[2]), (active_face[0], active_face[2], active_face[3]))
                 for triangle in triangles:
                     append_tetrahedron(triangle + (apex,))
 
@@ -250,24 +270,20 @@ def build_wedged_wall_transition(
             section_faces = []
             for side in range(2):
                 height_m = wedge_heights_m[station_index + side]
-                width_m = height_m * FULL_WEDGE_WIDTH_M / FULL_WEDGE_HEIGHT_M
                 base_z_m = base_levels_m[station_index + side]
                 section_faces.append(tuple(
                     node_id(
                         station_index + side,
-                        DOWNSTREAM_WALL_RADIUS_M - width_m + radial * width_m / wedge_radial_divisions,
-                        base_z_m + vertical * height_m / wedge_vertical_divisions,
+                        scaled_wedge_radius(radius_m, height_m),
+                        base_z_m + face_height_m * height_m / FULL_WEDGE_HEIGHT_M,
                     )
-                    for radial, vertical in face
+                    for radius_m, face_height_m in face
                 ))
-            if len(face) == 3:
-                cells.append((6, section_faces[0] + section_faces[1]))
-            else:
-                start_face, end_face = section_faces
-                cells.append((5, (
-                    start_face[0], end_face[0], end_face[1], start_face[1],
-                    start_face[3], end_face[3], end_face[2], start_face[2],
-                )))
+            start_face, end_face = section_faces
+            cells.append((5, (
+                start_face[0], end_face[0], end_face[1], start_face[1],
+                start_face[3], end_face[3], end_face[2], start_face[2],
+            )))
 
     face_patterns = {
         4: ((0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)),
@@ -337,7 +353,7 @@ def audit_left_wedged_wall_transition(mesh: LeftWedgedWallTransitionMesh) -> dic
         "wall_thickness_m": UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M,
         "transition_length_m": FULL_WEDGE_CHAINAGE_M - mesh.intersection_chainage_m,
         "wedge_removed": True,
-        "wedge_shelf_width_m": WEDGE_SHELF_WIDTH_M,
+        "wall_core_radius_m": [DOWNSTREAM_WEDGE_INNER_RADIUS_M, UPSTREAM_WEDGE_INNER_RADIUS_M],
         "element_size_m": mesh.element_size_m,
     }
 
