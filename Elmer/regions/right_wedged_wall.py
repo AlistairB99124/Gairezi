@@ -8,6 +8,7 @@ from regions.left_wedged_wall import (
     DOWNSTREAM_WALL_RADIUS_M,
     UPSTREAM_RADIUS_M,
     WEDGE_HEIGHT_M,
+    WEDGE_SHELF_WIDTH_M,
     WEDGE_WIDTH_M,
     WEDGE_TOE_RADIUS_M,
     LeftWedgedWallMesh,
@@ -42,6 +43,7 @@ def audit_right_wedged_wall(mesh: LeftWedgedWallMesh) -> dict[str, object]:
         "wedge_radius_m": [WEDGE_TOE_RADIUS_M, DOWNSTREAM_WALL_RADIUS_M],
         "wedge_height_m": WEDGE_HEIGHT_M,
         "wedge_width_m": WEDGE_WIDTH_M,
+        "wedge_shelf_width_m": WEDGE_SHELF_WIDTH_M,
         "element_size_m": mesh.element_size_m,
     }
 

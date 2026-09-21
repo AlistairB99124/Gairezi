@@ -1,37 +1,37 @@
 {
   "source_vtu": "structure_output/combined_solver/results/combined_results_t0001.vtu",
-  "element_count": 108238,
+  "element_count": 106986,
   "max_tensile_principal_stress_pa": {
-    "element_id": 102015,
-    "value_pa": 3446048.082099523,
+    "element_id": 69884,
+    "value_pa": 3338112.240471871,
     "centroid_xyz_m": [
-      72.32188830614157,
-      -24.15679741571274,
-      -13.419160683258196
+      78.22579026387498,
+      15.51509313365892,
+      -28.249952373354272
     ]
   },
   "max_compressive_principal_stress_pa": {
-    "element_id": 89979,
-    "value_pa": -6387298.413992272,
+    "element_id": 84276,
+    "value_pa": -6053079.872856431,
     "centroid_xyz_m": [
-      76.07681856427463,
-      -5.129668884352968,
-      -21.28798231273869
+      76.24902978812565,
+      -0.2704897336716853,
+      -24.756556467969265
     ]
   },
   "independent_affine_check": {
     "max_tensile_principal_stress_pa": {
-      "element_id": 102015,
-      "value_pa": 3446048.082099523
+      "element_id": 69884,
+      "value_pa": 3338112.240471871
     },
     "max_compressive_principal_stress_pa": {
-      "element_id": 89979,
-      "value_pa": -6387298.413992272
+      "element_id": 84276,
+      "value_pa": -6053079.872856431
     }
   },
   "note": "Positive principal stress indicates tension. Negative principal stress indicates compression.",
   "tensile_strength_pa": 2000000.0,
-  "tension_utilization": 1.7230240410497615,
+  "tension_utilization": 1.6690561202359355,
   "client_expected_tension_mpa": 1.2,
   "client_expected_compression_mpa": -3.33,
   "detailing_assessment": {

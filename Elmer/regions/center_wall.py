@@ -1,4 +1,4 @@
-"""Generate the standalone rectangular center wall."""
+"""Generate the center wall with the continuous downstream shelf wedge."""
 from __future__ import annotations
 
 from collections import Counter
@@ -15,7 +15,10 @@ WEDGE_TOE_RADIUS_M = 74.0
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
 BASE_Z_M = -28.5
-WEDGE_TOP_Z_M = -26.5
+WEDGE_HEIGHT_M = 1.5
+WEDGE_WIDTH_M = 2.0
+WEDGE_SHELF_WIDTH_M = 0.5
+WEDGE_TOP_Z_M = BASE_Z_M + WEDGE_HEIGHT_M
 CREST_Z_M = 0.0
 BODY_ID = 1
 BASE_BOUNDARY_ID = 1
@@ -49,6 +52,35 @@ def _levels(start: float, end: float, step: float) -> list[float]:
     return [start + index * step for index in range(count + 1)]
 
 
+def _wedge_section_faces(element_size_m: float) -> list[tuple[tuple[int, int], ...]]:
+    radial_divisions = round(WEDGE_WIDTH_M / element_size_m)
+    vertical_divisions = round(WEDGE_HEIGHT_M / element_size_m)
+    slope_width_m = WEDGE_WIDTH_M - WEDGE_SHELF_WIDTH_M
+    if (
+        not math.isclose(radial_divisions * element_size_m, WEDGE_WIDTH_M, abs_tol=1.0e-9)
+        or not math.isclose(vertical_divisions * element_size_m, WEDGE_HEIGHT_M, abs_tol=1.0e-9)
+        or not math.isclose(vertical_divisions * element_size_m, slope_width_m, abs_tol=1.0e-9)
+    ):
+        raise ValueError("Center wedge dimensions must align with the global element grid")
+
+    faces: list[tuple[tuple[int, int], ...]] = []
+    for vertical_index in range(vertical_divisions):
+        upper_start = vertical_index + 1
+        faces.append((
+            (vertical_index, vertical_index),
+            (upper_start, vertical_index),
+            (upper_start, vertical_index + 1),
+        ))
+        for radial_index in range(upper_start, radial_divisions):
+            faces.append((
+                (radial_index, vertical_index),
+                (radial_index + 1, vertical_index),
+                (radial_index + 1, vertical_index + 1),
+                (radial_index, vertical_index + 1),
+            ))
+    return faces
+
+
 def build_center_wall(root: Path) -> CenterWallMesh:
     element_size_m = _global_element_size(root)
     config = json.loads((root / "config.json").read_text())
@@ -56,6 +88,7 @@ def build_center_wall(root: Path) -> CenterWallMesh:
     chainages_m = _levels(START_CHAINAGE_M, END_CHAINAGE_M, element_size_m)
     radii_m = _levels(WEDGE_TOE_RADIUS_M, UPSTREAM_RADIUS_M, element_size_m)
     z_levels_m = _levels(BASE_Z_M, CREST_Z_M, element_size_m)
+    wedge_faces = _wedge_section_faces(element_size_m)
 
     nodes = []
     node_ids = {}
@@ -74,14 +107,9 @@ def build_center_wall(root: Path) -> CenterWallMesh:
 
     cells: list[tuple[int, tuple[int, ...]]] = []
     wall_start_index = round((DOWNSTREAM_WALL_RADIUS_M - WEDGE_TOE_RADIUS_M) / element_size_m)
-    wedge_layer_count = round((WEDGE_TOP_Z_M - BASE_Z_M) / element_size_m)
     for chainage_index in range(len(chainages_m) - 1):
         for z_index in range(len(z_levels_m) - 1):
-            for radial_index in range(len(radii_m) - 1):
-                in_wall = radial_index >= wall_start_index
-                in_wedge_hex = z_index < radial_index < wall_start_index
-                if not (in_wall or in_wedge_hex):
-                    continue
+            for radial_index in range(wall_start_index, len(radii_m) - 1):
                 cell = (
                     node_id(chainage_index, z_index, radial_index),
                     node_id(chainage_index + 1, z_index, radial_index),
@@ -93,16 +121,16 @@ def build_center_wall(root: Path) -> CenterWallMesh:
                     node_id(chainage_index, z_index + 1, radial_index + 1),
                 )
                 cells.append((5, cell))
-        for diagonal_index in range(wedge_layer_count):
-            prism = (
-                node_id(chainage_index, diagonal_index, diagonal_index),
-                node_id(chainage_index, diagonal_index, diagonal_index + 1),
-                node_id(chainage_index, diagonal_index + 1, diagonal_index + 1),
-                node_id(chainage_index + 1, diagonal_index, diagonal_index),
-                node_id(chainage_index + 1, diagonal_index, diagonal_index + 1),
-                node_id(chainage_index + 1, diagonal_index + 1, diagonal_index + 1),
-            )
-            cells.append((6, prism))
+        for face in wedge_faces:
+            start_face = tuple(node_id(chainage_index, vertical, radial) for radial, vertical in face)
+            end_face = tuple(node_id(chainage_index + 1, vertical, radial) for radial, vertical in face)
+            if len(face) == 3:
+                cells.append((6, start_face + end_face))
+            else:
+                cells.append((5, (
+                    start_face[0], end_face[0], end_face[1], start_face[1],
+                    start_face[3], end_face[3], end_face[2], start_face[2],
+                )))
 
     face_patterns = {
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
@@ -211,8 +239,7 @@ def audit_center_wall(mesh: CenterWallMesh) -> dict[str, object]:
     chainage_cells = round((END_CHAINAGE_M - START_CHAINAGE_M) / mesh.element_size_m)
     radial_cells = round((UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M) / mesh.element_size_m)
     vertical_cells = round((CREST_Z_M - BASE_Z_M) / mesh.element_size_m)
-    wedge_layer_count = round((WEDGE_TOP_Z_M - BASE_Z_M) / mesh.element_size_m)
-    wedge_cells_per_section = wedge_layer_count * (wedge_layer_count - 1) // 2 + wedge_layer_count
+    wedge_cells_per_section = len(_wedge_section_faces(mesh.element_size_m))
     expected_cells = chainage_cells * (radial_cells * vertical_cells + wedge_cells_per_section)
     boundary_counts = Counter(boundary_id for boundary_id, _ in mesh.boundaries)
     if len(mesh.cells) != expected_cells:
@@ -232,6 +259,7 @@ def audit_center_wall(mesh: CenterWallMesh) -> dict[str, object]:
         "wall_radius_m": [DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M],
         "wedge_radius_m": [WEDGE_TOE_RADIUS_M, DOWNSTREAM_WALL_RADIUS_M],
         "wedge_z_m": [BASE_Z_M, WEDGE_TOP_Z_M],
+        "wedge_shelf_width_m": WEDGE_SHELF_WIDTH_M,
         "z_m": [BASE_Z_M, CREST_Z_M],
         "element_size_m": mesh.element_size_m,
     }
