@@ -9,7 +9,14 @@ from pathlib import Path
 import struct
 
 from regions.plinth import build_conforming_plinth, build_plinth, load_contours
-from regions.uniform_wall import build_uniform_wall
+from regions.uniform_wall import (
+    DOWNSTREAM_BATTER_HEIGHT_M,
+    DOWNSTREAM_BATTER_RUN_M,
+    DOWNSTREAM_WALL_RADIUS_M,
+    UPSTREAM_RADIUS_M,
+    build_uniform_wall,
+    downstream_radius,
+)
 
 
 def build_wall(root: Path):
@@ -310,6 +317,13 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "face_connected_components": component_count,
         "boundary_faces": dict(sorted(Counter(boundary_id for boundary_id, _ in mesh.boundaries).items())),
         "regions": mesh.region_cell_counts,
+        "wall_geometry": {
+            "downstream_crest_radius_m": DOWNSTREAM_WALL_RADIUS_M,
+            "deepest_downstream_base_radius_m": downstream_radius(-DOWNSTREAM_BATTER_HEIGHT_M),
+            "upstream_radius_m": UPSTREAM_RADIUS_M,
+            "downstream_batter_height_m": DOWNSTREAM_BATTER_HEIGHT_M,
+            "downstream_batter_run_m": DOWNSTREAM_BATTER_RUN_M,
+        },
         "fixed_base_nodes": sum(mesh.fixed_base),
         "pressurized_upstream_nodes": sum(value > 0.0 for value in mesh.hydrostatic_pressure_pa),
         "maximum_applied_pressure_pa": max(mesh.hydrostatic_pressure_pa),

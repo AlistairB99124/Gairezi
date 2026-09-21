@@ -13,6 +13,8 @@ from regions.plinth import _monotone_values, _prism_orientation, load_contours, 
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
 CREST_Z_M = 0.0
+DOWNSTREAM_BATTER_HEIGHT_M = 28.5
+DOWNSTREAM_BATTER_RUN_M = 2.0
 BASE_BOUNDARY_ID = 1
 UPSTREAM_BOUNDARY_ID = 2
 DOWNSTREAM_BOUNDARY_ID = 3
@@ -77,6 +79,10 @@ def wall_levels(base_z_m: float, element_size_m: float) -> list[float]:
     return list(dict.fromkeys(levels))
 
 
+def downstream_radius(z_m: float) -> float:
+    return DOWNSTREAM_WALL_RADIUS_M + DOWNSTREAM_BATTER_RUN_M * z_m / DOWNSTREAM_BATTER_HEIGHT_M
+
+
 def build_uniform_wall(
     root: Path,
     start_chainage_m: float,
@@ -89,8 +95,8 @@ def build_uniform_wall(
     centerline_radius_m = float(config["wall_centerline_radius_m"])
     chainages_m = target_chainages(start_chainage_m, end_chainage_m, anchor_chainages_m, element_size_m)
     base_levels_m = [_monotone_values(contours, "plinth_z_m", value) for value in chainages_m]
-    radial_divisions = round((UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M) / element_size_m)
-    wall_radii_m = [DOWNSTREAM_WALL_RADIUS_M + index * element_size_m for index in range(radial_divisions + 1)]
+    maximum_wall_width_m = UPSTREAM_RADIUS_M - downstream_radius(-DOWNSTREAM_BATTER_HEIGHT_M)
+    radial_divisions = math.ceil(maximum_wall_width_m / element_size_m)
     section_levels_m = [wall_levels(base_z_m, element_size_m) for base_z_m in base_levels_m]
 
     nodes: list[tuple[float, float, float]] = []
@@ -105,17 +111,30 @@ def build_uniform_wall(
             nodes.append(coordinate)
         return coordinate_nodes[key]
 
+    def wall_radius(z_m: float, radial_index: int) -> float:
+        fraction = radial_index / radial_divisions
+        downstream_radius_m = downstream_radius(z_m)
+        return downstream_radius_m + fraction * (UPSTREAM_RADIUS_M - downstream_radius_m)
+
     cells: list[tuple[int, tuple[int, ...]]] = []
     for station_index in range(len(chainages_m) - 1):
         levels = (section_levels_m[station_index], section_levels_m[station_index + 1])
         for face in section_faces(*levels):
             for radial_index in range(radial_divisions):
                 inner = tuple(
-                    node_id(station_index + side, wall_radii_m[radial_index], levels[side][level_index])
+                    node_id(
+                        station_index + side,
+                        wall_radius(levels[side][level_index], radial_index),
+                        levels[side][level_index],
+                    )
                     for side, level_index in face
                 )
                 outer = tuple(
-                    node_id(station_index + side, wall_radii_m[radial_index + 1], levels[side][level_index])
+                    node_id(
+                        station_index + side,
+                        wall_radius(levels[side][level_index], radial_index + 1),
+                        levels[side][level_index],
+                    )
                     for side, level_index in face
                 )
                 if len(face) == 3:
