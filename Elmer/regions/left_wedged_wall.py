@@ -1,4 +1,4 @@
-"""Generate the standalone left wall with both outer element columns flared."""
+"""Generate the standalone full-thickness left wall."""
 from __future__ import annotations
 
 from collections import Counter
@@ -13,15 +13,9 @@ from regions.plinth import _monotone_values, _section_faces, load_contours, load
 
 START_CHAINAGE_M = 62.0
 END_CHAINAGE_M = 101.0
-DOWNSTREAM_WEDGE_TOE_RADIUS_M = 75.0
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
-UPSTREAM_WEDGE_TOE_RADIUS_M = 81.0
 WEDGE_HEIGHT_M = 4.0
-WEDGE_BASE_WIDTH_M = 1.5
-DOWNSTREAM_WEDGE_INNER_RADIUS_M = 76.5
-UPSTREAM_WEDGE_INNER_RADIUS_M = 79.5
-WEDGE_SLOPE_RUN_M = WEDGE_BASE_WIDTH_M - 0.5
 HAUNCH_HEIGHT_M = WEDGE_HEIGHT_M
 CREST_Z_M = 0.0
 BODY_ID = 1
@@ -66,34 +60,6 @@ def _upper_wall_levels(
     return list(dict.fromkeys(levels))
 
 
-def _wedge_section_faces(element_size_m: float) -> list[tuple[tuple[float, float], ...]]:
-    vertical_divisions = round(WEDGE_HEIGHT_M / element_size_m)
-    if not math.isclose(vertical_divisions * element_size_m, WEDGE_HEIGHT_M, abs_tol=1.0e-9):
-        raise ValueError("Wedge height must align with the global element grid")
-
-    faces = []
-    for vertical_index in range(vertical_divisions):
-        lower_height_m = vertical_index * element_size_m
-        upper_height_m = (vertical_index + 1) * element_size_m
-        lower_downstream_radius_m = DOWNSTREAM_WEDGE_TOE_RADIUS_M + WEDGE_SLOPE_RUN_M * lower_height_m / WEDGE_HEIGHT_M
-        upper_downstream_radius_m = DOWNSTREAM_WEDGE_TOE_RADIUS_M + WEDGE_SLOPE_RUN_M * upper_height_m / WEDGE_HEIGHT_M
-        lower_upstream_radius_m = UPSTREAM_WEDGE_TOE_RADIUS_M - WEDGE_SLOPE_RUN_M * lower_height_m / WEDGE_HEIGHT_M
-        upper_upstream_radius_m = UPSTREAM_WEDGE_TOE_RADIUS_M - WEDGE_SLOPE_RUN_M * upper_height_m / WEDGE_HEIGHT_M
-        faces.append((
-            (lower_downstream_radius_m, lower_height_m),
-            (DOWNSTREAM_WEDGE_INNER_RADIUS_M, lower_height_m),
-            (DOWNSTREAM_WEDGE_INNER_RADIUS_M, upper_height_m),
-            (upper_downstream_radius_m, upper_height_m),
-        ))
-        faces.append((
-            (UPSTREAM_WEDGE_INNER_RADIUS_M, lower_height_m),
-            (lower_upstream_radius_m, lower_height_m),
-            (upper_upstream_radius_m, upper_height_m),
-            (UPSTREAM_WEDGE_INNER_RADIUS_M, upper_height_m),
-        ))
-    return faces
-
-
 def build_wedged_wall(root: Path, start_chainage_m: float, end_chainage_m: float) -> LeftWedgedWallMesh:
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
     contours = load_contours(root / "Data" / "plinth.json")
@@ -105,8 +71,6 @@ def build_wedged_wall(root: Path, start_chainage_m: float, end_chainage_m: float
         DOWNSTREAM_WALL_RADIUS_M + index * element_size_m
         for index in range(round((UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M) / element_size_m) + 1)
     ]
-    wedge_faces = _wedge_section_faces(element_size_m)
-
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}
 
@@ -130,7 +94,7 @@ def build_wedged_wall(root: Path, start_chainage_m: float, end_chainage_m: float
             upper_start = base_levels_m[station_index] + upper_offset_m
             lower_end = base_levels_m[station_index + 1] + lower_offset_m
             upper_end = base_levels_m[station_index + 1] + upper_offset_m
-            for radial_index in range(1, len(wall_radii_m) - 2):
+            for radial_index in range(len(wall_radii_m) - 1):
                 inner_radius_m = wall_radii_m[radial_index]
                 outer_radius_m = wall_radii_m[radial_index + 1]
                 cells.append((5, (
@@ -157,20 +121,6 @@ def build_wedged_wall(root: Path, start_chainage_m: float, end_chainage_m: float
                         inner[0], inner[1], outer[1], outer[0],
                         inner[3], inner[2], outer[2], outer[3],
                     )))
-
-        for face in wedge_faces:
-            start_face = tuple(
-                node_id(station_index, radius_m, base_levels_m[station_index] + height_m)
-                for radius_m, height_m in face
-            )
-            end_face = tuple(
-                node_id(station_index + 1, radius_m, base_levels_m[station_index + 1] + height_m)
-                for radius_m, height_m in face
-            )
-            cells.append((5, (
-                start_face[0], end_face[0], end_face[1], start_face[1],
-                start_face[3], end_face[3], end_face[2], start_face[2],
-            )))
 
     face_patterns = {
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
@@ -230,11 +180,7 @@ def audit_left_wedged_wall(mesh: LeftWedgedWallMesh) -> dict[str, object]:
         "chainage_m": [START_CHAINAGE_M, END_CHAINAGE_M],
         "plinth_z_m": [-17.03, -28.5],
         "wall_radius_m": [DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M],
-        "wedge_radius_m": [DOWNSTREAM_WEDGE_TOE_RADIUS_M, UPSTREAM_WEDGE_TOE_RADIUS_M],
-        "wedge_height_m": WEDGE_HEIGHT_M,
-        "wedge_base_width_m": WEDGE_BASE_WIDTH_M,
-        "wall_core_radius_m": [DOWNSTREAM_WEDGE_INNER_RADIUS_M, UPSTREAM_WEDGE_INNER_RADIUS_M],
-        "haunch_height_m": HAUNCH_HEIGHT_M,
+        "wedge_removed": True,
         "element_size_m": mesh.element_size_m,
     }
 

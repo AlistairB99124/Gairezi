@@ -8,30 +8,23 @@ import math
 from pathlib import Path
 import struct
 
-from regions.center_wall import END_CHAINAGE_M as CENTER_END_CHAINAGE_M
-from regions.center_wall import START_CHAINAGE_M as CENTER_START_CHAINAGE_M
-from regions.left_wall import build_left_wall
-from regions.left_wedged_wall import build_left_wedged_wall, build_wedged_wall
-from regions.left_wedged_wall_transition import build_left_wedged_wall_transition
-from regions.plinth import build_conforming_plinth, build_plinth
-from regions.right_wall import build_right_wall
-from regions.right_wedged_wall import build_right_wedged_wall
-from regions.right_wedged_wall_transition import build_right_wedged_wall_transition
+from regions.plinth import build_conforming_plinth, build_plinth, load_contours
+from regions.uniform_wall import build_uniform_wall
 
 
-def build_center_wall(root: Path):
-    return build_wedged_wall(root, CENTER_START_CHAINAGE_M, CENTER_END_CHAINAGE_M)
+def build_wall(root: Path):
+    contours = load_contours(root / "Data" / "plinth.json")
+    return build_uniform_wall(
+        root,
+        contours[0].chainage_m,
+        contours[-1].chainage_m,
+        [point.chainage_m for point in contours],
+    )
 
 
 REGION_BUILDERS = (
     (1, "plinth", build_plinth),
-    (2, "left_wall", build_left_wall),
-    (3, "left_wedged_wall_transition", build_left_wedged_wall_transition),
-    (4, "left_wedged_wall", build_left_wedged_wall),
-    (5, "center_wall", build_center_wall),
-    (6, "right_wedged_wall", build_right_wedged_wall),
-    (7, "right_wedged_wall_transition", build_right_wedged_wall_transition),
-    (8, "right_wall", build_right_wall),
+    (2, "wall", build_wall),
 )
 
 STRUCTURAL_REGION_BUILDERS = REGION_BUILDERS[1:]

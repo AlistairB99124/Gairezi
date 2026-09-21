@@ -21,7 +21,7 @@ def build_right_wall(root: Path) -> UniformWallMesh:
     start_chainage_m = transition_end_chainage(contours, reference_base_z_m + WEDGE_HEIGHT_M)
     end_chainage_m = contours[-1].chainage_m
     anchors_m = [point.chainage_m for point in contours]
-    return build_uniform_wall(root, start_chainage_m, end_chainage_m, reference_base_z_m, anchors_m)
+    return build_uniform_wall(root, start_chainage_m, end_chainage_m, anchors_m)
 
 
 def audit_right_wall(mesh: UniformWallMesh) -> dict[str, object]:

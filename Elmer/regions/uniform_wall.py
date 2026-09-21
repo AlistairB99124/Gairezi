@@ -1,4 +1,4 @@
-"""Shared construction for wedge-free wall regions following the plinth contour."""
+"""Shared construction for wall regions following the plinth contour."""
 from __future__ import annotations
 
 from collections import Counter
@@ -7,13 +7,11 @@ import json
 import math
 from pathlib import Path
 
-from regions.left_wedged_wall import WEDGE_HEIGHT_M, _upper_wall_levels
 from regions.plinth import _monotone_values, _prism_orientation, load_contours, load_global_element_size
 
 
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
-REFERENCE_LAYER_HEIGHT_M = WEDGE_HEIGHT_M
 CREST_Z_M = 0.0
 BASE_BOUNDARY_ID = 1
 UPSTREAM_BOUNDARY_ID = 2
@@ -65,11 +63,24 @@ def section_faces(left_levels: list[float], right_levels: list[float]) -> list[t
     return faces
 
 
+def wall_levels(base_z_m: float, element_size_m: float) -> list[float]:
+    if CREST_Z_M - base_z_m <= 1.0e-9:
+        return [CREST_Z_M]
+    first_global_index = math.floor(base_z_m / element_size_m) + 1
+    levels = [base_z_m]
+    levels.extend(
+        index * element_size_m
+        for index in range(first_global_index, 1)
+        if base_z_m + 0.5 * element_size_m <= index * element_size_m < CREST_Z_M - 1.0e-9
+    )
+    levels.append(CREST_Z_M)
+    return list(dict.fromkeys(levels))
+
+
 def build_uniform_wall(
     root: Path,
     start_chainage_m: float,
     end_chainage_m: float,
-    reference_base_z_m: float,
     anchor_chainages_m: list[float],
 ) -> UniformWallMesh:
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
@@ -80,15 +91,7 @@ def build_uniform_wall(
     base_levels_m = [_monotone_values(contours, "plinth_z_m", value) for value in chainages_m]
     radial_divisions = round((UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M) / element_size_m)
     wall_radii_m = [DOWNSTREAM_WALL_RADIUS_M + index * element_size_m for index in range(radial_divisions + 1)]
-    lower_layer_count = round(REFERENCE_LAYER_HEIGHT_M / element_size_m)
-    fixed_levels_m = [
-        reference_base_z_m + index * element_size_m
-        for index in range(lower_layer_count)
-    ] + _upper_wall_levels(reference_base_z_m, element_size_m)
-    section_levels_m = [
-        [base_z_m] + [level_m for level_m in fixed_levels_m if level_m > base_z_m + 1.0e-9]
-        for base_z_m in base_levels_m
-    ]
+    section_levels_m = [wall_levels(base_z_m, element_size_m) for base_z_m in base_levels_m]
 
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}

@@ -10,7 +10,6 @@ from regions.left_wedged_wall_transition import (
     LeftWedgedWallTransitionMesh,
     build_wedged_wall_transition,
 )
-from regions.left_wedged_wall import DOWNSTREAM_WEDGE_INNER_RADIUS_M, UPSTREAM_WEDGE_INNER_RADIUS_M
 from regions.plinth import _monotone_values, load_contours
 from regions.uniform_wall import (
     DOWNSTREAM_WALL_RADIUS_M,
@@ -58,7 +57,6 @@ def audit_right_wedged_wall_transition(mesh: LeftWedgedWallTransitionMesh) -> di
         "wall_thickness_m": UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M,
         "fixed_reference_z_m": mesh.wedge_top_z_m,
         "wedge_removed": True,
-        "wall_core_radius_m": [DOWNSTREAM_WEDGE_INNER_RADIUS_M, UPSTREAM_WEDGE_INNER_RADIUS_M],
         "element_size_m": mesh.element_size_m,
     }
 

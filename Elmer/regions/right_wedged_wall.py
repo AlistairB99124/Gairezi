@@ -1,4 +1,4 @@
-"""Generate the standalone right wall with its integral smooth downstream toe."""
+"""Generate the standalone full-thickness right wall."""
 from __future__ import annotations
 
 from collections import Counter
@@ -6,11 +6,7 @@ from pathlib import Path
 
 from regions.left_wedged_wall import (
     DOWNSTREAM_WALL_RADIUS_M,
-    DOWNSTREAM_WEDGE_TOE_RADIUS_M,
     UPSTREAM_RADIUS_M,
-    UPSTREAM_WEDGE_TOE_RADIUS_M,
-    WEDGE_HEIGHT_M,
-    WEDGE_BASE_WIDTH_M,
     LeftWedgedWallMesh,
     build_wedged_wall,
     write_gmsh,
@@ -40,9 +36,7 @@ def audit_right_wedged_wall(mesh: LeftWedgedWallMesh) -> dict[str, object]:
         "chainage_m": [START_CHAINAGE_M, END_CHAINAGE_M],
         "plinth_z_m": [-28.5, -17.03],
         "wall_radius_m": [DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M],
-        "wedge_radius_m": [DOWNSTREAM_WEDGE_TOE_RADIUS_M, UPSTREAM_WEDGE_TOE_RADIUS_M],
-        "wedge_height_m": WEDGE_HEIGHT_M,
-        "wedge_base_width_m": WEDGE_BASE_WIDTH_M,
+        "wedge_removed": True,
         "element_size_m": mesh.element_size_m,
     }
 
