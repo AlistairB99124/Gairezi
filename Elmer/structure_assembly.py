@@ -118,10 +118,13 @@ def build_combined_region() -> dict[str, object]:
 
 
 def write_combined_solver_input(mesh, path: Path) -> None:
-        gravity_bodyforce = mesh.material.density_kg_m3 * mesh.loads.gravity_z_m_s2
-        pressure_gradient = mesh.loads.peak_water_pressure_pa / mesh.loads.maximum_water_height_m
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f'''Header
+    gravity_bodyforce = mesh.material.density_kg_m3 * mesh.loads.gravity_z_m_s2
+    pressure_gradient = mesh.loads.peak_water_pressure_pa / mesh.loads.maximum_water_height_m
+    support = json.loads((Path(__file__).resolve().parent / "load_cases.json").read_text())["loads"]["bedrock_support"]
+    horizontal_stiffness = float(support["horizontal_stiffness_n_per_m3"])
+    vertical_stiffness = float(support["vertical_stiffness_n_per_m3"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'''Header
     CHECK KEYWORDS Warn
     Mesh DB "mesh" "/"
     Results Directory "results"
@@ -188,11 +191,12 @@ Material 1
 End
 
 Boundary Condition 1
-    Name = "BedrockBase"
+    Name = "BedrockBaseSpring"
     Target Boundaries(1) = 1
-    Displacement 1 = 0.0
-    Displacement 2 = 0.0
-    Displacement 3 = 0.0
+    ! Undisturbed competent granite elastic half-space; stiffness in N/m^3.
+    Spring 1 = Real {horizontal_stiffness:.12g}
+    Spring 2 = Real {horizontal_stiffness:.12g}
+    Spring 3 = Real {vertical_stiffness:.12g}
 End
 
 Boundary Condition 2

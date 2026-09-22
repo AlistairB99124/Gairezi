@@ -108,10 +108,12 @@ def _chainages(contours: list[ContourPoint], element_size_m: float) -> list[floa
 def _vertical_levels(bottom_z_m: float, top_z_m: float, element_size_m: float) -> list[float]:
     boundary_clearance_m = 0.5 * element_size_m
     levels = [bottom_z_m]
-    layer_index = 1
-    while top_z_m - layer_index * element_size_m >= bottom_z_m + boundary_clearance_m:
-        levels.append(top_z_m - layer_index * element_size_m)
-        layer_index += 1
+    first_layer_index = math.ceil((bottom_z_m + boundary_clearance_m) / element_size_m)
+    last_layer_index = math.floor((top_z_m - boundary_clearance_m) / element_size_m)
+    levels.extend(
+        layer_index * element_size_m
+        for layer_index in range(first_layer_index, last_layer_index + 1)
+    )
     levels.append(top_z_m)
     return sorted(set(round(level, 9) for level in levels))
 
@@ -372,12 +374,17 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
         for face in top_faces.values()
         for x_m, y_m, _ in face
     })
-    maximum_thickness_m = max(
-        _monotone_values(contours, "plinth_z_m", chainage_m)
-        - _monotone_values(contours, "bedrock_z_m", chainage_m)
+    highest_top_z_m = max(point[2] for face in top_faces.values() for point in face)
+    lowest_bedrock_z_m = min(
+        _monotone_values(contours, "bedrock_z_m", chainage_m)
         for chainage_m in chainages_m
     )
-    layer_count = max(1, math.ceil(maximum_thickness_m / element_size_m))
+    highest_layer_index = math.ceil(highest_top_z_m / element_size_m)
+    lowest_layer_index = math.floor(lowest_bedrock_z_m / element_size_m)
+    global_levels_m = [
+        layer_index * element_size_m
+        for layer_index in range(highest_layer_index, lowest_layer_index - 1, -1)
+    ]
 
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}
@@ -391,16 +398,17 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
         for point in face
     }
 
-    def node_id(point: tuple[float, float, float], layer_index: int) -> int:
+    def node_id(point: tuple[float, float, float], target_z_m: float) -> int:
         x_m, y_m, top_z_m = point
         bedrock_z_m = bedrock_by_top_node[_coordinate_key(point)]
-        candidate_z_m = top_z_m - layer_index * element_size_m
-        if layer_index > 0 and (
-            layer_index == layer_count
-            or candidate_z_m <= bedrock_z_m + 0.5 * element_size_m
-        ):
-            candidate_z_m = bedrock_z_m
-        coordinate = (x_m, y_m, max(candidate_z_m, bedrock_z_m))
+        boundary_clearance_m = 0.5 * element_size_m
+        if target_z_m >= top_z_m - boundary_clearance_m:
+            z_m = top_z_m
+        elif target_z_m <= bedrock_z_m + boundary_clearance_m:
+            z_m = bedrock_z_m
+        else:
+            z_m = target_z_m
+        coordinate = (x_m, y_m, z_m)
         key = _coordinate_key(coordinate)
         if key not in coordinate_nodes:
             coordinate_nodes[key] = len(nodes) + 1
@@ -446,9 +454,9 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
         cells.append((7, base + (apex,)))
 
     for face in top_faces.values():
-        for layer_index in range(layer_count):
-            upper = tuple(node_id(point, layer_index) for point in face)
-            lower = tuple(node_id(point, layer_index + 1) for point in face)
+        for upper_z_m, lower_z_m in zip(global_levels_m, global_levels_m[1:]):
+            upper = tuple(node_id(point, upper_z_m) for point in face)
+            lower = tuple(node_id(point, lower_z_m) for point in face)
             unique_nodes = len(set(upper + lower))
             if len(face) == 3 and unique_nodes == 6:
                 append_prism(upper, lower)

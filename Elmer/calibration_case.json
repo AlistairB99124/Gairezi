@@ -1,6 +1,6 @@
 {
   "results_directory": "results_calibration",
-  "support_type": "fixed",
+  "support_type": "spring",
   "include_gravity": true,
   "include_hydrostatic": true,
   "include_crest_surcharge": true,
@@ -20,7 +20,9 @@
     "crest_overflow_pressure_pa": 20000.0
   },
   "support": {
-    "base_spring": [10000000000.0, 10000000000.0, 50000000000.0],
+    "rock_mass_youngs_modulus_pa": 44000000000.0,
+    "poisson_ratio": 0.25,
+    "influence_width_m": 7.0,
     "abutment_spring": [100000000000.0, 100000000000.0, 50000000000.0]
   }
 }

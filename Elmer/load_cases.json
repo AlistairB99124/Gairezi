@@ -21,11 +21,11 @@
     "water_density": 1000.0,
     "bedrock_support": {
       "model": "distributed_elastic_granite_half_space",
-      "rock_mass_youngs_modulus_pa": 35000000000.0,
+      "rock_mass_youngs_modulus_pa": 44000000000.0,
       "poisson_ratio": 0.25,
       "influence_width_m": 7.0,
-      "horizontal_stiffness_n_per_m3": 9100000000.0,
-      "vertical_stiffness_n_per_m3": 10700000000.0
+      "horizontal_stiffness_n_per_m3": 11493877551.020409,
+      "vertical_stiffness_n_per_m3": 13409523809.52381
     }
   },
   "outputs": {

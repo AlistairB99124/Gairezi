@@ -1,0 +1,113 @@
+Header
+  CHECK KEYWORDS Warn
+  Mesh DB "mesh" "/"
+  Include Path ""
+  Results Directory "results_calibration"
+End
+
+Simulation
+  Max Output Level = 5
+  Coordinate System = Cartesian 3D
+  Simulation Type = Steady State
+  Steady State Max Iterations = 1
+  Output Intervals = 1
+End
+
+Constants
+  Gravity(4) = Real 0 0 -1 9.81
+  Stefan Boltzmann = 5.670374419e-8
+End
+
+Body 1
+  Name = "DamBody"
+  Equation = 1
+  Material = 1
+  Body Force = 1
+End
+
+Body Force 1
+  Stress Bodyforce 3 = Real -23544.0
+End
+
+Equation 1
+  Name = "Elasticity"
+  Active Solvers(2) = 1 2
+End
+
+Solver 1
+  Equation = "StressSolve"
+  Procedure = "StressSolve" "StressSolver"
+  Variable = "Displacement"
+  Variable DOFs = 3
+  Calculate Stresses = Logical True
+  Calculate Principal = Logical True
+  Nonlinear System Max Iterations = 20
+  Linear System Solver = Direct
+  Linear System Direct Method = UMFPACK
+End
+
+Material 1
+  Name = "Concrete"
+  Youngs Modulus = 35000000000.0
+  Poisson Ratio = 0.2
+  Density = 2400.0
+End
+
+Boundary Condition 1
+  Name = "BedrockBaseSpring"
+  Target Boundaries(1) = 1
+  ! Undisturbed competent granite rock mass represented as an elastic half-space.
+  ! Spring units are N/m^3 (traction per displacement), not Young's modulus.
+  Spring 1 = Real 11493877551.020409
+  Spring 2 = Real 11493877551.020409
+  Spring 3 = Real 13409523809.52381
+End
+
+Boundary Condition 5
+  Name = "LeftAbutmentSpring"
+  Target Boundaries(1) = 5
+  Spring 1 = Real 100000000000.0
+  Spring 2 = Real 100000000000.0
+  Spring 3 = Real 50000000000.0
+End
+
+Boundary Condition 6
+  Name = "RightAbutmentSpring"
+  Target Boundaries(1) = 6
+  Spring 1 = Real 100000000000.0
+  Spring 2 = Real 100000000000.0
+  Spring 3 = Real 50000000000.0
+End
+
+
+Boundary Condition 2
+  Name = "UpstreamHydrostaticPressure"
+  Target Boundaries(1) = 2
+  ! Hydrostatic datum-aware expression: pressure_datum_z_m + upstream_head_m defines free-surface elevation.
+  ! At tx = pressure_datum_z_m, applied pressure is rho*g*upstream_head_m = 284490.000 Pa.
+  Normal Force = Variable Coordinate 3
+    Real MATC "-1000.0 * 9.81 * (33.0 - tx) * (tx < 33.0) * 1.0"
+End
+
+Boundary Condition 3
+  Name = "DownstreamTailwater"
+  Target Boundaries(1) = 3
+  ! Hydrostatic datum-aware expression: pressure_datum_z_m + downstream_head_m defines free-surface elevation.
+  Normal Force = Variable Coordinate 3
+    Real MATC "-1000.0 * 9.81 * (6.0 - tx) * (tx < 6.0) * 1.0"
+End
+
+Boundary Condition 4
+  Name = "CrestOverflowSurcharge"
+  Target Boundaries(1) = 4
+  Normal Force = Real -20000.0
+End
+
+
+
+Solver 2
+  Equation = "ResultOutput"
+  Procedure = "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = "dam_results"
+  Vtu Format = Logical True
+End

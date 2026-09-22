@@ -65,11 +65,12 @@ Material 1
 End
 
 Boundary Condition 1
-    Name = "BedrockBase"
+    Name = "BedrockBaseSpring"
     Target Boundaries(1) = 1
-    Displacement 1 = 0.0
-    Displacement 2 = 0.0
-    Displacement 3 = 0.0
+    ! Undisturbed competent granite elastic half-space; stiffness in N/m^3.
+    Spring 1 = Real 11493877551
+    Spring 2 = Real 11493877551
+    Spring 3 = Real 13409523809.5
 End
 
 Boundary Condition 2

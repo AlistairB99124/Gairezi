@@ -13,6 +13,16 @@ def _bool_scale(flag: bool) -> float:
     return 1.0 if flag else 0.0
 
 
+def _elastic_half_space_springs(support: dict) -> tuple[float, float, float]:
+    youngs_modulus_pa = float(support["rock_mass_youngs_modulus_pa"])
+    poisson_ratio = float(support["poisson_ratio"])
+    influence_width_m = float(support["influence_width_m"])
+    shear_modulus_pa = youngs_modulus_pa / (2.0 * (1.0 + poisson_ratio))
+    horizontal_stiffness = 8.0 * shear_modulus_pa / ((2.0 - poisson_ratio) * influence_width_m)
+    vertical_stiffness = 4.0 * shear_modulus_pa / ((1.0 - poisson_ratio) * influence_width_m)
+    return horizontal_stiffness, horizontal_stiffness, vertical_stiffness
+
+
 def _load_config() -> dict:
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Missing calibration config: {CONFIG_PATH}")
@@ -21,7 +31,8 @@ def _load_config() -> dict:
 
 def _support_block(config: dict) -> str:
     support_type = config["support_type"].strip().lower()
-    base_spring = config["support"]["base_spring"]
+    support = config["support"]
+    base_spring = _elastic_half_space_springs(support)
     abutment_spring = config["support"]["abutment_spring"]
 
     if support_type == "fixed":
@@ -37,6 +48,8 @@ End
         bc1 = f"""Boundary Condition 1
   Name = \"BedrockBaseSpring\"
   Target Boundaries(1) = 1
+  ! Undisturbed competent granite rock mass represented as an elastic half-space.
+  ! Spring units are N/m^3 (traction per displacement), not Young's modulus.
   Spring 1 = Real {base_spring[0]}
   Spring 2 = Real {base_spring[1]}
   Spring 3 = Real {base_spring[2]}
