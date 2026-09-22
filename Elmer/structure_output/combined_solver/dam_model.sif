@@ -79,3 +79,16 @@ Boundary Condition 2
     Normal Force = Variable Coordinate 3
         Real MATC "-9810 * (0.0 - tx) * (tx < 0.0)"
 End
+
+Boundary Condition 3
+    Name = "DownstreamTailwater"
+    Target Boundaries(1) = 3
+    Normal Force = Variable Coordinate 3
+        Real MATC "-9810 * (-27 - tx) * (tx < -27)"
+End
+
+Boundary Condition 4
+    Name = "CrestOverflowSurcharge"
+    Target Boundaries(1) = 4
+    Normal Force = Real -19620
+End

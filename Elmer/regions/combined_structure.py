@@ -10,8 +10,10 @@ import struct
 
 from regions.plinth import build_conforming_plinth, build_plinth, load_contours
 from regions.uniform_wall import (
+    DOWNSTREAM_BATTER_BASE_Z_M,
     DOWNSTREAM_BATTER_HEIGHT_M,
     DOWNSTREAM_BATTER_RUN_M,
+    DOWNSTREAM_BATTER_TOP_Z_M,
     DOWNSTREAM_WALL_RADIUS_M,
     UPSTREAM_RADIUS_M,
     build_uniform_wall,
@@ -319,8 +321,10 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "regions": mesh.region_cell_counts,
         "wall_geometry": {
             "downstream_crest_radius_m": DOWNSTREAM_WALL_RADIUS_M,
-            "deepest_downstream_base_radius_m": downstream_radius(-DOWNSTREAM_BATTER_HEIGHT_M),
+            "downstream_base_radius_m": downstream_radius(DOWNSTREAM_BATTER_BASE_Z_M),
             "upstream_radius_m": UPSTREAM_RADIUS_M,
+            "downstream_batter_top_z_m": DOWNSTREAM_BATTER_TOP_Z_M,
+            "downstream_batter_base_z_m": DOWNSTREAM_BATTER_BASE_Z_M,
             "downstream_batter_height_m": DOWNSTREAM_BATTER_HEIGHT_M,
             "downstream_batter_run_m": DOWNSTREAM_BATTER_RUN_M,
         },

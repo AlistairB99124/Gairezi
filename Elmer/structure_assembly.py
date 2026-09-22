@@ -120,9 +120,17 @@ def build_combined_region() -> dict[str, object]:
 def write_combined_solver_input(mesh, path: Path) -> None:
     gravity_bodyforce = mesh.material.density_kg_m3 * mesh.loads.gravity_z_m_s2
     pressure_gradient = mesh.loads.peak_water_pressure_pa / mesh.loads.maximum_water_height_m
-    support = json.loads((Path(__file__).resolve().parent / "load_cases.json").read_text())["loads"]["bedrock_support"]
+    loads = json.loads((Path(__file__).resolve().parent / "load_cases.json").read_text())["loads"]
+    support = loads["bedrock_support"]
     horizontal_stiffness = float(support["horizontal_stiffness_n_per_m3"])
     vertical_stiffness = float(support["vertical_stiffness_n_per_m3"])
+    water_density = float(loads["water_density"])
+    tailwater_head = float(loads["tailwater_head"])
+    overflow_head = float(loads["overflow_head"])
+    foundation_elevation = min(z_m for _, _, z_m in mesh.nodes)
+    tailwater_elevation = foundation_elevation + tailwater_head
+    water_pressure_gradient = water_density * abs(mesh.loads.gravity_z_m_s2)
+    overflow_surcharge = water_pressure_gradient * overflow_head
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f'''Header
     CHECK KEYWORDS Warn
@@ -204,6 +212,19 @@ Boundary Condition 2
     Target Boundaries(1) = 2
     Normal Force = Variable Coordinate 3
         Real MATC "-{pressure_gradient:.12g} * (0.0 - tx) * (tx < 0.0)"
+End
+
+Boundary Condition 3
+    Name = "DownstreamTailwater"
+    Target Boundaries(1) = 3
+    Normal Force = Variable Coordinate 3
+        Real MATC "-{water_pressure_gradient:.12g} * ({tailwater_elevation:.12g} - tx) * (tx < {tailwater_elevation:.12g})"
+End
+
+Boundary Condition 4
+    Name = "CrestOverflowSurcharge"
+    Target Boundaries(1) = 4
+    Normal Force = Real -{overflow_surcharge:.12g}
 End
 ''')
 

@@ -16,6 +16,7 @@
   "loads": {
     "gravity": -9.81,
     "water_height": 29.0,
+    "tailwater_head": 2.0,
     "overflow_head": 2.0,
     "overflow_water_level": 31.0,
     "water_density": 1000.0,

@@ -3,35 +3,35 @@
   "element_count": 150370,
   "max_tensile_principal_stress_pa": {
     "element_id": 84922,
-    "value_pa": 2852381.8314180626,
+    "value_pa": 2981786.997181105,
     "centroid_xyz_m": [
-      76.10080068451373,
-      23.84979036861039,
-      -28.174090312907108
+      76.10637839533392,
+      23.851537084970577,
+      -28.174087034803154
     ]
   },
   "max_compressive_principal_stress_pa": {
-    "element_id": 20446,
-    "value_pa": -2450597.604435282,
+    "element_id": 65591,
+    "value_pa": -5359970.459421635,
     "centroid_xyz_m": [
-      70.19364664796187,
-      23.490184142706795,
-      -28.673807637592656
+      66.75344974901722,
+      36.67771896364978,
+      -23.625815617592583
     ]
   },
   "independent_affine_check": {
     "max_tensile_principal_stress_pa": {
       "element_id": 84922,
-      "value_pa": 2852381.8314180626
+      "value_pa": 2981786.997181105
     },
     "max_compressive_principal_stress_pa": {
-      "element_id": 20446,
-      "value_pa": -2450597.604435282
+      "element_id": 65591,
+      "value_pa": -5359970.459421635
     }
   },
   "note": "Positive principal stress indicates tension. Negative principal stress indicates compression.",
   "tensile_strength_pa": 2000000.0,
-  "tension_utilization": 1.4261909157090313,
+  "tension_utilization": 1.4908934985905524,
   "client_expected_tension_mpa": 1.2,
   "client_expected_compression_mpa": -3.33,
   "detailing_assessment": {
