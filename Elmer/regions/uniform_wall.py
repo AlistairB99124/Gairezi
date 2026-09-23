@@ -7,7 +7,7 @@ import json
 import math
 from pathlib import Path
 
-from regions.plinth import _monotone_values, _prism_orientation, load_contours, load_global_element_size
+from regions.plinth import _monotone_values, load_contours, load_global_element_size
 
 
 DOWNSTREAM_WALL_RADIUS_M = 76.0
@@ -81,6 +81,10 @@ def wall_levels(base_z_m: float, element_size_m: float) -> list[float]:
     return list(dict.fromkeys(levels))
 
 
+def snapped_wall_base(base_z_m: float, element_size_m: float) -> float:
+    return math.ceil((base_z_m - 1.0e-9) / element_size_m) * element_size_m
+
+
 def downstream_radius(z_m: float) -> float:
     batter_fraction = min(max((DOWNSTREAM_BATTER_TOP_Z_M - z_m) / DOWNSTREAM_BATTER_HEIGHT_M, 0.0), 1.0)
     return DOWNSTREAM_WALL_RADIUS_M - DOWNSTREAM_BATTER_RUN_M * batter_fraction
@@ -97,7 +101,10 @@ def build_uniform_wall(
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
     chainages_m = target_chainages(start_chainage_m, end_chainage_m, anchor_chainages_m, element_size_m)
-    base_levels_m = [_monotone_values(contours, "plinth_z_m", value) for value in chainages_m]
+    base_levels_m = [
+        snapped_wall_base(_monotone_values(contours, "plinth_z_m", value), element_size_m)
+        for value in chainages_m
+    ]
     maximum_wall_width_m = UPSTREAM_RADIUS_M - downstream_radius(DOWNSTREAM_BATTER_BASE_Z_M)
     radial_divisions = math.ceil(maximum_wall_width_m / element_size_m)
     section_levels_m = [wall_levels(base_z_m, element_size_m) for base_z_m in base_levels_m]
@@ -122,34 +129,51 @@ def build_uniform_wall(
     cells: list[tuple[int, tuple[int, ...]]] = []
     for station_index in range(len(chainages_m) - 1):
         levels = (section_levels_m[station_index], section_levels_m[station_index + 1])
-        for face in section_faces(*levels):
+        first_course_z_m = max(levels[0][0], levels[1][0])
+        course_levels_m = [
+            z_m for z_m in levels[0]
+            if first_course_z_m - 1.0e-9 <= z_m <= CREST_Z_M
+        ]
+        if not course_levels_m or abs(course_levels_m[0] - first_course_z_m) > 1.0e-9:
+            raise ValueError("Wall base staircase must begin on a global Z course")
+        for lower_z_m, upper_z_m in zip(course_levels_m, course_levels_m[1:]):
             for radial_index in range(radial_divisions):
-                inner = tuple(
+                lower_inner = tuple(
                     node_id(
                         station_index + side,
-                        wall_radius(levels[side][level_index], radial_index),
-                        levels[side][level_index],
+                        wall_radius(lower_z_m, radial_index),
+                        lower_z_m,
                     )
-                    for side, level_index in face
+                    for side in range(2)
                 )
-                outer = tuple(
+                lower_outer = tuple(
                     node_id(
                         station_index + side,
-                        wall_radius(levels[side][level_index], radial_index + 1),
-                        levels[side][level_index],
+                        wall_radius(lower_z_m, radial_index + 1),
+                        lower_z_m,
                     )
-                    for side, level_index in face
+                    for side in range(2)
                 )
-                if len(face) == 3:
-                    cell = inner + outer
-                    if _prism_orientation(nodes, cell) < 0.0:
-                        cell = (cell[0], cell[2], cell[1], cell[3], cell[5], cell[4])
-                    cells.append((6, cell))
-                else:
-                    cells.append((5, (
-                        inner[0], inner[1], outer[1], outer[0],
-                        inner[3], inner[2], outer[2], outer[3],
-                    )))
+                upper_inner = tuple(
+                    node_id(
+                        station_index + side,
+                        wall_radius(upper_z_m, radial_index),
+                        upper_z_m,
+                    )
+                    for side in range(2)
+                )
+                upper_outer = tuple(
+                    node_id(
+                        station_index + side,
+                        wall_radius(upper_z_m, radial_index + 1),
+                        upper_z_m,
+                    )
+                    for side in range(2)
+                )
+                cells.append((5, (
+                    lower_inner[0], lower_inner[1], lower_outer[1], lower_outer[0],
+                    upper_inner[0], upper_inner[1], upper_outer[1], upper_outer[0],
+                )))
 
     face_patterns = {
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
@@ -182,10 +206,7 @@ def build_uniform_wall(
             boundary_id = LEFT_END_BOUNDARY_ID
         elif max(abs(station_m - end_chainage_m) for station_m in stations_m) < tolerance:
             boundary_id = RIGHT_END_BOUNDARY_ID
-        elif all(
-            abs(z_m - _monotone_values(contours, "plinth_z_m", station_m)) < tolerance
-            for station_m, z_m in zip(stations_m, z_values_m)
-        ):
+        elif max(z_values_m) - min(z_values_m) < tolerance and max(z_values_m) < CREST_Z_M - tolerance:
             boundary_id = BASE_BOUNDARY_ID
         else:
             boundary_id = DOWNSTREAM_BOUNDARY_ID

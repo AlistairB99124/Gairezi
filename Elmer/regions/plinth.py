@@ -261,12 +261,28 @@ def build_plinth(root: Path) -> PlinthMesh:
     }
     face_counts: Counter[tuple[int, ...]] = Counter()
     oriented_faces: dict[tuple[int, ...], tuple[int, ...]] = {}
-    for element_type, cell in cells:
+    face_owners: dict[tuple[int, ...], int] = {}
+    parents = list(range(len(cells)))
+
+    def find(cell_index: int) -> int:
+        while parents[cell_index] != cell_index:
+            parents[cell_index] = parents[parents[cell_index]]
+            cell_index = parents[cell_index]
+        return cell_index
+
+    for cell_index, (element_type, cell) in enumerate(cells):
         for pattern in face_patterns[element_type]:
             face = tuple(cell[index] for index in pattern)
             key = tuple(sorted(face))
             face_counts[key] += 1
             oriented_faces[key] = face
+            if key in face_owners:
+                first_root = find(cell_index)
+                second_root = find(face_owners[key])
+                if first_root != second_root:
+                    parents[second_root] = first_root
+            else:
+                face_owners[key] = cell_index
 
     def node_chainage(node_id: int) -> float:
         x_m, y_m, _ = nodes[node_id - 1]
@@ -341,13 +357,14 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
         end_min = min(math.hypot(x_m, y_m) for x_m, y_m, _ in end_points)
         start_max = max(math.hypot(x_m, y_m) for x_m, y_m, _ in start_points)
         end_max = max(math.hypot(x_m, y_m) for x_m, y_m, _ in end_points)
+        tread_z_m = max(point[2] for point in start_points + end_points)
 
         def top_point(chainage_m: float, radius_m: float) -> tuple[float, float, float]:
             angle = chainage_m / centerline_radius_m
             return (
                 radius_m * math.sin(angle),
                 radius_m * math.cos(angle),
-                _monotone_values(contours, "plinth_z_m", chainage_m),
+                tread_z_m,
             )
 
         strips = []
@@ -640,9 +657,36 @@ def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
         for node_id in face
     }
     unexpected_off_grid_nodes = off_grid_nodes - contour_nodes
+    non_bedrock_transition_cells = []
+    for cell_index, (element_type, cell) in enumerate(mesh.cells, start=1):
+        if element_type == 5:
+            continue
+        touches_bedrock = any(
+            abs(
+                mesh.nodes[node_id - 1][2]
+                - _monotone_values(
+                    load_contours(Path(__file__).resolve().parents[2] / "Data" / "plinth.json"),
+                    "bedrock_z_m",
+                    math.atan2(mesh.nodes[node_id - 1][0], mesh.nodes[node_id - 1][1])
+                    * json.loads((Path(__file__).resolve().parents[2] / "config.json").read_text())["wall_centerline_radius_m"],
+                )
+            ) < 1.0e-6
+            for node_id in cell
+        )
+        if not touches_bedrock:
+            non_bedrock_transition_cells.append(cell_index)
     expected_radial_cells = round((UPSTREAM_RADIUS_M - DOWNSTREAM_RADIUS_M) / mesh.element_size_m)
     if not {FOUNDATION_BOUNDARY_ID, UPSTREAM_BOUNDARY_ID, DOWNSTREAM_BOUNDARY_ID, TOP_BOUNDARY_ID} <= set(boundary_counts):
         raise ValueError(f"Missing plinth boundaries: found {sorted(boundary_counts)}")
+    if unexpected_off_grid_nodes:
+        raise ValueError(f"Plinth has {len(unexpected_off_grid_nodes)} off-grid nodes outside contour closures")
+    if non_bedrock_transition_cells:
+        raise ValueError(
+            f"Plinth has {len(non_bedrock_transition_cells)} non-hexahedral cells outside the bedrock closure"
+        )
+    component_count = len({find(cell_index) for cell_index in range(len(cells))})
+    if component_count != 1:
+        raise ValueError(f"Plinth has {component_count} face-connected components")
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
@@ -655,4 +699,5 @@ def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
         "radial_cells": expected_radial_cells,
         "exact_contour_nodes_off_grid": len(off_grid_nodes),
         "interior_nodes_off_grid": len(unexpected_off_grid_nodes),
+        "face_connected_components": component_count,
     }

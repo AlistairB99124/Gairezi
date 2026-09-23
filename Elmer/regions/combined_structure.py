@@ -9,6 +9,7 @@ from pathlib import Path
 import struct
 
 from regions.plinth import build_conforming_plinth, build_plinth, load_contours
+from regions.plinth_haunch import build_plinth_haunch
 from regions.uniform_wall import (
     DOWNSTREAM_BATTER_BASE_Z_M,
     DOWNSTREAM_BATTER_HEIGHT_M,
@@ -101,14 +102,13 @@ def build_combined_structure(root: Path) -> CombinedStructure:
     fixed_node_ids: set[int] = set()
     upstream_node_ids: set[int] = set()
     boundary_faces: dict[tuple[int, ...], list[tuple[int, tuple[int, ...]]]] = {}
+    wall_base_faces: set[tuple[int, ...]] = set()
     region_cell_counts: dict[str, int] = {}
 
-    structural_regions = [
-        (region_id, region_name, builder(root))
-        for region_id, region_name, builder in STRUCTURAL_REGION_BUILDERS
-    ]
-    plinth = build_conforming_plinth(root, [mesh for _, _, mesh in structural_regions])
-    regions = [(1, "plinth", plinth), *structural_regions]
+    wall = build_wall(root)
+    plinth = build_conforming_plinth(root, [wall])
+    haunch = build_plinth_haunch(root, wall, plinth)
+    regions = [(1, "plinth", plinth), (2, "wall", wall), (3, "haunch", haunch)]
 
     for region_id, region_name, mesh in regions:
         local_to_global: dict[int, int] = {}
@@ -127,7 +127,10 @@ def build_combined_structure(root: Path) -> CombinedStructure:
         for boundary_id, face in mesh.boundaries:
             oriented_face = tuple(local_to_global[node_id] for node_id in face)
             global_face = set(oriented_face)
-            boundary_faces.setdefault(tuple(sorted(global_face)), []).append((boundary_id, oriented_face))
+            face_key = tuple(sorted(global_face))
+            boundary_faces.setdefault(face_key, []).append((boundary_id, oriented_face))
+            if region_name == "wall" and boundary_id == 1:
+                wall_base_faces.add(face_key)
             if region_name == "plinth" and boundary_id == 1:
                 fixed_node_ids.update(global_face)
             if boundary_id == 2:
@@ -136,6 +139,14 @@ def build_combined_structure(root: Path) -> CombinedStructure:
     boundaries = [entries[0] for entries in boundary_faces.values() if len(entries) == 1]
     if any(len(entries) > 2 for entries in boundary_faces.values()):
         raise ValueError("More than two regions share a boundary face")
+    unbonded_wall_base_faces = [
+        face_key for face_key in wall_base_faces
+        if len(boundary_faces[face_key]) != 2
+    ]
+    if unbonded_wall_base_faces:
+        raise ValueError(
+            f"Wall has {len(unbonded_wall_base_faces)} base faces without a plinth bond"
+        )
 
     fixed_base = [int(node_id in fixed_node_ids) for node_id in range(len(nodes))]
     hydrostatic_pressure_pa = [0.0] * len(nodes)
@@ -178,7 +189,8 @@ def write_combined_gmsh(mesh: CombinedStructure, path: Path) -> None:
         element_id = 1
         for element_type, cell in mesh.cells:
             node_ids = " ".join(str(node_id + 1) for node_id in cell)
-            stream.write(f"{element_id} {element_type} 2 1 1 {node_ids}\n")
+            region_id = mesh.region_ids[element_id - 1]
+            stream.write(f"{element_id} {element_type} 2 {region_id} {region_id} {node_ids}\n")
             element_id += 1
         for boundary_id, face in mesh.boundaries:
             element_type = 2 if len(face) == 3 else 3
@@ -276,6 +288,18 @@ def write_combined_vtu(mesh: CombinedStructure, path: Path) -> None:
 
 def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     element_counts = Counter(element_type for element_type, _ in mesh.cells)
+    if any(
+        element_type != 5
+        for (element_type, _), region_id in zip(mesh.cells, mesh.region_ids)
+        if region_id == 2
+    ):
+        raise ValueError("Wall contains non-hexahedral cells")
+    if any(
+        element_type not in (5, 6)
+        for (element_type, _), region_id in zip(mesh.cells, mesh.region_ids)
+        if region_id == 3
+    ):
+        raise ValueError("Haunch contains unsupported cells")
     expected_cells = sum(mesh.region_cell_counts.values())
     if len(mesh.cells) != expected_cells or len(mesh.region_ids) != expected_cells:
         raise ValueError("Combined cell arrays do not preserve all regional cells")
@@ -296,12 +320,30 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         return cell_index
 
     face_owners: dict[tuple[int, ...], int] = {}
+    region_interfaces: Counter[tuple[int, int]] = Counter()
+    plinth_boundary_nodes: set[int] = set()
+    haunch_cells_bonded_to_plinth: set[int] = set()
+    for boundary_id, face in mesh.boundaries:
+        if boundary_id == 1:
+            plinth_boundary_nodes.update(face)
     for cell_index, (element_type, cell) in enumerate(mesh.cells):
+        if mesh.region_ids[cell_index] == 1 and element_type != 5 and not set(cell) & plinth_boundary_nodes:
+            raise ValueError("Plinth has a non-hexahedral cell outside the bedrock closure")
         for pattern in face_patterns[element_type]:
             face = tuple(sorted(cell[index] for index in pattern))
             if face in face_owners:
+                owner_index = face_owners[face]
+                first_region = mesh.region_ids[owner_index]
+                second_region = mesh.region_ids[cell_index]
+                if first_region != second_region:
+                    region_interfaces[tuple(sorted((first_region, second_region)))] += 1
+                    if {first_region, second_region} == {1, 3}:
+                        if first_region == 3:
+                            haunch_cells_bonded_to_plinth.add(owner_index)
+                        if second_region == 3:
+                            haunch_cells_bonded_to_plinth.add(cell_index)
                 first_root = find(cell_index)
-                second_root = find(face_owners[face])
+                second_root = find(owner_index)
                 if first_root != second_root:
                     parents[second_root] = first_root
             else:
@@ -309,6 +351,11 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     component_count = len({find(cell_index) for cell_index in range(len(mesh.cells))})
     if component_count != 1:
         raise ValueError(f"Combined structure has {component_count} face-connected components")
+    if region_interfaces[(1, 2)] == 0:
+        raise ValueError("Wall and plinth do not share bonded interface faces")
+    haunch_cell_count = mesh.region_cell_counts.get("haunch", 0)
+    if len(haunch_cells_bonded_to_plinth) != haunch_cell_count:
+        raise ValueError("Every reinforcement cap cell must share a complete face with the plinth")
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
@@ -317,6 +364,10 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "triangular_prisms": element_counts[6],
         "pyramids": element_counts[7],
         "face_connected_components": component_count,
+        "region_interface_faces": {
+            f"{first_region}-{second_region}": count
+            for (first_region, second_region), count in sorted(region_interfaces.items())
+        },
         "boundary_faces": dict(sorted(Counter(boundary_id for boundary_id, _ in mesh.boundaries).items())),
         "regions": mesh.region_cell_counts,
         "wall_geometry": {

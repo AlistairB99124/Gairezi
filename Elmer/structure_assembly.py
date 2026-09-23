@@ -152,7 +152,21 @@ Constants
 End
 
 Body 1
-    Name = "CombinedDamBody"
+    Name = "PlinthBody"
+    Equation = 1
+    Material = 1
+    Body Force = 1
+End
+
+Body 2
+    Name = "WallBody"
+    Equation = 1
+    Material = 1
+    Body Force = 1
+End
+
+Body 3
+    Name = "HaunchBody"
     Equation = 1
     Material = 1
     Body Force = 1
@@ -201,10 +215,9 @@ End
 Boundary Condition 1
     Name = "BedrockBaseSpring"
     Target Boundaries(1) = 1
-    ! Undisturbed competent granite elastic half-space; stiffness in N/m^3.
-    Spring 1 = Real {horizontal_stiffness:.12g}
-    Spring 2 = Real {horizontal_stiffness:.12g}
-    Spring 3 = Real {vertical_stiffness:.12g}
+    Displacement 1 = 0.0
+    Displacement 2 = 0.0
+    Displacement 3 = 0.0
 End
 
 Boundary Condition 2
