@@ -122,8 +122,9 @@ def write_combined_solver_input(mesh, path: Path) -> None:
     pressure_gradient = mesh.loads.peak_water_pressure_pa / mesh.loads.maximum_water_height_m
     loads = json.loads((Path(__file__).resolve().parent / "load_cases.json").read_text())["loads"]
     support = loads["bedrock_support"]
-    horizontal_stiffness = float(support["horizontal_stiffness_n_per_m3"])
-    vertical_stiffness = float(support["vertical_stiffness_n_per_m3"])
+    spring_x = float(support["spring_x_n_per_m3"])
+    spring_y = float(support["spring_y_n_per_m3"])
+    spring_z = float(support["spring_z_n_per_m3"])
     water_density = float(loads["water_density"])
     tailwater_head = float(loads["tailwater_head"])
     overflow_head = float(loads["overflow_head"])
@@ -215,9 +216,9 @@ End
 Boundary Condition 1
     Name = "BedrockBaseSpring"
     Target Boundaries(1) = 1
-    Displacement 1 = 0.0
-    Displacement 2 = 0.0
-    Displacement 3 = 0.0
+    Spring 1 = Real {spring_x:.12g}
+    Spring 2 = Real {spring_y:.12g}
+    Spring 3 = Real {spring_z:.12g}
 End
 
 Boundary Condition 2

@@ -14,8 +14,10 @@ END_CHAINAGE_M = 116.0
 DOWNSTREAM_WALL_RADIUS_M = 76.0
 UPSTREAM_RADIUS_M = 80.0
 BASE_Z_M = -28.5
+SPLIT_Z_M = -24.0
 CREST_Z_M = 0.0
-BODY_ID = 1
+CENTER_BOTTOM_WALL_BODY_ID = 1
+CENTER_TOP_WALL_BODY_ID = 2
 BASE_BOUNDARY_ID = 1
 UPSTREAM_BOUNDARY_ID = 2
 DOWNSTREAM_BOUNDARY_ID = 3
@@ -28,6 +30,7 @@ RIGHT_END_BOUNDARY_ID = 6
 class CenterWallMesh:
     nodes: list[tuple[float, float, float]]
     cells: list[tuple[int, tuple[int, ...]]]
+    region_ids: list[int]
     boundaries: list[tuple[int, tuple[int, ...]]]
     element_size_m: float
 
@@ -68,6 +71,7 @@ def build_center_wall(root: Path) -> CenterWallMesh:
         return node_ids[key]
 
     cells: list[tuple[int, tuple[int, ...]]] = []
+    region_ids: list[int] = []
     for chainage_index in range(len(chainages_m) - 1):
         for z_index in range(len(z_levels_m) - 1):
             for radial_index in range(len(radii_m) - 1):
@@ -82,6 +86,11 @@ def build_center_wall(root: Path) -> CenterWallMesh:
                     node_id(chainage_index, z_levels_m[z_index + 1], radii_m[radial_index + 1]),
                 )
                 cells.append((5, cell))
+                region_ids.append(
+                    CENTER_BOTTOM_WALL_BODY_ID
+                    if z_levels_m[z_index] < SPLIT_Z_M
+                    else CENTER_TOP_WALL_BODY_ID
+                )
     face_patterns = {
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
         6: ((0, 1, 2), (3, 5, 4), (0, 3, 4, 1), (1, 4, 5, 2), (2, 5, 3, 0)),
@@ -119,7 +128,7 @@ def build_center_wall(root: Path) -> CenterWallMesh:
             boundary_id = DOWNSTREAM_BOUNDARY_ID
         boundaries.append((boundary_id, face))
 
-    return CenterWallMesh(nodes, cells, boundaries, element_size_m)
+    return CenterWallMesh(nodes, cells, region_ids, boundaries, element_size_m)
 
 
 def write_gmsh(mesh: CenterWallMesh, path: Path) -> None:
@@ -132,8 +141,8 @@ def write_gmsh(mesh: CenterWallMesh, path: Path) -> None:
         stream.write("$EndNodes\n$Elements\n")
         stream.write(f"{len(mesh.cells) + len(mesh.boundaries)}\n")
         element_id = 1
-        for element_type, cell in mesh.cells:
-            stream.write(f"{element_id} {element_type} 2 {BODY_ID} {BODY_ID} {' '.join(map(str, cell))}\n")
+        for (element_type, cell), region_id in zip(mesh.cells, mesh.region_ids):
+            stream.write(f"{element_id} {element_type} 2 {region_id} {region_id} {' '.join(map(str, cell))}\n")
             element_id += 1
         for boundary_id, face in mesh.boundaries:
             element_type = 2 if len(face) == 3 else 3
@@ -157,6 +166,7 @@ def write_vtu(mesh: CenterWallMesh, path: Path) -> None:
         struct.pack(f"<I{len(connectivity)}i", 4 * len(connectivity), *connectivity),
         struct.pack(f"<I{len(offsets)}i", 4 * len(offsets), *offsets),
         struct.pack(f"<I{len(cell_types)}B", len(cell_types), *cell_types),
+        struct.pack(f"<I{len(mesh.region_ids)}i", 4 * len(mesh.region_ids), *mesh.region_ids),
     ]
     offsets_bytes = []
     byte_offset = 0
@@ -169,7 +179,9 @@ def write_vtu(mesh: CenterWallMesh, path: Path) -> None:
         "  <UnstructuredGrid>",
         f'    <Piece NumberOfPoints="{len(mesh.nodes)}" NumberOfCells="{len(mesh.cells)}">',
         "      <PointData/>",
-        "      <CellData/>",
+        "      <CellData Scalars=\"RegionId\">",
+        f'        <DataArray type="Int32" Name="RegionId" format="appended" offset="{offsets_bytes[4]}"/>',
+        "      </CellData>",
         "      <Points>",
         f'        <DataArray type="Float64" NumberOfComponents="3" format="appended" offset="{offsets_bytes[0]}"/>',
         "      </Points>",
@@ -193,6 +205,14 @@ def audit_center_wall(mesh: CenterWallMesh) -> dict[str, object]:
     boundary_counts = Counter(boundary_id for boundary_id, _ in mesh.boundaries)
     if len(mesh.cells) != expected_cells:
         raise ValueError(f"Expected {expected_cells} center-wall cells, found {len(mesh.cells)}")
+    if len(mesh.region_ids) != len(mesh.cells):
+        raise ValueError("Center-wall regions do not match cell count")
+    split_cells = round((SPLIT_Z_M - BASE_Z_M) / mesh.element_size_m)
+    expected_bottom_cells = chainage_cells * radial_cells * split_cells
+    if mesh.region_ids.count(CENTER_BOTTOM_WALL_BODY_ID) != expected_bottom_cells:
+        raise ValueError("Unexpected center-bottom-wall cell count")
+    if mesh.region_ids.count(CENTER_TOP_WALL_BODY_ID) != expected_cells - expected_bottom_cells:
+        raise ValueError("Unexpected center-top-wall cell count")
     if set(boundary_counts) != set(range(1, 7)):
         raise ValueError(f"Missing center-wall boundaries: found {sorted(boundary_counts)}")
     if any(abs(z_m / mesh.element_size_m - round(z_m / mesh.element_size_m)) > 1.0e-9 for _, _, z_m in mesh.nodes):
@@ -208,5 +228,17 @@ def audit_center_wall(mesh: CenterWallMesh) -> dict[str, object]:
         "wall_radius_m": [DOWNSTREAM_WALL_RADIUS_M, UPSTREAM_RADIUS_M],
         "wedge_removed": True,
         "z_m": [BASE_Z_M, CREST_Z_M],
+        "regions": {
+            "center_bottom_wall": {
+                "body_id": CENTER_BOTTOM_WALL_BODY_ID,
+                "z_m": [BASE_Z_M, SPLIT_Z_M],
+                "cells": mesh.region_ids.count(CENTER_BOTTOM_WALL_BODY_ID),
+            },
+            "center_top_wall": {
+                "body_id": CENTER_TOP_WALL_BODY_ID,
+                "z_m": [SPLIT_Z_M, CREST_Z_M],
+                "cells": mesh.region_ids.count(CENTER_TOP_WALL_BODY_ID),
+            },
+        },
         "element_size_m": mesh.element_size_m,
     }

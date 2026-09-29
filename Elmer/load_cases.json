@@ -25,8 +25,9 @@
       "rock_mass_youngs_modulus_pa": 44000000000.0,
       "poisson_ratio": 0.25,
       "influence_width_m": 7.0,
-      "horizontal_stiffness_n_per_m3": 11493877551.020409,
-      "vertical_stiffness_n_per_m3": 13409523809.52381
+      "spring_x_n_per_m3": 226000000.0,
+      "spring_y_n_per_m3": 263000000.0,
+      "spring_z_n_per_m3": 376000000.0
     }
   },
   "outputs": {

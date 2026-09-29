@@ -81,9 +81,9 @@ End
 Boundary Condition 1
     Name = "BedrockBaseSpring"
     Target Boundaries(1) = 1
-    Displacement 1 = 0.0
-    Displacement 2 = 0.0
-    Displacement 3 = 0.0
+    Spring 1 = Real 226000000
+    Spring 2 = Real 263000000
+    Spring 3 = Real 376000000
 End
 
 Boundary Condition 2
