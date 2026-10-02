@@ -62,16 +62,25 @@ from regions.right_wedged_wall_transition import (
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = Path(__file__).resolve().parent / "structure_output"
 COMBINED_SOLVER_DIR = OUTPUT_DIR / "combined_solver"
+COMBINED_SOLVER_MPI_PROCESSES = 4
 
 
-def convert_with_elmergrid(mesh_path: Path, output_dir: Path) -> bool:
+def convert_with_elmergrid(
+    mesh_path: Path,
+    output_dir: Path,
+    partition_count: int | None = None,
+) -> bool:
     executable = shutil.which("ElmerGrid")
     if executable is None:
         return False
     if output_dir.exists():
         shutil.rmtree(output_dir)
+    command = [executable, "14", "2", str(mesh_path), "-autoclean"]
+    if partition_count is not None:
+        command.extend(["-metiskway", str(partition_count)])
+    command.extend(["-out", str(output_dir)])
     subprocess.run(
-        [executable, "14", "2", str(mesh_path), "-autoclean", "-out", str(output_dir)],
+        command,
         check=True,
         cwd=mesh_path.parent,
     )
@@ -202,7 +211,7 @@ End
 Solver 2
     Equation = "ResultOutput"
     Procedure = "ResultOutputSolve" "ResultOutputSolver"
-    Output File Name = "combined_results"
+    Output File Name = "combined_results_mpi"
     Vtu Format = Logical True
 End
 
@@ -247,23 +256,28 @@ def solve_combined_structure() -> dict[str, object]:
         mesh = build_combined_structure(ROOT)
         mesh_path = COMBINED_SOLVER_DIR / "combined_structure.msh"
         write_combined_gmsh(mesh, mesh_path)
-        if not convert_with_elmergrid(mesh_path, COMBINED_SOLVER_DIR / "mesh"):
+        if not convert_with_elmergrid(
+            mesh_path,
+            COMBINED_SOLVER_DIR / "mesh",
+            partition_count=COMBINED_SOLVER_MPI_PROCESSES,
+        ):
                 raise RuntimeError("ElmerGrid was not found on PATH")
         sif_path = COMBINED_SOLVER_DIR / "dam_model.sif"
         write_combined_solver_input(mesh, sif_path)
         (COMBINED_SOLVER_DIR / "results").mkdir(exist_ok=True)
-        executable = shutil.which("ElmerSolver")
-        if executable is None:
-                raise RuntimeError("ElmerSolver was not found on PATH")
+        executable = shutil.which("ElmerSolver_mpi")
+        launcher = shutil.which("mpirun")
+        if executable is None or launcher is None:
+            raise RuntimeError("ElmerSolver_mpi and mpirun are required for the combined MPI solve")
         environment = os.environ.copy()
         environment["ELMER_HOME"] = str(Path(executable).resolve().parent.parent)
         subprocess.run(
-            [executable, sif_path.name],
+            [launcher, "-np", str(COMBINED_SOLVER_MPI_PROCESSES), executable, sif_path.name],
             check=True,
             cwd=COMBINED_SOLVER_DIR,
             env=environment,
         )
-        result_path = COMBINED_SOLVER_DIR / "results" / "combined_results_t0001.vtu"
+        result_path = COMBINED_SOLVER_DIR / "results" / "combined_results_mpi_t0001.pvtu"
         if not result_path.is_file():
                 raise RuntimeError(f"Elmer did not create {result_path}")
         report = audit_combined_structure(mesh)
