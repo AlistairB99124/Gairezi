@@ -7,13 +7,13 @@ import json
 import math
 from pathlib import Path
 
-from regions.center_wall import write_gmsh, write_vtu
-from regions.left_wedged_wall import (
+from .center_wall import write_gmsh, write_vtu
+from .left_wedged_wall import (
     HAUNCH_HEIGHT_M,
     WEDGE_HEIGHT_M,
     _upper_wall_levels,
 )
-from regions.plinth import (
+from .plinth import (
     _monotone_values,
     _section_faces,
     load_contours,

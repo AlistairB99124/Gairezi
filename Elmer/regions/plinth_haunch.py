@@ -6,17 +6,18 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 
-from regions.plinth import _coordinate_key, _hex_orientation, _prism_orientation
+from .plinth import _coordinate_key, _hex_orientation, _prism_orientation
+from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS
 
 
-BODY_ID = 3
-BASE_BOUNDARY_ID = 1
-UPSTREAM_BOUNDARY_ID = 2
-DOWNSTREAM_BOUNDARY_ID = 3
-CREST_BOUNDARY_ID = 4
-LEFT_END_BOUNDARY_ID = 5
-RIGHT_END_BOUNDARY_ID = 6
-OTHER_BOUNDARY_ID = 7
+BODY_ID = REGION_GROUP_IDS["HAUNCH"]
+BASE_BOUNDARY_ID = FACE_GROUP_IDS["FOUNDATION"]
+UPSTREAM_BOUNDARY_ID = FACE_GROUP_IDS["UPSTREAM"]
+DOWNSTREAM_BOUNDARY_ID = FACE_GROUP_IDS["DOWNSTREAM"]
+CREST_BOUNDARY_ID = FACE_GROUP_IDS["CREST"]
+LEFT_END_BOUNDARY_ID = FACE_GROUP_IDS["LEFT_ABUTMENT"]
+RIGHT_END_BOUNDARY_ID = FACE_GROUP_IDS["RIGHT_ABUTMENT"]
+OTHER_BOUNDARY_ID = FACE_GROUP_IDS["OTHER_EXTERIOR"]
 
 
 @dataclass

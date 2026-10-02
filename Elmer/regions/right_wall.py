@@ -4,10 +4,10 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
-from regions.center_wall import write_gmsh, write_vtu
-from regions.plinth import _monotone_values, load_contours
-from regions.right_wedged_wall_transition import WEDGE_END_CHAINAGE_M, WEDGE_HEIGHT_M, transition_end_chainage
-from regions.uniform_wall import (
+from .center_wall import write_gmsh, write_vtu
+from .plinth import _monotone_values, load_contours
+from .right_wedged_wall_transition import WEDGE_END_CHAINAGE_M, WEDGE_HEIGHT_M, transition_end_chainage
+from .uniform_wall import (
     DOWNSTREAM_WALL_RADIUS_M,
     UPSTREAM_RADIUS_M,
     UniformWallMesh,

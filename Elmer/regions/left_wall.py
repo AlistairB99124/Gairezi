@@ -7,16 +7,16 @@ import json
 import math
 from pathlib import Path
 
-from regions.center_wall import write_gmsh, write_vtu
-from regions.left_wedged_wall import _upper_wall_levels
-from regions.left_wedged_wall_transition import (
+from .center_wall import write_gmsh, write_vtu
+from .left_wedged_wall import _upper_wall_levels
+from .left_wedged_wall_transition import (
     DOWNSTREAM_WALL_RADIUS_M,
     FULL_WEDGE_CHAINAGE_M,
     FULL_WEDGE_HEIGHT_M,
     UPSTREAM_RADIUS_M,
     _intersection_chainage,
 )
-from regions.plinth import (
+from .plinth import (
     _monotone_values,
     _prism_orientation,
     _section_faces,

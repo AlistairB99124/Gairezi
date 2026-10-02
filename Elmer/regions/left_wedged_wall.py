@@ -7,8 +7,8 @@ import json
 import math
 from pathlib import Path
 
-from regions.center_wall import write_gmsh, write_vtu
-from regions.plinth import _monotone_values, _section_faces, load_contours, load_global_element_size
+from .center_wall import write_gmsh, write_vtu
+from .plinth import _monotone_values, _section_faces, load_contours, load_global_element_size
 
 
 START_CHAINAGE_M = 62.0

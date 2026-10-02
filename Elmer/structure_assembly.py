@@ -7,51 +7,57 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
-from regions.center_wall import (
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+from structural_model import (
+    audit_combined_structure,
+    build_combined_structure,
+)
+
+from Elmer.regions.center_wall import (
     audit_center_wall,
     build_center_wall,
     write_gmsh as write_center_wall_gmsh,
     write_vtu as write_center_wall_vtu,
 )
-from regions.combined_structure import (
-    audit_combined_structure,
-    build_combined_structure,
-    write_combined_gmsh,
-    write_combined_vtu,
-)
-from regions.left_wall import (
+from Elmer.regions.combined_structure import write_combined_gmsh, write_combined_vtu
+from Elmer.regions.left_wall import (
     audit_left_wall,
     build_left_wall,
     write_gmsh as write_left_wall_gmsh,
     write_vtu as write_left_wall_vtu,
 )
-from regions.left_wedged_wall import (
+from Elmer.regions.left_wedged_wall import (
     audit_left_wedged_wall,
     build_left_wedged_wall,
     write_gmsh as write_left_wedged_wall_gmsh,
     write_vtu as write_left_wedged_wall_vtu,
 )
-from regions.left_wedged_wall_transition import (
+from Elmer.regions.left_wedged_wall_transition import (
     audit_left_wedged_wall_transition,
     build_left_wedged_wall_transition,
     write_gmsh as write_left_wedged_wall_transition_gmsh,
     write_vtu as write_left_wedged_wall_transition_vtu,
 )
-from regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
-from regions.right_wall import (
+from Elmer.regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
+from Elmer.regions.right_wall import (
     audit_right_wall,
     build_right_wall,
     write_gmsh as write_right_wall_gmsh,
     write_vtu as write_right_wall_vtu,
 )
-from regions.right_wedged_wall import (
+from Elmer.regions.right_wedged_wall import (
     audit_right_wedged_wall,
     build_right_wedged_wall,
     write_gmsh as write_right_wedged_wall_gmsh,
     write_vtu as write_right_wedged_wall_vtu,
 )
-from regions.right_wedged_wall_transition import (
+from Elmer.regions.right_wedged_wall_transition import (
     audit_right_wedged_wall_transition,
     build_right_wedged_wall_transition,
     write_gmsh as write_right_wedged_wall_transition_gmsh,
@@ -59,7 +65,6 @@ from regions.right_wedged_wall_transition import (
 )
 
 
-ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = Path(__file__).resolve().parent / "structure_output"
 COMBINED_SOLVER_DIR = OUTPUT_DIR / "combined_solver"
 COMBINED_SOLVER_MPI_PROCESSES = 4
@@ -129,14 +134,13 @@ def build_combined_region() -> dict[str, object]:
 def write_combined_solver_input(mesh, path: Path) -> None:
     gravity_bodyforce = mesh.material.density_kg_m3 * mesh.loads.gravity_z_m_s2
     pressure_gradient = mesh.loads.peak_water_pressure_pa / mesh.loads.maximum_water_height_m
-    loads = json.loads((Path(__file__).resolve().parent / "load_cases.json").read_text())["loads"]
-    support = loads["bedrock_support"]
-    spring_x = float(support["spring_x_n_per_m3"])
-    spring_y = float(support["spring_y_n_per_m3"])
-    spring_z = float(support["spring_z_n_per_m3"])
-    water_density = float(loads["water_density"])
-    tailwater_head = float(loads["tailwater_head"])
-    overflow_head = float(loads["overflow_head"])
+    support = mesh.foundation_support
+    spring_x = support.spring_x_n_per_m3
+    spring_y = support.spring_y_n_per_m3
+    spring_z = support.spring_z_n_per_m3
+    water_density = mesh.loads.water_density_kg_m3
+    tailwater_head = mesh.loads.tailwater_head_m
+    overflow_head = mesh.loads.overflow_head_m
     foundation_elevation = min(z_m for _, _, z_m in mesh.nodes)
     tailwater_elevation = foundation_elevation + tailwater_head
     water_pressure_gradient = water_density * abs(mesh.loads.gravity_z_m_s2)

@@ -2,7 +2,7 @@
     {
         "Boundary": "BedrockFoundation",
         "Value": 0,
-        "Type": "Fixed Base (No move)"
+        "Type": "Foundation reference face; supported by directional springs"
     },
     {
         "Boundary": "Gravity",
@@ -18,5 +18,35 @@
         "Boundary": "Peak Water Pressure",
         "Value": 284490,
         "Type": "Pa"
+    },
+    {
+        "Boundary": "WaterDensity",
+        "Value": 1000,
+        "Type": "kg/m3"
+    },
+    {
+        "Boundary": "TailwaterHead",
+        "Value": 2,
+        "Type": "m"
+    },
+    {
+        "Boundary": "OverflowHead",
+        "Value": 2,
+        "Type": "m"
+    },
+    {
+        "Boundary": "FoundationSpringX",
+        "Value": 226000000,
+        "Type": "N/m3"
+    },
+    {
+        "Boundary": "FoundationSpringY",
+        "Value": 263000000,
+        "Type": "N/m3"
+    },
+    {
+        "Boundary": "FoundationSpringZ",
+        "Value": 376000000,
+        "Type": "N/m3"
     }
 ]

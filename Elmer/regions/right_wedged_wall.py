@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
-from regions.left_wedged_wall import (
+from .left_wedged_wall import (
     DOWNSTREAM_WALL_RADIUS_M,
     UPSTREAM_RADIUS_M,
     LeftWedgedWallMesh,

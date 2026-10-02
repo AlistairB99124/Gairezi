@@ -380,6 +380,12 @@ def create_report_sheet(
 
 def load_tensile_strength(load_cases_path: Path) -> float:
     payload = json.loads(load_cases_path.read_text())
+    if isinstance(payload, list):
+        values = {
+            str(row["Parameter Name"]): float(row["Client Input"])
+            for row in payload
+        }
+        return values["Concrete Tensile Strength"]
     return float(payload["material"]["tensile_strength"])
 
 
@@ -572,10 +578,12 @@ def main() -> None:
         help="Path to the Gmsh mesh file used for architecture-style overlays",
     )
     parser.add_argument(
+        "--material-properties",
         "--load-cases",
+        dest="load_cases",
         type=Path,
-        default=Path(__file__).resolve().parent / "load_cases.json",
-        help="Path to load_cases.json for threshold overlays",
+        default=Path(__file__).resolve().parent.parent / "Data" / "Concrete_Material_Properties.json",
+        help="Path to shared material properties JSON (legacy --load-cases option accepted)",
     )
     parser.add_argument("--youngs-modulus", type=float, default=3.5e10)
     parser.add_argument("--poisson-ratio", type=float, default=0.2)
