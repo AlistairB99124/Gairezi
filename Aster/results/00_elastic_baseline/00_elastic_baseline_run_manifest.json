@@ -1,0 +1,7 @@
+{
+  "case": "00_elastic_baseline",
+  "returncode": 0,
+  "comm_sha256": "8df1d027abe9ab001ddebbd243a4449b0ad76dcad34a36a2e1b18c8fca8cd0e7",
+  "mesh_sha256": "aaaff42efea550c10087f1a9c2e4415c84e644c4373945d3de12622f4dd0c9d2",
+  "export": "/Users/alistairdavies/Projects/Gairezi/Aster/results/00_elastic_baseline/00_elastic_baseline.export"
+}

@@ -30,7 +30,7 @@ class DataArraySpec:
     components: int
 
 
-def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
+def _parse_vtu_piece(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
     data = path.read_bytes()
     appended_tag = b'<AppendedData encoding="raw">'
     appended_start = data.index(appended_tag)
@@ -70,6 +70,10 @@ def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, list[tuple[int, np.nd
         return values
 
     displacement = read_array(arrays["displacement"])
+    stress_components = np.column_stack([
+        read_array(arrays[name])
+        for name in ("stress_xx", "stress_yy", "stress_zz", "stress_xy", "stress_yz", "stress_xz")
+    ])
     points = read_array(arrays["unnamed_0"])
     connectivity = read_array(arrays["connectivity"])
     offsets = read_array(arrays["offsets"])
@@ -82,7 +86,31 @@ def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, list[tuple[int, np.nd
             cells.append((cell_type, connectivity[start:end]))
         start = end
 
-    return points, displacement, cells
+    return points, displacement, stress_components, cells
+
+
+def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
+    if path.suffix != ".pvtu":
+        return _parse_vtu_piece(path)
+
+    manifest = path.read_text()
+    piece_paths = [path.parent / source for source in re.findall(r'<Piece Source="([^"]+)"/>', manifest)]
+    if not piece_paths:
+        raise ValueError(f"PVTU manifest has no result pieces: {path}")
+
+    points_parts: list[np.ndarray] = []
+    displacement_parts: list[np.ndarray] = []
+    stress_parts: list[np.ndarray] = []
+    cells: list[tuple[int, np.ndarray]] = []
+    point_offset = 0
+    for piece_path in piece_paths:
+        points, displacement, stress_components, piece_cells = _parse_vtu_piece(piece_path)
+        points_parts.append(points)
+        displacement_parts.append(displacement)
+        stress_parts.append(stress_components)
+        cells.extend((cell_type, connectivity + point_offset) for cell_type, connectivity in piece_cells)
+        point_offset += len(points)
+    return np.vstack(points_parts), np.vstack(displacement_parts), np.vstack(stress_parts), cells
 
 
 def constitutive_matrix(youngs_modulus: float, poisson_ratio: float) -> np.ndarray:
@@ -380,6 +408,12 @@ def create_report_sheet(
 
 def load_tensile_strength(load_cases_path: Path) -> float:
     payload = json.loads(load_cases_path.read_text())
+    if isinstance(payload, list):
+        values = {
+            str(row["Parameter Name"]): float(row["Client Input"])
+            for row in payload
+        }
+        return values["Concrete Tensile Strength"]
     return float(payload["material"]["tensile_strength"])
 
 
@@ -424,8 +458,7 @@ def analyze(
     expected_compression_mpa: float | None,
     exclude_below_z: float | None = None,
 ) -> tuple[Path, Path, Path, Path, Path]:
-    points, displacement, volume_cells = parse_vtu(vtu_path)
-    material_matrix = constitutive_matrix(youngs_modulus, poisson_ratio)
+    points, displacement, native_stress, volume_cells = parse_vtu(vtu_path)
 
     element_rows: list[dict[str, float]] = []
     max_tension = {"element_id": -1, "value_pa": float("-inf"), "centroid_xyz_m": [0.0, 0.0, 0.0]}
@@ -435,14 +468,8 @@ def analyze(
 
     for element_id, (cell_type, node_ids) in enumerate(volume_cells, start=1):
         coords = points[node_ids]
-        element_displacements = displacement[node_ids]
-        affine_stress = affine_fit_stress(coords, element_displacements, material_matrix)
-        stress = (
-            brick_center_stress(coords, element_displacements, material_matrix)
-            if cell_type == 12
-            else affine_stress
-        )
-        affine_principal = np.linalg.eigvalsh(stress_tensor(affine_stress))
+        stress = native_stress[node_ids].mean(axis=0)
+        principal = np.linalg.eigvalsh(stress_tensor(stress))
         centroid = coords.mean(axis=0)
 
         row = {
@@ -456,34 +483,34 @@ def analyze(
             "tau_xy_pa": float(stress[3]),
             "tau_yz_pa": float(stress[4]),
             "tau_xz_pa": float(stress[5]),
-            "principal_min_pa": float(affine_principal[0]),
-            "principal_mid_pa": float(affine_principal[1]),
-            "principal_max_pa": float(affine_principal[2]),
-            "affine_principal_min_pa": float(affine_principal[0]),
-            "affine_principal_mid_pa": float(affine_principal[1]),
-            "affine_principal_max_pa": float(affine_principal[2]),
+            "principal_min_pa": float(principal[0]),
+            "principal_mid_pa": float(principal[1]),
+            "principal_max_pa": float(principal[2]),
+            "native_nodal_principal_min_pa": float(principal[0]),
+            "native_nodal_principal_mid_pa": float(principal[1]),
+            "native_nodal_principal_max_pa": float(principal[2]),
         }
         if exclude_below_z is not None and centroid[2] <= exclude_below_z:
             continue
 
         element_rows.append(row)
 
-        if affine_principal[2] > max_tension["value_pa"]:
+        if principal[2] > max_tension["value_pa"]:
             max_tension = {
                 "element_id": element_id,
-            "value_pa": float(affine_principal[2]),
+            "value_pa": float(principal[2]),
                 "centroid_xyz_m": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
             }
-        if affine_principal[0] < max_compression["value_pa"]:
+        if principal[0] < max_compression["value_pa"]:
             max_compression = {
                 "element_id": element_id,
-            "value_pa": float(affine_principal[0]),
+            "value_pa": float(principal[0]),
                 "centroid_xyz_m": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
             }
-        if affine_principal[2] > max_tension_affine["value_pa"]:
-            max_tension_affine = {"element_id": element_id, "value_pa": float(affine_principal[2])}
-        if affine_principal[0] < max_compression_affine["value_pa"]:
-            max_compression_affine = {"element_id": element_id, "value_pa": float(affine_principal[0])}
+        if principal[2] > max_tension_affine["value_pa"]:
+            max_tension_affine = {"element_id": element_id, "value_pa": float(principal[2])}
+        if principal[0] < max_compression_affine["value_pa"]:
+            max_compression_affine = {"element_id": element_id, "value_pa": float(principal[0])}
 
     if not element_rows:
         raise ValueError("The selected exclusion range removed every volume element")
@@ -500,7 +527,7 @@ def analyze(
         "element_count": len(element_rows),
         "max_tensile_principal_stress_pa": max_tension,
         "max_compressive_principal_stress_pa": max_compression,
-        "independent_affine_check": {
+        "native_nodal_stress_average": {
             "max_tensile_principal_stress_pa": max_tension_affine,
             "max_compressive_principal_stress_pa": max_compression_affine,
         },
@@ -572,10 +599,12 @@ def main() -> None:
         help="Path to the Gmsh mesh file used for architecture-style overlays",
     )
     parser.add_argument(
+        "--material-properties",
         "--load-cases",
+        dest="load_cases",
         type=Path,
-        default=Path(__file__).resolve().parent / "load_cases.json",
-        help="Path to load_cases.json for threshold overlays",
+        default=Path(__file__).resolve().parent.parent / "Data" / "Concrete_Material_Properties.json",
+        help="Path to shared material properties JSON (legacy --load-cases option accepted)",
     )
     parser.add_argument("--youngs-modulus", type=float, default=3.5e10)
     parser.add_argument("--poisson-ratio", type=float, default=0.2)

@@ -8,17 +8,18 @@ import math
 from pathlib import Path
 import struct
 
+from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS
 
 UPSTREAM_RADIUS_M = 81.0
 DOWNSTREAM_RADIUS_M = 74.0
-BODY_ID = 1
-FOUNDATION_BOUNDARY_ID = 1
-UPSTREAM_BOUNDARY_ID = 2
-DOWNSTREAM_BOUNDARY_ID = 3
-TOP_BOUNDARY_ID = 4
-LEFT_END_BOUNDARY_ID = 5
-RIGHT_END_BOUNDARY_ID = 6
-OTHER_BOUNDARY_ID = 7
+BODY_ID = REGION_GROUP_IDS["PLINTH"]
+FOUNDATION_BOUNDARY_ID = FACE_GROUP_IDS["FOUNDATION"]
+UPSTREAM_BOUNDARY_ID = FACE_GROUP_IDS["UPSTREAM"]
+DOWNSTREAM_BOUNDARY_ID = FACE_GROUP_IDS["DOWNSTREAM"]
+TOP_BOUNDARY_ID = FACE_GROUP_IDS["CREST"]
+LEFT_END_BOUNDARY_ID = FACE_GROUP_IDS["LEFT_ABUTMENT"]
+RIGHT_END_BOUNDARY_ID = FACE_GROUP_IDS["RIGHT_ABUTMENT"]
+OTHER_BOUNDARY_ID = FACE_GROUP_IDS["OTHER_EXTERIOR"]
 
 
 @dataclass(frozen=True)
@@ -331,6 +332,10 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
 
+    def stepped_bedrock_z_m(chainage_m: float) -> float:
+        bedrock_z_m = _monotone_values(contours, "bedrock_z_m", round(chainage_m, 6))
+        return math.floor((bedrock_z_m + 1.0e-9) / element_size_m) * element_size_m
+
     top_faces: dict[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...]] = {}
     segment_nodes: dict[tuple[float, float], dict[float, list[tuple[float, float, float]]]] = {}
     for mesh in interface_meshes:
@@ -393,7 +398,7 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
     })
     highest_top_z_m = max(point[2] for face in top_faces.values() for point in face)
     lowest_bedrock_z_m = min(
-        _monotone_values(contours, "bedrock_z_m", chainage_m)
+        stepped_bedrock_z_m(chainage_m)
         for chainage_m in chainages_m
     )
     highest_layer_index = math.ceil(highest_top_z_m / element_size_m)
@@ -406,10 +411,8 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}
     bedrock_by_top_node = {
-        _coordinate_key(point): _monotone_values(
-            contours,
-            "bedrock_z_m",
-            centerline_radius_m * math.atan2(point[0], point[1]),
+        _coordinate_key(point): stepped_bedrock_z_m(
+            centerline_radius_m * math.atan2(point[0], point[1])
         )
         for face in top_faces.values()
         for point in face
@@ -562,7 +565,7 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
         elif max(abs(station_m - chainages_m[-1]) for station_m in stations_m) < tolerance:
             boundary_id = RIGHT_END_BOUNDARY_ID
         elif all(
-            abs(z_m - _monotone_values(contours, "bedrock_z_m", station_m)) < tolerance
+            abs(z_m - stepped_bedrock_z_m(station_m)) < tolerance
             for station_m, (_, _, z_m) in zip(stations_m, coordinates)
         ):
             boundary_id = FOUNDATION_BOUNDARY_ID

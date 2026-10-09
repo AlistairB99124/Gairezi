@@ -1,0 +1,7 @@
+{
+  "case": "03_horizontal_crack",
+  "returncode": 0,
+  "comm_sha256": "c94d806e3e2ee27c8c05bff6c33a3f68c6c70a49a264caef92902745f0f357f2",
+  "mesh_sha256": "000a7d5158ad35f0d57b6fea62490181d10d3b5f36a7599cc7dc411ea57b8134",
+  "export": "/home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/03_horizontal_crack.export"
+}

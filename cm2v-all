@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+converted=0
+
+while IFS= read -r -d $'\0' med_file; do
+    "$workspace_root/cm2v" "$med_file"
+    ((converted += 1))
+done < <(find "$workspace_root/Aster/results" -type f -name '*.med' -print0 | sort -z)
+
+printf 'Converted %d MED files to VTU.\n' "$converted"

@@ -1,0 +1,46 @@
+{
+  "source_vtu": "structure_output/combined_solver/results/combined_results_t0001.vtu",
+  "element_count": 149068,
+  "max_tensile_principal_stress_pa": {
+    "element_id": 117071,
+    "value_pa": 1622952.4497240153,
+    "centroid_xyz_m": [
+      75.56476283874724,
+      -0.2216772891806583,
+      -25.751609260108197
+    ]
+  },
+  "max_compressive_principal_stress_pa": {
+    "element_id": 98014,
+    "value_pa": -2348656.7016837653,
+    "centroid_xyz_m": [
+      78.49258357436419,
+      14.524510195353365,
+      -9.750486816630808
+    ]
+  },
+  "independent_affine_check": {
+    "max_tensile_principal_stress_pa": {
+      "element_id": 117071,
+      "value_pa": 1622952.4497240153
+    },
+    "max_compressive_principal_stress_pa": {
+      "element_id": 98014,
+      "value_pa": -2348656.7016837653
+    }
+  },
+  "note": "Positive principal stress indicates tension. Negative principal stress indicates compression.",
+  "tensile_strength_pa": 2000000.0,
+  "tension_utilization": 0.8114762248620077,
+  "client_expected_tension_mpa": 1.2,
+  "client_expected_compression_mpa": -3.33,
+  "detailing_assessment": {
+    "critical_zone": "body",
+    "notes": [
+      "Model uses a base wall thickness of 4.00 m.",
+      "Model does not include crest thickening.",
+      "Model does not include galleries, fillets, or abutment transition stiffening.",
+      "Model uses compliant base springs, explicit abutment spring restraints, and surrogate curved-wall geometry."
+    ]
+  }
+}

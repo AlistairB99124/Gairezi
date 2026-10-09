@@ -50,18 +50,24 @@ of truth.
 | Gravity | `Data/Env_Boundaries_And_Loads.json` | -9.81 m/s2 in Z |
 | Reservoir level | same | 29 m |
 | Peak upstream pressure | same | 284.49 kPa |
-| Tailwater head | `Elmer/load_cases.json` | 2 m |
+| Water density | `Data/Env_Boundaries_And_Loads.json` | 1000 kg/m3 |
+| Tailwater head | same | 2 m |
 | Crest overflow head | same | 2 m |
 
 The current bedrock support is a distributed directional spring surrogate:
 
 $$
 k_x=226\times10^6,\quad k_y=263\times10^6,\quad k_z=376\times10^6
-\quad \mathrm{N/m^3}.
+\quad \mathrm{N/m^3}
 $$
+These values are stored in `Data/Env_Boundaries_And_Loads.json`. Preserve this
+support for baseline parity. Do not replace it with fixed support or an explicit
+rock mass during this phase.
 
-Preserve this support for baseline parity. Do not replace it with fixed support
-or an explicit rock mass during this phase.
+Import the common in-memory model through `structural_model`:
+`build_combined_structure`, `audit_combined_structure`, and
+`build_named_groups`. Solver-specific exporters and input writers must remain
+outside this shared model API.
 
 ## Target Layout
 
@@ -128,14 +134,14 @@ The exporter must assert that every required group is nonempty. It must also
 write a JSON manifest recording group node/face/cell counts, region volumes,
 exterior areas, element types, and coordinate bounds.
 
-The group mapping belongs in one Python module, close to the geometry writer.
-Do not infer a group from a normal vector after conversion and do not rely on
-Gmsh/Elmer renumbered IDs.
+The canonical mapping is `Elmer/regions/model_groups.py`, re-exported through
+`structural_model`. Do not infer a group from a normal vector after conversion
+and do not rely on Gmsh/Elmer renumbered IDs.
 
 ### 3. Write and Validate the MED Mesh
 
-Implement `Aster/build_med_mesh.py` using the current in-memory
-`CombinedStructure` output. The exporter must preserve:
+Implement `Aster/build_med_mesh.py` using
+`structural_model.build_combined_structure`. The exporter must preserve:
 
 - coordinates in metres;
 - hexahedra and triangular prisms without topology conversion;

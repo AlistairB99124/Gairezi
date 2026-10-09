@@ -1,0 +1,11 @@
+Quantity,Elmer,Code_Aster,Difference (Aster - Elmer),Difference (%),Client expected
+"Max tensile principal stress, element-based (MPa)",1.6230,1.6061,-0.0169,-1.04,1.2
+"Max compressive principal stress, element-based (MPa)",-2.3487,-2.3461,0.0025,-0.11,-3.33
+Tension utilisation vs 2.0 MPa strength (-),0.8115,0.8030,-0.0084,-1.04,
+"Max tensile principal stress, nodal output (MPa)",3.0670,3.0908,0.0238,0.78,
+"Max compressive principal stress, nodal output (MPa)",-3.8685,-2.9889,0.8796,-22.74,
+Max displacement magnitude (mm),8.9115,8.8974,-0.0141,-0.16,
+Foundation reaction Fx (MN),314.7895,314.7900,0.0005,0.00,
+Foundation reaction Fy (MN),88.5115,88.5117,0.0001,0.00,
+Foundation reaction Fz (MN),338.8509,338.8509,-0.0000,-0.00,
+"Location of max tension, element centroid (m)",75.56 -0.22 -25.75,75.56 -0.22 -25.75,,,

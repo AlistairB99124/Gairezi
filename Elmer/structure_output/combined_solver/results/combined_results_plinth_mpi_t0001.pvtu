@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<VTKFile type="PUnstructuredGrid" version="0.1" byte_order="LittleEndian">
+  <PUnstructuredGrid>
+    <PPointData/>
+    <PCellData Scalars="BodyId"><PDataArray type="Int32" Name="BodyId"/></PCellData>
+    <PPoints><PDataArray type="Float64" NumberOfComponents="3"/></PPoints>
+    <Piece Source="combined_results_plinth_mpi_t0001_4np1.vtu"/>
+    <Piece Source="combined_results_plinth_mpi_t0001_4np2.vtu"/>
+    <Piece Source="combined_results_plinth_mpi_t0001_4np3.vtu"/>
+    <Piece Source="combined_results_plinth_mpi_t0001_4np4.vtu"/>
+  </PUnstructuredGrid>
+</VTKFile>

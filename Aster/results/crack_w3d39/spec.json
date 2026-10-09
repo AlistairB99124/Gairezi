@@ -1,0 +1,12 @@
+{
+  "orientation": "horizontal",
+  "chainage_m": 108.5,
+  "upstream_radius_m": 80.0,
+  "z_m": -25.0,
+  "width_m": 3.0,
+  "depth_m": 3.9,
+  "water_head_above_crest_m": 2.0,
+  "friction_coefficient": 0.7,
+  "load_steps": 2,
+  "fast": true
+}

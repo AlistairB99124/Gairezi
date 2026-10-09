@@ -1,0 +1,7 @@
+{
+  "case": "contact",
+  "returncode": 143,
+  "comm_sha256": "3ca124cb90e956091a456d575c61c58a11a8685b95553af47c3099781d4edcec",
+  "mesh_sha256": "36d6cf9100db36e515ad8844266dcc2c452ee0baa72157fff2922894e30d6494",
+  "export": "/home/alistair/projects/Gairezi/Aster/results/crack_w3d39/contact.export"
+}

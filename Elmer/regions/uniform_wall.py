@@ -7,7 +7,8 @@ import json
 import math
 from pathlib import Path
 
-from regions.plinth import _monotone_values, load_contours, load_global_element_size
+from .plinth import _monotone_values, load_contours, load_global_element_size
+from .model_groups import FACE_GROUP_IDS
 
 
 DOWNSTREAM_WALL_RADIUS_M = 76.0
@@ -17,12 +18,17 @@ DOWNSTREAM_BATTER_HEIGHT_M = 4.0
 DOWNSTREAM_BATTER_RUN_M = 2.0
 DOWNSTREAM_BATTER_TOP_Z_M = -24.5
 DOWNSTREAM_BATTER_BASE_Z_M = -28.5
-BASE_BOUNDARY_ID = 1
-UPSTREAM_BOUNDARY_ID = 2
-DOWNSTREAM_BOUNDARY_ID = 3
-CREST_BOUNDARY_ID = 4
-LEFT_END_BOUNDARY_ID = 5
-RIGHT_END_BOUNDARY_ID = 6
+CENTER_STEP_START_CHAINAGE_M = 98.0
+CENTER_STEP_END_CHAINAGE_M = 119.0
+CENTER_PLINTH_COURSE_LENGTH_M = 1.5
+CENTER_STEP_RADIUS_M = 74.5
+CENTER_STEP_TOP_Z_M = -27.5
+BASE_BOUNDARY_ID = FACE_GROUP_IDS["FOUNDATION"]
+UPSTREAM_BOUNDARY_ID = FACE_GROUP_IDS["UPSTREAM"]
+DOWNSTREAM_BOUNDARY_ID = FACE_GROUP_IDS["DOWNSTREAM"]
+CREST_BOUNDARY_ID = FACE_GROUP_IDS["CREST"]
+LEFT_END_BOUNDARY_ID = FACE_GROUP_IDS["LEFT_ABUTMENT"]
+RIGHT_END_BOUNDARY_ID = FACE_GROUP_IDS["RIGHT_ABUTMENT"]
 
 
 @dataclass
@@ -86,8 +92,18 @@ def snapped_wall_base(base_z_m: float, element_size_m: float) -> float:
 
 
 def downstream_radius(z_m: float) -> float:
-    batter_fraction = min(max((DOWNSTREAM_BATTER_TOP_Z_M - z_m) / DOWNSTREAM_BATTER_HEIGHT_M, 0.0), 1.0)
-    return DOWNSTREAM_WALL_RADIUS_M - DOWNSTREAM_BATTER_RUN_M * batter_fraction
+    return DOWNSTREAM_WALL_RADIUS_M
+
+
+def center_step_downstream_radius(z_m: float) -> float:
+    if z_m <= CENTER_STEP_TOP_Z_M:
+        return CENTER_STEP_RADIUS_M
+    batter_fraction = min(max((DOWNSTREAM_BATTER_TOP_Z_M - z_m) / (DOWNSTREAM_BATTER_TOP_Z_M - CENTER_STEP_TOP_Z_M), 0.0), 1.0)
+    return DOWNSTREAM_WALL_RADIUS_M - (DOWNSTREAM_WALL_RADIUS_M - CENTER_STEP_RADIUS_M) * batter_fraction
+
+
+def wall_base_level(chainage_m: float, contour_base_z_m: float, element_size_m: float) -> float:
+    return snapped_wall_base(contour_base_z_m, element_size_m)
 
 
 def build_uniform_wall(
@@ -95,6 +111,7 @@ def build_uniform_wall(
     start_chainage_m: float,
     end_chainage_m: float,
     anchor_chainages_m: list[float],
+    extra_radial_fractions: tuple[float, ...] = (),
 ) -> UniformWallMesh:
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
     contours = load_contours(root / "Data" / "plinth.json")
@@ -102,11 +119,16 @@ def build_uniform_wall(
     centerline_radius_m = float(config["wall_centerline_radius_m"])
     chainages_m = target_chainages(start_chainage_m, end_chainage_m, anchor_chainages_m, element_size_m)
     base_levels_m = [
-        snapped_wall_base(_monotone_values(contours, "plinth_z_m", value), element_size_m)
+        wall_base_level(value, _monotone_values(contours, "plinth_z_m", value), element_size_m)
         for value in chainages_m
     ]
     maximum_wall_width_m = UPSTREAM_RADIUS_M - downstream_radius(DOWNSTREAM_BATTER_BASE_Z_M)
     radial_divisions = math.ceil(maximum_wall_width_m / element_size_m)
+    radial_fractions = sorted({*(index / radial_divisions for index in range(radial_divisions + 1)), *extra_radial_fractions})
+    if radial_fractions[0] != 0.0 or radial_fractions[-1] != 1.0 or any(
+        not 0.0 <= fraction <= 1.0 for fraction in radial_fractions
+    ):
+        raise ValueError("Extra radial fractions must lie within the wall thickness")
     section_levels_m = [wall_levels(base_z_m, element_size_m) for base_z_m in base_levels_m]
 
     nodes: list[tuple[float, float, float]] = []
@@ -121,8 +143,8 @@ def build_uniform_wall(
             nodes.append(coordinate)
         return coordinate_nodes[key]
 
-    def wall_radius(z_m: float, radial_index: int) -> float:
-        fraction = radial_index / radial_divisions
+    def wall_radius(station_index: int, z_m: float, fraction: float) -> float:
+        chainage_m = chainages_m[station_index]
         downstream_radius_m = downstream_radius(z_m)
         return downstream_radius_m + fraction * (UPSTREAM_RADIUS_M - downstream_radius_m)
 
@@ -137,11 +159,11 @@ def build_uniform_wall(
         if not course_levels_m or abs(course_levels_m[0] - first_course_z_m) > 1.0e-9:
             raise ValueError("Wall base staircase must begin on a global Z course")
         for lower_z_m, upper_z_m in zip(course_levels_m, course_levels_m[1:]):
-            for radial_index in range(radial_divisions):
+            for lower_fraction, upper_fraction in zip(radial_fractions, radial_fractions[1:]):
                 lower_inner = tuple(
                     node_id(
                         station_index + side,
-                        wall_radius(lower_z_m, radial_index),
+                        wall_radius(station_index + side, lower_z_m, lower_fraction),
                         lower_z_m,
                     )
                     for side in range(2)
@@ -149,7 +171,7 @@ def build_uniform_wall(
                 lower_outer = tuple(
                     node_id(
                         station_index + side,
-                        wall_radius(lower_z_m, radial_index + 1),
+                        wall_radius(station_index + side, lower_z_m, upper_fraction),
                         lower_z_m,
                     )
                     for side in range(2)
@@ -157,7 +179,7 @@ def build_uniform_wall(
                 upper_inner = tuple(
                     node_id(
                         station_index + side,
-                        wall_radius(upper_z_m, radial_index),
+                        wall_radius(station_index + side, upper_z_m, lower_fraction),
                         upper_z_m,
                     )
                     for side in range(2)
@@ -165,7 +187,7 @@ def build_uniform_wall(
                 upper_outer = tuple(
                     node_id(
                         station_index + side,
-                        wall_radius(upper_z_m, radial_index + 1),
+                        wall_radius(station_index + side, upper_z_m, upper_fraction),
                         upper_z_m,
                     )
                     for side in range(2)

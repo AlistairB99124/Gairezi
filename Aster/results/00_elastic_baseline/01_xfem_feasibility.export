@@ -1,0 +1,11 @@
+P actions make_etude
+P mode interactif
+P version stable
+P memory_limit 12000
+F comm /home/alistair/projects/Gairezi/Aster/cases/01_xfem_feasibility.comm D 1
+F mmed /home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/mesh.med D 20
+F mess /home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/01_xfem_feasibility.mess R 6
+F rmed /home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/01_xfem_feasibility_result.med R 80
+F libr /home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/01_xfem_feasibility_table.txt R 30
+F libr /home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/case_inputs.json D 31
+F libr /home/alistair/projects/Gairezi/Aster/cases/01_xfem_feasibility.json D 32

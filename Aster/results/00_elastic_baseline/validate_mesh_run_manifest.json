@@ -1,0 +1,7 @@
+{
+  "case": "validate_mesh",
+  "returncode": 0,
+  "comm_sha256": "a16a1fd486643217de0132e9d3df22794e7bff7b182a1b7f203c4a6bfdc7ecdc",
+  "mesh_sha256": "a3ee16aef631042fccec59be075e089e443c1710e87891a9c56d9bb2eac62b89",
+  "export": "/home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/validate_mesh.export"
+}

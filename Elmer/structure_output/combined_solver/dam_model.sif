@@ -31,13 +31,6 @@ Body 2
     Body Force = 1
 End
 
-Body 3
-    Name = "HaunchBody"
-    Equation = 1
-    Material = 1
-    Body Force = 1
-End
-
 Body Force 1
     Stress Bodyforce 3 = Real -23544
 End
@@ -81,9 +74,9 @@ End
 Boundary Condition 1
     Name = "BedrockBaseSpring"
     Target Boundaries(1) = 1
-    Spring 1 = Real 226000000
-    Spring 2 = Real 263000000
-    Spring 3 = Real 376000000
+    Spring 1 = Real 1000000000
+    Spring 2 = Real 1000000000
+    Spring 3 = Real 5000000000
 End
 
 Boundary Condition 2
@@ -104,4 +97,12 @@ Boundary Condition 4
     Name = "CrestOverflowSurcharge"
     Target Boundaries(1) = 4
     Normal Force = Real -19620
+End
+
+Boundary Condition 5
+    Name = "WallPlinthSpring"
+    Target Boundaries(1) = 8
+    Spring 1 = Real 1250000000
+    Spring 2 = Real 1250000000
+    Spring 3 = Real 3000000000
 End

@@ -33,12 +33,14 @@
       "command": "bash",
       "args": [
         "-lc",
-        "cd \"${workspaceFolder}/Elmer\" && python3 structure_assembly.py combined-solve"
+        "cd \"${workspaceFolder}\" && .venv/bin/python3 Elmer/structure_assembly.py combined-solve"
       ],
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
-          "ELMER_HOME": "/usr/local"
+          "ELMER_HOME": "/usr/local",
+          "PATH": "${env:HOME}/elmerfem/build/fem/src:${env:PATH}",
+          "DYLD_LIBRARY_PATH": "${env:HOME}/elmerfem/build/fem/src:${env:HOME}/elmerfem/build/fem/src/modules"
         }
       },
       "problemMatcher": [],
@@ -49,6 +51,86 @@
         "clear": true
       },
       "detail": "Builds the combined mesh, runs the Elmer stress solver, and writes the result VTU into Elmer/structure_output/combined_solver/results."
+    },
+    {
+      "label": "Elmer: Regenerate combined client results",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "cd \"${workspaceFolder}\" && .venv/bin/python3 Elmer/analyze_stress.py --vtu Elmer/structure_output/combined_solver/results/combined_results_mpi_t0001.pvtu --out-dir Elmer/structure_output/combined_solver/results --mesh Elmer/structure_output/combined_solver/combined_structure.msh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Regenerates client stress plots, CSV, JSON, and report files from the latest combined solver PVTU."
+    },
+    {
+      "label": "Code_Aster: Docker build MED mesh",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "cd \"${workspaceFolder}\" && .venv/bin/python3 Aster/build_med_mesh.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Uses jesusbill/code_aster:latest to build Aster/results/00_elastic_baseline/mesh.med."
+    },
+    {
+      "label": "Code_Aster: Docker elastic baseline",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "cd \"${workspaceFolder}\" && .venv/bin/python3 Aster/run_case.py Aster/cases/00_elastic_baseline.comm"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Runs the baseline Code_Aster solve in Docker and writes both MED and VTU results under Aster/results/00_elastic_baseline."
+    },
+    {
+      "label": "Code_Aster: Convert all MED results to VTU",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "./cm2v-all"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Converts every MED file under Aster/results to an updated sibling VTU using cm2v."
     }
   ]
 }

@@ -1,0 +1,14 @@
+{
+  "orientation": "horizontal",
+  "chainage_m": 108.5,
+  "centerline_radius_m": 78.0,
+  "upstream_radius_m": 80.0,
+  "z_m": -25.0,
+  "offset_m": 0.05,
+  "depth_m": 2.0,
+  "width_m": 0.5,
+  "overshoot_m": 0.1,
+  "fracture_toughness_pa_sqrt_m": 850000.0,
+  "fracture_energy_n_per_m": 120.0,
+  "water_head_above_crest_m": 2.0
+}

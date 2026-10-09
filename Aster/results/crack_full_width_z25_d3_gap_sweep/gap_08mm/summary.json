@@ -1,0 +1,24 @@
+{
+  "spec": {
+    "orientation": "horizontal",
+    "chainage_m": 108.5,
+    "upstream_radius_m": 80.0,
+    "z_m": -25.0,
+    "depth_m": 3.0,
+    "full_width": true,
+    "water_head_above_crest_m": 2.0,
+    "friction_coefficient": 0.7,
+    "load_steps": 4,
+    "gap_mm": 8.0
+  },
+  "response": {
+    "gap_mm": 8.0,
+    "aperture_mm_min": 7.32453441717714,
+    "aperture_mm_max": 7.99181776620922,
+    "aperture_mm_mean": 7.706271450208811,
+    "fraction_in_contact": 0.0,
+    "maximum_slip_mm": 0.1348835375930505,
+    "maximum_principal_tension_mpa": 3.5271378693492292,
+    "minimum_principal_compression_mpa": -4.950341032004421
+  }
+}

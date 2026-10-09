@@ -2,67 +2,32 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-
-from regions.center_wall import (
-    audit_center_wall,
-    build_center_wall,
-    write_gmsh as write_center_wall_gmsh,
-    write_vtu as write_center_wall_vtu,
-)
-from regions.combined_structure import (
-    audit_combined_structure,
-    build_combined_structure,
-    write_combined_gmsh,
-    write_combined_vtu,
-)
-from regions.left_wall import (
-    audit_left_wall,
-    build_left_wall,
-    write_gmsh as write_left_wall_gmsh,
-    write_vtu as write_left_wall_vtu,
-)
-from regions.left_wedged_wall import (
-    audit_left_wedged_wall,
-    build_left_wedged_wall,
-    write_gmsh as write_left_wedged_wall_gmsh,
-    write_vtu as write_left_wedged_wall_vtu,
-)
-from regions.left_wedged_wall_transition import (
-    audit_left_wedged_wall_transition,
-    build_left_wedged_wall_transition,
-    write_gmsh as write_left_wedged_wall_transition_gmsh,
-    write_vtu as write_left_wedged_wall_transition_vtu,
-)
-from regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
-from regions.right_wall import (
-    audit_right_wall,
-    build_right_wall,
-    write_gmsh as write_right_wall_gmsh,
-    write_vtu as write_right_wall_vtu,
-)
-from regions.right_wedged_wall import (
-    audit_right_wedged_wall,
-    build_right_wedged_wall,
-    write_gmsh as write_right_wedged_wall_gmsh,
-    write_vtu as write_right_wedged_wall_vtu,
-)
-from regions.right_wedged_wall_transition import (
-    audit_right_wedged_wall_transition,
-    build_right_wedged_wall_transition,
-    write_gmsh as write_right_wedged_wall_transition_gmsh,
-    write_vtu as write_right_wedged_wall_transition_vtu,
-)
+import sys
 
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+from structural_model import (
+    audit_combined_structure,
+    build_combined_structure,
+)
+
+from Elmer.regions.combined_structure import write_combined_gmsh, write_combined_vtu
+from Elmer.regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
+
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "structure_output"
 COMBINED_SOLVER_DIR = OUTPUT_DIR / "combined_solver"
 COMBINED_SOLVER_MPI_PROCESSES = 4
+LOAD_CASES_PATH = Path(__file__).resolve().parent / "load_cases.json"
 
 
 def convert_with_elmergrid(
@@ -100,19 +65,6 @@ def build_plinth_region() -> dict[str, object]:
     return report
 
 
-def build_center_wall_region() -> dict[str, object]:
-    mesh = build_center_wall(ROOT)
-    mesh_path = OUTPUT_DIR / "center_wall.msh"
-    preview_path = OUTPUT_DIR / "center_wall.vtu"
-    write_center_wall_gmsh(mesh, mesh_path)
-    write_center_wall_vtu(mesh, preview_path)
-    report = audit_center_wall(mesh)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "center_wall_mesh")
-    return report
-
-
 def build_combined_region() -> dict[str, object]:
     mesh = build_combined_structure(ROOT)
     mesh_path = OUTPUT_DIR / "combined_structure.msh"
@@ -126,17 +78,57 @@ def build_combined_region() -> dict[str, object]:
     return report
 
 
+def apply_load_case(mesh, path: Path) -> None:
+    """Override solver properties with the selected Elmer load case."""
+    payload = json.loads(path.read_text())
+    material = payload["material"]
+    loads = payload["loads"]
+    bedrock_support = loads["bedrock_support"]
+    plinth_support = loads["plinth_support"]
+    mesh.material = replace(
+        mesh.material,
+        density_kg_m3=float(material["density"]),
+        youngs_modulus_pa=float(material["youngs_modulus"]),
+        poissons_ratio=float(material["poisson_ratio"]),
+        tensile_strength_pa=float(material["tensile_strength"]),
+    )
+    mesh.loads = replace(
+        mesh.loads,
+        gravity_z_m_s2=float(loads["gravity"]),
+        maximum_water_height_m=float(loads["water_height"]),
+        peak_water_pressure_pa=float(loads["water_density"]) * abs(float(loads["gravity"])) * float(loads["water_height"]),
+        water_density_kg_m3=float(loads["water_density"]),
+        tailwater_head_m=float(loads["tailwater_head"]),
+        overflow_head_m=float(loads["overflow_head"]),
+    )
+    mesh.foundation_support = replace(
+        mesh.foundation_support,
+        spring_x_n_per_m3=float(bedrock_support["spring_x_n_per_m3"]),
+        spring_y_n_per_m3=float(bedrock_support["spring_y_n_per_m3"]),
+        spring_z_n_per_m3=float(bedrock_support["spring_z_n_per_m3"]),
+    )
+    mesh.plinth_support = replace(
+        mesh.plinth_support,
+        spring_x_n_per_m3=float(plinth_support["spring_x_n_per_m3"]),
+        spring_y_n_per_m3=float(plinth_support["spring_y_n_per_m3"]),
+        spring_z_n_per_m3=float(plinth_support["spring_z_n_per_m3"]),
+    )
+
+
 def write_combined_solver_input(mesh, path: Path) -> None:
     gravity_bodyforce = mesh.material.density_kg_m3 * mesh.loads.gravity_z_m_s2
     pressure_gradient = mesh.loads.peak_water_pressure_pa / mesh.loads.maximum_water_height_m
-    loads = json.loads((Path(__file__).resolve().parent / "load_cases.json").read_text())["loads"]
-    support = loads["bedrock_support"]
-    spring_x = float(support["spring_x_n_per_m3"])
-    spring_y = float(support["spring_y_n_per_m3"])
-    spring_z = float(support["spring_z_n_per_m3"])
-    water_density = float(loads["water_density"])
-    tailwater_head = float(loads["tailwater_head"])
-    overflow_head = float(loads["overflow_head"])
+    foundation_support = mesh.foundation_support
+    foundation_spring_x = foundation_support.spring_x_n_per_m3
+    foundation_spring_y = foundation_support.spring_y_n_per_m3
+    foundation_spring_z = foundation_support.spring_z_n_per_m3
+    plinth_support = mesh.plinth_support
+    plinth_spring_x = plinth_support.spring_x_n_per_m3
+    plinth_spring_y = plinth_support.spring_y_n_per_m3
+    plinth_spring_z = plinth_support.spring_z_n_per_m3
+    water_density = mesh.loads.water_density_kg_m3
+    tailwater_head = mesh.loads.tailwater_head_m
+    overflow_head = mesh.loads.overflow_head_m
     foundation_elevation = min(z_m for _, _, z_m in mesh.nodes)
     tailwater_elevation = foundation_elevation + tailwater_head
     water_pressure_gradient = water_density * abs(mesh.loads.gravity_z_m_s2)
@@ -170,13 +162,6 @@ End
 
 Body 2
     Name = "WallBody"
-    Equation = 1
-    Material = 1
-    Body Force = 1
-End
-
-Body 3
-    Name = "HaunchBody"
     Equation = 1
     Material = 1
     Body Force = 1
@@ -225,9 +210,9 @@ End
 Boundary Condition 1
     Name = "BedrockBaseSpring"
     Target Boundaries(1) = 1
-    Spring 1 = Real {spring_x:.12g}
-    Spring 2 = Real {spring_y:.12g}
-    Spring 3 = Real {spring_z:.12g}
+    Spring 1 = Real {foundation_spring_x:.12g}
+    Spring 2 = Real {foundation_spring_y:.12g}
+    Spring 3 = Real {foundation_spring_z:.12g}
 End
 
 Boundary Condition 2
@@ -249,122 +234,49 @@ Boundary Condition 4
     Target Boundaries(1) = 4
     Normal Force = Real -{overflow_surcharge:.12g}
 End
+
+Boundary Condition 5
+    Name = "WallPlinthSpring"
+    Target Boundaries(1) = 8
+    Spring 1 = Real {plinth_spring_x:.12g}
+    Spring 2 = Real {plinth_spring_y:.12g}
+    Spring 3 = Real {plinth_spring_z:.12g}
+End
 ''')
 
 
 def solve_combined_structure() -> dict[str, object]:
-        mesh = build_combined_structure(ROOT)
-        mesh_path = COMBINED_SOLVER_DIR / "combined_structure.msh"
-        write_combined_gmsh(mesh, mesh_path)
-        if not convert_with_elmergrid(
-            mesh_path,
-            COMBINED_SOLVER_DIR / "mesh",
-            partition_count=COMBINED_SOLVER_MPI_PROCESSES,
-        ):
-                raise RuntimeError("ElmerGrid was not found on PATH")
-        sif_path = COMBINED_SOLVER_DIR / "dam_model.sif"
-        write_combined_solver_input(mesh, sif_path)
-        (COMBINED_SOLVER_DIR / "results").mkdir(exist_ok=True)
-        executable = shutil.which("ElmerSolver_mpi")
-        launcher = shutil.which("mpirun")
-        if executable is None or launcher is None:
-            raise RuntimeError("ElmerSolver_mpi and mpirun are required for the combined MPI solve")
-        environment = os.environ.copy()
-        environment["ELMER_HOME"] = str(Path(executable).resolve().parent.parent)
-        subprocess.run(
-            [launcher, "-np", str(COMBINED_SOLVER_MPI_PROCESSES), executable, sif_path.name],
-            check=True,
-            cwd=COMBINED_SOLVER_DIR,
-            env=environment,
-        )
-        result_path = COMBINED_SOLVER_DIR / "results" / "combined_results_mpi_t0001.pvtu"
-        if not result_path.is_file():
-                raise RuntimeError(f"Elmer did not create {result_path}")
-        report = audit_combined_structure(mesh)
-        report["solver_input"] = str(sif_path)
-        report["stress_result"] = str(result_path)
-        return report
-
-
-def build_left_wall_region() -> dict[str, object]:
-    mesh = build_left_wall(ROOT)
-    mesh_path = OUTPUT_DIR / "left_wall.msh"
-    preview_path = OUTPUT_DIR / "left_wall.vtu"
-    write_left_wall_gmsh(mesh, mesh_path)
-    write_left_wall_vtu(mesh, preview_path)
-    report = audit_left_wall(mesh)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "left_wall_mesh")
-    return report
-
-
-def build_left_wedged_wall_region() -> dict[str, object]:
-    mesh = build_left_wedged_wall(ROOT)
-    mesh_path = OUTPUT_DIR / "left_wedged_wall.msh"
-    preview_path = OUTPUT_DIR / "left_wedged_wall.vtu"
-    write_left_wedged_wall_gmsh(mesh, mesh_path)
-    write_left_wedged_wall_vtu(mesh, preview_path)
-    report = audit_left_wedged_wall(mesh)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "left_wedged_wall_mesh")
-    return report
-
-
-def build_left_wedged_wall_transition_region() -> dict[str, object]:
-    mesh = build_left_wedged_wall_transition(ROOT)
-    mesh_path = OUTPUT_DIR / "left_wedged_wall_transition.msh"
-    preview_path = OUTPUT_DIR / "left_wedged_wall_transition.vtu"
-    write_left_wedged_wall_transition_gmsh(mesh, mesh_path)
-    write_left_wedged_wall_transition_vtu(mesh, preview_path)
-    report = audit_left_wedged_wall_transition(mesh)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(
-        mesh_path, OUTPUT_DIR / "left_wedged_wall_transition_mesh"
+    mesh = build_combined_structure(ROOT)
+    apply_load_case(mesh, LOAD_CASES_PATH)
+    mesh_path = COMBINED_SOLVER_DIR / "combined_structure.msh"
+    write_combined_gmsh(mesh, mesh_path)
+    if not convert_with_elmergrid(
+        mesh_path,
+        COMBINED_SOLVER_DIR / "mesh",
+        partition_count=COMBINED_SOLVER_MPI_PROCESSES,
+    ):
+        raise RuntimeError("ElmerGrid was not found on PATH")
+    sif_path = COMBINED_SOLVER_DIR / "dam_model.sif"
+    write_combined_solver_input(mesh, sif_path)
+    (COMBINED_SOLVER_DIR / "results").mkdir(exist_ok=True)
+    executable = shutil.which("ElmerSolver_mpi")
+    launcher = shutil.which("mpirun")
+    if executable is None or launcher is None:
+        raise RuntimeError("ElmerSolver_mpi and mpirun are required for the combined MPI solve")
+    environment = os.environ.copy()
+    environment.setdefault("ELMER_HOME", "/usr/local")
+    subprocess.run(
+        [launcher, "-np", str(COMBINED_SOLVER_MPI_PROCESSES), executable, sif_path.name],
+        check=True,
+        cwd=COMBINED_SOLVER_DIR,
+        env=environment,
     )
-    return report
-
-
-def build_right_wedged_wall_region() -> dict[str, object]:
-    mesh = build_right_wedged_wall(ROOT)
-    mesh_path = OUTPUT_DIR / "right_wedged_wall.msh"
-    preview_path = OUTPUT_DIR / "right_wedged_wall.vtu"
-    write_right_wedged_wall_gmsh(mesh, mesh_path)
-    write_right_wedged_wall_vtu(mesh, preview_path)
-    report = audit_right_wedged_wall(mesh)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "right_wedged_wall_mesh")
-    return report
-
-
-def build_right_wedged_wall_transition_region() -> dict[str, object]:
-    mesh = build_right_wedged_wall_transition(ROOT)
-    mesh_path = OUTPUT_DIR / "right_wedged_wall_transition.msh"
-    preview_path = OUTPUT_DIR / "right_wedged_wall_transition.vtu"
-    write_right_wedged_wall_transition_gmsh(mesh, mesh_path)
-    write_right_wedged_wall_transition_vtu(mesh, preview_path)
-    report = audit_right_wedged_wall_transition(mesh)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(
-        mesh_path, OUTPUT_DIR / "right_wedged_wall_transition_mesh"
-    )
-    return report
-
-
-def build_right_wall_region() -> dict[str, object]:
-    mesh = build_right_wall(ROOT)
-    mesh_path = OUTPUT_DIR / "right_wall.msh"
-    preview_path = OUTPUT_DIR / "right_wall.vtu"
-    write_right_wall_gmsh(mesh, mesh_path)
-    write_right_wall_vtu(mesh, preview_path)
-    report = audit_right_wall(mesh)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "right_wall_mesh")
+    result_path = COMBINED_SOLVER_DIR / "results" / "combined_results_mpi_t0001.pvtu"
+    if not result_path.is_file():
+        raise RuntimeError(f"Elmer did not create {result_path}")
+    report = audit_combined_structure(mesh)
+    report["solver_input"] = str(sif_path)
+    report["stress_result"] = str(result_path)
     return report
 
 
@@ -374,32 +286,15 @@ def main() -> None:
         "region",
         nargs="?",
         default="plinth",
-        choices=(
-            "plinth", "center_wall", "combined", "combined-solve", "left_wall", "left_wedged_wall", "left_wedged_wall_transition",
-            "right_wedged_wall", "right_wedged_wall_transition", "right_wall",
-        ),
+        choices=("plinth", "combined", "combined-solve"),
     )
     args = parser.parse_args()
     if args.region == "plinth":
         print(json.dumps(build_plinth_region(), indent=2))
-    elif args.region == "center_wall":
-        print(json.dumps(build_center_wall_region(), indent=2))
     elif args.region == "combined":
         print(json.dumps(build_combined_region(), indent=2))
     elif args.region == "combined-solve":
         print(json.dumps(solve_combined_structure(), indent=2))
-    elif args.region == "left_wall":
-        print(json.dumps(build_left_wall_region(), indent=2))
-    elif args.region == "left_wedged_wall":
-        print(json.dumps(build_left_wedged_wall_region(), indent=2))
-    elif args.region == "left_wedged_wall_transition":
-        print(json.dumps(build_left_wedged_wall_transition_region(), indent=2))
-    elif args.region == "right_wedged_wall":
-        print(json.dumps(build_right_wedged_wall_region(), indent=2))
-    elif args.region == "right_wedged_wall_transition":
-        print(json.dumps(build_right_wedged_wall_transition_region(), indent=2))
-    elif args.region == "right_wall":
-        print(json.dumps(build_right_wall_region(), indent=2))
 
 
 if __name__ == "__main__":

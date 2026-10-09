@@ -1,0 +1,25 @@
+<VTKFile type="PUnstructuredGrid" version="0.1" byte_order="LittleEndian">
+  <PUnstructuredGrid>
+    <PPointData Scalars="stress_xx" Vectors="displacement">
+      <PDataArray type="Float64" Name="stress_xx" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="stress_yy" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="stress_zz" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="stress_xy" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="stress_yz" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="stress_xz" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="vonmises" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="tresca" NumberOfComponents="1" format="appended"/>
+      <PDataArray type="Float64" Name="displacement" NumberOfComponents="3" format="appended"/>
+      <PDataArray type="Float64" Name="principal stress" NumberOfComponents="3" format="appended"/>
+    </PPointData>
+    <PCellData>
+    </PCellData>
+    <PPoints>
+      <DataArray type="Float64" NumberOfComponents="3" format="appended"/>
+    </PPoints>
+    <Piece Source="combined_results_mpi_4np1_t0001.vtu"/>
+    <Piece Source="combined_results_mpi_4np2_t0001.vtu"/>
+    <Piece Source="combined_results_mpi_4np3_t0001.vtu"/>
+    <Piece Source="combined_results_mpi_4np4_t0001.vtu"/>
+  </PUnstructuredGrid>
+</VTKFile>

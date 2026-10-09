@@ -4,6 +4,23 @@ This repository is the clean v2 working copy for the Gairedzi dam study.
 
 The purpose of this repo is to separate the newer plinth-based geometry work from the earlier baseline model and keep the design assumptions explicit.
 
+## Python environment setup
+
+Create the repository virtual environment and install the Python dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r client_requirements.txt
+```
+
+Activate the environment in each new shell before running the Python workflows:
+
+```bash
+source .venv/bin/activate
+```
+
 ## Background: v1 baseline
 
 The original v1 model was a straightforward curved dam wall built directly from the general base contour data in Data/Dam_Base_Contours.json.

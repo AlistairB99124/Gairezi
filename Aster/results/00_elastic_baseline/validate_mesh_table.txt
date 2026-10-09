@@ -1,0 +1,19 @@
+{
+  "volume_m3": {
+    "PLINTH": 2817.3123324118346,
+    "WALL": 10519.118029573523,
+    "HAUNCH": 70.41893880275852
+  },
+  "cell_counts": {
+    "PLINTH": 23518,
+    "WALL": 125136,
+    "HAUNCH": 414,
+    "FOUNDATION": 4590,
+    "UPSTREAM": 12327,
+    "DOWNSTREAM": 12533,
+    "CREST": 3960,
+    "LEFT_ABUTMENT": 14,
+    "RIGHT_ABUTMENT": 14,
+    "OTHER_EXTERIOR": 2976
+  }
+}

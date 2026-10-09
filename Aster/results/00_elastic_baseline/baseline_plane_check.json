@@ -1,0 +1,112 @@
+{
+  "chainage_m": 108.5,
+  "z_m": -25.0,
+  "water_pressure_kPa": 264.87,
+  "friction_coefficient_assumed": 0.7,
+  "profile_from_upstream_face": [
+    {
+      "radius_m": 80.0,
+      "depth_below_upstream_face_m": -0.0,
+      "sigma_zz_MPa": -0.936,
+      "shear_MPa": 0.055,
+      "net_normal_with_water_MPa": -0.671,
+      "friction_demand_ratio": 0.083
+    },
+    {
+      "radius_m": 79.646,
+      "depth_below_upstream_face_m": 0.354,
+      "sigma_zz_MPa": -0.828,
+      "shear_MPa": 0.113,
+      "net_normal_with_water_MPa": -0.564,
+      "friction_demand_ratio": 0.195
+    },
+    {
+      "radius_m": 79.292,
+      "depth_below_upstream_face_m": 0.708,
+      "sigma_zz_MPa": -0.725,
+      "shear_MPa": 0.212,
+      "net_normal_with_water_MPa": -0.46,
+      "friction_demand_ratio": 0.418
+    },
+    {
+      "radius_m": 78.938,
+      "depth_below_upstream_face_m": 1.062,
+      "sigma_zz_MPa": -0.624,
+      "shear_MPa": 0.294,
+      "net_normal_with_water_MPa": -0.359,
+      "friction_demand_ratio": 0.673
+    },
+    {
+      "radius_m": 78.583,
+      "depth_below_upstream_face_m": 1.417,
+      "sigma_zz_MPa": -0.528,
+      "shear_MPa": 0.358,
+      "net_normal_with_water_MPa": -0.263,
+      "friction_demand_ratio": 0.967
+    },
+    {
+      "radius_m": 78.229,
+      "depth_below_upstream_face_m": 1.771,
+      "sigma_zz_MPa": -0.439,
+      "shear_MPa": 0.403,
+      "net_normal_with_water_MPa": -0.174,
+      "friction_demand_ratio": 1.312
+    },
+    {
+      "radius_m": 77.875,
+      "depth_below_upstream_face_m": 2.125,
+      "sigma_zz_MPa": -0.357,
+      "shear_MPa": 0.429,
+      "net_normal_with_water_MPa": -0.092,
+      "friction_demand_ratio": 1.719
+    },
+    {
+      "radius_m": 77.521,
+      "depth_below_upstream_face_m": 2.479,
+      "sigma_zz_MPa": -0.284,
+      "shear_MPa": 0.436,
+      "net_normal_with_water_MPa": -0.02,
+      "friction_demand_ratio": 2.191
+    },
+    {
+      "radius_m": 77.167,
+      "depth_below_upstream_face_m": 2.833,
+      "sigma_zz_MPa": -0.225,
+      "shear_MPa": 0.424,
+      "net_normal_with_water_MPa": 0.04,
+      "friction_demand_ratio": 2.686
+    },
+    {
+      "radius_m": 76.813,
+      "depth_below_upstream_face_m": 3.187,
+      "sigma_zz_MPa": -0.186,
+      "shear_MPa": 0.39,
+      "net_normal_with_water_MPa": 0.079,
+      "friction_demand_ratio": 3.005
+    },
+    {
+      "radius_m": 76.458,
+      "depth_below_upstream_face_m": 3.542,
+      "sigma_zz_MPa": -0.177,
+      "shear_MPa": 0.338,
+      "net_normal_with_water_MPa": 0.088,
+      "friction_demand_ratio": 2.729
+    },
+    {
+      "radius_m": 76.104,
+      "depth_below_upstream_face_m": 3.896,
+      "sigma_zz_MPa": -0.213,
+      "shear_MPa": 0.28,
+      "net_normal_with_water_MPa": 0.052,
+      "friction_demand_ratio": 1.883
+    },
+    {
+      "radius_m": 75.75,
+      "depth_below_upstream_face_m": 4.25,
+      "sigma_zz_MPa": -0.291,
+      "shear_MPa": 0.263,
+      "net_normal_with_water_MPa": -0.026,
+      "friction_demand_ratio": 1.292
+    }
+  ]
+}

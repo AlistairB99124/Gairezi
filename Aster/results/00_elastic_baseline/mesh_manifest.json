@@ -1,0 +1,66 @@
+{
+  "mesh_file": "/Users/alistairdavies/Projects/Gairezi/Aster/results/00_elastic_baseline/mesh.med",
+  "unit": "m",
+  "node_count": 166332,
+  "volume_cell_counts": {
+    "hexahedron": 147414,
+    "wedge": 1654
+  },
+  "group_counts": {
+    "PLINTH": 23518,
+    "WALL": 125136,
+    "HAUNCH": 414,
+    "FOUNDATION": 4590,
+    "UPSTREAM": 12327,
+    "DOWNSTREAM": 12533,
+    "CREST": 3960,
+    "LEFT_ABUTMENT": 14,
+    "RIGHT_ABUTMENT": 14,
+    "OTHER_EXTERIOR": 2976
+  },
+  "required_groups": [
+    "PLINTH",
+    "WALL",
+    "HAUNCH",
+    "FOUNDATION",
+    "UPSTREAM",
+    "DOWNSTREAM",
+    "CREST"
+  ],
+  "region_volumes_m3": {
+    "PLINTH": 2817.3123324118287,
+    "WALL": 10519.118029573967,
+    "HAUNCH": 70.41893880275867
+  },
+  "exterior_areas_m2": {
+    "FOUNDATION": 1234.3674853234102,
+    "LEFT_ABUTMENT": 0.9741603958224245,
+    "OTHER_EXTERIOR": 863.4686564008023,
+    "DOWNSTREAM": 3076.1182996668263,
+    "RIGHT_ABUTMENT": 1.758834134615387,
+    "UPSTREAM": 3172.5207618821387,
+    "CREST": 659.9954799566958
+  },
+  "bounds_min": [
+    7.576444001553635,
+    -48.8362786073285,
+    -29.000000000000004
+  ],
+  "bounds_max": [
+    80.99999674477964,
+    80.57433783575995,
+    0.0
+  ],
+  "family_ids": {
+    "PLINTH": -1,
+    "WALL": -2,
+    "HAUNCH": -3,
+    "FOUNDATION": -4,
+    "UPSTREAM": -5,
+    "DOWNSTREAM": -6,
+    "CREST": -7,
+    "LEFT_ABUTMENT": -8,
+    "RIGHT_ABUTMENT": -9,
+    "OTHER_EXTERIOR": -10
+  }
+}
