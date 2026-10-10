@@ -32,7 +32,7 @@ def docker_executable() -> str:
 
 def container_path(path: Path) -> str:
     """Translate a workspace path into the mounted container path."""
-    return str(CONTAINER_ROOT / path.resolve().relative_to(ROOT))
+    return "/workspace/" + path.resolve().relative_to(ROOT).as_posix()
 
 
 def run_in_container(shell_command: str, cwd: Path) -> int:

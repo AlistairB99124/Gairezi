@@ -42,10 +42,17 @@ def _coordinate_key(point: tuple[float, float, float]) -> tuple[float, float, fl
     return tuple(round(value, 9) for value in point)
 
 
-def load_contours(path: Path) -> list[ContourPoint]:
+def load_contours(path: Path, crest_raise_m: float = 0.0) -> list[ContourPoint]:
+    """Rebase surveyed elevations to the raised crest datum, in metres."""
+    if not math.isfinite(crest_raise_m):
+        raise ValueError("Crest raise must be finite")
     rows = json.loads(path.read_text())
     contours = [
-        ContourPoint(float(row["chainage"]), float(row["bedrock"]), float(row["plinth"]))
+        ContourPoint(
+            float(row["chainage"]),
+            float(row["bedrock"]) - crest_raise_m,
+            float(row["plinth"]) - crest_raise_m,
+        )
         for row in rows
     ]
     if len(contours) < 2 or any(a.chainage_m >= b.chainage_m for a, b in zip(contours, contours[1:])):
@@ -53,6 +60,11 @@ def load_contours(path: Path) -> list[ContourPoint]:
     if any(point.bedrock_z_m > point.plinth_z_m for point in contours):
         raise ValueError("Bedrock must not be above the plinth contour")
     return contours
+
+
+def load_model_contours(root: Path) -> list[ContourPoint]:
+    config = json.loads((root / "config.json").read_text())
+    return load_contours(root / "Data" / "plinth.json", float(config.get("crest_raise_m", 0.0)))
 
 
 def load_global_element_size(path: Path) -> float:
@@ -213,7 +225,7 @@ def _hex_orientation(nodes: list[tuple[float, float, float]], cell: tuple[int, .
 
 
 def build_plinth(root: Path) -> PlinthMesh:
-    contours = load_contours(root / "Data" / "plinth.json")
+    contours = load_model_contours(root)
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
@@ -327,7 +339,7 @@ def build_plinth(root: Path) -> PlinthMesh:
 
 
 def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> PlinthMesh:
-    contours = load_contours(root / "Data" / "plinth.json")
+    contours = load_model_contours(root)
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
@@ -668,7 +680,7 @@ def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
             abs(
                 mesh.nodes[node_id - 1][2]
                 - _monotone_values(
-                    load_contours(Path(__file__).resolve().parents[2] / "Data" / "plinth.json"),
+                    load_model_contours(Path(__file__).resolve().parents[2]),
                     "bedrock_z_m",
                     math.atan2(mesh.nodes[node_id - 1][0], mesh.nodes[node_id - 1][1])
                     * json.loads((Path(__file__).resolve().parents[2] / "config.json").read_text())["wall_centerline_radius_m"],

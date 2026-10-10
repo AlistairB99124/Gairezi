@@ -76,13 +76,14 @@ gravity = AFFE_CHAR_MECA(
 )
 
 water_gradient = loads['water_density_kg_m3'] * abs(gravity_z)
-reservoir_gradient = loads['peak_water_pressure_pa'] / loads['maximum_water_height_m']
+reservoir_gradient = water_gradient
 tailwater_level = loads['foundation_elevation_m'] + loads['tailwater_head_m']
 
 # Pressures depend on z only, so piecewise-linear functions replace the formulas (CALC_G_XFEM rejects formula loads).
 upstream_pressure = DEFI_FONCTION(
     NOM_PARA='Z',
-    VALE=(-40.0, reservoir_gradient * 40.0, 0.0, 0.0, 10.0, 0.0),
+    VALE=(-40.0, reservoir_gradient * (40.0 + loads['overflow_head_m']),
+          loads['overflow_head_m'], 0.0, max(10.0, loads['overflow_head_m'] + 1.0), 0.0),
     INTERPOL='LIN',
     PROL_GAUCHE='LINEAIRE',
     PROL_DROITE='CONSTANT',
@@ -108,7 +109,9 @@ overflow = AFFE_CHAR_MECA(
 )
 
 # Water in the crack: reservoir level including the overflow surcharge, constant over the small crack.
-crack_depth_below_surface = -crack_z + crack_spec['water_head_above_crest_m']
+crack_depth_below_surface = max(
+    -crack_z + crack_spec.get('water_head_above_crest_m', loads['overflow_head_m']), 0.0
+)
 crack_pressure = water_gradient * crack_depth_below_surface
 crack_water = AFFE_CHAR_MECA(
     MODELE=model_x,

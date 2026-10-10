@@ -1,0 +1,183 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "FEniCSx: Verify frictionless contact benchmark",
+      "type": "process",
+      "command": "wsl.exe",
+      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "run", "--scenario", "frictionless_contact_benchmark"],
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Verifies opening, closure, pressure, equilibrium and unloading of two elastic bars on two meshes; not a dam crack solve."
+    },
+    {
+      "label": "FEniCSx: Import and audit dam mesh",
+      "type": "process",
+      "command": "wsl.exe",
+      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "import-dam"],
+      "problemMatcher": [],
+      "detail": "Subdivides the current dam conformingly, verifies boundary tags and writes XDMF mesh/tag output."
+    },
+    {
+      "label": "FEniCSx: Verify dam elastic parity",
+      "type": "process",
+      "command": "wsl.exe",
+      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "run", "--scenario", "dam_elastic_parity"],
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Solves the full tetrahedral dam and checks displacement probes, spring reactions and equilibrium against Elmer."
+    },
+    {
+      "label": "FEniCSx: Check WSL environment and scenarios",
+      "type": "process",
+      "command": "wsl.exe",
+      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "check"],
+      "problemMatcher": [],
+      "detail": "Checks the Ubuntu DOLFINx environment and validates cracking.json without running a model."
+    },
+    {
+      "label": "FEniCSx: Inventory Elmer dam for migration",
+      "type": "process",
+      "command": "wsl.exe",
+      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "inventory"],
+      "problemMatcher": [],
+      "detail": "Audits the existing procedural dam, tags and spring/load definitions without modifying Elmer files."
+    },
+    {
+      "label": "FEniCSx: Update configured results",
+      "type": "process",
+      "command": "wsl.exe",
+      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "run"],
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Runs enabled cracking.json scenarios, including the elastic benchmark and full dam parity. Unverified crack solves are blocked."
+    },
+    {
+      "label": "Elmer: Run solver",
+      "type": "process",
+      "command": "ElmerSolver.exe",
+      "args": [
+        "dam_model.sif"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\Elmer"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Runs the Elmer solver against the local dam model and writes VTU output into Elmer/results."
+    },
+    {
+      "label": "Elmer: Run combined solver",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "Elmer\\structure_assembly.py",
+        "combined-solve"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Builds the combined mesh, runs the Elmer stress solver, and writes the result VTU into Elmer/structure_output/combined_solver/results."
+    },
+    {
+      "label": "Elmer: Regenerate combined client results",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "Elmer\\analyze_stress.py",
+        "--vtu",
+        "Elmer\\structure_output\\combined_solver\\results\\combined_results_mpi_t0001.pvtu",
+        "--out-dir",
+        "Elmer\\structure_output\\combined_solver\\results",
+        "--mesh",
+        "Elmer\\structure_output\\combined_solver\\combined_structure.msh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Regenerates client stress plots, CSV, JSON, and report files from the latest combined solver PVTU."
+    },
+    {
+      "label": "Code_Aster: Docker build MED mesh",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "Aster\\build_med_mesh.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Uses jesusbill/code_aster:latest to build Aster/results/00_elastic_baseline/mesh.med."
+    },
+    {
+      "label": "Code_Aster: Docker elastic baseline",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "Aster\\run_case.py",
+        "Aster\\cases\\00_elastic_baseline.comm"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Runs the baseline Code_Aster solve in Docker and writes both MED and VTU results under Aster/results/00_elastic_baseline."
+    },
+    {
+      "label": "Code_Aster: Convert all MED results to VTU",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "Aster\\convert_med_to_vtu.py",
+        "Aster\\results",
+        "--overwrite"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Converts every MED file under Aster/results to an updated sibling VTU."
+    }
+  ]
+}

@@ -61,11 +61,11 @@ gravity = AFFE_CHAR_MECA(
 )
 
 water_gradient = loads['water_density_kg_m3'] * abs(gravity_z)
-reservoir_gradient = loads['peak_water_pressure_pa'] / loads['maximum_water_height_m']
+reservoir_gradient = water_gradient
 tailwater_level = loads['foundation_elevation_m'] + loads['tailwater_head_m']
 
 upstream_pressure = FORMULE(
-    VALE='%.12g*max(-Z, 0.0)' % reservoir_gradient, NOM_PARA=('X', 'Y', 'Z')
+    VALE='%.12g*max(%.12g - Z, 0.0)' % (reservoir_gradient, loads['overflow_head_m']), NOM_PARA=('X', 'Y', 'Z')
 )
 tailwater_pressure = FORMULE(
     VALE='%.12g*max(%.12g - Z, 0.0)' % (water_gradient, tailwater_level), NOM_PARA=('X', 'Y', 'Z')
@@ -82,7 +82,9 @@ overflow = AFFE_CHAR_MECA(
     PRES_REP=_F(GROUP_MA='CREST', PRES=water_gradient * loads['overflow_head_m']),
 )
 
-crack_pressure = water_gradient * (-spec['z_m'] + spec['water_head_above_crest_m'])
+crack_pressure = water_gradient * max(
+    -spec['z_m'] + spec.get('water_head_above_crest_m', loads['overflow_head_m']), 0.0
+)
 crack_water = AFFE_CHAR_MECA(
     MODELE=model,
     PRES_REP=_F(GROUP_MA=lips, PRES=crack_pressure),

@@ -30,6 +30,28 @@ COMBINED_SOLVER_MPI_PROCESSES = 4
 LOAD_CASES_PATH = Path(__file__).resolve().parent / "load_cases.json"
 
 
+def mpi_launcher() -> tuple[str, str]:
+    names = ("mpiexec", "mpirun") if os.name == "nt" else ("mpirun", "mpiexec")
+    for name in names:
+        executable = shutil.which(name)
+        if executable is not None:
+            return executable, "-np" if name == "mpirun" else "-n"
+    if os.name == "nt":
+        directories = (
+            os.environ.get("MSMPI_BIN"),
+            str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft MPI" / "Bin"),
+        )
+        for directory in directories:
+            if directory:
+                executable = Path(directory) / "mpiexec.exe"
+                if executable.is_file():
+                    return str(executable), "-n"
+    raise RuntimeError(
+        "MPI launcher not found. Install MPI and add mpirun or mpiexec to PATH; "
+        "on Windows, install Microsoft MPI or set MSMPI_BIN to its Bin directory."
+    )
+
+
 def convert_with_elmergrid(
     mesh_path: Path,
     output_dir: Path,
@@ -96,7 +118,9 @@ def apply_load_case(mesh, path: Path) -> None:
         mesh.loads,
         gravity_z_m_s2=float(loads["gravity"]),
         maximum_water_height_m=float(loads["water_height"]),
-        peak_water_pressure_pa=float(loads["water_density"]) * abs(float(loads["gravity"])) * float(loads["water_height"]),
+        peak_water_pressure_pa=float(loads["water_density"]) * abs(float(loads["gravity"])) * (
+            float(loads["water_height"]) + float(loads["overflow_head"])
+        ),
         water_density_kg_m3=float(loads["water_density"]),
         tailwater_head_m=float(loads["tailwater_head"]),
         overflow_head_m=float(loads["overflow_head"]),
@@ -117,7 +141,7 @@ def apply_load_case(mesh, path: Path) -> None:
 
 def write_combined_solver_input(mesh, path: Path) -> None:
     gravity_bodyforce = mesh.material.density_kg_m3 * mesh.loads.gravity_z_m_s2
-    pressure_gradient = mesh.loads.peak_water_pressure_pa / mesh.loads.maximum_water_height_m
+    pressure_gradient = mesh.loads.water_pressure_gradient_pa_per_m
     foundation_support = mesh.foundation_support
     foundation_spring_x = foundation_support.spring_x_n_per_m3
     foundation_spring_y = foundation_support.spring_y_n_per_m3
@@ -219,7 +243,7 @@ Boundary Condition 2
     Name = "UpstreamHydrostaticPressure"
     Target Boundaries(1) = 2
     Normal Force = Variable Coordinate 3
-        Real MATC "-{pressure_gradient:.12g} * (0.0 - tx) * (tx < 0.0)"
+        Real MATC "-{pressure_gradient:.12g} * ({overflow_head:.12g} - tx) * (tx < {overflow_head:.12g})"
 End
 
 Boundary Condition 3
@@ -246,6 +270,10 @@ End
 
 
 def solve_combined_structure() -> dict[str, object]:
+    executable = shutil.which("ElmerSolver_mpi")
+    if executable is None:
+        raise RuntimeError("ElmerSolver_mpi was not found on PATH; install an MPI-enabled Elmer build.")
+    launcher, process_option = mpi_launcher()
     mesh = build_combined_structure(ROOT)
     apply_load_case(mesh, LOAD_CASES_PATH)
     mesh_path = COMBINED_SOLVER_DIR / "combined_structure.msh"
@@ -259,14 +287,10 @@ def solve_combined_structure() -> dict[str, object]:
     sif_path = COMBINED_SOLVER_DIR / "dam_model.sif"
     write_combined_solver_input(mesh, sif_path)
     (COMBINED_SOLVER_DIR / "results").mkdir(exist_ok=True)
-    executable = shutil.which("ElmerSolver_mpi")
-    launcher = shutil.which("mpirun")
-    if executable is None or launcher is None:
-        raise RuntimeError("ElmerSolver_mpi and mpirun are required for the combined MPI solve")
     environment = os.environ.copy()
-    environment.setdefault("ELMER_HOME", "/usr/local")
+    environment.setdefault("ELMER_HOME", str(Path(executable).resolve().parent.parent))
     subprocess.run(
-        [launcher, "-np", str(COMBINED_SOLVER_MPI_PROCESSES), executable, sif_path.name],
+        [launcher, process_option, str(COMBINED_SOLVER_MPI_PROCESSES), executable, sif_path.name],
         check=True,
         cwd=COMBINED_SOLVER_DIR,
         env=environment,

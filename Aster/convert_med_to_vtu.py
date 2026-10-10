@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Convert Code_Aster MED files to VTU files using meshio."""
+"""Convert Code_Aster MED files to VTU using containerized MEDCoupling."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import shlex
+import tempfile
 
 import numpy as np
 import meshio
+
+from run_case import ROOT, container_path, run_in_container
 
 
 def add_stress_fields(mesh: meshio.Mesh) -> None:
@@ -40,16 +44,24 @@ def convert(source: Path, overwrite: bool) -> bool:
         print(f"Skipping existing {target}")
         return True
 
-    mesh = meshio.read(source)
-    field_data = {}
-    for name, value in mesh.field_data.items():
-        try:
-            field_data[name] = np.asarray(value)
-        except ValueError:
-            print(f"Omitting non-rectangular field metadata {name!r} from {source}")
-    mesh.field_data = field_data
-    add_stress_fields(mesh)
-    meshio.write(target, mesh)
+    source = source.resolve()
+    target = source.with_suffix(".vtu")
+    helper = ROOT / "Aster" / "export_med_results.py"
+    with tempfile.TemporaryDirectory(prefix=".med-export-", dir=source.parent) as directory:
+        output_dir = Path(directory)
+        command = "python3 " + " ".join(
+            shlex.quote(container_path(path)) for path in (helper, source, output_dir)
+        )
+        returncode = run_in_container(command, source.parent)
+        if returncode != 0:
+            raise RuntimeError(f"MED result export failed with exit code {returncode}: {source}")
+        mesh = meshio.read(output_dir / "geometry.vtu")
+        with np.load(output_dir / "fields.npz", allow_pickle=False) as fields:
+            mesh.point_data.update({name: fields[name] for name in fields.files})
+        add_stress_fields(mesh)
+        temporary_target = output_dir / "result.vtu"
+        meshio.write(temporary_target, mesh)
+        temporary_target.replace(target)
     print(f"Wrote {target}")
     return True
 

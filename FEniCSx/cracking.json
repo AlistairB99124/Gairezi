@@ -1,0 +1,69 @@
+[
+  {
+    "id": "elastic_benchmark",
+    "enabled": true,
+    "kind": "elastic_benchmark",
+    "mesh_divisions": 4,
+    "axial_strain": 0.00001,
+    "maximum_relative_l2_error": 0.00000001,
+    "solver": {
+      "relative_tolerance": 1e-10,
+      "maximum_iterations": 500
+    }
+  },
+  {
+    "id": "frictionless_contact_benchmark",
+    "enabled": true,
+    "kind": "contact_benchmark",
+    "bar_lengths_m": [1.0, 1.5],
+    "cross_section_m2": 0.01,
+    "initial_gap_m": 0.0001,
+    "mesh_divisions": [2, 8],
+    "outer_closures_m": [-0.00005, 0.0, 0.00005, 0.0001, 0.00015, 0.0002, 0.00005, -0.00005],
+    "verification": {
+      "gap_tolerance_m": 1e-10,
+      "displacement_tolerance_m": 1e-10,
+      "relative_tolerance": 1e-8,
+      "maximum_active_set_iterations": 10
+    }
+  },
+  {
+    "id": "dam_elastic_parity",
+    "enabled": true,
+    "kind": "dam_elastic",
+    "reference": "Elmer/structure_output/combined_solver/results/combined_results_mpi_t0001.pvtu",
+    "maximum_relative_volume_change": 0.001,
+    "solver": {
+      "relative_tolerance": 1e-10,
+      "maximum_iterations": 2000
+    },
+    "parity": {
+      "maximum_relative_l2_difference": 0.05,
+      "maximum_probe_relative_difference": 0.10,
+      "maximum_force_balance_error": 0.001,
+      "probes": [
+        {"name": "upstream_crest", "region_id": 2, "point_m": [78.5, 14.3, 0.0], "maximum_distance_m": 1.0},
+        {"name": "upstream_midwall", "region_id": 2, "point_m": [78.5, 14.3, -14.0], "maximum_distance_m": 1.0},
+        {"name": "upstream_lower_wall", "region_id": 2, "point_m": [78.5, 14.3, -25.0], "maximum_distance_m": 1.0},
+        {"name": "plinth_base", "region_id": 1, "point_m": [76.5, 14.0, -29.0], "maximum_distance_m": 1.5}
+      ]
+    }
+  },
+  {
+    "id": "horizontal_crack_template",
+    "enabled": false,
+    "kind": "predefined_crack",
+    "crack": {
+      "orientation": "horizontal",
+      "chainage_m": 108.5,
+      "z_m": -25.0,
+      "width_m": 3.0,
+      "depth_m": 2.0,
+      "initial_opening_mm": 2.0
+    },
+    "contact": {
+      "model": "frictionless",
+      "water_pressure_on_faces": false
+    }
+  }
+]

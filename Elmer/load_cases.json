@@ -8,17 +8,17 @@
   },
   "geometry": {
     "radius_upstream_face": 80.0,
-    "thickness": 4.0,
+    "thickness": 5.0,
     "flat_segment_start": 51.0,
     "flat_segment_end": 56.0,
     "chainage_span": 132.0
   },
   "loads": {
     "gravity": -9.81,
-    "water_height": 29.0,
+    "water_height": 31.0,
     "tailwater_head": 2.0,
-    "overflow_head": 2.0,
-    "overflow_water_level": 31.0,
+    "overflow_head": 3.0,
+    "overflow_water_level": 34.0,
     "water_density": 1000.0,
     "bedrock_support": {
       "model": "distributed_elastic_granite_half_space",

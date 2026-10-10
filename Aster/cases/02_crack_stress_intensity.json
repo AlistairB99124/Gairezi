@@ -1,6 +1,6 @@
 {
   "chainage_m": 108.5,
-  "centerline_radius_m": 78.0,
+  "centerline_radius_m": 77.5,
   "upstream_radius_m": 80.0,
   "z_m": -25.0,
   "z_offset_m": 0.05,
@@ -9,7 +9,6 @@
   "width_m": 0.5,
   "fracture_toughness_pa_sqrt_m": 850000.0,
   "fracture_energy_n_per_m": 120.0,
-  "water_head_above_crest_m": 2.0,
   "theta_r_inf_m": 0.6,
   "theta_r_sup_m": 1.5
 }

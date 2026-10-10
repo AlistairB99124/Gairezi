@@ -11,12 +11,12 @@
     },
     {
         "Boundary": "MaximumWaterHeight",
-        "Value": 29,
+        "Value": 31,
         "Type": "Meters"
     },
     {
         "Boundary": "Peak Water Pressure",
-        "Value": 284490,
+        "Value": 333540,
         "Type": "Pa"
     },
     {
@@ -26,12 +26,12 @@
     },
     {
         "Boundary": "TailwaterHead",
-        "Value": 2,
+        "Value": 3,
         "Type": "m"
     },
     {
         "Boundary": "OverflowHead",
-        "Value": 2,
+        "Value": 3,
         "Type": "m"
     },
     {

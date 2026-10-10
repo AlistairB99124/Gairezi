@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 import struct
 
-from .plinth import build_conforming_plinth, build_plinth, load_contours
+from .plinth import build_conforming_plinth, build_plinth, load_model_contours
 from .uniform_wall import (
     DOWNSTREAM_BATTER_BASE_Z_M,
     DOWNSTREAM_WALL_RADIUS_M,
@@ -19,7 +19,7 @@ from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS, build_named_groups
 
 
 def build_wall(root: Path, extra_radial_fractions: tuple[float, ...] = ()):
-    contours = load_contours(root / "Data" / "plinth.json")
+    contours = load_model_contours(root)
     return build_uniform_wall(
         root,
         contours[0].chainage_m,
@@ -53,6 +53,13 @@ class EnvironmentalLoads:
     water_density_kg_m3: float
     tailwater_head_m: float
     overflow_head_m: float
+
+    @property
+    def water_pressure_gradient_pa_per_m(self) -> float:
+        return self.water_density_kg_m3 * abs(self.gravity_z_m_s2)
+
+    def upstream_pressure_pa(self, elevation_m: float) -> float:
+        return self.water_pressure_gradient_pa_per_m * max(self.overflow_head_m - elevation_m, 0.0)
 
 
 @dataclass(frozen=True)
@@ -91,7 +98,7 @@ def load_material(path: Path) -> MaterialProperties:
 
 def load_environment(path: Path) -> EnvironmentalLoads:
     values = _named_values(path, "Boundary", "Value")
-    return EnvironmentalLoads(
+    loads = EnvironmentalLoads(
         gravity_z_m_s2=values["Gravity"],
         maximum_water_height_m=values["MaximumWaterHeight"],
         peak_water_pressure_pa=values["Peak Water Pressure"],
@@ -99,6 +106,13 @@ def load_environment(path: Path) -> EnvironmentalLoads:
         tailwater_head_m=values["TailwaterHead"],
         overflow_head_m=values["OverflowHead"],
     )
+    expected_peak = loads.upstream_pressure_pa(-loads.maximum_water_height_m)
+    if not math.isclose(loads.peak_water_pressure_pa, expected_peak, rel_tol=1e-10, abs_tol=1e-6):
+        raise ValueError(
+            f"Peak Water Pressure {loads.peak_water_pressure_pa} Pa must equal "
+            f"rho*abs(g)*(MaximumWaterHeight+OverflowHead) = {expected_peak} Pa"
+        )
+    return loads
 
 
 def load_foundation_support(path: Path) -> FoundationSupport:
@@ -242,8 +256,7 @@ def write_combined_vtu(mesh: CombinedStructure, path: Path) -> None:
     pressure_traction_vectors = [(0.0, 0.0, 0.0)] * len(mesh.nodes)
     for node_id in upstream_nodes:
         x_m, y_m, z_m = mesh.nodes[node_id]
-        depth_fraction = min(max(-z_m / mesh.loads.maximum_water_height_m, 0.0), 1.0)
-        pressure_pa = mesh.loads.peak_water_pressure_pa * depth_fraction
+        pressure_pa = mesh.loads.upstream_pressure_pa(z_m)
         radius_m = math.hypot(x_m, y_m)
         hydrostatic_pressure[node_id] = pressure_pa
         pressure_traction_vectors[node_id] = (
@@ -451,9 +464,11 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         },
         "foundation_nodes": foundation_node_count,
         "pressurized_upstream_nodes": sum(
-            -mesh.nodes[node_id][2] > 0.0 for node_id in upstream_node_ids
+            mesh.loads.upstream_pressure_pa(mesh.nodes[node_id][2]) > 0.0 for node_id in upstream_node_ids
         ),
-        "maximum_applied_pressure_pa": mesh.loads.peak_water_pressure_pa,
+        "maximum_applied_pressure_pa": max(
+            mesh.loads.upstream_pressure_pa(mesh.nodes[node_id][2]) for node_id in upstream_node_ids
+        ),
         "material": {
             "density_kg_m3": mesh.material.density_kg_m3,
             "youngs_modulus_pa": mesh.material.youngs_modulus_pa,

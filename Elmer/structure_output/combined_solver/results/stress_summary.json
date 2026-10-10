@@ -1,0 +1,46 @@
+{
+  "source_vtu": "Elmer\\structure_output\\combined_solver\\results\\combined_results_mpi_t0001.pvtu",
+  "element_count": 139758,
+  "max_tensile_principal_stress_pa": {
+    "element_id": 55828,
+    "value_pa": 1250033.5641583786,
+    "centroid_xyz_m": [
+      77.95131318011211,
+      16.837435160400318,
+      -29.7495073408605
+    ]
+  },
+  "max_compressive_principal_stress_pa": {
+    "element_id": 58818,
+    "value_pa": -2694365.0322478283,
+    "centroid_xyz_m": [
+      78.35305115554769,
+      14.81905181925976,
+      -0.24984477380599526
+    ]
+  },
+  "native_nodal_stress_average": {
+    "max_tensile_principal_stress_pa": {
+      "element_id": 55828,
+      "value_pa": 1250033.5641583786
+    },
+    "max_compressive_principal_stress_pa": {
+      "element_id": 58818,
+      "value_pa": -2694365.0322478283
+    }
+  },
+  "note": "Positive principal stress indicates tension. Negative principal stress indicates compression.",
+  "tensile_strength_pa": 2000000.0,
+  "tension_utilization": 0.6250167820791893,
+  "client_expected_tension_mpa": 1.2,
+  "client_expected_compression_mpa": -3.33,
+  "detailing_assessment": {
+    "critical_zone": "body",
+    "notes": [
+      "Model uses a base wall thickness of 4.00 m.",
+      "Model does not include crest thickening.",
+      "Model does not include galleries, fillets, or abutment transition stiffening.",
+      "Model uses compliant base springs, explicit abutment spring restraints, and surrogate curved-wall geometry."
+    ]
+  }
+}

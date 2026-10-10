@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from typing import Optional
 
+from regions.plinth import load_contours
 
 root = Path(__file__).resolve().parent.parent
 input_path = root / "Data" / "Dam_Base_Contours.json"
@@ -70,7 +71,7 @@ if not 0.0 < wedge_start_below_crest_m:
 if not 0.0 < wedge_angle_from_vertical_deg < 90.0:
     raise ValueError("The wedge angle from vertical must lie between 0 and 90 degrees")
 plinth_upstream_offset_m = 1.0
-plinth_downstream_offset_m = 2.0
+plinth_downstream_offset_m = 1.0
 plinth_base_width_m = wall_thickness + plinth_upstream_offset_m + plinth_downstream_offset_m
 plinth_width_m = plinth_base_width_m
 
@@ -266,15 +267,12 @@ if len(rows) < 3 and not plinth_path.exists():
 
 profile_points = []
 if geometry_mode == "v2":
-    with plinth_path.open() as fh:
-        plinth_data = json.load(fh)
+    model_contours = load_contours(plinth_path, float(config.get("crest_raise_m", 0.0)))
     ground_by_station = {
-        float(row["chainage"]): float(row.get("groundLevel", row.get("ground", 0.0)))
-        for row in plinth_data
+        point.chainage_m: point.bedrock_z_m for point in model_contours
     }
     plinth_by_station = {
-        float(row["chainage"]): float(row.get("plinth", row.get("plinthLevel", 0.0)))
-        for row in plinth_data
+        point.chainage_m: point.plinth_z_m for point in model_contours
     }
 
     if rows:
@@ -286,13 +284,9 @@ if geometry_mode == "v2":
         if station not in plinth_by_station:
             continue
         theta = station / radius
-        ground_depth_below_crest = float(ground_by_station[station])
-        plinth_depth_below_crest = float(plinth_by_station[station])
-        # `plinth` is the local wall height from plinth to the crest. Keep the crest
-        # at the project datum and place the wall base at that depth below it.
-        plinth_elevation = -plinth_depth_below_crest
+        plinth_elevation = float(plinth_by_station[station])
         crest_elevation = 0.0
-        ground_elevation = -ground_depth_below_crest
+        ground_elevation = float(ground_by_station[station])
         profile_points.append(
             {
                 "station": station,
@@ -303,7 +297,7 @@ if geometry_mode == "v2":
                 "crest_z": crest_elevation,
                 "ground_z": ground_elevation,
                 "plinth_z": plinth_elevation,
-                "rise_above_ground": ground_depth_below_crest - plinth_depth_below_crest,
+                "rise_above_ground": plinth_elevation - ground_elevation,
                 "wedge_offset_m": 0.0,
                 "bedrock_boundary_z": ground_elevation,
             }

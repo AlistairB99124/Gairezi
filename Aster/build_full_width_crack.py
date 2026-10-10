@@ -22,7 +22,6 @@ SPEC = {
     "depth_m": 3.0,
     "full_width": True,
     "gap_mm": 2.0,
-    "water_head_above_crest_m": 2.0,
     "friction_coefficient": 0.7,
     "load_steps": 4,
 }

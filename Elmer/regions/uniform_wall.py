@@ -7,11 +7,11 @@ import json
 import math
 from pathlib import Path
 
-from .plinth import _monotone_values, load_contours, load_global_element_size
+from .plinth import _monotone_values, load_model_contours, load_global_element_size
 from .model_groups import FACE_GROUP_IDS
 
 
-DOWNSTREAM_WALL_RADIUS_M = 76.0
+DOWNSTREAM_WALL_RADIUS_M = 75.0
 UPSTREAM_RADIUS_M = 80.0
 CREST_Z_M = 0.0
 DOWNSTREAM_BATTER_HEIGHT_M = 4.0
@@ -114,7 +114,7 @@ def build_uniform_wall(
     extra_radial_fractions: tuple[float, ...] = (),
 ) -> UniformWallMesh:
     element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
-    contours = load_contours(root / "Data" / "plinth.json")
+    contours = load_model_contours(root)
     config = json.loads((root / "config.json").read_text())
     centerline_radius_m = float(config["wall_centerline_radius_m"])
     chainages_m = target_chainages(start_chainage_m, end_chainage_m, anchor_chainages_m, element_size_m)

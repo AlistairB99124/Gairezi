@@ -26,7 +26,6 @@ BASE_SPEC = {
     "z_m": -25.0,
     "depth_m": 3.0,
     "full_width": True,
-    "water_head_above_crest_m": 2.0,
     "friction_coefficient": 0.7,
     "load_steps": 4,
 }
