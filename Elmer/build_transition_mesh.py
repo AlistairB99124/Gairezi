@@ -3,31 +3,34 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import math
+import sys
 
 import gmsh
 
 
 root = Path(__file__).resolve().parent.parent
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+from Elmer.model_config import load_config
+from Elmer.regions.plinth import load_model_contours
+
 out_dir = Path(__file__).resolve().parent
-plinth_path = root / "Data" / "plinth.json"
-grid_controls_path = root / "Data" / "Computational_Grid_Controls.json"
 config_path = root / "config.json"
 
 
 def control_value(name: str) -> float:
-    for row in json.loads(grid_controls_path.read_text()):
-        if row["Mesh Control"] == name:
-            return float(row["Client Value"])
-    raise ValueError(f"Missing mesh control: {name}")
+    keys = {"Global Element Size": "global_element_size_m", "Local Corner Refinement": "local_element_size_m"}
+    return float(load_config(config_path)["geometry"][keys[name]])
 
 
-config = json.loads(config_path.read_text())
-wall_thickness = float(config["wall_thickness_m"])
-upstream_radius = float(config["wall_upstream_radius_m"])
-centerline_radius = float(config["wall_centerline_radius_m"])
-downstream_radius = float(config["wall_downstream_radius_m"])
-wedge_threshold = float(config["wedge_start_below_crest_m"])
-wedge_angle = math.radians(float(config["wedge_angle_from_vertical_deg"]))
+config = load_config(config_path)
+wall = config["geometry"]["wall"]
+wall_thickness = float(wall["radial_width_m"])
+upstream_radius = float(wall["upstream_radius_m"])
+centerline_radius = float(wall["centerline_radius_m"])
+downstream_radius = float(wall["downstream_radius_m"])
+wedge_threshold = 25.0
+wedge_angle = math.radians(45.0)
 mesh_size = control_value("Global Element Size")
 corner_size = control_value("Local Corner Refinement")
 minimum_transition_quality = 0.005
@@ -112,8 +115,8 @@ def add_convergence_size_field(
 
 def main() -> None:
     rows = [
-        {"chainage": float(row["chainage"]), "ground": float(row["ground"]), "plinth": float(row["plinth"])}
-        for row in json.loads(plinth_path.read_text())
+        {"chainage": point.chainage_m, "ground": -point.bedrock_z_m, "plinth": -point.plinth_z_m}
+        for point in load_model_contours(root)
     ]
     rows.sort(key=lambda row: row["chainage"])
     start_station = rows[0]["chainage"] + transition_bulk_size

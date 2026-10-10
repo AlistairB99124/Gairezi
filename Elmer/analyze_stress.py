@@ -408,13 +408,7 @@ def create_report_sheet(
 
 def load_tensile_strength(load_cases_path: Path) -> float:
     payload = json.loads(load_cases_path.read_text())
-    if isinstance(payload, list):
-        values = {
-            str(row["Parameter Name"]): float(row["Client Input"])
-            for row in payload
-        }
-        return values["Concrete Tensile Strength"]
-    return float(payload["material"]["tensile_strength"])
+    return float(payload["material"]["concrete"]["tensile_strength_pa"])
 
 
 def build_detailing_assessment(summary: dict, mesh_path: Path) -> dict:
@@ -599,15 +593,16 @@ def main() -> None:
         help="Path to the Gmsh mesh file used for architecture-style overlays",
     )
     parser.add_argument(
+        "--config",
         "--material-properties",
         "--load-cases",
         dest="load_cases",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "Data" / "Concrete_Material_Properties.json",
-        help="Path to shared material properties JSON (legacy --load-cases option accepted)",
+        default=Path(__file__).resolve().parent.parent / "config.json",
+        help="Path to root config.json (legacy --material-properties and --load-cases options accepted)",
     )
-    parser.add_argument("--youngs-modulus", type=float, default=3.5e10)
-    parser.add_argument("--poisson-ratio", type=float, default=0.2)
+    parser.add_argument("--youngs-modulus", type=float)
+    parser.add_argument("--poisson-ratio", type=float)
     parser.add_argument("--expected-tension-mpa", type=float, default=1.2)
     parser.add_argument("--expected-compression-mpa", type=float, default=-3.33)
     parser.add_argument(
@@ -616,12 +611,15 @@ def main() -> None:
         help="Exclude volume elements whose centroid elevation is at or below this value in metres.",
     )
     args = parser.parse_args()
+    material = json.loads(args.load_cases.read_text())["material"]["concrete"]
+    youngs_modulus = float(material["youngs_modulus"]) if args.youngs_modulus is None else args.youngs_modulus
+    poisson_ratio = float(material["poisson_ratio"]) if args.poisson_ratio is None else args.poisson_ratio
 
     csv_path, summary_path, stress_plot_path, critical_plot_path, report_path = analyze(
         args.vtu,
         args.out_dir,
-        args.youngs_modulus,
-        args.poisson_ratio,
+        youngs_modulus,
+        poisson_ratio,
         args.mesh,
         args.load_cases,
         args.expected_tension_mpa,

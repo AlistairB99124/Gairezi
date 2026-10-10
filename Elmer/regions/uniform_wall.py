@@ -3,16 +3,16 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-import json
 import math
 from pathlib import Path
 
 from .plinth import _monotone_values, load_model_contours, load_global_element_size
 from .model_groups import FACE_GROUP_IDS
+from ..model_config import load_config
 
 
-DOWNSTREAM_WALL_RADIUS_M = 75.0
-UPSTREAM_RADIUS_M = 80.0
+DOWNSTREAM_WALL_RADIUS_M = float(load_config()["geometry"]["wall"]["downstream_radius_m"])
+UPSTREAM_RADIUS_M = float(load_config()["geometry"]["wall"]["upstream_radius_m"])
 CREST_Z_M = 0.0
 DOWNSTREAM_BATTER_HEIGHT_M = 4.0
 DOWNSTREAM_BATTER_RUN_M = 2.0
@@ -113,16 +113,18 @@ def build_uniform_wall(
     anchor_chainages_m: list[float],
     extra_radial_fractions: tuple[float, ...] = (),
 ) -> UniformWallMesh:
-    element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
+    element_size_m = load_global_element_size(root / "config.json")
     contours = load_model_contours(root)
-    config = json.loads((root / "config.json").read_text())
-    centerline_radius_m = float(config["wall_centerline_radius_m"])
+    wall = load_config(root / "config.json")["geometry"]["wall"]
+    centerline_radius_m = float(wall["centerline_radius_m"])
+    upstream_radius_m = float(wall["upstream_radius_m"])
+    downstream_radius_m = float(wall["downstream_radius_m"])
     chainages_m = target_chainages(start_chainage_m, end_chainage_m, anchor_chainages_m, element_size_m)
     base_levels_m = [
         wall_base_level(value, _monotone_values(contours, "plinth_z_m", value), element_size_m)
         for value in chainages_m
     ]
-    maximum_wall_width_m = UPSTREAM_RADIUS_M - downstream_radius(DOWNSTREAM_BATTER_BASE_Z_M)
+    maximum_wall_width_m = upstream_radius_m - downstream_radius_m
     radial_divisions = math.ceil(maximum_wall_width_m / element_size_m)
     radial_fractions = sorted({*(index / radial_divisions for index in range(radial_divisions + 1)), *extra_radial_fractions})
     if radial_fractions[0] != 0.0 or radial_fractions[-1] != 1.0 or any(
@@ -145,8 +147,7 @@ def build_uniform_wall(
 
     def wall_radius(station_index: int, z_m: float, fraction: float) -> float:
         chainage_m = chainages_m[station_index]
-        downstream_radius_m = downstream_radius(z_m)
-        return downstream_radius_m + fraction * (UPSTREAM_RADIUS_M - downstream_radius_m)
+        return downstream_radius_m + fraction * (upstream_radius_m - downstream_radius_m)
 
     cells: list[tuple[int, tuple[int, ...]]] = []
     for station_index in range(len(chainages_m) - 1):
@@ -220,7 +221,7 @@ def build_uniform_wall(
         radii_m = [math.hypot(x_m, y_m) for x_m, y_m, _ in coordinates]
         stations_m = [centerline_radius_m * math.atan2(x_m, y_m) for x_m, y_m, _ in coordinates]
         z_values_m = [z_m for _, _, z_m in coordinates]
-        if max(abs(radius_m - UPSTREAM_RADIUS_M) for radius_m in radii_m) < tolerance:
+        if max(abs(radius_m - upstream_radius_m) for radius_m in radii_m) < tolerance:
             boundary_id = UPSTREAM_BOUNDARY_ID
         elif max(abs(z_m - CREST_Z_M) for z_m in z_values_m) < tolerance:
             boundary_id = CREST_BOUNDARY_ID

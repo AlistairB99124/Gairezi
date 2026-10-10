@@ -3,13 +3,13 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-import json
 import math
 from pathlib import Path
 
 from .model_groups import FACE_GROUP_IDS
 from .mortar_interface import MORTAR_THICKNESS_M, MORTAR_WALL_BOUNDARY_ID
 from .plinth import _hex_orientation
+from ..model_config import load_config
 from .uniform_wall import (
     CENTER_STEP_END_CHAINAGE_M,
     CENTER_STEP_RADIUS_M,
@@ -48,7 +48,7 @@ def _build_mesh(
     z_levels_m: tuple[float, ...],
     interface_faces: dict[str, int],
 ) -> StepMesh:
-    centerline_radius_m = float(json.loads((root / "config.json").read_text())["wall_centerline_radius_m"])
+    centerline_radius_m = float(load_config(root / "config.json")["geometry"]["wall"]["centerline_radius_m"])
     chainages_m = _step_chainages(wall)
     nodes: list[tuple[float, float, float]] = []
     node_ids: dict[tuple[float, float, float], int] = {}

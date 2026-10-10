@@ -16,6 +16,7 @@ from .uniform_wall import (
     build_uniform_wall,
 )
 from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS, build_named_groups
+from ..model_config import load_config
 
 
 def build_wall(root: Path, extra_radial_fractions: tuple[float, ...] = ()):
@@ -82,29 +83,27 @@ class CombinedStructure:
     region_cell_counts: dict[str, int]
 
 
-def _named_values(path: Path, name_key: str, value_key: str) -> dict[str, float]:
-    return {str(row[name_key]): float(row[value_key]) for row in json.loads(path.read_text())}
-
-
 def load_material(path: Path) -> MaterialProperties:
-    values = _named_values(path, "Parameter Name", "Client Input")
+    values = load_config(path)["material"]["concrete"]
     return MaterialProperties(
-        density_kg_m3=values["Concrete Density"],
-        youngs_modulus_pa=values["Young's Modulus (E)"],
-        poissons_ratio=values["Poisson's Ratio (v)"],
-        tensile_strength_pa=values["Concrete Tensile Strength"],
+        density_kg_m3=float(values["density"]),
+        youngs_modulus_pa=float(values["youngs_modulus"]),
+        poissons_ratio=float(values["poisson_ratio"]),
+        tensile_strength_pa=float(values["tensile_strength_pa"]),
     )
 
 
 def load_environment(path: Path) -> EnvironmentalLoads:
-    values = _named_values(path, "Boundary", "Value")
+    values = load_config(path)["loads"]
     loads = EnvironmentalLoads(
-        gravity_z_m_s2=values["Gravity"],
-        maximum_water_height_m=values["MaximumWaterHeight"],
-        peak_water_pressure_pa=values["Peak Water Pressure"],
-        water_density_kg_m3=values["WaterDensity"],
-        tailwater_head_m=values["TailwaterHead"],
-        overflow_head_m=values["OverflowHead"],
+        gravity_z_m_s2=float(values["gravity"]),
+        maximum_water_height_m=float(values["water_height"]),
+        peak_water_pressure_pa=float(values["water_density"]) * abs(float(values["gravity"])) * (
+            float(values["water_height"]) + float(values["overflow_head"])
+        ),
+        water_density_kg_m3=float(values["water_density"]),
+        tailwater_head_m=float(values["tailwater_head"]),
+        overflow_head_m=float(values["overflow_head"]),
     )
     expected_peak = loads.upstream_pressure_pa(-loads.maximum_water_height_m)
     if not math.isclose(loads.peak_water_pressure_pa, expected_peak, rel_tol=1e-10, abs_tol=1e-6):
@@ -115,21 +114,21 @@ def load_environment(path: Path) -> EnvironmentalLoads:
     return loads
 
 
-def load_foundation_support(path: Path) -> FoundationSupport:
-    values = _named_values(path, "Boundary", "Value")
+def load_foundation_support(path: Path, region: str = "bedrock") -> FoundationSupport:
+    values = load_config(path)["geometry"][region]["support"]["spring_n_per_m3"]
     return FoundationSupport(
-        spring_x_n_per_m3=values["FoundationSpringX"],
-        spring_y_n_per_m3=values["FoundationSpringY"],
-        spring_z_n_per_m3=values["FoundationSpringZ"],
+        spring_x_n_per_m3=float(values["x"]),
+        spring_y_n_per_m3=float(values["y"]),
+        spring_z_n_per_m3=float(values["z"]),
     )
 
 
 def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ...] = ()) -> CombinedStructure:
-    material = load_material(root / "Data" / "Concrete_Material_Properties.json")
-    load_path = root / "Data" / "Env_Boundaries_And_Loads.json"
+    material = load_material(root / "config.json")
+    load_path = root / "config.json"
     loads = load_environment(load_path)
     foundation_support = load_foundation_support(load_path)
-    plinth_support = foundation_support
+    plinth_support = load_foundation_support(load_path, "plinth")
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}
     cells: list[tuple[int, tuple[int, ...]]] = []
@@ -441,6 +440,14 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     )
     if wall_interface_face_count == 0 or wall_interface_face_count != plinth_interface_face_count:
         raise ValueError("Wall/plinth interface faces are missing or unpaired")
+    wall_node_ids = {
+        node_id
+        for (_, cell), region_id in zip(mesh.cells, mesh.region_ids)
+        if region_id == REGION_GROUP_IDS["WALL"]
+        for node_id in cell
+    }
+    wall_radii = [math.hypot(*mesh.nodes[node_id][:2]) for node_id in wall_node_ids]
+    wall_min_radius, wall_max_radius = min(wall_radii), max(wall_radii)
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
@@ -457,10 +464,10 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "boundary_faces": dict(sorted(Counter(boundary_id for boundary_id, _ in mesh.boundaries).items())),
         "regions": mesh.region_cell_counts,
         "wall_geometry": {
-            "downstream_radius_m": DOWNSTREAM_WALL_RADIUS_M,
-            "upstream_radius_m": UPSTREAM_RADIUS_M,
-            "uniform_thickness_m": UPSTREAM_RADIUS_M - DOWNSTREAM_WALL_RADIUS_M,
-            "wall_base_elevation_m": DOWNSTREAM_BATTER_BASE_Z_M,
+            "downstream_radius_m": wall_min_radius,
+            "upstream_radius_m": wall_max_radius,
+            "uniform_thickness_m": wall_max_radius - wall_min_radius,
+            "wall_base_elevation_m": min(mesh.nodes[node_id][2] for node_id in wall_node_ids),
         },
         "foundation_nodes": foundation_node_count,
         "pressurized_upstream_nodes": sum(

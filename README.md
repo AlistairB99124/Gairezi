@@ -105,60 +105,67 @@ against Elmer, plus an exact two-bar normal-contact benchmark. A 3-D crack-surfa
 adapter remains the next validation gate; enabled dam crack templates are
 currently blocked.
 
+## Root dam configuration
+
+[config.json](config.json) supplies the dam properties for the combined Elmer
+solver and shared Code_Aster/FEniCSx mesh. Neither the deleted `Data` inputs nor
+the deleted `Elmer/load_cases.json` is read by these workflows.
+
+| Section | Meaning |
+|---|---|
+| `geometry.global_element_size_m` | Shared mesh spacing in metres |
+| `geometry.local_element_size_m` | Corner refinement for standalone geometry generators |
+| `geometry.wall` | Wall face radii, radial width and centreline |
+| `geometry.plinth` | Plinth radii, signed contour elevations and wall/plinth spring support |
+| `geometry.bedrock` | Signed bedrock contour elevations and foundation spring support |
+| `material.concrete` | Density, Young's modulus, Poisson ratio and tensile-strength reporting threshold |
+| `material.bedrock` | Rock material data; no rock volume is currently meshed |
+| `loads` | Gravity, water density, reference water depth, overflow and tailwater heads |
+| `outputs` | Requested result metadata; the existing solver/post-processor still writes its standard result fields |
+
+Contour `height` is a signed elevation relative to crest z = 0, not a positive
+wall height. Plinth and bedrock stations must match and be strictly increasing.
+The mesh follows these contours; `height_above_plinth_m` is nominal metadata,
+not a second instruction to shift their elevations. Changing dam height means
+updating the contour elevations. There is no implicit crest raise or chainage
+rescaling. Radial width must equal upstream minus downstream radius, and each
+centreline must lie midway between its own faces.
+
+The supplied model has a **4 m wall** at radii **76-80 m**, on a **6 m plinth**
+at radii **75-81 m**. Both centrelines are 78 m, with 1 m overhang on each side.
+The deepest wall/plinth interface is z = -28 m and bedrock is z = -29 m.
+Support stiffness uses the explicit directional `spring_n_per_m3` values;
+rock/concrete elastic moduli do not silently recalculate these springs.
+
 ### Reservoir overflow head and pressure
 
-The active reservoir load includes 3 m of water above the z = 0 crest:
-`p(z) = rho * abs(g) * max(OverflowHead - z, 0)`.
-With fresh water at 1000 kg/m3 and gravity 9.81 m/s2, pressure is 29430 Pa
-at the crest and **333540 Pa at z = -31 m** (`1000 * 9.81 * (31 + 3)`).
-The slope remains 9810 Pa/m; do not use the corrected peak divided by 31
-as a new pressure gradient. The crest also receives 29430 Pa normal pressure
-on its own face, which is distinct from upstream-face loading.
+As intended, the water surface is at `loads.overflow_head` above crest z = 0:
+`p(z) = water_density * abs(gravity) * max(overflow_head - z, 0)`.
+`water_height` is a reference depth, not a reservoir-level control.
+`overflow_water_level` must equal `water_height + overflow_head` and is also
+a reference depth. The reported reference peak is calculated from that sum,
+not independently configured.
 
-`Data/Env_Boundaries_And_Loads.json` stores this reference-depth peak.
-The active combined Elmer/FEniCSx run uses `Elmer/load_cases.json`, whose
-overflow head is also 3 m. Different tailwater/support settings in these files
-remain intentional per-workflow inputs; this pressure correction does not
-change them. The independently configured Elmer calibration case is unchanged.
-Code_Aster upstream loads use the same head-offset law; crack-face pressure
-inherits the case's overflow head unless an explicit scenario override is supplied.
-The existing high-pressure crack control retains its deliberate 3 MPa override.
+With the supplied 31 m reference depth and 3 m overflow head, the reference
+peak is **333540 Pa**, but the actual pressure at the model's deepest bedrock
+z = -29 m is **313920 Pa**, and at the wall/plinth interface z = -28 m it is
+**304110 Pa**. Crest pressure is **29430 Pa**. This distinction is intentional.
+Changing `overflow_head`, gravity or water density changes the applied pressure;
+changing only the reference depth does not.
 
-**Previously generated results are stale for this corrected load.** Rerun
-**Elmer: Run combined solver**, then **FEniCSx: Verify dam elastic parity**.
-The parity runner rejects the old reference SIF rather than comparing different
-load cases. For Code_Aster, rebuild case inputs/meshes before rerunning the
-elastic or crack cases; archived `case_inputs.json` and scenario overrides are
-not automatically rewritten. Dam crack contact in FEniCSx remains blocked;
-the synthetic two-bar benchmark does not use reservoir pressure.
+Run **Elmer: Run combined solver**, or in PowerShell:
 
-## Current radial dimensions
+```powershell
+.\.venv\Scripts\python.exe -B Elmer\structure_assembly.py combined-solve
+```
 
-### Raised-crest scenario
-
-The nominal height is now 31 m, raised 2 m from the 29 m reference.
-`config.json` records `crest_raise_m = 2`: imported plinth and bedrock
-elevations are reduced by 2 m to retain crest z = 0. The surveyed
-`Data/plinth.json` remains unchanged; the physical foundation is not lowered.
-The shared Elmer/FEniCSx/Code_Aster mesh and standalone curved generator use
-these rebased elevations. Local wall heights still follow the plinth contour:
-the deepest plinth top is now z = -30 m, with bedrock at z = -31 m.
-Thus upstream pressure is 323730 Pa at that wall/plinth interface and
-333540 Pa at the reference foundation depth. The 3 m overflow head gives a
-34 m reference water depth. Tailwater heads and support properties are unchanged.
-All existing meshes/results must be regenerated before reporting this scenario.
-
-The active shared Elmer/FEniCSx model has a **5 m wall** on a **7 m plinth**,
-leaving **1 m overhang on both sides**. The upstream wall face remains at
-radius 80 m; the downstream face is at 75 m. The wall centreline is 77.5 m,
-midway between the plinth faces at radii 74 m and 81 m. Chainage-to-angle
-mapping and the source Code_Aster crack locations use this updated centreline.
-The standalone curved-dam generator also uses 1 m plinth offsets on both sides.
-
-Existing meshes, dam results and elastic parity references predate this
-geometry change. Regenerate the Elmer combined mesh/results before rerunning
-FEniCSx dam parity; rebuild Code_Aster meshes and case inputs before rerunning
-crack cases. Saved results are not rewritten automatically.
+Then run **Elmer: Regenerate combined client results** to refresh plots/reports.
+Directly running an existing SIF does not reload JSON. Code_Aster's
+`build_med_mesh.py` derives mesh and generated `case_inputs.json` from the same
+root configuration. Rebuild existing Code_Aster cases and FEniCSx imports before
+comparing new results; archived results are not automatically migrated.
+The separate calibration and crack/scenario JSONs remain scenario-specific
+inputs, not additional sources for the shared baseline dam properties.
 
 ## Background: v1 baseline
 

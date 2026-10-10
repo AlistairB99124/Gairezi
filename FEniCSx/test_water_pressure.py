@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 class WaterPressureTests(unittest.TestCase):
     def loads(self):
-        return load_environment(ROOT / "Data" / "Env_Boundaries_And_Loads.json")
+        return load_environment(ROOT / "config.json")
 
     def test_calculation_and_profile(self):
         loads = self.loads()
@@ -33,13 +33,13 @@ class WaterPressureTests(unittest.TestCase):
             self.assertAlmostEqual(loads.upstream_pressure_pa(z), expected)
         self.assertEqual(loads.water_pressure_gradient_pa_per_m, 9810)
 
-    def test_inconsistent_peak_is_rejected(self):
-        data = json.loads((ROOT / "Data" / "Env_Boundaries_And_Loads.json").read_text())
-        next(row for row in data if row["Boundary"] == "Peak Water Pressure")["Value"] = 284490
+    def test_inconsistent_reference_water_level_is_rejected(self):
+        data = json.loads((ROOT / "config.json").read_text())
+        data["loads"]["overflow_water_level"] = 32
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "loads.json"
             path.write_text(json.dumps(data))
-            with self.assertRaisesRegex(ValueError, "MaximumWaterHeight\\+OverflowHead"):
+            with self.assertRaisesRegex(ValueError, "overflow_water_level"):
                 load_environment(path)
 
     def structure(self):
@@ -52,7 +52,7 @@ class WaterPressureTests(unittest.TestCase):
 
     def test_active_elmer_load_case_and_generated_sif(self):
         structure = self.structure()
-        apply_load_case(structure, ROOT / "Elmer" / "load_cases.json")
+        apply_load_case(structure, ROOT / "config.json")
         self.assertEqual(structure.loads.peak_water_pressure_pa, 333540)
         self.assertEqual(structure.loads.overflow_head_m, 3)
         with tempfile.TemporaryDirectory() as directory:

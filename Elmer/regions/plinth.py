@@ -9,9 +9,10 @@ from pathlib import Path
 import struct
 
 from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS
+from ..model_config import load_config
 
-UPSTREAM_RADIUS_M = 81.0
-DOWNSTREAM_RADIUS_M = 74.0
+UPSTREAM_RADIUS_M = float(load_config()["geometry"]["plinth"]["upstream_radius_m"])
+DOWNSTREAM_RADIUS_M = float(load_config()["geometry"]["plinth"]["downstream_radius_m"])
 BODY_ID = REGION_GROUP_IDS["PLINTH"]
 FOUNDATION_BOUNDARY_ID = FACE_GROUP_IDS["FOUNDATION"]
 UPSTREAM_BOUNDARY_ID = FACE_GROUP_IDS["UPSTREAM"]
@@ -46,12 +47,16 @@ def load_contours(path: Path, crest_raise_m: float = 0.0) -> list[ContourPoint]:
     """Rebase surveyed elevations to the raised crest datum, in metres."""
     if not math.isfinite(crest_raise_m):
         raise ValueError("Crest raise must be finite")
-    rows = json.loads(path.read_text())
+    geometry = load_config(path)["geometry"]
+    rows = geometry["plinth"]["contours"]
+    bedrock = {float(row["chainage"]): float(row["height"]) for row in geometry["bedrock"]["contours"]}
+    if len(bedrock) != len(geometry["bedrock"]["contours"]) or set(bedrock) != {float(row["chainage"]) for row in rows}:
+        raise ValueError("Plinth and bedrock contours must have matching unique chainages")
     contours = [
         ContourPoint(
             float(row["chainage"]),
-            float(row["bedrock"]) - crest_raise_m,
-            float(row["plinth"]) - crest_raise_m,
+            bedrock[float(row["chainage"])] - crest_raise_m,
+            float(row["height"]) - crest_raise_m,
         )
         for row in rows
     ]
@@ -59,20 +64,17 @@ def load_contours(path: Path, crest_raise_m: float = 0.0) -> list[ContourPoint]:
         raise ValueError("Plinth contour chainages must be strictly increasing")
     if any(point.bedrock_z_m > point.plinth_z_m for point in contours):
         raise ValueError("Bedrock must not be above the plinth contour")
+    if any(not math.isfinite(value) for point in contours for value in (point.chainage_m, point.bedrock_z_m, point.plinth_z_m)):
+        raise ValueError("Contour chainages and elevations must be finite")
     return contours
 
 
 def load_model_contours(root: Path) -> list[ContourPoint]:
-    config = json.loads((root / "config.json").read_text())
-    return load_contours(root / "Data" / "plinth.json", float(config.get("crest_raise_m", 0.0)))
+    return load_contours(root / "config.json")
 
 
 def load_global_element_size(path: Path) -> float:
-    controls = json.loads(path.read_text())
-    matches = [float(row["Client Value"]) for row in controls if row["Mesh Control"] == "Global Element Size"]
-    if len(matches) != 1 or matches[0] <= 0.0:
-        raise ValueError("Expected one positive Global Element Size")
-    return matches[0]
+    return float(load_config(path)["geometry"]["global_element_size_m"])
 
 
 def _monotone_values(contours: list[ContourPoint], attribute: str, chainage_m: float) -> float:
@@ -226,9 +228,11 @@ def _hex_orientation(nodes: list[tuple[float, float, float]], cell: tuple[int, .
 
 def build_plinth(root: Path) -> PlinthMesh:
     contours = load_model_contours(root)
-    element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
-    config = json.loads((root / "config.json").read_text())
-    centerline_radius_m = float(config["wall_centerline_radius_m"])
+    element_size_m = load_global_element_size(root / "config.json")
+    geometry = load_config(root / "config.json")["geometry"]
+    centerline_radius_m = float(geometry["wall"]["centerline_radius_m"])
+    UPSTREAM_RADIUS_M = float(geometry["plinth"]["upstream_radius_m"])
+    DOWNSTREAM_RADIUS_M = float(geometry["plinth"]["downstream_radius_m"])
     chainages_m = _chainages(contours, element_size_m)
     radial_count = round((UPSTREAM_RADIUS_M - DOWNSTREAM_RADIUS_M) / element_size_m)
     radial_levels_m = [DOWNSTREAM_RADIUS_M + index * element_size_m for index in range(radial_count + 1)]
@@ -340,9 +344,11 @@ def build_plinth(root: Path) -> PlinthMesh:
 
 def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> PlinthMesh:
     contours = load_model_contours(root)
-    element_size_m = load_global_element_size(root / "Data" / "Computational_Grid_Controls.json")
-    config = json.loads((root / "config.json").read_text())
-    centerline_radius_m = float(config["wall_centerline_radius_m"])
+    element_size_m = load_global_element_size(root / "config.json")
+    geometry = load_config(root / "config.json")["geometry"]
+    centerline_radius_m = float(geometry["wall"]["centerline_radius_m"])
+    UPSTREAM_RADIUS_M = float(geometry["plinth"]["upstream_radius_m"])
+    DOWNSTREAM_RADIUS_M = float(geometry["plinth"]["downstream_radius_m"])
 
     def stepped_bedrock_z_m(chainage_m: float) -> float:
         bedrock_z_m = _monotone_values(contours, "bedrock_z_m", round(chainage_m, 6))
@@ -683,7 +689,7 @@ def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
                     load_model_contours(Path(__file__).resolve().parents[2]),
                     "bedrock_z_m",
                     math.atan2(mesh.nodes[node_id - 1][0], mesh.nodes[node_id - 1][1])
-                    * json.loads((Path(__file__).resolve().parents[2] / "config.json").read_text())["wall_centerline_radius_m"],
+                    * load_config()["geometry"]["wall"]["centerline_radius_m"],
                 )
             ) < 1.0e-6
             for node_id in cell

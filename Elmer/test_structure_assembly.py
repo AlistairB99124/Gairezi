@@ -15,11 +15,11 @@ from Elmer.regions.combined_structure import load_environment, load_material, lo
 class RaisedReservoirTests(unittest.TestCase):
     def test_active_load_case_and_generated_pressure_law(self):
         root = assembly.ROOT
-        environment = root / "Data" / "Env_Boundaries_And_Loads.json"
+        environment = root / "config.json"
         support = load_foundation_support(environment)
         mesh = SimpleNamespace(
             loads=load_environment(environment),
-            material=load_material(root / "Data" / "Concrete_Material_Properties.json"),
+            material=load_material(environment),
             foundation_support=support, plinth_support=support,
             nodes=[(80.0, 0.0, -31.0), (80.0, 0.0, 0.0)],
         )

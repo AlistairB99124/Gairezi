@@ -14,9 +14,9 @@ The target is predefined cracks with configurable location, depth, initial openi
 and contact, not automatic crack initiation/propagation. Crack growth would require
 an additional fracture law and independently justified material data.
 
-The shared source geometry now has a 5 m wall (radii 75-80 m) centred on a
-7 m plinth (radii 74-81 m), with 1 m overhang on each side and centreline
-radius 77.5 m. Regenerate the Elmer combined reference and reimport the dam;
+The shared source geometry reads [root config.json](../config.json): a 4 m wall
+(radii 76-80 m) centred on a 6 m plinth (radii 75-81 m), with 1 m overhang on
+each side and centreline radius 78 m. Regenerate the Elmer reference and reimport the dam;
 previous dam meshes and parity results are historical, not validation of
 these updated dimensions.
 
@@ -182,9 +182,10 @@ water pressure, a crack front, crack propagation or dam safety.
 ### Corrected reservoir load
 
 The current load case has 3 m of overflow head. The upstream pressure is
-`9810 * max(3 - z, 0)` Pa: 29430 Pa at the crest and 333540 Pa at z = -31 m.
-The nominal 31 m scenario retains crest z = 0 by rebasing imported foundation
-coordinates by -2 m via `config.json`; surveyed contours are unchanged.
+`9810 * max(3 - z, 0)` Pa: 29430 Pa at the crest and 313920 Pa at z = -29 m.
+The contours in root `config.json` retain crest z = 0 without an implicit shift.
+The 31 m reference water depth gives a reported reference peak of 333540 Pa,
+not the maximum pressure on the current mesh.
 This is a head offset, not an increased gradient. Rerun the combined Elmer solver
 before the dam parity task: the earlier reference and reported parity numbers
 below predate this correction and are historical, not corrected-load results.
@@ -192,7 +193,7 @@ The reference-input check intentionally rejects those older inputs. The reduced
 two-bar contact benchmark is unaffected; it does not model water.
 
 The enabled `dam_elastic_parity` scenario consumes the current procedural model
-and [Elmer load case](../Elmer/load_cases.json). The corresponding generated
+and [root configuration](../config.json). The corresponding generated
 Gmsh/SIF inputs must match the reference inputs exactly, ignoring newline style;
 reference outputs must not predate those inputs. The PVTU and each piece are hashed
 into the manifest. This detects input mismatch and obvious stale files but cannot

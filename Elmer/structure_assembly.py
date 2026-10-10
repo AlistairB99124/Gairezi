@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -22,12 +21,14 @@ from structural_model import (
 
 from Elmer.regions.combined_structure import write_combined_gmsh, write_combined_vtu
 from Elmer.regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
+from Elmer.model_config import CONFIG_PATH
+from Elmer.regions.combined_structure import load_material, load_environment, load_foundation_support
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "structure_output"
 COMBINED_SOLVER_DIR = OUTPUT_DIR / "combined_solver"
 COMBINED_SOLVER_MPI_PROCESSES = 4
-LOAD_CASES_PATH = Path(__file__).resolve().parent / "load_cases.json"
+LOAD_CASES_PATH = CONFIG_PATH
 
 
 def mpi_launcher() -> tuple[str, str]:
@@ -101,42 +102,11 @@ def build_combined_region() -> dict[str, object]:
 
 
 def apply_load_case(mesh, path: Path) -> None:
-    """Override solver properties with the selected Elmer load case."""
-    payload = json.loads(path.read_text())
-    material = payload["material"]
-    loads = payload["loads"]
-    bedrock_support = loads["bedrock_support"]
-    plinth_support = loads["plinth_support"]
-    mesh.material = replace(
-        mesh.material,
-        density_kg_m3=float(material["density"]),
-        youngs_modulus_pa=float(material["youngs_modulus"]),
-        poissons_ratio=float(material["poisson_ratio"]),
-        tensile_strength_pa=float(material["tensile_strength"]),
-    )
-    mesh.loads = replace(
-        mesh.loads,
-        gravity_z_m_s2=float(loads["gravity"]),
-        maximum_water_height_m=float(loads["water_height"]),
-        peak_water_pressure_pa=float(loads["water_density"]) * abs(float(loads["gravity"])) * (
-            float(loads["water_height"]) + float(loads["overflow_head"])
-        ),
-        water_density_kg_m3=float(loads["water_density"]),
-        tailwater_head_m=float(loads["tailwater_head"]),
-        overflow_head_m=float(loads["overflow_head"]),
-    )
-    mesh.foundation_support = replace(
-        mesh.foundation_support,
-        spring_x_n_per_m3=float(bedrock_support["spring_x_n_per_m3"]),
-        spring_y_n_per_m3=float(bedrock_support["spring_y_n_per_m3"]),
-        spring_z_n_per_m3=float(bedrock_support["spring_z_n_per_m3"]),
-    )
-    mesh.plinth_support = replace(
-        mesh.plinth_support,
-        spring_x_n_per_m3=float(plinth_support["spring_x_n_per_m3"]),
-        spring_y_n_per_m3=float(plinth_support["spring_y_n_per_m3"]),
-        spring_z_n_per_m3=float(plinth_support["spring_z_n_per_m3"]),
-    )
+    """Apply materials, loads and supports from the root configuration."""
+    mesh.material = load_material(path)
+    mesh.loads = load_environment(path)
+    mesh.foundation_support = load_foundation_support(path)
+    mesh.plinth_support = load_foundation_support(path, "plinth")
 
 
 def write_combined_solver_input(mesh, path: Path) -> None:

@@ -15,7 +15,7 @@ from configuration import load_scenarios
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-LOAD_CASE = ROOT / "Elmer" / "load_cases.json"
+LOAD_CASE = ROOT / "config.json"
 
 
 def environment() -> dict:
@@ -52,7 +52,7 @@ def inventory() -> dict:
     groups = build_named_groups(structure)
     return {
         "status": "inventory_only_not_imported_or_solved",
-        "source": "structural_model.build_combined_structure + Elmer/load_cases.json",
+        "source": "structural_model.build_combined_structure + config.json",
         "units": {"coordinates": "m", "stress": "Pa", "springs": "N/m^3"},
         "nodes": len(structure.nodes),
         "volume_cells": len(structure.cells),

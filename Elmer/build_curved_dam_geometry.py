@@ -5,54 +5,39 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 from typing import Optional
 
-from regions.plinth import load_contours
-
 root = Path(__file__).resolve().parent.parent
-input_path = root / "Data" / "Dam_Base_Contours.json"
-plinth_path = root / "Data" / "plinth.json"
-grid_controls_path = root / "Data" / "Computational_Grid_Controls.json"
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+from Elmer.regions.plinth import load_contours
+from Elmer.model_config import load_config
+
+plinth_path = root / "config.json"
 out_dir = Path(__file__).resolve().parent
 
-config_paths = [
-    root / "v2" / "config.json",
-    root / "config.json",
-]
-config = {}
-for config_path in config_paths:
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        break
-
-geometry_mode = str(config.get("geometry_mode", "v2")).lower()
-
-if input_path.exists():
-    with input_path.open() as fh:
-        data = json.load(fh)
-else:
-    data = []
-
-with grid_controls_path.open() as fh:
-    grid_controls = json.load(fh)
+config = load_config(plinth_path)
+geometry = config["geometry"]
+wall_config = geometry["wall"]
+geometry_mode = "v2"
+data = []
 
 
 def get_grid_control_value(control_name):
-    for row in grid_controls:
-        if row.get("Mesh Control") == control_name:
-            return float(row["Client Value"])
-    raise ValueError(f"Missing mesh control '{control_name}' in {grid_controls_path}")
+    keys = {"Global Element Size": "global_element_size_m", "Local Corner Refinement": "local_element_size_m"}
+    return float(geometry[keys[control_name]])
 
-wall_thickness = float(config.get("wall_thickness_m", 4.0))
-upstream_radius = float(config.get("wall_upstream_radius_m", config.get("wall_radius_m", 80.0)))
-radius = float(config.get("wall_centerline_radius_m", upstream_radius - 0.5 * wall_thickness))
-downstream_radius = float(config.get("wall_downstream_radius_m", upstream_radius - wall_thickness))
+wall_thickness = float(wall_config["radial_width_m"])
+upstream_radius = float(wall_config["upstream_radius_m"])
+radius = float(wall_config["centerline_radius_m"])
+downstream_radius = float(wall_config["downstream_radius_m"])
 if not math.isclose(upstream_radius - downstream_radius, wall_thickness, abs_tol=1.0e-8):
     raise ValueError("Upstream and downstream wall radii must differ by the wall thickness")
 if not math.isclose(radius, 0.5 * (upstream_radius + downstream_radius), abs_tol=1.0e-8):
     raise ValueError("Wall centreline radius must lie midway between the wall-face radii")
-wall_height_above_plinth_m = float(config.get("wall_height_above_plinth_m", 29.0))
-wedge_enabled = bool(config.get("wedge_enabled", True))
+wall_height_above_plinth_m = float(wall_config["height_above_plinth_m"])
+wedge_enabled = False
 wedge_anchor_radius = float(config.get("wedge_anchor_radius_m", downstream_radius))
 wedge_start_below_crest_m = float(config.get("wedge_start_below_crest_m", 25.0))
 wedge_ratio_horizontal_m = float(config.get("wedge_ratio_horizontal_m", 2.0))
@@ -70,12 +55,12 @@ if not 0.0 < wedge_start_below_crest_m:
     raise ValueError("The wedge start below crest must be positive")
 if not 0.0 < wedge_angle_from_vertical_deg < 90.0:
     raise ValueError("The wedge angle from vertical must lie between 0 and 90 degrees")
-plinth_upstream_offset_m = 1.0
-plinth_downstream_offset_m = 1.0
+plinth_upstream_offset_m = float(geometry["plinth"]["upstream_radius_m"]) - upstream_radius
+plinth_downstream_offset_m = downstream_radius - float(geometry["plinth"]["downstream_radius_m"])
 plinth_base_width_m = wall_thickness + plinth_upstream_offset_m + plinth_downstream_offset_m
 plinth_width_m = plinth_base_width_m
 
-dam_height = 30.0
+dam_height = wall_height_above_plinth_m
 mesh_size = get_grid_control_value("Global Element Size")
 target_block_size = mesh_size
 local_corner_size = get_grid_control_value("Local Corner Refinement")
@@ -261,13 +246,12 @@ for row in data:
     rows.append(row)
 
 rows.sort(key=lambda row: float(row["chainage"]))
-plinth_path = root / "Data" / "plinth.json"
 if len(rows) < 3 and not plinth_path.exists():
     raise ValueError("Need at least three unique contour points to build the dam geometry")
 
 profile_points = []
 if geometry_mode == "v2":
-    model_contours = load_contours(plinth_path, float(config.get("crest_raise_m", 0.0)))
+    model_contours = load_contours(plinth_path)
     ground_by_station = {
         point.chainage_m: point.bedrock_z_m for point in model_contours
     }

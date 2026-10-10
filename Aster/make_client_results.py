@@ -71,7 +71,7 @@ def run_pipeline(name: str, points: np.ndarray, displacement: np.ndarray, types,
         3.5e10,
         0.2,
         ROOT / "Elmer" / "curved_dam_mesh.msh",
-        ROOT / "Data" / "Concrete_Material_Properties.json",
+        ROOT / "config.json",
         1.2,
         -3.33,
     )
