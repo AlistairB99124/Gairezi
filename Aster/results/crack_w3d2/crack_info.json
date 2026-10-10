@@ -1,0 +1,12 @@
+{
+  "split_nodes": 30,
+  "lip_faces": 36,
+  "front_radius_m": 77.875,
+  "actual_depth_m": 2.125,
+  "actual_chainage_range_m": [
+    107.0,
+    110.00000000000001
+  ],
+  "actual_width_m": 3.000000000000014,
+  "crack_area_m2": null
+}

@@ -1,0 +1,1 @@
+"""Elmer solver adapter and current structural model implementation."""

@@ -1,0 +1,2 @@
+/usr/bin/bash: warning: setlocale: LC_ALL: cannot change locale (fr_FR.UTF-8)
+METRICS {"node_pairs": 30, "opening_mm_max": 3.887515309664025e-12, "opening_mm_min": -4.058149948352706e-06, "fraction_open_over_1um": 0.0, "fraction_open_over_100um": 0.0, "slip_mm_max": 0.009814917714992284, "fraction_slipping_over_1um": 0.5}

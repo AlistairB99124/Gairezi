@@ -1,0 +1,34 @@
+import json
+
+DEBUT(CODE=_F(NIV_PUB_WEB='INTERNET'), LANG='EN')
+
+mesh = LIRE_MAILLAGE(FORMAT='MED', UNITE=20)
+
+volume_groups = ('PLINTH', 'WALL', 'HAUNCH')
+face_groups = ('FOUNDATION', 'UPSTREAM', 'DOWNSTREAM', 'CREST', 'LEFT_ABUTMENT', 'RIGHT_ABUTMENT', 'OTHER_EXTERIOR')
+
+model = AFFE_MODELE(
+    MAILLAGE=mesh,
+    AFFE=_F(GROUP_MA=volume_groups, PHENOMENE='MECANIQUE', MODELISATION='3D'),
+)
+
+# RHO=1 so that the integrated mass equals the volume in m3.
+unit = DEFI_MATERIAU(ELAS=_F(E=1.0, NU=0.2, RHO=1.0))
+field_mat = AFFE_MATERIAU(MAILLAGE=mesh, AFFE=_F(TOUT='OUI', MATER=unit))
+
+report = {'volume_m3': {}, 'cell_counts': {}}
+for name in volume_groups:
+    table = POST_ELEM(
+        MODELE=model,
+        CHAM_MATER=field_mat,
+        MASS_INER=_F(GROUP_MA=name),
+    )
+    report['volume_m3'][name] = table.EXTR_TABLE().values()['MASSE'][0]
+
+for name in volume_groups + face_groups:
+    report['cell_counts'][name] = len(mesh.getCells(name))
+
+with open('fort.30', 'w') as stream:
+    json.dump(report, stream, indent=2)
+
+FIN()

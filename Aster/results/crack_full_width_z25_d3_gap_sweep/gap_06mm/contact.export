@@ -1,0 +1,11 @@
+P actions make_etude
+P mode interactif
+P memory_limit 7000
+P ncpus 4
+F comm /workspace/Aster/cases/04_crack_contact.comm D 1
+F mmed /workspace/Aster/results/crack_full_width_z25_d3_gap_sweep/gap_06mm/mesh.med D 20
+F mess /workspace/Aster/results/crack_full_width_z25_d3_gap_sweep/gap_06mm/contact.mess R 6
+F rmed /workspace/Aster/results/crack_full_width_z25_d3_gap_sweep/gap_06mm/contact_result.med R 80
+F libr /workspace/Aster/results/crack_full_width_z25_d3_gap_sweep/gap_06mm/contact_table.txt R 30
+F libr /workspace/Aster/results/crack_full_width_z25_d3_gap_sweep/gap_06mm/case_inputs.json D 31
+F libr /workspace/Aster/results/crack_full_width_z25_d3_gap_sweep/gap_06mm/spec.json D 32

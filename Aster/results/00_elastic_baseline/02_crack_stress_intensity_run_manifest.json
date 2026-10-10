@@ -1,0 +1,7 @@
+{
+  "case": "02_crack_stress_intensity",
+  "returncode": 0,
+  "comm_sha256": "0f495d76677acbe649004e308f411a36c160d862e231449ef2a8bd81af186f34",
+  "mesh_sha256": "000a7d5158ad35f0d57b6fea62490181d10d3b5f36a7599cc7dc411ea57b8134",
+  "export": "/home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/02_crack_stress_intensity.export"
+}

@@ -1,0 +1,10 @@
+[
+  {"name": "w3d39", "width_m": 3.0, "depth_m": 3.9},
+  {"name": "w3through", "width_m": 3.0, "depth_m": 4.3, "through": true},
+  {"name": "w6through", "width_m": 6.0, "depth_m": 4.3, "through": true},
+  {"name": "w10through", "width_m": 10.0, "depth_m": 4.3, "through": true},
+  {"name": "w6through_mu05", "width_m": 6.0, "depth_m": 4.3, "through": true, "friction_coefficient": 0.5},
+  {"name": "w6through_mu03", "width_m": 6.0, "depth_m": 4.3, "through": true, "friction_coefficient": 0.3},
+  {"name": "w6d3", "width_m": 6.0, "depth_m": 3.0},
+  {"name": "w10d3", "width_m": 10.0, "depth_m": 3.0}
+]

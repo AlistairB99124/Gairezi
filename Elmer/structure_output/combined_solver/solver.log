@@ -1,0 +1,237 @@
+ELMER SOLVER (v 26.2) STARTED AT: 2026/10/07 18:17:54
+ Started inside library code
+ Going parallel initialization
+ELMER SOLVER (v 26.2) STARTED AT: 2026/10/07 18:17:54
+ Started inside library code
+ Going parallel initialization
+ELMER SOLVER (v 26.2) STARTED AT: 2026/10/07 18:17:54
+ Started inside library code
+ Going parallel initialization
+ELMER SOLVER (v 26.2) STARTED AT: 2026/10/07 18:17:54
+ Started inside library code
+ Going parallel initialization
+ParCommInit: Initialize #PEs: 4
+ Back from parallel initialization
+ParCommInit: Initialize #PEs: 4
+ Back from parallel initialization
+MAIN: 
+MAIN: =============================================================
+MAIN: ElmerSolver finite element software, Welcome!
+MAIN: This program is free software licensed under (L)GPL
+MAIN: ParCommInit: Initialize #PEs: 4
+ Back from parallel initialization
+ParCommInit: Copyright 1st April 1995 - , CSC - IT Center for Science Ltd.
+MAIN: Webpage http://www.csc.fi/elmer, Email elmeradm@csc.fi
+MAIN: Version: 26.2-devel (Rev: b12e038fe, Compiled: 2026-10-05)
+MAIN:  Running in parallel using 4 tasks.
+MAIN:  Running with just one thread per task.
+MAIN: =============================================================
+Initialize #PEs: 4
+ Back from parallel initialization
+MAIN: 
+MAIN: 
+MAIN: -------------------------------------
+MAIN: Reading Model: dam_model.sif
+LoadInputFile: Scanning input file: dam_model.sif
+LoadInputFile: Scanning only size info
+LoadInputFile: First time visiting
+LoadInputFile: Reading base load of sif file
+LoadInputFile: Loading input file: dam_model.sif
+LoadInputFile: Reading base load of sif file
+LoadInputFile: Number of BCs: 4
+LoadInputFile: Number of Body Forces: 1
+LoadInputFile: Number of Initial Conditions: 0
+LoadInputFile: Number of Materials: 2
+LoadInputFile: Number of Equations: 1
+LoadInputFile: Number of Solvers: 2
+LoadInputFile: Number of Bodies: 5
+ElmerMeshReader: Base mesh name: mesh//
+PrepareMesh: Preparing mesh for the future
+LoadMesh: Elapsed REAL time:     0.6113 (s)
+MAIN: -------------------------------------
+OptimizeBandwidth: Initial bandwidth for elasticity: 45279
+OptimizeBandwidth: Optimized bandwidth for elasticity: 1432
+MAIN: Number of timesteps to be saved: 1
+MAIN: 
+MAIN: -------------------------------------
+MAIN:  Steady state iteration:            1
+MAIN: -------------------------------------
+MAIN: 
+ParallelInitMatrix: Creating communication structures for matrix!
+ParallelInitMatrix: Allocating communication structures for matrix!
+ElasticSolver: ----------------------------------
+ElasticSolver: Starting Elasticity Solver
+ElasticSolver: -------------------------------------
+ElasticSolver: ELASTICITY ITERATION 1
+ElasticSolver: -------------------------------------
+       1 0.5724E+01 0.5701E+01
+       2 0.1366E+01 0.1361E+01
+       3 0.9764E+00 0.9725E+00
+       4 0.2732E+01 0.2721E+01
+       5 0.1010E+01 0.1006E+01
+       6 0.8664E+00 0.8629E+00
+       7 0.3828E+00 0.3812E+00
+       8 0.7099E+00 0.7071E+00
+       9 0.3436E+00 0.3422E+00
+      10 0.3117E+00 0.3105E+00
+      11 0.3007E+00 0.2995E+00
+      12 0.2627E+00 0.2616E+00
+      13 0.2758E+00 0.2747E+00
+      14 0.2123E+00 0.2114E+00
+      15 0.2184E+00 0.2175E+00
+      16 0.2067E+00 0.2059E+00
+      17 0.1944E+00 0.1936E+00
+      18 0.6551E+00 0.6525E+00
+      19 0.7885E-01 0.7853E-01
+      20 0.8067E-01 0.8035E-01
+      21 0.6606E-01 0.6579E-01
+      22 0.7168E-01 0.7139E-01
+      23 0.6819E-01 0.6791E-01
+      24 0.5813E-01 0.5789E-01
+      25 0.5920E-01 0.5896E-01
+      26 0.5368E-01 0.5346E-01
+      27 0.1640E+00 0.1633E+00
+      28 0.4380E-01 0.4362E-01
+      29 0.4334E-01 0.4316E-01
+      30 0.3803E-01 0.3787E-01
+      31 0.3856E-01 0.3841E-01
+      32 0.2874E-01 0.2863E-01
+      33 0.3115E-01 0.3102E-01
+      34 0.2102E-01 0.2093E-01
+      35 0.1525E-01 0.1519E-01
+      36 0.1583E-01 0.1577E-01
+      37 0.1418E-01 0.1412E-01
+      38 0.7908E-02 0.7877E-02
+      39 0.6771E-02 0.6743E-02
+      40 0.5773E-02 0.5750E-02
+      41 0.4349E-02 0.4332E-02
+      42 0.4216E-02 0.4199E-02
+      43 0.4109E-02 0.4092E-02
+      44 0.3724E-02 0.3708E-02
+      45 0.3264E-02 0.3251E-02
+      46 0.3306E-02 0.3293E-02
+      47 0.2869E-02 0.2858E-02
+      48 0.3178E-02 0.3165E-02
+      49 0.2766E-02 0.2755E-02
+      50 0.2523E-02 0.2513E-02
+      51 0.2805E-02 0.2794E-02
+      52 0.2627E-02 0.2617E-02
+      53 0.2296E-02 0.2287E-02
+      54 0.2442E-02 0.2432E-02
+      55 0.2042E-02 0.2034E-02
+      56 0.2254E-02 0.2245E-02
+      57 0.2171E-02 0.2162E-02
+      58 0.1719E-02 0.1712E-02
+      59 0.1827E-02 0.1820E-02
+      60 0.2027E-02 0.2019E-02
+      61 0.5124E-03 0.5103E-03
+      62 0.8656E-03 0.8621E-03
+      63 0.8925E-03 0.8889E-03
+      64 0.7679E-03 0.7648E-03
+      65 0.5110E-03 0.5090E-03
+      66 0.4060E-03 0.4043E-03
+      67 0.4007E-03 0.3990E-03
+      68 0.3584E-03 0.3570E-03
+      69 0.3334E-03 0.3320E-03
+      70 0.1515E-03 0.1509E-03
+      71 0.1479E-03 0.1473E-03
+      72 0.9879E-04 0.9839E-04
+      73 0.7630E-04 0.7599E-04
+      74 0.6535E-04 0.6509E-04
+      75 0.3033E-04 0.3021E-04
+      76 0.7050E-05 0.7022E-05
+      77 0.4673E-04 0.4654E-04
+      78 0.2763E-04 0.2751E-04
+      79 0.2235E-04 0.2226E-04
+      80 0.1883E-04 0.1876E-04
+      81 0.1146E-03 0.1141E-03
+      82 0.9924E-05 0.9884E-05
+      83 0.2565E-05 0.2554E-05
+      84 0.2507E-05 0.2497E-05
+      85 0.1654E-05 0.1648E-05
+      86 0.2001E-05 0.1993E-05
+      87 0.1944E-05 0.1936E-05
+      88 0.1743E-05 0.1736E-05
+      89 0.1482E-05 0.1476E-05
+      90 0.4225E-06 0.4208E-06
+      91 0.1218E-06 0.1213E-06
+      92 0.1442E-06 0.1436E-06
+      93 0.1384E-06 0.1378E-06
+      94 0.9074E-07 0.9038E-07
+      95 0.3982E-07 0.3966E-07
+      96 0.4430E-07 0.4412E-07
+      97 0.4430E-07 0.4413E-07
+      98 0.1862E-07 0.1854E-07
+      99 0.1481E-07 0.1475E-07
+     100 0.1077E-07 0.1073E-07
+     101 0.1083E-07 0.1079E-07
+     102 0.2603E-07 0.2593E-07
+     103 0.5315E-08 0.5294E-08
+     104 0.7138E-09 0.7109E-09
+     105 0.9645E-09 0.9606E-09
+     106 0.8141E-09 0.8109E-09
+     107 0.6055E-09 0.6031E-09
+     108 0.1298E-08 0.1293E-08
+BiCGStabl:      109 0.8431E-10 0.8397E-10
+ComputeChange: NS (ITER=1) (NRM,RELC): ( 0.25663649E-02  2.0000000     ) :: elasticity
+ElasticSolver: Computing postprocessing fields
+OptimizeBandwidth: Initial bandwidth for elasticity: 45279
+OptimizeBandwidth: Optimized bandwidth for elasticity: 1432
+NodalProjectorSolve: Stress component 11
+ParallelInitMatrix: Creating communication structures for matrix!
+ParallelInitMatrix: Allocating communication structures for matrix!
+       1 0.1843E-03 0.1839E-03
+       2 0.1880E-05 0.1875E-05
+       3 0.4004E-07 0.3994E-07
+       4 0.3786E-08 0.3777E-08
+       5 0.2122E-10 0.2116E-10
+BiCGStabl:        5 0.2122E-10 0.2116E-10
+NodalProjectorSolve: Stress component 22
+       1 0.1785E-03 0.1777E-03
+       2 0.2568E-05 0.2556E-05
+       3 0.4664E-07 0.4643E-07
+       4 0.1116E-08 0.1111E-08
+       5 0.2949E-09 0.2936E-09
+BiCGStabl:        6 0.1615E-10 0.1608E-10
+NodalProjectorSolve: Stress component 33
+       1 0.2329E-03 0.2318E-03
+       2 0.4460E-05 0.4438E-05
+       3 0.1178E-06 0.1172E-06
+       4 0.2116E-08 0.2105E-08
+       5 0.3391E-10 0.3374E-10
+BiCGStabl:        5 0.3391E-10 0.3374E-10
+NodalProjectorSolve: Stress component 12
+       1 0.1427E-03 0.1422E-03
+       2 0.2326E-05 0.2318E-05
+       3 0.4489E-07 0.4473E-07
+       4 0.6057E-09 0.6036E-09
+BiCGStabl:        5 0.7268E-10 0.7242E-10
+NodalProjectorSolve: Stress component 23
+       1 0.3190E-03 0.3178E-03
+       2 0.6178E-05 0.6156E-05
+       3 0.2226E-06 0.2218E-06
+       4 0.4195E-08 0.4180E-08
+       5 0.6013E-10 0.5992E-10
+BiCGStabl:        5 0.6013E-10 0.5992E-10
+NodalProjectorSolve: Stress component 13
+       1 0.3013E-03 0.3005E-03
+       2 0.3299E-05 0.3290E-05
+       3 0.1159E-06 0.1155E-06
+       4 0.3212E-08 0.3203E-08
+       5 0.7317E-10 0.7297E-10
+BiCGStabl:        5 0.7317E-10 0.7297E-10
+ElasticSolver: Displacing the mesh with computed displacement field
+ElasticSolver: All done
+ElasticSolver: ------------------------------------------
+ComputeChange: SS (ITER=1) (NRM,RELC): ( 0.25663649E-02  2.0000000     ) :: elasticity
+ResultOutputSolver: -------------------------------------
+ResultOutputSolver: Saving with prefix: combined_results_mpi
+CreateListForSaving: Field Variables for Saving
+ResultOutputSolver: Saving in unstructured VTK XML (.vtu) format
+VtuOutputSolver: Saving results in VTK XML format with prefix: combined_results_mpi
+VtuOutputSolver: Saving number of partitions: 4
+ResultOutputSolver: -------------------------------------
+MAIN: *** Elmer Solver: ALL DONE ***
+MAIN: The end
+SOLVER TOTAL TIME(CPU,REAL):       543.51      805.15
+ELMER SOLVER FINISHED AT: 2026/10/07 18:31:20

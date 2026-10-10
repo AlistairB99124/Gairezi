@@ -1,0 +1,47 @@
+{
+  "material": {
+    "density": 2400,
+    "youngs_modulus": 3.5e10,
+    "poisson_ratio": 0.2,
+    "tensile_strength": 2.0e6,
+    "nonlinear_concrete_damage": true
+  },
+  "geometry": {
+    "radius_upstream_face": 80.0,
+    "thickness": 4.0,
+    "flat_segment_start": 51.0,
+    "flat_segment_end": 56.0,
+    "chainage_span": 132.0
+  },
+  "loads": {
+    "gravity": -9.81,
+    "water_height": 29.0,
+    "tailwater_head": 2.0,
+    "overflow_head": 2.0,
+    "overflow_water_level": 31.0,
+    "water_density": 1000.0,
+    "bedrock_support": {
+      "model": "distributed_elastic_granite_half_space",
+      "rock_mass_youngs_modulus_pa": 44000000000.0,
+      "poisson_ratio": 0.25,
+      "influence_width_m": 7.0,
+      "spring_x_n_per_m3": 1000000000.0,
+      "spring_y_n_per_m3": 1000000000.0,
+      "spring_z_n_per_m3": 5000000000.0
+    },
+    "plinth_support": {
+      "model": "distributed_elastic_concrete_half_space",
+      "concrete_youngs_modulus_pa": 30000000000.0,
+      "poisson_ratio": 0.25,
+      "influence_width_m": 7.0,
+      "spring_x_n_per_m3": 1250000000.0,
+      "spring_y_n_per_m3": 1250000000.0,
+      "spring_z_n_per_m3": 3000000000.0
+    }
+  },
+  "outputs": {
+    "max_displacement": true,
+    "max_tensile_stress": true,
+    "cracking_risk": true
+  }
+}

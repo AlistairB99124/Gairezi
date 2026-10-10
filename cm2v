@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ $# -ne 1 ]]; then
+    printf 'Usage: cm2v <path-to-file.med>\n' >&2
+    exit 2
+fi
+
+source_file="$1"
+if [[ "$source_file" != *.med ]]; then
+    printf 'Input must be a .med file: %s\n' "$source_file" >&2
+    exit 2
+fi
+
+if [[ ! -f "$source_file" ]]; then
+    printf 'MED file not found: %s\n' "$source_file" >&2
+    exit 1
+fi
+
+"$workspace_root/.venv/bin/python3" \
+    "$workspace_root/Aster/convert_med_to_vtu.py" \
+    "$source_file" \
+    --overwrite

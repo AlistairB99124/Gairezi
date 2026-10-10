@@ -1,0 +1,7 @@
+{
+  "case": "03_control_crack",
+  "returncode": 0,
+  "comm_sha256": "b83af57ecfe0596aa2a977e40583c1b034d7b9e5c18eaf63a39d2535d899f923",
+  "mesh_sha256": "000a7d5158ad35f0d57b6fea62490181d10d3b5f36a7599cc7dc411ea57b8134",
+  "export": "/home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/03_control_crack.export"
+}

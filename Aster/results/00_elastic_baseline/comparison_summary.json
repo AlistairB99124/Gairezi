@@ -1,0 +1,68 @@
+{
+  "node_count": 166332,
+  "elmer_shared_node_max_mismatch": 0.0,
+  "displacement_m": {
+    "elmer_max_magnitude": 0.008911456766972083,
+    "aster_max_magnitude": 0.008897374083230276,
+    "difference": {
+      "rms": 9.249993531664741e-06,
+      "p99_abs": 2.3946653976343078e-05,
+      "max_abs": 3.628480891248589e-05,
+      "max_abs_over_reference_max": 0.004071703410711229,
+      "rms_over_reference_max": 0.0010379889364382437
+    }
+  },
+  "stress_components_pa": {
+    "elmer_max_abs": 3027598.724577106,
+    "aster_max_abs": 2368387.7419139827,
+    "difference": {
+      "rms": 22100.564055782423,
+      "p99_abs": 91653.42086485265,
+      "max_abs": 1539603.0470260484,
+      "max_abs_over_reference_max": 0.5085228219076818,
+      "rms_over_reference_max": 0.007299700543660859
+    }
+  },
+  "principal_stress_pa": {
+    "elmer_max_tension": 3066966.8352125846,
+    "aster_max_tension": 3090808.098774013,
+    "elmer_max_compression": -3868534.911797749,
+    "aster_max_compression": -2988893.9367650207,
+    "elmer_location_of_max_tension": [
+      73.99999702609497,
+      0.020979464592593727,
+      -26.0
+    ],
+    "aster_location_of_max_tension": [
+      73.99999702609497,
+      0.020979464592593727,
+      -26.0
+    ]
+  },
+  "von_mises_pa": {
+    "elmer_max": 4238654.957523551,
+    "aster_max": 3453452.2920546075
+  },
+  "foundation_reaction_n": {
+    "elmer_from_displacement": [
+      314789504.69659,
+      88511545.4344197,
+      338850938.89467096
+    ],
+    "aster_from_displacement": [
+      314790041.8835446,
+      88511684.59992681,
+      338850938.893549
+    ],
+    "aster_reac_noda_on_spring_nodes": [
+      -5.440487658159299e-07,
+      5.861887730773674e-08,
+      8.24629466933402e-08
+    ],
+    "aster_reac_noda_sum_all_nodes": [
+      1.8061747252849647e-05,
+      -5.216661355830071e-06,
+      8.393216603508336e-06
+    ]
+  }
+}

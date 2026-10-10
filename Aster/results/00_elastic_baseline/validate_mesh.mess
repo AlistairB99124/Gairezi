@@ -1,0 +1,393 @@
+setting '--memory' value to 7372.80 MB (keyword RESERVE_MEMOIRE)
+copying '/home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/mesh.med' to 'fort.20'...
+copying '/home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/case_inputs.json' to 'fort.31'...
+Ouverture en écriture du fichier ./vola.1
+
+<INFO> Démarrage de l'exécution.
+
+                  -- CODE_ASTER -- VERSION : DÉVELOPPEMENT STABILISÉE (testing) --                  
+                               Version 17.4.0 modifiée le 22/12/2025                                
+                               révision 50ebc13c70ee - branche 'HEAD'                               
+                                   Copyright EDF R&D 1991 - 2026                                    
+                                                                                                    
+                              Exécution du : Sat Oct  3 07:57:55 2026                               
+                              Nom de la machine : alistair-MacBookPro                               
+                                        Architecture : 64bit                                        
+                                    Type de processeur : x86_64                                     
+               Système d'exploitation : Linux-6.8.0-138-generic-x86_64-with-glibc2.36               
+                                  Langue des messages : fr (utf-8)                                  
+                                     Version de Python : 3.11.2                                     
+                                     Version de NumPy : 1.24.2                                      
+                                     Parallélisme MPI : inactif                                     
+                                    Parallélisme OpenMP : actif                                     
+                              Nombre de processus OpenMP utilisés : 1                               
+                               Version de la librairie HDF5 : 1.10.3                                
+                                Version de la librairie MED : 4.2.0                                 
+                               Version de la librairie MFront : 4.2.0                               
+                              Version de la librairie MUMPS : 5.6.2.2c                              
+                                  Librairie PETSc : non disponible                                  
+                               Version de la librairie SCOTCH : 7.0.4                               
+
+starting the execution...
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <I> <SUPERVIS_22>                                                                              ║
+ ║                                                                                                ║
+ ║ Les mots-clés CODE et DEBUG dans DEBUT/POURSUITE sont réservés aux cas-tests.                  ║
+ ║ De même pour l'option, "--test" de CA.init().                                                  ║
+ ║ Il ne faut pas les utiliser dans les études car ils modifient certaines valeurs par            ║
+ ║ défaut des commandes DEBUT/POURSUITE qui ont des conséquences sur le comportement              ║
+ ║ en cas d'erreur ou sur les performances.                                                       ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+Valeur initiale du temps CPU maximum =   259200 secondes
+  Valeur du temps CPU maximum passé aux commandes =   259190 secondes
+  Réserve CPU prévue = 10 secondes
+
+Ouverture en écriture du fichier ./glob.1
+
+Ouverture en écriture du fichier ./vola.1
+
+Ouverture en lecture du fichier
+/opt/salome-meca/2025/V2025.1.0_scibian_univ/tools/Code_aster_stable-1740/lib64/aster/elem.1
+
+Nom de la base                          :  ELEMBASE
+     Créée avec la version                   :  17.04.00
+     Nombre d'enregistrements utilisés       :  46
+     Nombre d'enregistrements maximum        :  512
+     Nombre d'enregistrements par fichier    :  512
+     Longueur d'enregistrement (octets)      :  819200
+     Nombre d'identificateurs utilisés       :  123
+     Taille maximum du répertoire            :  300
+     Pourcentage d'utilisation du répertoire :  41 %
+
+Ouverture en lecture du fichier
+/opt/salome-meca/2025/V2025.1.0_scibian_univ/tools/Code_aster_stable-1740/lib64/aster/elem.1
+
+Nom de la base                          :  ELEMBASE
+     Nombre d'enregistrements utilisés       :  46
+     Nombre d'enregistrements maximum        :  512
+     Nombre d'enregistrements par fichier    :  512
+     Longueur d'enregistrement (octets)      :  819200
+     Nombre total d'accès en lecture         :  64
+     Volume des accès en lecture             :         50.00 Mo.
+     Nombre total d'accès en écriture        :  0
+     Volume des accès en écriture            :          0.00 Mo.
+     Nombre d'identificateurs utilisés       :  123
+     Taille maximum du répertoire            :  300
+     Pourcentage d'utilisation du répertoire :  41 %
+
+Relecture des catalogues des éléments faite.
+
+Fin de lecture (durée  0.413672  s.) 
+
+                      Mémoire limite pour l'allocation dynamique : 7884.86 Mo                       
+                         ajouté à l'initialisation du processus : 559.22 Mo                         
+                               Limite cible du processus : 8444.08 Mo                               
+                         Taille limite des fichiers d'échange : 2048.00 Go                          
+# Mémoire (Mo) :   559.22 /   551.10 /   207.61 /   183.67 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0001   user+syst:        0.10s (syst:        0.48s, elaps:        1.13s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt17
+# ----------------------------------------------------------------------------------------------
+# Commande #0002 de /local00/tmp/run_aster_cyev2mqh/validate_mesh.comm.changed.py, ligne 17
+mesh = LIRE_MAILLAGE(FORMAT='MED',
+                     INFO=1,
+                     INFO_MED=0,
+                     PARTITIONNEUR='SANS',
+                     UNITE=20,
+                     VERI_MAIL=_F(APLAT=0.001,
+                                  VERIF='OUI'))
+
+Nom MED du maillage : dam
+
+
+------------ MAILLAGE 00000001 - IMPRESSIONS NIVEAU  1 ------------
+
+
+NOMBRE DE NOEUDS                      166332
+
+NOMBRE DE MAILLES                     190608
+                              POI1                 5126
+                              TRIA3                 656
+                              QUAD4               35758
+                              PENTA6               1654
+                              HEXA8              147414
+
+NOMBRE DE GROUPES DE MAILLES            5137
+
+--------------------------------------------------------------------------------
+
+Vérification du maillage.
+
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <A> <MODELISA8_14>                                                                             ║
+ ║                                                                                                ║
+ ║ La maille POI1 1 est incluse dans une autre.                                                   ║
+ ║                                                                                                ║
+ ║                                                                                                ║
+ ║ Ceci est une alarme. Si vous ne comprenez pas le sens de cette                                 ║
+ ║ alarme, vous pouvez obtenir des résultats inattendus !                                         ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <A> <MODELISA8_14>                                                                             ║
+ ║                                                                                                ║
+ ║ La maille POI1 2 est incluse dans une autre.                                                   ║
+ ║                                                                                                ║
+ ║                                                                                                ║
+ ║ Ceci est une alarme. Si vous ne comprenez pas le sens de cette                                 ║
+ ║ alarme, vous pouvez obtenir des résultats inattendus !                                         ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <A> <MODELISA8_14>                                                                             ║
+ ║                                                                                                ║
+ ║ La maille POI1 3 est incluse dans une autre.                                                   ║
+ ║                                                                                                ║
+ ║                                                                                                ║
+ ║ Ceci est une alarme. Si vous ne comprenez pas le sens de cette                                 ║
+ ║ alarme, vous pouvez obtenir des résultats inattendus !                                         ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <A> <MODELISA8_14>                                                                             ║
+ ║                                                                                                ║
+ ║ La maille POI1 4 est incluse dans une autre.                                                   ║
+ ║                                                                                                ║
+ ║                                                                                                ║
+ ║ Ceci est une alarme. Si vous ne comprenez pas le sens de cette                                 ║
+ ║ alarme, vous pouvez obtenir des résultats inattendus !                                         ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <A> <MODELISA8_14>                                                                             ║
+ ║                                                                                                ║
+ ║ La maille POI1 5 est incluse dans une autre.                                                   ║
+ ║                                                                                                ║
+ ║                                                                                                ║
+ ║ Ceci est une alarme. Si vous ne comprenez pas le sens de cette                                 ║
+ ║ alarme, vous pouvez obtenir des résultats inattendus !                                         ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <A> <CATAMESS_41>                                                                              ║
+ ║                                                                                                ║
+ ║ Le message d'alarme 'MODELISA8_14' a été émis 5 fois, il ne sera plus affiché.                 ║
+ ║                                                                                                ║
+ ║                                                                                                ║
+ ║ Ceci est une alarme. Si vous ne comprenez pas le sens de cette                                 ║
+ ║ alarme, vous pouvez obtenir des résultats inattendus !                                         ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+# Résultat commande #0002 (LIRE_MAILLAGE): mesh ('<00000001>') de type <Mesh>
+# Mémoire (Mo) :   645.79 /   625.15 /   239.59 /   208.11 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0002   user+syst:       37.15s (syst:       26.69s, elaps:      113.48s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt22
+# ----------------------------------------------------------------------------------------------
+# Commande #0003 de /local00/tmp/run_aster_cyev2mqh/validate_mesh.comm.changed.py, ligne 22
+model = AFFE_MODELE(AFFE=_F(GROUP_MA=('PLINTH', 'WALL', 'HAUNCH'),
+                            MODELISATION='3D',
+                            PHENOMENE='MECANIQUE'),
+                    DISTRIBUTION=_F(METHODE='SOUS_DOMAINE',
+                                    PARTITIONNEUR='METIS'),
+                    INFO=1,
+                    MAILLAGE=mesh,
+                    VERI_FORMULATION_IFS='OUI',
+                    VERI_JACOBIEN='OUI',
+                    VERI_NORM_IFS='OUI',
+                    VERI_PLAN='OUI')
+
+Sur les 190608 mailles du maillage 00000001, on a demandé l'affectation de 149068, on a pu en
+affecter 149068.
+Modélisation     Formulation      Type maille  Élément fini     Nombre
+3D               _                HEXA8        MECA_HEXA8       147414
+3D               _                PENTA6       MECA_PENTA6      1654
+#2      Calculs elementaires et assemblages               CPU (USER+SYST/SYST/ELAPS):      0.28      0.02      0.55
+# Résultat commande #0003 (AFFE_MODELE): model ('<00000002>') de type <Model>
+# Mémoire (Mo) :   781.37 /   773.35 /   250.94 /   230.34 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0003   user+syst:        2.43s (syst:        0.08s, elaps:        4.93s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt28
+# ----------------------------------------------------------------------------------------------
+# Commande #0004 de /local00/tmp/run_aster_cyev2mqh/validate_mesh.comm.changed.py, ligne 28
+unit = DEFI_MATERIAU(ELAS=_F(B_ENDOGE=0.0,
+                             COEF_AMOR=1.0,
+                             E=1.0,
+                             K_DESSIC=0.0,
+                             NU=0.2,
+                             RHO=1.0),
+                     INFO=1)
+
+# Résultat commande #0004 (DEFI_MATERIAU): unit ('<00000003>') de type <Material>
+# Mémoire (Mo) :   781.37 /   773.35 /   250.94 /   230.34 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0004   user+syst:        0.09s (syst:        0.00s, elaps:        0.17s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt29
+# ----------------------------------------------------------------------------------------------
+# Commande #0005 de /local00/tmp/run_aster_cyev2mqh/validate_mesh.comm.changed.py, ligne 29
+field_mat = AFFE_MATERIAU(AFFE=_F(MATER=unit,
+                                  TOUT='OUI'),
+                          INFO=1,
+                          MAILLAGE=mesh)
+
+# Résultat commande #0005 (AFFE_MATERIAU): field_mat ('<00000004>') de type <MaterialField>
+# Mémoire (Mo) :   781.37 /   773.35 /   250.94 /   230.34 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0005   user+syst:        0.08s (syst:        0.00s, elaps:        0.17s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt33
+# ----------------------------------------------------------------------------------------------
+# Commande #0006 de /local00/tmp/run_aster_cyev2mqh/validate_mesh.comm.changed.py, ligne 33
+table = POST_ELEM(CHAM_MATER=field_mat,
+                  CRITERE='RELATIF',
+                  GEOMETRIE='INITIALE',
+                  INFO=1,
+                  MASS_INER=_F(GROUP_MA='PLINTH'),
+                  MODELE=model,
+                  MODE_FOURIER=0,
+                  NIVE_COUCHE='MOY',
+                  NUME_COUCHE=1,
+                  PRECISION=1e-06)
+
+#2      Calculs elementaires et assemblages               CPU (USER+SYST/SYST/ELAPS):      0.23      0.01      0.45
+# Résultat commande #0006 (POST_ELEM): table ('<00000005>') de type <Table>
+# Mémoire (Mo) :   796.16 /   773.35 /   264.47 /   230.34 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0006   user+syst:        2.76s (syst:        0.05s, elaps:        5.60s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt33
+# ----------------------------------------------------------------------------------------------
+# Commande #0007 de /local00/tmp/run_aster_cyev2mqh/validate_mesh.comm.changed.py, ligne 33
+table = POST_ELEM(CHAM_MATER=field_mat,
+                  CRITERE='RELATIF',
+                  GEOMETRIE='INITIALE',
+                  INFO=1,
+                  MASS_INER=_F(GROUP_MA='WALL'),
+                  MODELE=model,
+                  MODE_FOURIER=0,
+                  NIVE_COUCHE='MOY',
+                  NUME_COUCHE=1,
+                  PRECISION=1e-06)
+
+#2      Calculs elementaires et assemblages               CPU (USER+SYST/SYST/ELAPS):      1.17      0.02      2.34
+# Résultat commande #0007 (POST_ELEM): table ('<00000006>') de type <Table>
+# Mémoire (Mo) :   807.98 /   773.35 /   275.78 /   236.02 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0007   user+syst:       75.66s (syst:        0.44s, elaps:      137.66s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt33
+# ----------------------------------------------------------------------------------------------
+# Commande #0008 de /local00/tmp/run_aster_cyev2mqh/validate_mesh.comm.changed.py, ligne 33
+table = POST_ELEM(CHAM_MATER=field_mat,
+                  CRITERE='RELATIF',
+                  GEOMETRIE='INITIALE',
+                  INFO=1,
+                  MASS_INER=_F(GROUP_MA='HAUNCH'),
+                  MODELE=model,
+                  MODE_FOURIER=0,
+                  NIVE_COUCHE='MOY',
+                  NUME_COUCHE=1,
+                  PRECISION=1e-06)
+
+#2      Calculs elementaires et assemblages               CPU (USER+SYST/SYST/ELAPS):      0.00      0.00      0.01
+# Résultat commande #0008 (POST_ELEM): table ('<00000007>') de type <Table>
+# Mémoire (Mo) :   807.98 /   773.35 /   275.78 /   236.02 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0008   user+syst:        0.10s (syst:        0.02s, elaps:        0.17s)
+# ----------------------------------------------------------------------------------------------
+
+.. _stg1_txt76
+# ----------------------------------------------------------------------------------------------
+# Commande #0009 de /opt/salome-meca/2025/V2025.1
+0_scibian_univ/tools/Code_aster_stable-1740/lib64/aster/code_aster/CodeCommands/fin.py, ligne 76
+FIN(INFO_RESU='NON',
+    RETASSAGE='NON')
+
+No database in results, objects not saved on processor #0
+
+ ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+ ║ <I> <CATAMESS_89>                                                                              ║
+ ║                                                                                                ║
+ ║ Liste des alarmes émises lors de l'exécution du calcul.                                        ║
+ ║                                                                                                ║
+ ║     Les alarmes que vous avez choisies d'ignorer sont précédées de (*).                        ║
+ ║     Nombre d'occurrences pour chacune des alarmes :                                            ║
+ ║            MODELISA8_14         émise 5126 fois                                                ║
+ ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+<I> <FIN> ARRET NORMAL DANS "FIN" PAR APPEL A "JEFINI".
+  
+ <I> <FIN> MEMOIRE JEVEUX MINIMALE REQUISE POUR L'EXECUTION :                     236.02 Mo
+ <I> <FIN> MEMOIRE JEVEUX OPTIMALE REQUISE POUR L'EXECUTION :                     275.78 Mo
+ <I> <FIN> MAXIMUM DE MEMOIRE UTILISEE PAR LE PROCESSUS LORS DE L'EXECUTION :     807.98 Mo
+  
+ <I>       FERMETURE DES BASES EFFECTUEE
+  
+   STATISTIQUES CONCERNANT L'ALLOCATION DYNAMIQUE :
+     TAILLE CUMULEE MAXIMUM            :                  276  Mo.
+     TAILLE CUMULEE LIBEREE            :                 8258  Mo.
+     NOMBRE TOTAL D'ALLOCATIONS        :             35959832
+     NOMBRE TOTAL DE LIBERATIONS       :             35954407
+     APPELS AU MECANISME DE LIBERATION :                    0
+     TAILLE MEMOIRE CUMULEE RECUPEREE  :                    0  Mo.
+     VOLUME DES LECTURES               :                    0  Mo.
+     VOLUME DES ECRITURES              :                    0  Mo.
+  
+   MEMOIRE JEVEUX MINIMALE REQUISE POUR L'EXECUTION :     236.02 Mo
+     - IMPOSE DE NOMBREUX ACCES DISQUE
+     - RALENTIT LA VITESSE D'EXECUTION
+   MEMOIRE JEVEUX OPTIMALE REQUISE POUR L'EXECUTION :     275.78 Mo
+     - LIMITE LES ACCES DISQUE
+     - AMELIORE LA VITESSE D'EXECUTION
+   MAXIMUM DE MEMOIRE UTILISEE PAR LE PROCESSUS     :     807.98 Mo
+     - COMPREND LA MEMOIRE CONSOMMEE PAR  JEVEUX, 
+       LE SUPERVISEUR PYTHON, LES LIBRAIRIES EXTERNES
+  
+ <I>       FIN D'EXECUTION LE : SA-03-OCTO-2026 08:02:19
+INFO './glob.1' deleted
+Deleting './glob.2': No such file or directory
+INFO './vola.1' deleted
+Deleting './vola.2': No such file or directory
+
+ ********************************************************************************
+ * COMMAND                  :       USER :     SYSTEM :   USER+SYS :    ELAPSED *
+ ********************************************************************************
+ * DEBUT                    :       0.10 :       0.48 :       0.58 :       1.13 *
+ * LIRE_MAILLAGE            :      37.15 :      26.69 :      63.84 :     113.48 *
+ * AFFE_MODELE              :       2.43 :       0.08 :       2.51 :       4.93 *
+ * DEFI_MATERIAU            :       0.09 :       0.00 :       0.09 :       0.17 *
+ * AFFE_MATERIAU            :       0.08 :       0.00 :       0.08 :       0.17 *
+ * POST_ELEM                :       2.76 :       0.05 :       2.81 :       5.60 *
+ * POST_ELEM                :      75.66 :       0.44 :      76.10 :     137.66 *
+ * POST_ELEM                :       0.10 :       0.02 :       0.12 :       0.17 *
+ * FIN                      :       0.13 :       0.01 :       0.14 :       0.21 *
+ *  . check syntax          :       0.05 :       0.01 :       0.06 :       0.07 *
+ *  . fortran               :      81.13 :       1.07 :      82.20 :     149.62 *
+ *  . cleanup               :       0.15 :       0.00 :       0.15 :       0.29 *
+ ********************************************************************************
+ * TOTAL_JOB                :     118.85 :      27.91 :     146.76 :     264.37 *
+ ********************************************************************************
+
+# Mémoire (Mo) :   807.98 /   774.35 /   275.78 /   236.02 (VmPeak / VmSize / Optimum / Minimum)
+# Fin commande #0009   user+syst:        0.13s (syst:        0.01s, elaps:        0.21s)
+# ----------------------------------------------------------------------------------------------
+
+EXECUTION_CODE_ASTER_EXIT_23917=0
+
+
+
+------------------------------------------------------------
+--- DIAGNOSTIC JOB : <A>_ALARM
+------------------------------------------------------------
+

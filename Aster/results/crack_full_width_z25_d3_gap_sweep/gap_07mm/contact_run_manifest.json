@@ -1,0 +1,9 @@
+{
+  "case": "contact",
+  "returncode": 0,
+  "wrapper_returncode": 0,
+  "solver_succeeded": true,
+  "comm_sha256": "74bf80187a16bd89265f7261fc8e34c0902c0da9a05d6f1cb54624ee14a26dfd",
+  "mesh_sha256": "c8239e41abdc6ac36f62c96e66aa64d5ec3067328f290838dd5136ee8753dd93",
+  "export": "/Users/alistairdavies/Projects/Gairezi/Aster/results/crack_full_width_z25_d3_gap_sweep/gap_07mm/contact.export"
+}

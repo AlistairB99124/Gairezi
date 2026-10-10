@@ -1,0 +1,25 @@
+{
+  "geometry": {
+    "description": "Full-width horizontal crack in the wall at z = -25 m",
+    "chainage_range_m": [89.5, 124.0],
+    "radial_depth_m": 3.0,
+    "initial_height_mm": 2.0,
+    "lip_faces": 621,
+    "split_node_pairs": 612
+  },
+  "loads": {
+    "gravity": true,
+    "hydrostatic_upstream_and_downstream": true,
+    "hydrostatic_crack_faces": true,
+    "crest_overflow": true
+  },
+  "response": {
+    "aperture_mm_min": 1.3253994077892495,
+    "aperture_mm_max": 1.9917881281932022,
+    "aperture_mm_mean": 1.7066165389430983,
+    "fraction_in_contact": 0.0,
+    "maximum_slip_mm": 0.13194285839798622,
+    "maximum_principal_tension_mpa": 3.526370744019733,
+    "minimum_principal_compression_mpa": -4.895279208979367
+  }
+}

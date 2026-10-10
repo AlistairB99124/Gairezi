@@ -1,0 +1,17 @@
+{
+  "orientation": "horizontal",
+  "full_width": true,
+  "split_nodes": 612,
+  "lip_faces": 621,
+  "front_nodes": 88,
+  "actual_depth_m": 3.000000000000014,
+  "initial_gap_mm": 6.0,
+  "footprint_chainage_range_m": [
+    89.5,
+    123.99999999999999
+  ],
+  "footprint_z_range_m": [
+    -25.0,
+    -25.0
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "case": "01_xfem_feasibility",
+  "returncode": 0,
+  "comm_sha256": "a4ff8ed3a0c8d448238e5e0fb84ba3e88615ddd92fca74088498f7c2ab3e4b08",
+  "mesh_sha256": "000a7d5158ad35f0d57b6fea62490181d10d3b5f36a7599cc7dc411ea57b8134",
+  "export": "/home/alistair/projects/Gairezi/Aster/results/00_elastic_baseline/01_xfem_feasibility.export"
+}

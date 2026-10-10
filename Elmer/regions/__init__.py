@@ -1,0 +1,1 @@
+"""Independent structural region generators."""

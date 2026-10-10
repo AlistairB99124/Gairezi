@@ -1,0 +1,2 @@
+/usr/bin/bash: warning: setlocale: LC_ALL: cannot change locale (fr_FR.UTF-8)
+OPENING {"lip_node_pairs": 151, "opening_mm_min": -0.02117969647026156, "opening_mm_max": 7.175818275088202e-16, "opening_mm_mean": -0.0006400313497743809, "slip_mm_max": 0.006549630350427627, "fraction_open": 0.0, "location_min": [74.56375367170102, 11.79546371350911, -27.000000000000004], "location_max": [78.68757072599115, 16.249628579790034, -22.999999999999993]}

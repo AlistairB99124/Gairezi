@@ -1,0 +1,96 @@
+import json
+import math
+
+DEBUT(CODE=_F(NIV_PUB_WEB='INTERNET'), LANG='EN')
+
+# Inputs shared with the Elmer model, written by Aster/build_med_mesh.py.
+with open('fort.31') as stream:
+    inputs = json.load(stream)
+material = inputs['material']
+loads = inputs['loads']
+spring_per_area = inputs['foundation_spring_n_per_m3']
+spring_areas = inputs['spring_areas_m2']
+
+volumes = ('PLINTH', 'WALL', 'HAUNCH')
+skins = ('UPSTREAM', 'DOWNSTREAM', 'CREST')
+
+mesh = LIRE_MAILLAGE(FORMAT='MED', UNITE=20)
+mesh = MODI_MAILLAGE(reuse=mesh, MAILLAGE=mesh, ORIE_PEAU=_F(GROUP_MA_PEAU=skins))
+
+model = AFFE_MODELE(
+    MAILLAGE=mesh,
+    AFFE=(
+        _F(GROUP_MA=volumes + skins, PHENOMENE='MECANIQUE', MODELISATION='3D'),
+        _F(GROUP_MA='SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),
+    ),
+)
+
+concrete = DEFI_MATERIAU(
+    ELAS=_F(E=material['youngs_modulus_pa'], NU=material['poissons_ratio'], RHO=material['density_kg_m3'])
+)
+field_mat = AFFE_MATERIAU(MAILLAGE=mesh, AFFE=_F(GROUP_MA=volumes, MATER=concrete))
+
+# Lumped directional springs: stiffness per area times each node's tributary area.
+springs = AFFE_CARA_ELEM(
+    MODELE=model,
+    DISCRET=[
+        _F(
+            GROUP_MA='SPR%d' % index,
+            CARA='K_T_D_N',
+            VALE=tuple(k * area for k in spring_per_area),
+        )
+        for index, area in enumerate(spring_areas)
+    ],
+)
+
+gravity_z = loads['gravity_z_m_s2']
+gravity = AFFE_CHAR_MECA(
+    MODELE=model,
+    PESANTEUR=_F(GRAVITE=abs(gravity_z), DIRECTION=(0.0, 0.0, math.copysign(1.0, gravity_z)), GROUP_MA=volumes),
+)
+
+water_gradient = loads['water_density_kg_m3'] * abs(gravity_z)
+reservoir_gradient = loads['peak_water_pressure_pa'] / loads['maximum_water_height_m']
+tailwater_level = loads['foundation_elevation_m'] + loads['tailwater_head_m']
+
+# Same linear-in-depth laws as the Elmer MATC expressions; free surface of the reservoir at z = 0.
+upstream_pressure = FORMULE(
+    VALE='%.12g*max(-Z, 0.0)' % reservoir_gradient, NOM_PARA=('X', 'Y', 'Z')
+)
+tailwater_pressure = FORMULE(
+    VALE='%.12g*max(%.12g - Z, 0.0)' % (water_gradient, tailwater_level), NOM_PARA=('X', 'Y', 'Z')
+)
+hydrostatic = AFFE_CHAR_MECA_F(
+    MODELE=model,
+    PRES_REP=(
+        _F(GROUP_MA='UPSTREAM', PRES=upstream_pressure),
+        _F(GROUP_MA='DOWNSTREAM', PRES=tailwater_pressure),
+    ),
+)
+overflow = AFFE_CHAR_MECA(
+    MODELE=model,
+    PRES_REP=_F(GROUP_MA='CREST', PRES=water_gradient * loads['overflow_head_m']),
+)
+
+result = MECA_STATIQUE(
+    MODELE=model,
+    CHAM_MATER=field_mat,
+    CARA_ELEM=springs,
+    EXCIT=(_F(CHARGE=gravity), _F(CHARGE=hydrostatic), _F(CHARGE=overflow)),
+    SOLVEUR=_F(METHODE='MUMPS', GESTION_MEMOIRE='AUTO'),
+)
+
+result = CALC_CHAMP(
+    reuse=result,
+    RESULTAT=result,
+    CONTRAINTE=('SIGM_ELNO', 'SIGM_NOEU'),
+    FORCE='REAC_NODA',
+)
+
+IMPR_RESU(
+    FORMAT='MED',
+    UNITE=80,
+    RESU=_F(RESULTAT=result, NOM_CHAM=('DEPL', 'SIGM_NOEU', 'REAC_NODA')),
+)
+
+FIN()
