@@ -1,2 +1,7 @@
 /Elmer/structure_output/combined_solver/results/
 /Elmer/structure_output/combined_solver/mesh/
+__pycache__/
+*.pyc
+*.bak
+*.bak_*
+

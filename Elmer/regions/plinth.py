@@ -663,7 +663,12 @@ def write_vtu(mesh: PlinthMesh, path: Path) -> None:
     path.write_bytes(header + b"\n_" + b"".join(chunks) + b"\n  </AppendedData>\n</VTKFile>\n")
 
 
-def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
+def audit_plinth(mesh: PlinthMesh, root: Path) -> dict[str, object]:
+    geometry = load_config(root / "config.json")["geometry"]
+    upstream_radius_m = float(geometry["plinth"]["upstream_radius_m"])
+    downstream_radius_m = float(geometry["plinth"]["downstream_radius_m"])
+    centerline_radius_m = float(geometry["wall"]["centerline_radius_m"])
+    contours = load_model_contours(root)
     element_counts = Counter(element_type for element_type, _ in mesh.cells)
     boundary_counts = Counter(boundary_id for boundary_id, _ in mesh.boundaries)
     off_grid_nodes = {
@@ -686,17 +691,17 @@ def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
             abs(
                 mesh.nodes[node_id - 1][2]
                 - _monotone_values(
-                    load_model_contours(Path(__file__).resolve().parents[2]),
+                    contours,
                     "bedrock_z_m",
                     math.atan2(mesh.nodes[node_id - 1][0], mesh.nodes[node_id - 1][1])
-                    * load_config()["geometry"]["wall"]["centerline_radius_m"],
+                    * centerline_radius_m,
                 )
             ) < 1.0e-6
             for node_id in cell
         )
         if not touches_bedrock:
             non_bedrock_transition_cells.append(cell_index)
-    expected_radial_cells = round((UPSTREAM_RADIUS_M - DOWNSTREAM_RADIUS_M) / mesh.element_size_m)
+    expected_radial_cells = round((upstream_radius_m - downstream_radius_m) / mesh.element_size_m)
     if not {FOUNDATION_BOUNDARY_ID, UPSTREAM_BOUNDARY_ID, DOWNSTREAM_BOUNDARY_ID, TOP_BOUNDARY_ID} <= set(boundary_counts):
         raise ValueError(f"Missing plinth boundaries: found {sorted(boundary_counts)}")
     if unexpected_off_grid_nodes:
@@ -705,7 +710,32 @@ def audit_plinth(mesh: PlinthMesh) -> dict[str, object]:
         raise ValueError(
             f"Plinth has {len(non_bedrock_transition_cells)} non-hexahedral cells outside the bedrock closure"
         )
-    component_count = len({find(cell_index) for cell_index in range(len(cells))})
+    face_patterns = {
+        5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
+        6: ((0, 1, 2), (3, 5, 4), (0, 3, 4, 1), (1, 4, 5, 2), (2, 5, 3, 0)),
+    }
+    face_owners: dict[tuple[int, ...], int] = {}
+    parents = list(range(len(mesh.cells)))
+
+    def find(cell_index: int) -> int:
+        while parents[cell_index] != cell_index:
+            parents[cell_index] = parents[parents[cell_index]]
+            cell_index = parents[cell_index]
+        return cell_index
+
+    for cell_index, (element_type, cell) in enumerate(mesh.cells):
+        for pattern in face_patterns[element_type]:
+            face = tuple(cell[index] for index in pattern)
+            key = tuple(sorted(face))
+            if key in face_owners:
+                first_root = find(cell_index)
+                second_root = find(face_owners[key])
+                if first_root != second_root:
+                    parents[second_root] = first_root
+            else:
+                face_owners[key] = cell_index
+
+    component_count = len({find(cell_index) for cell_index in range(len(mesh.cells))})
     if component_count != 1:
         raise ValueError(f"Plinth has {component_count} face-connected components")
     return {

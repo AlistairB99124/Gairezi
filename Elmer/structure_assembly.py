@@ -81,7 +81,7 @@ def build_plinth_region() -> dict[str, object]:
     preview_path = OUTPUT_DIR / "plinth.vtu"
     write_gmsh(mesh, mesh_path)
     write_vtu(mesh, preview_path)
-    report = audit_plinth(mesh)
+    report = audit_plinth(mesh, ROOT)
     report["gmsh_path"] = str(mesh_path)
     report["paraview_path"] = str(preview_path)
     report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "plinth_mesh")

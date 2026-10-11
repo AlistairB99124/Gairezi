@@ -8,6 +8,10 @@ design plan for a future Windows WPF application. Read
 defines the configuration contract, implementation order, job lifecycle,
 security boundary, and acceptance gates.
 
+The app mock-up is `Design_Docs/Dam Analysis Workbench UI.png` (relative to
+the parent Lamb repository: `Gairezi/Design_Docs/Dam Analysis Workbench UI.png`).
+Use it as the visual reference when building the WPF layout and styling.
+
 The root `config.json` is the authoritative dam-data contract. Do not create a
 second independently maintained configuration or silently reinterpret physical
 inputs. Preserve the documented distinction between active inputs, nominal
