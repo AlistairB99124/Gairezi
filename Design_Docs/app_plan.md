@@ -1,0 +1,459 @@
+# Dam Analysis Workbench - implementation plan
+
+## 1. Goal and scope
+
+Build a Windows WPF application in Visual Studio that edits one dam configuration,
+submits it to a lightweight local Python API, runs the existing Elmer workflow,
+and displays the resulting analysis and reports.
+
+The existing [config.json](../config.json) is the dam-data contract.
+Preserve its `geometry`, `material`, `loads`, and `outputs` structure.
+Do not create another independently maintained set of dam properties.
+
+Use [Dam Analysis Workbench UI.png](./Dam%20Analysis%20Workbench%20UI.png) as the
+visual reference: dark navy/red styling, left navigation, configuration tabs,
+contour grids, configuration summary, JSON preview, and Submit button.
+This is a native WPF frontend, not a Python-rendered web form.
+
+**First release:** local Windows use, one active Elmer analysis, complete
+configuration editing, validation, job monitoring, cancellation, and result
+viewing. Code_Aster integration and interactive 3-D results are later milestones.
+Do not build authentication accounts, a cloud service, a distributed queue,
+or a web frontend for this first release.
+
+## 2. Proposed architecture
+
+```text
+WPF application (C#, MVVM)
+    |
+    | HTTP over loopback: configuration JSON and job requests
+    v
+Python API (FastAPI + Uvicorn, one server process)
+    |
+    | starts an isolated Python worker process for each accepted job
+    v
+Existing mesh builder -> ElmerGrid -> MPI ElmerSolver -> post-processing
+    |
+    v
+Per-job configuration snapshot, logs, mesh, solver result, summary and plots
+    |
+    v
+API job status / result endpoints -> WPF results screen
+```
+
+Elmer does not consume JSON directly. The Python worker consumes the submitted
+configuration and generates the Gmsh mesh and Elmer SIF before invoking Elmer.
+Reuse the existing numerical model rather than reimplementing it in the API.
+
+### Suggested project locations
+
+| Location | Responsibility |
+|---|---|
+| Parent repository `Lamb.sln` | Existing Visual Studio solution; open this for Workbench development |
+| Parent repository `Lamb.Windows.App/` | Existing WPF project, views, view models, models and HTTP client |
+| Parent repository `Lamb.API/` | Existing Python API project; inspect and reuse rather than creating a duplicate |
+| This repository's `Elmer/` | Shared configuration validation, mesh generation, solver and post-processing |
+| This repository's `Aster/` | Future alternative backend using the same dam configuration |
+| This repository's `config.json` | Version-controlled example/default dam configuration |
+| `%LOCALAPPDATA%\Lamb\DamAnalysisWorkbench\jobs\<job-id>\` | Generated job inputs, outputs and logs, outside Git |
+
+#### Repository and Visual Studio solution boundary
+
+The WPF application and its solution already live in the parent `Lamb`
+repository. Continue using its existing `Lamb.sln` and
+`Lamb.Windows.App/Lamb.Windows.App.csproj`; do not create a second solution,
+move the WPF project, or add this entire repository as a C# project. The parent
+solution also already contains `Lamb.API`; inspect that project before adding
+or replacing API infrastructure.
+
+This `Gairezi` checkout is a separate, nested Git repository containing the
+existing dam model. Copilot can work across it when Visual Studio is opened at
+the parent repository/solution context, but the nested repository is not a
+project reference. Changes under `Gairezi/` are versioned in this repository;
+changes under `Lamb.Windows.App/` or `Lamb.API/` are versioned in the parent
+repository. Keep those Git boundaries intact unless the owner explicitly
+chooses to merge the repositories or configure a submodule.
+
+The Visual Studio solution is an IDE/build container, not a requirement that
+every source directory be a project. Use Python for the dam model and backend
+tests, and keep `Gairezi/config.json` as the single dam-data contract.
+
+Keep API address, executable locations, job storage and other application settings
+separate from dam properties. These are deployment settings, not a second dam JSON.
+Keep a single configuration snapshot per job as its authoritative input.
+
+## 3. Existing workspace: reuse and gaps
+
+The baseline workflow is already working:
+
+- [model_config.py](../Elmer/model_config.py) loads and validates root configuration.
+- [structure_assembly.py](../Elmer/structure_assembly.py) builds the combined mesh,
+  converts/partitions it with ElmerGrid and runs four MPI solver processes.
+- [analyze_stress.py](../Elmer/analyze_stress.py) generates CSV, summary JSON and plots.
+- The combined solve and client-report generation are currently separate steps.
+- The CLI writes into fixed workspace directories and some compatibility radius
+  constants are populated from root configuration when modules are imported.
+
+Before HTTP submission can be reliable:
+
+1. Accept explicit configuration and output-directory inputs throughout the
+   worker path. Never overwrite the repository configuration to submit a job.
+2. Remove reliance on import-time root-configuration values from the submitted-job
+   path, including audits and post-processing. Two different jobs must not share
+   stale radius/material values.
+3. Run mesh generation, solving and post-processing as one tracked pipeline.
+4. Detect solver and report failures explicitly; existing files must not turn a
+   failed job into apparent success.
+5. Validate generated results before exposing them to the frontend.
+
+Preserve the existing CLI defaults so VS Code tasks and command-line runs continue
+to work.
+
+## 4. Configuration contract and validation
+
+### Preserve current physical meanings
+
+| Input | UI/API treatment |
+|---|---|
+| Wall/plinth radii and radial width | Validate width and midpoint relationships; display units in metres |
+| Contour `height` | Label as signed elevation relative to crest z = 0 |
+| `height_above_plinth_m` | Clearly identify current nominal metadata; contours control the actual height |
+| Global element size | Controls the shared combined mesh |
+| Local element size | Identify which generator uses it; do not imply it refines the current combined mesh |
+| `water_height` | Reference depth only, not reservoir surface elevation |
+| `overflow_head` | Actual water surface above crest; changes hydrostatic loading |
+| `overflow_water_level` | Derived reference depth: water height plus overflow head |
+| Explicit directional springs | Actual support stiffness; material modulus does not recalculate springs |
+| Bedrock material | Retain in configuration; no bedrock volume is currently meshed |
+| Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |
+
+No silent physical reinterpretation as part of the API work. If actual-height
+editing or reservoir-depth behavior is wanted later, agree the transformation
+and add numerical regression tests first.
+
+### Contract tasks
+
+- Refactor validation to accept a JSON object as well as a file path.
+- Use one Python validation/model definition to generate the API schema and to
+  validate worker inputs; avoid competing Pydantic and legacy validators.
+- Reject missing/unknown fields, incorrect types, booleans used as numbers,
+  nonfinite values, invalid radii, invalid mesh sizes and invalid material values.
+- Validate matching unique plinth/bedrock stations, increasing chainages,
+  bedrock below plinth, and finite signed elevations.
+- Validate exact X/Y/Z spring entries, supported support models/material mappings,
+  boolean output flags, and the reference water-depth relationship.
+- Return field paths and messages that WPF can associate with individual controls.
+- Return warnings for nominal or inactive properties instead of implying they
+  affect the analysis.
+- Keep derived frontend fields read-only where appropriate; serialize them into
+  the existing contract without creating a second persisted source.
+- Record an API/contract version in service/job metadata without changing the
+  dam JSON unless a schema change is deliberately agreed.
+
+## 5. Lightweight Python API
+
+Use FastAPI for request validation and documented endpoints, and Uvicorn as the
+local HTTP host. Add dependencies only when implementing this phase and verify
+compatibility with the project's selected Python interpreter.
+
+### Proposed endpoints
+
+| Method and route | Purpose |
+|---|---|
+| `GET /health` | API version, backend availability and prerequisite checks |
+| `GET /config/schema` | Current editable configuration schema and field capabilities |
+| `GET /config/default` | Read the repository's example/default configuration |
+| `POST /config/validate` | Validate a configuration; return errors, warnings and derived preview values |
+| `POST /jobs` | Submit the dam configuration as the JSON body; return HTTP 202 with job ID |
+| `GET /jobs` | List persisted local job history |
+| `GET /jobs/{id}` | State, stage, timestamps, warnings and failure information |
+| `GET /jobs/{id}/logs?offset=...` | Incremental bounded log retrieval |
+| `POST /jobs/{id}/cancel` | Request cancellation of that job's process tree |
+| `GET /jobs/{id}/results` | Structured metrics and available artifact manifest |
+| `GET /jobs/{id}/artifacts/{artifact-id}` | Serve an allowlisted file belonging to that job |
+
+For version one, `POST /jobs` always selects Elmer; backend choice is service/job
+metadata, not a duplicate dam configuration. Add Code_Aster selection later.
+
+### Job lifecycle
+
+`queued -> running -> succeeded | failed | cancelled | interrupted`
+
+Running stages: `validating`, `meshing`, `converting`, `solving`, `postprocessing`.
+Show stage and elapsed time, not fabricated percentage progress from solver logs.
+
+- Permit one active job initially; reject a second submission with a clear 409
+  busy response rather than adding queue infrastructure.
+- Persist the accepted configuration, its hash, executable/version metadata,
+  timestamps, status, complete logs and result manifest under the job directory.
+- Use atomic writes for job metadata and configuration snapshots.
+- Execute the heavy work in a separate process; do not block API request handling.
+- Launch subprocesses with explicit argument lists and working directories,
+  never interpolate request values into shell commands.
+- Capture stdout/stderr from ElmerGrid, MPI Elmer and report generation.
+- Mark success only after required fresh artifacts exist and parse successfully.
+- Validate the PVTU and all referenced partition VTUs, not just the wrapper file.
+- Keep partial artifacts for diagnostics, marked incomplete on failed jobs.
+- Cancellation must stop only the job's worker/MPI process tree and wait for
+  termination before accepting another job. Never kill processes by executable name.
+- On restart, reconcile persisted active jobs and owned process identifiers;
+  mark abandoned jobs interrupted and prevent orphaned workers from overlapping.
+- Poll status/logs from WPF for the MVP; streaming/WebSockets are unnecessary.
+
+### Local-service boundary
+
+Bind to `127.0.0.1`, not all interfaces. Use a per-session local token or equivalent
+local-client protection; loopback alone does not authorize callers.
+Do not enable permissive browser CORS. Limit payload size, job storage and
+expensive mesh requests, and reject unsafe artifact paths.
+Do not accept arbitrary executable paths or shell commands from HTTP requests.
+Keep user job data local.
+
+## 6. WPF frontend
+
+Use C# WPF with MVVM, asynchronous `HttpClient`, `System.Text.Json`, and
+`CommunityToolkit.Mvvm`. Select a supported .NET target available in the user's
+Visual Studio installation at implementation time.
+
+### Screens based on the mock-up
+
+| Screen | First-release content |
+|---|---|
+| Home | Backend readiness, recent jobs and new/open configuration actions |
+| Configuration / Geometry | Mesh spacing, wall/plinth radii, contour DataGrids and support editors |
+| Configuration / Material | Concrete/bedrock fields with units and applicability notes |
+| Configuration / Loads | Gravity, water density, tailwater and overflow controls; reference-depth labels |
+| Configuration / Outputs | Implemented result selections, with unsupported features visibly disabled |
+| JSON Preview | Read-only JSON synchronized with the form; import/export full configuration |
+| Run / Results | Stage, elapsed time, logs, cancellation, metrics, images and artifact links |
+| Settings | API connectivity and local environment status; no duplicate dam properties |
+| About | App/backend versions and engineering-validation limitations |
+
+### UI behavior
+
+- Match the mock-up using reusable WPF resources/styles, rather than hard-coded
+  styling in every control. Use approved local branding assets.
+- Keep one configuration model bound to forms and JSON preview.
+- Provide add/remove/edit contour rows and load/save the complete configuration.
+- Support invariant-culture JSON serialization independently of Windows number
+  formatting. Convert display units explicitly, for example GPa to Pa.
+- Show inline validation and section-level summary states; Submit is enabled only
+  when API validation and backend readiness pass.
+- Preserve the editable draft while a job runs. Results show the submitted
+  configuration snapshot, not the current edited draft.
+- Prevent duplicate submissions and handle network timeout/disconnection without
+  presenting a running job as failed or submitting it twice.
+- Show real result extrema and units, links to locations and configuration hash.
+- Display existing report images first; offer CSV downloads and opening the PVTU
+  in an installed ParaView application. Embedded 3-D viewing is not an MVP dependency.
+- Use 2-D contour charts for geometry preview. Any schematic 3-D preview must be
+  labelled schematic, not the audited solver mesh.
+- Maintain keyboard navigation, readable contrast, resize behavior and DPI scaling.
+
+## 7. Result contract
+
+Create a small backend-independent results DTO containing:
+
+- Job ID, backend, configuration hash and completion status.
+- Maximum displacement magnitude in metres and its physical location.
+- Maximum tensile and compressive principal stress in Pa and their locations.
+- Tensile-strength utilization where requested; label it an indicator, not proof
+  of cracking or dam safety.
+- Mesh statistics, convergence status and warnings.
+- Artifact IDs, types, labels and download URLs.
+
+Reuse existing stress calculations. Add a verified displacement-summary
+calculation because the current stress report is not a complete API result contract.
+Define output selections precisely: required native solver fields remain available,
+while optional reporting metrics/plots can be omitted when not requested.
+Do not advertise nonlinear damage/crack propagation that the elastic model does
+not implement.
+
+## 8. Phased TODO list and acceptance gates
+
+### Phase 1 - submission-ready solver boundary
+
+- [ ] Document the current configuration fields and active/nominal capabilities.
+- [ ] Refactor shared configuration validation for object and file input.
+- [ ] Thread explicit configuration and job-output paths through mesh, audits,
+  solver input and post-processing; remove submission-path global state.
+- [ ] Keep the existing CLI working; add explicit config/output options.
+- [ ] Join solve and client-report generation into one callable worker pipeline.
+- [ ] Add fresh-artifact checks, result manifest and structured summary.
+- [ ] Test two distinct configurations in one Python process and in separate
+  workers without modifying the repository configuration.
+- [ ] Confirm a clean job directory regenerates all required artifacts.
+
+**Gate:** CLI runs from an arbitrary job configuration, produces complete results
+in its own directory, and preserves the existing numerical baseline.
+
+### Phase 2 - API and job management
+
+- [ ] Add FastAPI/Uvicorn dependencies and the API entry point.
+- [ ] Implement health/default/schema/validation endpoints.
+- [ ] Implement submission, single-job busy handling, polling and logs.
+- [ ] Persist snapshots, hashes, job metadata and history.
+- [ ] Implement cancellation and restart/interrupted-job handling.
+- [ ] Implement result/artifact endpoints and local-service protections.
+- [ ] Test with a fake backend: success, nonconvergence, missing artifacts,
+  post-processing failure, invalid input, busy response and cancellation.
+- [ ] Run one real Elmer job through HTTP and compare against the same CLI input.
+
+**Gate:** JSON submission returns promptly, a real job completes asynchronously,
+and results are attributable to the exact submitted snapshot.
+
+### Phase 3 - WPF editor and mock-up
+
+- [ ] Create the Visual Studio solution and MVVM application shell.
+- [ ] Add mock-up styling and responsive left/content/summary layout.
+- [ ] Implement configuration models and explicit JSON property mappings.
+- [ ] Implement geometry/material/load/output editors and contour grids.
+- [ ] Implement import/export, synchronized JSON preview and dirty-draft handling.
+- [ ] Connect validation/readiness and map API errors to controls.
+- [ ] Implement charts and applicability/help text.
+- [ ] Verify JSON round trips preserve every field and number.
+
+**Gate:** importing the existing configuration, editing it and exporting it produces
+a valid object accepted by the shared validator.
+
+### Phase 4 - end-to-end desktop analysis
+
+- [ ] Implement Submit, job polling, incremental logs and Cancel.
+- [ ] Implement result cards, report-image viewing and artifact downloads.
+- [ ] Implement local job history and reopening a submitted snapshot.
+- [ ] Add offline/reconnect/busy/failure UX and prevent duplicate submissions.
+- [ ] Run the supplied dam configuration from WPF through the API to Elmer.
+- [ ] Change a known active parameter and verify the expected mesh/load/output change.
+- [ ] Verify changes to nominal/reference fields show the documented warnings.
+- [ ] Compare WPF/API and CLI results using identical config and solver versions.
+
+**Gate:** the user can configure, submit, monitor and inspect a complete analysis
+without opening VS Code or editing Python.
+
+### Phase 5 - installation and handover
+
+**Deployment decision:** provide one Windows installer that bundles WPF, the
+Python backend and a tested Elmer distribution, and handles Microsoft MPI as a
+prerequisite. The client experience is **Install -> Launch -> Configure -> Submit**.
+Users must not need to install Python, run pip, configure PATH or set environment
+variables manually.
+
+#### Application-local dependencies
+
+Suggested installed layout:
+
+```text
+DamAnalysisWorkbench\
+  Workbench.exe
+  backend\
+    ...packaged Python interpreter, API and dependencies...
+  dependencies\
+    elmer\
+      bin\
+        ElmerGrid.exe
+        ElmerSolver_mpi.exe
+        ...matching runtime DLLs...
+      lib\
+        ...solver modules...
+      ...other required distribution files...
+```
+
+Bundle a pinned, tested Windows Elmer distribution, not just its executables:
+solver modules and compiler/numerical runtime libraries must remain compatible.
+ElmerGrid and ElmerSolver are currently found through PATH; the packaged backend
+will instead use absolute executable paths relative to its installation.
+Set `ELMER_HOME` and any required PATH additions only in child-process
+environments. Do not change the user's global environment.
+Installed application files are read-only inputs; generated configurations,
+meshes, logs and results remain in the writable per-job application-data storage.
+
+Package the Python runtime and dependencies so no system Python is required.
+Publish WPF with its required .NET runtime or have the installer handle that
+prerequisite. Validate packaging compatibility with the selected Python/.NET
+versions during implementation.
+
+#### Setup wizard and MPI prerequisite
+
+Retain the current four-process MPI workflow. The installer should detect a
+compatible Microsoft MPI runtime and install the official prerequisite when
+missing, subject to its distribution terms and user approval/elevation.
+Do not assume copying MPI DLLs into the application directory replaces supported
+runtime installation. Resolve the installed MPI launcher explicitly at runtime.
+
+The wizard should show prerequisite checks, installation progress and actionable
+failures, then run a small mesh/solver smoke test. Handle declined administrator
+permission and failed prerequisite installation without claiming setup succeeded.
+An offline installer should include the approved prerequisite payload; otherwise
+clearly disclose any required download.
+
+A serial Elmer variant could reduce prerequisites, but is not the initial
+deployment choice. It would require separate performance and numerical testing,
+and must not be used as a silent fallback when MPI is missing.
+
+#### Redistribution and maintenance
+
+Elmer can be redistributed subject to the applicable licences. Review the exact
+selected distribution and its third-party components before release.
+Include licence/copyright notices and provide corresponding source in a manner
+that satisfies the applicable GPL obligations.
+Invoking Elmer as a separate process is the intended integration boundary, not
+a blanket legal assurance about licensing the complete product.
+Verify Microsoft MPI installer redistribution terms separately.
+
+Reference sources:
+- [Elmer repository licence](https://github.com/ElmerCSC/elmerfem/blob/devel/LICENSE.md)
+- [Microsoft MPI documentation and runtime downloads](https://learn.microsoft.com/en-us/message-passing-interface/microsoft-mpi)
+
+Record bundled versions and checksums. Upgrade dependencies deliberately and
+rerun numerical regressions before shipping an update. Installer repair/uninstall
+must not remove an independently installed shared MPI runtime or user job history
+without explicit consent.
+
+#### Installation TODOs
+
+- [ ] Start with manually launched API during development.
+- [ ] Add managed API startup/shutdown from WPF for the desktop release.
+- [ ] Select and pin the Windows Elmer distribution and its required runtime files.
+- [ ] Package the Python interpreter/API dependencies and WPF runtime.
+- [ ] Invoke bundled Elmer executables by absolute path and set only child-process
+  environment variables.
+- [ ] Implement setup-wizard checks and installation of an approved Microsoft MPI
+  runtime; handle elevation, declined consent and installation failure.
+- [ ] Include approved offline prerequisites or document required downloads.
+- [ ] Review redistribution obligations and include notices, source provision,
+  versions and checksums.
+- [ ] Handle executable paths with spaces and working directories independent
+  of the source checkout.
+- [ ] Run a small post-install mesh/solver smoke test and expose diagnostics.
+- [ ] Test repair, upgrades and uninstall without deleting user jobs or shared MPI.
+- [ ] Add retention/manual cleanup for completed jobs with confirmation.
+- [ ] Add build/test/run instructions and verify on a clean Windows machine with
+  no preinstalled Python, Elmer, developer PATH entries or MPI.
+
+**Gate:** installation and launch work outside the developer workspace without
+manual dependency or environment-variable configuration, and the bundled backend
+successfully runs an analysis.
+
+### Later milestones
+
+- [ ] Code_Aster backend using the same configuration snapshot and result DTO.
+- [ ] Scenario-specific crack inputs only after their data contract is agreed.
+- [ ] Interactive 3-D mesh/results viewer.
+- [ ] Side-by-side job comparison and parameter sweeps.
+- [ ] Remote/multi-user service only after a separate security/deployment design.
+
+## 9. Testing and immediate next step
+
+Use existing mesh/pressure/solver regression tests as the numerical foundation.
+Add API tests with temporary job directories and fake executables so most tests
+do not need MPI or an expensive dam solve. Add WPF model/serialization/view-model
+tests and a small manual UI checklist for the supplied mock-up.
+
+The first implementation task is **Phase 1**, not the styled frontend:
+make one isolated configuration-to-results worker run reliably.
+Then expose that worker through the small API, and connect the WPF application.
+This sequence avoids building a polished Submit button on top of shared files,
+stale results or unsupported configuration controls.
+
+Successful execution and convergence do not constitute engineering validation
+or establish that the dam is safe.

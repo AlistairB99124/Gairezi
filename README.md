@@ -131,6 +131,25 @@ updating the contour elevations. There is no implicit crest raise or chainage
 rescaling. Radial width must equal upstream minus downstream radius, and each
 centreline must lie midway between its own faces.
 
+The shared validator in [Elmer/model_config.py](Elmer/model_config.py) accepts
+either a configuration file or a parsed JSON object. It rejects missing or
+unknown fields, non-numeric/nonfinite values, invalid geometry and material
+values, mismatched contour stations, incorrect support mappings, and invalid
+output-flag types. Validation errors include JSON-style field paths.
+
+| Field/capability | Combined Elmer workflow |
+|---|---|
+| `geometry.global_element_size_m` | Active; controls the shared mesh spacing |
+| `geometry.local_element_size_m` | Validated, but does not refine the combined mesh |
+| Wall/plinth radii and contour elevations | Active; define the mesh geometry |
+| `geometry.wall.height_above_plinth_m` | Nominal metadata; contour elevations define actual geometry |
+| Directional support springs | Active; explicit X/Y/Z stiffnesses are used as configured |
+| Bedrock material properties | Retained and validated; no bedrock volume is currently meshed |
+| `loads.overflow_head`, gravity and water density | Active in hydrostatic loading |
+| `loads.water_height` and `loads.overflow_water_level` | Reference-depth metadata; the latter must equal their documented sum |
+| `outputs.*` flags | Validated metadata only; the current solver still writes its standard fields and reports |
+| `outputs.cracking_risk` | Not a crack/damage analysis; the elastic model does not implement crack propagation |
+
 The supplied model has a **4 m wall** at radii **76-80 m**, on a **6 m plinth**
 at radii **75-81 m**. Both centrelines are 78 m, with 1 m overhang on each side.
 The deepest wall/plinth interface is z = -28 m and bedrock is z = -29 m.
