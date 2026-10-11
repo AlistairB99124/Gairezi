@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-from structural_model import (
+ELMER_DIR = Path(__file__).resolve().parent
+if str(ELMER_DIR) not in sys.path:
+        sys.path.insert(0, str(ELMER_DIR))
+
+from Elmer.structural_model import (
     audit_combined_structure,
     build_combined_structure,
 )
@@ -75,29 +79,29 @@ def convert_with_elmergrid(
     return True
 
 
-def build_plinth_region() -> dict[str, object]:
-    mesh = build_plinth(ROOT)
-    mesh_path = OUTPUT_DIR / "plinth.msh"
-    preview_path = OUTPUT_DIR / "plinth.vtu"
+def build_plinth_region(root: Path = ROOT, output_dir: Path = OUTPUT_DIR) -> dict[str, object]:
+    mesh = build_plinth(root)
+    mesh_path = output_dir / "plinth.msh"
+    preview_path = output_dir / "plinth.vtu"
     write_gmsh(mesh, mesh_path)
     write_vtu(mesh, preview_path)
-    report = audit_plinth(mesh, ROOT)
+    report = audit_plinth(mesh, root)
     report["gmsh_path"] = str(mesh_path)
     report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "plinth_mesh")
+    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, output_dir / "plinth_mesh")
     return report
 
 
-def build_combined_region() -> dict[str, object]:
-    mesh = build_combined_structure(ROOT)
-    mesh_path = OUTPUT_DIR / "combined_structure.msh"
-    preview_path = OUTPUT_DIR / "combined_structure.vtu"
+def build_combined_region(root: Path = ROOT, output_dir: Path = OUTPUT_DIR) -> dict[str, object]:
+    mesh = build_combined_structure(root)
+    mesh_path = output_dir / "combined_structure.msh"
+    preview_path = output_dir / "combined_structure.vtu"
     write_combined_gmsh(mesh, mesh_path)
     write_combined_vtu(mesh, preview_path)
     report = audit_combined_structure(mesh)
     report["gmsh_path"] = str(mesh_path)
     report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, OUTPUT_DIR / "combined_structure_mesh")
+    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, output_dir / "combined_structure_mesh")
     return report
 
 
@@ -239,38 +243,57 @@ End
 ''')
 
 
-def solve_combined_structure() -> dict[str, object]:
+def solve_combined_structure(
+    root: Path = ROOT,
+    solver_dir: Path = COMBINED_SOLVER_DIR,
+    config_path: Path | None = None,
+) -> dict[str, object]:
     executable = shutil.which("ElmerSolver_mpi")
     if executable is None:
         raise RuntimeError("ElmerSolver_mpi was not found on PATH; install an MPI-enabled Elmer build.")
     launcher, process_option = mpi_launcher()
-    mesh = build_combined_structure(ROOT)
-    apply_load_case(mesh, LOAD_CASES_PATH)
-    mesh_path = COMBINED_SOLVER_DIR / "combined_structure.msh"
+    mesh = build_combined_structure(root)
+    apply_load_case(mesh, config_path if config_path is not None else root / "config.json")
+    mesh_path = solver_dir / "combined_structure.msh"
     write_combined_gmsh(mesh, mesh_path)
     if not convert_with_elmergrid(
         mesh_path,
-        COMBINED_SOLVER_DIR / "mesh",
+        solver_dir / "mesh",
         partition_count=COMBINED_SOLVER_MPI_PROCESSES,
     ):
         raise RuntimeError("ElmerGrid was not found on PATH")
-    sif_path = COMBINED_SOLVER_DIR / "dam_model.sif"
+    sif_path = solver_dir / "dam_model.sif"
     write_combined_solver_input(mesh, sif_path)
-    (COMBINED_SOLVER_DIR / "results").mkdir(exist_ok=True)
+    (solver_dir / "results").mkdir(exist_ok=True)
     environment = os.environ.copy()
     environment.setdefault("ELMER_HOME", str(Path(executable).resolve().parent.parent))
     subprocess.run(
         [launcher, process_option, str(COMBINED_SOLVER_MPI_PROCESSES), executable, sif_path.name],
         check=True,
-        cwd=COMBINED_SOLVER_DIR,
+        cwd=solver_dir,
         env=environment,
     )
-    result_path = COMBINED_SOLVER_DIR / "results" / "combined_results_mpi_t0001.pvtu"
+    result_path = solver_dir / "results" / "combined_results_mpi_t0001.pvtu"
     if not result_path.is_file():
         raise RuntimeError(f"Elmer did not create {result_path}")
     report = audit_combined_structure(mesh)
     report["solver_input"] = str(sif_path)
     report["stress_result"] = str(result_path)
+
+    from analyze_stress import analyze_result
+
+    analysis_dir = solver_dir / "results" / "analysis"
+    try:
+        stress_analysis = analyze_result(
+            result_path,
+            analysis_dir,
+            mesh.material.youngs_modulus_pa,
+            mesh.material.poissons_ratio,
+            mesh.material.tensile_strength_pa,
+        )
+        report["stress_analysis"] = stress_analysis
+    except Exception as error:  # noqa: BLE001 - analysis must not fail a succeeded solve
+        report["stress_analysis_error"] = str(error)
     return report
 
 
@@ -282,13 +305,42 @@ def main() -> None:
         default="plinth",
         choices=("plinth", "combined", "combined-solve"),
     )
+    parser.add_argument(
+        "--config-root",
+        type=Path,
+        default=None,
+        help="Directory containing config.json (defaults to the repository root).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory to write generated mesh/preview artifacts (defaults to Elmer/structure_output).",
+    )
+    parser.add_argument(
+        "--report-path",
+        type=Path,
+        default=None,
+        help=(
+            "If given, write the structured JSON report to this file instead of stdout. "
+            "Use this when stdout is shared with a subprocess (e.g. ElmerGrid/ElmerSolver_mpi) "
+            "whose own console output would otherwise corrupt the report."
+        ),
+    )
     args = parser.parse_args()
+    root = args.config_root if args.config_root is not None else ROOT
+    output_dir = args.output_dir if args.output_dir is not None else OUTPUT_DIR
+    solver_dir = output_dir / "combined_solver" if args.output_dir is not None else COMBINED_SOLVER_DIR
     if args.region == "plinth":
-        print(json.dumps(build_plinth_region(), indent=2))
+        report = build_plinth_region(root, output_dir)
     elif args.region == "combined":
-        print(json.dumps(build_combined_region(), indent=2))
-    elif args.region == "combined-solve":
-        print(json.dumps(solve_combined_structure(), indent=2))
+        report = build_combined_region(root, output_dir)
+    else:
+        report = solve_combined_structure(root, solver_dir)
+    if args.report_path is not None:
+        args.report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    else:
+        print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

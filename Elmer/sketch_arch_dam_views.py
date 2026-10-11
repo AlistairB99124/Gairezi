@@ -6,8 +6,8 @@ import json
 import math
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 
 def read_gmsh_nodes(mesh_path: Path) -> list[tuple[float, float, float]]:
@@ -113,90 +113,87 @@ def plot_views(mesh_path: Path, out_path: Path) -> None:
     inner_top = [s["inner_top"] for s in stations]
     outer_top = [s["outer_top"] for s in stations]
 
-    fig = plt.figure(figsize=(14, 10), dpi=180)
-    fig.suptitle("Arch Dam Orientation Sketches", fontsize=16, fontweight="bold")
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[[{"type": "xy"}, {"type": "xy"}], [{"type": "xy"}, {"type": "scene"}]],
+        subplot_titles=("Plan View (X-Y)", "Elevation View (X-Z)", "Elevation View (Y-Z)", "Isometric Sketch"),
+    )
 
-    ax1 = fig.add_subplot(2, 2, 1)
     x_ib, y_ib, _ = xyz(inner_base)
     x_ob, y_ob, _ = xyz(outer_base)
-    ax1.plot(x_ib, y_ib, "k-", linewidth=1.8, label="Upstream wall face")
-    ax1.plot(x_ob, y_ob, "k-", linewidth=1.8, label="Downstream wall face")
+    fig.add_trace(go.Scatter(x=x_ib, y=y_ib, mode="lines", line=dict(color="black", width=1.8), name="Upstream wall face"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x_ob, y=y_ob, mode="lines", line=dict(color="black", width=1.8), name="Downstream wall face"), row=1, col=1)
     for a, b in zip(inner_base[::5], outer_base[::5]):
-        ax1.plot([a[0], b[0]], [a[1], b[1]], color="0.35", linewidth=0.9)
-    ax1.set_title("Plan View (X-Y)")
-    ax1.set_xlabel("X (m)")
-    ax1.set_ylabel("Y (m)")
-    ax1.axis("equal")
-    ax1.grid(True, color="0.9", linewidth=0.6)
-    ax1.legend(frameon=False)
+        fig.add_trace(go.Scatter(x=[a[0], b[0]], y=[a[1], b[1]], mode="lines", line=dict(color="rgba(90,90,90,0.9)", width=0.9), showlegend=False), row=1, col=1)
 
-    ax2 = fig.add_subplot(2, 2, 2)
     x_it, _, z_it = xyz(inner_top)
     x_ot, _, z_ot = xyz(outer_top)
     x_ib, _, z_ib = xyz(inner_base)
     x_ob, _, z_ob = xyz(outer_base)
-    ax2.plot(x_ib, z_ib, "k-", linewidth=1.5)
-    ax2.plot(x_ob, z_ob, "k-", linewidth=1.5)
-    ax2.plot(x_it, z_it, "k--", linewidth=1.2)
-    ax2.plot(x_ot, z_ot, "k--", linewidth=1.2)
     downstream_x = [p[0] for p in downstream_face]
     downstream_z = [p[2] for p in downstream_face]
-    ax2.plot(downstream_x, downstream_z, "r-", linewidth=1.8, label="Downstream wall face")
+    fig.add_trace(go.Scatter(x=x_ib, y=z_ib, mode="lines", line=dict(color="black", width=1.5), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_ob, y=z_ob, mode="lines", line=dict(color="black", width=1.5), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_it, y=z_it, mode="lines", line=dict(color="black", width=1.2, dash="dash"), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_ot, y=z_ot, mode="lines", line=dict(color="black", width=1.2, dash="dash"), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=downstream_x, y=downstream_z, mode="lines", line=dict(color="red", width=1.8), name="Downstream wall face", showlegend=False), row=1, col=2)
     for ib, it, ob, ot in zip(inner_base[::5], inner_top[::5], outer_base[::5], outer_top[::5]):
-        ax2.plot([ib[0], it[0]], [ib[2], it[2]], color="0.4", linewidth=0.8)
-        ax2.plot([ob[0], ot[0]], [ob[2], ot[2]], color="0.4", linewidth=0.8)
-    ax2.set_title("Elevation View (X-Z)")
-    ax2.set_xlabel("X (m)")
-    ax2.set_ylabel("Z (m)")
-    ax2.grid(True, color="0.9", linewidth=0.6)
-    ax2.legend(frameon=False)
+        fig.add_trace(go.Scatter(x=[ib[0], it[0]], y=[ib[2], it[2]], mode="lines", line=dict(color="rgba(100,100,100,0.9)", width=0.8), showlegend=False), row=1, col=2)
+        fig.add_trace(go.Scatter(x=[ob[0], ot[0]], y=[ob[2], ot[2]], mode="lines", line=dict(color="rgba(100,100,100,0.9)", width=0.8), showlegend=False), row=1, col=2)
 
-    ax3 = fig.add_subplot(2, 2, 3)
     _, y_it, z_it = xyz(inner_top)
     _, y_ot, z_ot = xyz(outer_top)
     _, y_ib, z_ib = xyz(inner_base)
     _, y_ob, z_ob = xyz(outer_base)
-    ax3.plot(y_ib, z_ib, "k-", linewidth=1.5)
-    ax3.plot(y_ob, z_ob, "k-", linewidth=1.5)
-    ax3.plot(y_it, z_it, "k--", linewidth=1.2)
-    ax3.plot(y_ot, z_ot, "k--", linewidth=1.2)
     downstream_y = [p[1] for p in downstream_face]
-    downstream_z = [p[2] for p in downstream_face]
-    ax3.plot(downstream_y, downstream_z, "r-", linewidth=1.8, label="Downstream wall face")
+    fig.add_trace(go.Scatter(x=y_ib, y=z_ib, mode="lines", line=dict(color="black", width=1.5), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=y_ob, y=z_ob, mode="lines", line=dict(color="black", width=1.5), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=y_it, y=z_it, mode="lines", line=dict(color="black", width=1.2, dash="dash"), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=y_ot, y=z_ot, mode="lines", line=dict(color="black", width=1.2, dash="dash"), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=downstream_y, y=downstream_z, mode="lines", line=dict(color="red", width=1.8), showlegend=False), row=2, col=1)
     for ib, it, ob, ot in zip(inner_base[::5], inner_top[::5], outer_base[::5], outer_top[::5]):
-        ax3.plot([ib[1], it[1]], [ib[2], it[2]], color="0.4", linewidth=0.8)
-        ax3.plot([ob[1], ot[1]], [ob[2], ot[2]], color="0.4", linewidth=0.8)
-    ax3.set_title("Elevation View (Y-Z)")
-    ax3.set_xlabel("Y (m)")
-    ax3.set_ylabel("Z (m)")
-    ax3.grid(True, color="0.9", linewidth=0.6)
-    ax3.legend(frameon=False)
+        fig.add_trace(go.Scatter(x=[ib[1], it[1]], y=[ib[2], it[2]], mode="lines", line=dict(color="rgba(100,100,100,0.9)", width=0.8), showlegend=False), row=2, col=1)
+        fig.add_trace(go.Scatter(x=[ob[1], ot[1]], y=[ob[2], ot[2]], mode="lines", line=dict(color="rgba(100,100,100,0.9)", width=0.8), showlegend=False), row=2, col=1)
 
-    ax4 = fig.add_subplot(2, 2, 4, projection="3d")
     for edge in (inner_base, outer_base, inner_top, outer_top):
         x, y, z = xyz(edge)
-        ax4.plot(x, y, z, color="k", linewidth=1.4)
+        fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode="lines", line=dict(color="black", width=4), showlegend=False), row=2, col=2)
     for ib, ob, it, ot in zip(inner_base[::5], outer_base[::5], inner_top[::5], outer_top[::5]):
-        ax4.plot([ib[0], ob[0]], [ib[1], ob[1]], [ib[2], ob[2]], color="0.35", linewidth=0.8)
-        ax4.plot([it[0], ot[0]], [it[1], ot[1]], [it[2], ot[2]], color="0.35", linewidth=0.8)
-        ax4.plot([ib[0], it[0]], [ib[1], it[1]], [ib[2], it[2]], color="0.35", linewidth=0.8)
-        ax4.plot([ob[0], ot[0]], [ob[1], ot[1]], [ob[2], ot[2]], color="0.35", linewidth=0.8)
-    ax4.set_title("Isometric Sketch")
-    ax4.set_xlabel("X (m)")
-    ax4.set_ylabel("Y (m)")
-    ax4.set_zlabel("Z (m)")
-    ax4.view_init(elev=24, azim=-58)
+        fig.add_trace(go.Scatter3d(x=[ib[0], ob[0]], y=[ib[1], ob[1]], z=[ib[2], ob[2]], mode="lines", line=dict(color="rgba(90,90,90,0.9)", width=2), showlegend=False), row=2, col=2)
+        fig.add_trace(go.Scatter3d(x=[it[0], ot[0]], y=[it[1], ot[1]], z=[it[2], ot[2]], mode="lines", line=dict(color="rgba(90,90,90,0.9)", width=2), showlegend=False), row=2, col=2)
+        fig.add_trace(go.Scatter3d(x=[ib[0], it[0]], y=[ib[1], it[1]], z=[ib[2], it[2]], mode="lines", line=dict(color="rgba(90,90,90,0.9)", width=2), showlegend=False), row=2, col=2)
+        fig.add_trace(go.Scatter3d(x=[ob[0], ot[0]], y=[ob[1], ot[1]], z=[ob[2], ot[2]], mode="lines", line=dict(color="rgba(90,90,90,0.9)", width=2), showlegend=False), row=2, col=2)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.update_xaxes(title_text="X (m)", row=1, col=1, scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title_text="Y (m)", row=1, col=1)
+    fig.update_xaxes(title_text="X (m)", row=1, col=2)
+    fig.update_yaxes(title_text="Z (m)", row=1, col=2)
+    fig.update_xaxes(title_text="Y (m)", row=2, col=1)
+    fig.update_yaxes(title_text="Z (m)", row=2, col=1)
+    fig.update_scenes(
+        xaxis_title="X (m)",
+        yaxis_title="Y (m)",
+        zaxis_title="Z (m)",
+        camera=dict(eye=dict(x=1.4, y=-1.9, z=1.1)),
+    )
+
+    fig.update_layout(
+        title=dict(text="Arch Dam Orientation Sketches", x=0.5, font=dict(size=20)),
+        width=1400,
+        height=1000,
+        showlegend=True,
+        template="plotly_white",
+    )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path)
+    fig.write_image(str(out_path), scale=1.2)
 
-    svg_path = out_path.with_suffix(".svg")
-    fig.savefig(svg_path)
-    plt.close(fig)
+    html_path = out_path.with_suffix(".html")
+    fig.write_html(str(html_path), include_plotlyjs="cdn")
 
     print(f"Wrote {out_path}")
-    print(f"Wrote {svg_path}")
+    print(f"Wrote {html_path}")
 
 
 def main() -> None:

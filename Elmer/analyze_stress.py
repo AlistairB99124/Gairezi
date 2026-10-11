@@ -8,8 +8,9 @@ import json
 import re
 import struct
 
-from matplotlib import pyplot as plt
-from matplotlib.collections import LineCollection
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from PIL import Image
 import numpy as np
 
 from sketch_arch_dam_views import load_station_edges, plot_views, xyz
@@ -203,65 +204,78 @@ def stress_tensor(voigt: np.ndarray) -> np.ndarray:
     )
 
 
-def build_segment_collection(x_values: np.ndarray, y_values: np.ndarray, scalar_values: np.ndarray, cmap: str) -> LineCollection:
-    points = np.column_stack([x_values, y_values]).reshape(-1, 1, 2)
-    segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    segment_values = 0.5 * (scalar_values[:-1] + scalar_values[1:])
-    collection = LineCollection(segments, cmap=cmap, linewidths=8)
-    collection.set_array(segment_values)
-    return collection
-
-
 def plot_stress_distribution(element_rows: list[dict[str, float]], tensile_strength_pa: float, out_path: Path) -> None:
     centroids = np.array([[row["centroid_x_m"], row["centroid_y_m"], row["centroid_z_m"]] for row in element_rows])
     tension = np.array([row["principal_max_pa"] for row in element_rows]) / 1.0e6
     compression = -np.array([row["principal_min_pa"] for row in element_rows]) / 1.0e6
     tensile_strength_mpa = tensile_strength_pa / 1.0e6
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), dpi=180)
-    fig.suptitle("Principal Stress Distribution", fontsize=16, fontweight="bold")
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            "Plan: Tensile Principal Stress (MPa)",
+            "Plan: Compressive Principal Stress Magnitude (MPa)",
+            "Max Principal Tension by Arc Length",
+            "Min Principal Compression Magnitude by Arc Length",
+        ),
+    )
 
-    plan_tension = build_segment_collection(centroids[:, 0], centroids[:, 1], tension, "Reds")
-    axes[0, 0].add_collection(plan_tension)
-    axes[0, 0].autoscale()
-    axes[0, 0].set_aspect("equal")
-    axes[0, 0].set_title("Plan: Tensile Principal Stress (MPa)")
-    axes[0, 0].set_xlabel("X (m)")
-    axes[0, 0].set_ylabel("Y (m)")
-    axes[0, 0].grid(True, color="0.9", linewidth=0.6)
-    fig.colorbar(plan_tension, ax=axes[0, 0], shrink=0.85)
-
-    plan_compression = build_segment_collection(centroids[:, 0], centroids[:, 1], compression, "Blues")
-    axes[0, 1].add_collection(plan_compression)
-    axes[0, 1].autoscale()
-    axes[0, 1].set_aspect("equal")
-    axes[0, 1].set_title("Plan: Compressive Principal Stress Magnitude (MPa)")
-    axes[0, 1].set_xlabel("X (m)")
-    axes[0, 1].set_ylabel("Y (m)")
-    axes[0, 1].grid(True, color="0.9", linewidth=0.6)
-    fig.colorbar(plan_compression, ax=axes[0, 1], shrink=0.85)
+    fig.add_trace(
+        go.Scatter(
+            x=centroids[:, 0],
+            y=centroids[:, 1],
+            mode="markers",
+            marker=dict(color=tension, colorscale="Reds", size=5, colorbar=dict(title="MPa", x=0.44, len=0.42, y=0.79)),
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=centroids[:, 0],
+            y=centroids[:, 1],
+            mode="markers",
+            marker=dict(color=compression, colorscale="Blues", size=5, colorbar=dict(title="MPa", x=1.0, len=0.42, y=0.79)),
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
 
     arc_step = np.linalg.norm(np.diff(centroids[:, :2], axis=0), axis=1)
     chainage = np.concatenate([[0.0], np.cumsum(arc_step)])
-    axes[1, 0].plot(chainage, tension, color="#b22222", linewidth=2.2)
-    axes[1, 0].fill_between(chainage, 0.0, tension, color="#e9967a", alpha=0.55)
-    axes[1, 0].axhline(tensile_strength_mpa, color="#6a1b9a", linestyle="--", linewidth=1.6, label=f"Tensile strength {tensile_strength_mpa:.2f} MPa")
-    axes[1, 0].set_title("Max Principal Tension by Arc Length")
-    axes[1, 0].set_xlabel("Arc Length (m)")
-    axes[1, 0].set_ylabel("Tension (MPa)")
-    axes[1, 0].grid(True, color="0.9", linewidth=0.6)
-    axes[1, 0].legend(frameon=False, loc="upper right")
+    fig.add_trace(
+        go.Scatter(x=chainage, y=tension, mode="lines", line=dict(color="#b22222", width=2.2), fill="tozeroy", fillcolor="rgba(233,150,122,0.55)", showlegend=False),
+        row=2,
+        col=1,
+    )
+    fig.add_hline(y=tensile_strength_mpa, line=dict(color="#6a1b9a", dash="dash", width=1.6), annotation_text=f"Tensile strength {tensile_strength_mpa:.2f} MPa", row=2, col=1)
 
-    axes[1, 1].plot(chainage, compression, color="#0b5394", linewidth=2.2)
-    axes[1, 1].fill_between(chainage, 0.0, compression, color="#9fc5e8", alpha=0.6)
-    axes[1, 1].set_title("Min Principal Compression Magnitude by Arc Length")
-    axes[1, 1].set_xlabel("Arc Length (m)")
-    axes[1, 1].set_ylabel("Compression (MPa)")
-    axes[1, 1].grid(True, color="0.9", linewidth=0.6)
+    fig.add_trace(
+        go.Scatter(x=chainage, y=compression, mode="lines", line=dict(color="#0b5394", width=2.2), fill="tozeroy", fillcolor="rgba(159,197,232,0.6)", showlegend=False),
+        row=2,
+        col=2,
+    )
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(out_path)
-    plt.close(fig)
+    fig.update_xaxes(title_text="X (m)", row=1, col=1, scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title_text="Y (m)", row=1, col=1)
+    fig.update_xaxes(title_text="X (m)", row=1, col=2)
+    fig.update_yaxes(title_text="Y (m)", row=1, col=2)
+    fig.update_xaxes(title_text="Arc Length (m)", row=2, col=1)
+    fig.update_yaxes(title_text="Tension (MPa)", row=2, col=1)
+    fig.update_xaxes(title_text="Arc Length (m)", row=2, col=2)
+    fig.update_yaxes(title_text="Compression (MPa)", row=2, col=2)
+
+    fig.update_layout(
+        title=dict(text="Principal Stress Distribution", x=0.5, font=dict(size=20)),
+        width=1400,
+        height=1000,
+        template="plotly_white",
+    )
+
+    fig.write_image(str(out_path), scale=1.2)
 
 
 def plot_critical_views(mesh_path: Path, tension_point: np.ndarray, compression_point: np.ndarray, out_path: Path) -> None:
@@ -271,70 +285,69 @@ def plot_critical_views(mesh_path: Path, tension_point: np.ndarray, compression_
     inner_top = [s["inner_top"] for s in stations]
     outer_top = [s["outer_top"] for s in stations]
 
-    fig = plt.figure(figsize=(14, 10), dpi=180)
-    fig.suptitle("Critical Stress Locations", fontsize=16, fontweight="bold")
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[[{"type": "xy"}, {"type": "xy"}], [{"type": "xy"}, {"type": "scene"}]],
+        subplot_titles=("Plan View", "Elevation (X-Z)", "Elevation (Y-Z)", "Isometric"),
+    )
 
-    ax1 = fig.add_subplot(2, 2, 1)
     x_ib, y_ib, _ = xyz(inner_base)
     x_ob, y_ob, _ = xyz(outer_base)
-    ax1.plot(x_ib, y_ib, "k-", linewidth=1.6)
-    ax1.plot(x_ob, y_ob, "k-", linewidth=1.6)
-    ax1.scatter(tension_point[0], tension_point[1], color="#d73027", s=70, label="Max tension")
-    ax1.scatter(compression_point[0], compression_point[1], color="#08519c", s=70, label="Max compression")
-    ax1.set_title("Plan View")
-    ax1.set_xlabel("X (m)")
-    ax1.set_ylabel("Y (m)")
-    ax1.axis("equal")
-    ax1.grid(True, color="0.9", linewidth=0.6)
-    ax1.legend(frameon=False)
+    fig.add_trace(go.Scatter(x=x_ib, y=y_ib, mode="lines", line=dict(color="black", width=1.6), showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x_ob, y=y_ob, mode="lines", line=dict(color="black", width=1.6), showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[tension_point[0]], y=[tension_point[1]], mode="markers", marker=dict(color="#d73027", size=11), name="Max tension"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[compression_point[0]], y=[compression_point[1]], mode="markers", marker=dict(color="#08519c", size=11), name="Max compression"), row=1, col=1)
 
-    ax2 = fig.add_subplot(2, 2, 2)
     x_it, _, z_it = xyz(inner_top)
     x_ot, _, z_ot = xyz(outer_top)
     x_ib, _, z_ib = xyz(inner_base)
     x_ob, _, z_ob = xyz(outer_base)
-    ax2.plot(x_ib, z_ib, "k-", linewidth=1.3)
-    ax2.plot(x_ob, z_ob, "k-", linewidth=1.3)
-    ax2.plot(x_it, z_it, "k--", linewidth=1.0)
-    ax2.plot(x_ot, z_ot, "k--", linewidth=1.0)
-    ax2.scatter(tension_point[0], tension_point[2], color="#d73027", s=70)
-    ax2.scatter(compression_point[0], compression_point[2], color="#08519c", s=70)
-    ax2.set_title("Elevation (X-Z)")
-    ax2.set_xlabel("X (m)")
-    ax2.set_ylabel("Z (m)")
-    ax2.grid(True, color="0.9", linewidth=0.6)
+    fig.add_trace(go.Scatter(x=x_ib, y=z_ib, mode="lines", line=dict(color="black", width=1.3), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_ob, y=z_ob, mode="lines", line=dict(color="black", width=1.3), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_it, y=z_it, mode="lines", line=dict(color="black", width=1.0, dash="dash"), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_ot, y=z_ot, mode="lines", line=dict(color="black", width=1.0, dash="dash"), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=[tension_point[0]], y=[tension_point[2]], mode="markers", marker=dict(color="#d73027", size=11), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=[compression_point[0]], y=[compression_point[2]], mode="markers", marker=dict(color="#08519c", size=11), showlegend=False), row=1, col=2)
 
-    ax3 = fig.add_subplot(2, 2, 3)
     _, y_it, z_it = xyz(inner_top)
     _, y_ot, z_ot = xyz(outer_top)
     _, y_ib, z_ib = xyz(inner_base)
     _, y_ob, z_ob = xyz(outer_base)
-    ax3.plot(y_ib, z_ib, "k-", linewidth=1.3)
-    ax3.plot(y_ob, z_ob, "k-", linewidth=1.3)
-    ax3.plot(y_it, z_it, "k--", linewidth=1.0)
-    ax3.plot(y_ot, z_ot, "k--", linewidth=1.0)
-    ax3.scatter(tension_point[1], tension_point[2], color="#d73027", s=70)
-    ax3.scatter(compression_point[1], compression_point[2], color="#08519c", s=70)
-    ax3.set_title("Elevation (Y-Z)")
-    ax3.set_xlabel("Y (m)")
-    ax3.set_ylabel("Z (m)")
-    ax3.grid(True, color="0.9", linewidth=0.6)
+    fig.add_trace(go.Scatter(x=y_ib, y=z_ib, mode="lines", line=dict(color="black", width=1.3), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=y_ob, y=z_ob, mode="lines", line=dict(color="black", width=1.3), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=y_it, y=z_it, mode="lines", line=dict(color="black", width=1.0, dash="dash"), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=y_ot, y=z_ot, mode="lines", line=dict(color="black", width=1.0, dash="dash"), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=[tension_point[1]], y=[tension_point[2]], mode="markers", marker=dict(color="#d73027", size=11), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=[compression_point[1]], y=[compression_point[2]], mode="markers", marker=dict(color="#08519c", size=11), showlegend=False), row=2, col=1)
 
-    ax4 = fig.add_subplot(2, 2, 4, projection="3d")
     for edge in (inner_base, outer_base, inner_top, outer_top):
         x_vals, y_vals, z_vals = xyz(edge)
-        ax4.plot(x_vals, y_vals, z_vals, color="k", linewidth=1.2)
-    ax4.scatter(tension_point[0], tension_point[1], tension_point[2], color="#d73027", s=80)
-    ax4.scatter(compression_point[0], compression_point[1], compression_point[2], color="#08519c", s=80)
-    ax4.set_title("Isometric")
-    ax4.set_xlabel("X (m)")
-    ax4.set_ylabel("Y (m)")
-    ax4.set_zlabel("Z (m)")
-    ax4.view_init(elev=24, azim=-58)
+        fig.add_trace(go.Scatter3d(x=x_vals, y=y_vals, z=z_vals, mode="lines", line=dict(color="black", width=4), showlegend=False), row=2, col=2)
+    fig.add_trace(go.Scatter3d(x=[tension_point[0]], y=[tension_point[1]], z=[tension_point[2]], mode="markers", marker=dict(color="#d73027", size=6), showlegend=False), row=2, col=2)
+    fig.add_trace(go.Scatter3d(x=[compression_point[0]], y=[compression_point[1]], z=[compression_point[2]], mode="markers", marker=dict(color="#08519c", size=6), showlegend=False), row=2, col=2)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(out_path)
-    plt.close(fig)
+    fig.update_xaxes(title_text="X (m)", row=1, col=1, scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title_text="Y (m)", row=1, col=1)
+    fig.update_xaxes(title_text="X (m)", row=1, col=2)
+    fig.update_yaxes(title_text="Z (m)", row=1, col=2)
+    fig.update_xaxes(title_text="Y (m)", row=2, col=1)
+    fig.update_yaxes(title_text="Z (m)", row=2, col=1)
+    fig.update_scenes(
+        xaxis_title="X (m)",
+        yaxis_title="Y (m)",
+        zaxis_title="Z (m)",
+        camera=dict(eye=dict(x=1.4, y=-1.9, z=1.1)),
+    )
+
+    fig.update_layout(
+        title=dict(text="Critical Stress Locations", x=0.5, font=dict(size=20)),
+        width=1400,
+        height=1000,
+        template="plotly_white",
+    )
+
+    fig.write_image(str(out_path), scale=1.2)
 
 
 def create_report_sheet(
@@ -347,30 +360,10 @@ def create_report_sheet(
     expected_compression_mpa: float | None,
     out_path: Path,
 ) -> None:
-    orientation = plt.imread(orientation_path)
-    distribution = plt.imread(distribution_path)
-    critical = plt.imread(critical_path)
+    orientation = Image.open(orientation_path)
+    distribution = Image.open(distribution_path)
+    critical = Image.open(critical_path)
 
-    fig = plt.figure(figsize=(16, 11), dpi=180)
-    fig.suptitle("Arch Dam Stress Review Sheet", fontsize=18, fontweight="bold")
-
-    ax1 = fig.add_subplot(2, 2, 1)
-    ax1.imshow(orientation)
-    ax1.set_title("Geometry Orientation")
-    ax1.axis("off")
-
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax2.imshow(distribution)
-    ax2.set_title("Principal Stress Distribution")
-    ax2.axis("off")
-
-    ax3 = fig.add_subplot(2, 2, 3)
-    ax3.imshow(critical)
-    ax3.set_title("Critical Stress Locations")
-    ax3.axis("off")
-
-    ax4 = fig.add_subplot(2, 2, 4)
-    ax4.axis("off")
     max_tension_mpa = summary["max_tensile_principal_stress_pa"]["value_pa"] / 1.0e6
     max_compression_mpa = summary["max_compressive_principal_stress_pa"]["value_pa"] / 1.0e6
     utilization = max_tension_mpa / (tensile_strength_pa / 1.0e6)
@@ -398,12 +391,202 @@ def create_report_sheet(
             f"Client expected compression: {expected_compression_mpa:.2f} MPa",
             f"Delta: {max_compression_mpa - expected_compression_mpa:+.3f} MPa",
         ])
-    ax4.text(0.02, 0.98, "\n".join(lines), va="top", ha="left", fontsize=12, family="monospace")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(out_path)
-    fig.savefig(out_path.with_suffix(".svg"))
-    plt.close(fig)
+    summary_fig = go.Figure()
+    summary_fig.add_annotation(
+        text="<br>".join(line if line else "&nbsp;" for line in lines),
+        xref="paper",
+        yref="paper",
+        x=0.02,
+        y=0.98,
+        showarrow=False,
+        align="left",
+        font=dict(family="Courier New, monospace", size=16),
+    )
+    summary_fig.update_xaxes(visible=False)
+    summary_fig.update_yaxes(visible=False)
+    summary_fig.update_layout(width=800, height=700, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10))
+    summary_bytes = summary_fig.to_image(format="png", scale=1.2)
+    import io
+    summary_image = Image.open(io.BytesIO(summary_bytes))
+
+    def fit(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+        return img.resize(size)
+
+    cell_size = (800, 700)
+    sheet = Image.new("RGB", (cell_size[0] * 2, cell_size[1] * 2 + 80), color="white")
+    sheet.paste(fit(orientation, cell_size), (0, 80))
+    sheet.paste(fit(distribution, cell_size), (cell_size[0], 80))
+    sheet.paste(fit(critical, cell_size), (0, 80 + cell_size[1]))
+    sheet.paste(fit(summary_image, cell_size), (cell_size[0], 80 + cell_size[1]))
+
+    from PIL import ImageDraw, ImageFont
+    draw = ImageDraw.Draw(sheet)
+    try:
+        title_font = ImageFont.truetype("arial.ttf", 36)
+    except OSError:
+        title_font = ImageFont.load_default()
+    draw.text((sheet.width // 2, 25), "Arch Dam Stress Review Sheet", font=title_font, fill="black", anchor="mm")
+
+    sheet.save(out_path)
+
+
+def plot_dam_outline_sketch(
+    element_rows: list[dict[str, float]],
+    tension_point: np.ndarray,
+    compression_point: np.ndarray,
+    out_path: Path,
+) -> None:
+    """Self-contained sketch of the dam highlighting stress extrema.
+
+    Unlike `plot_critical_views`, this does not depend on a sidecar Gmsh mesh
+    or station-edge metadata; it derives the dam silhouette directly from the
+    solved element centroids, so it stays consistent with whatever geometry
+    produced the current job's result.
+    """
+    centroids = np.array([[row["centroid_x_m"], row["centroid_y_m"], row["centroid_z_m"]] for row in element_rows])
+    tension = np.array([row["principal_max_pa"] for row in element_rows]) / 1.0e6
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("Plan View: Tensile Principal Stress (MPa)", "Elevation (X-Z): Tensile Principal Stress (MPa)"),
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=centroids[:, 0],
+            y=centroids[:, 1],
+            mode="markers",
+            marker=dict(color=tension, colorscale="RdYlBu_r", size=4, colorbar=dict(title="MPa", x=0.44, len=0.85)),
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(go.Scatter(x=[tension_point[0]], y=[tension_point[1]], mode="markers", marker=dict(color="black", symbol="x", size=14), name="Max tension"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[compression_point[0]], y=[compression_point[1]], mode="markers", marker=dict(color="black", symbol="cross", size=14), name="Max compression"), row=1, col=1)
+
+    fig.add_trace(
+        go.Scatter(
+            x=centroids[:, 0],
+            y=centroids[:, 2],
+            mode="markers",
+            marker=dict(color=tension, colorscale="RdYlBu_r", size=4, colorbar=dict(title="MPa", x=1.0, len=0.85)),
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
+    fig.add_trace(go.Scatter(x=[tension_point[0]], y=[tension_point[2]], mode="markers", marker=dict(color="black", symbol="x", size=14), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=[compression_point[0]], y=[compression_point[2]], mode="markers", marker=dict(color="black", symbol="cross", size=14), showlegend=False), row=1, col=2)
+
+    fig.update_xaxes(title_text="X (m)", row=1, col=1, scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(title_text="Y (m)", row=1, col=1)
+    fig.update_xaxes(title_text="X (m)", row=1, col=2)
+    fig.update_yaxes(title_text="Z (m)", row=1, col=2)
+
+    fig.update_layout(
+        title=dict(text="Dam Stress Sketch", x=0.5, font=dict(size=20)),
+        width=1400,
+        height=600,
+        template="plotly_white",
+    )
+
+    fig.write_image(str(out_path), scale=1.2)
+
+
+def analyze_result(
+    vtu_path: Path,
+    out_dir: Path,
+    youngs_modulus: float,
+    poisson_ratio: float,
+    tensile_strength_pa: float,
+) -> dict:
+    """Lightweight, pipeline-facing analysis entry point used by the job worker.
+
+    Unlike `analyze()`, this does not depend on a sidecar Gmsh mesh or legacy
+    load-cases file; it derives everything from the solved VTU result and the
+    material properties already known to the caller, so its output stays
+    consistent with the job's own configuration snapshot.
+    """
+    points, _displacement, native_stress, volume_cells = parse_vtu(vtu_path)
+
+    element_rows: list[dict[str, float]] = []
+    max_tension = {"element_id": -1, "value_pa": float("-inf"), "centroid_xyz_m": [0.0, 0.0, 0.0]}
+    max_compression = {"element_id": -1, "value_pa": float("inf"), "centroid_xyz_m": [0.0, 0.0, 0.0]}
+
+    for element_id, (_cell_type, node_ids) in enumerate(volume_cells, start=1):
+        coords = points[node_ids]
+        stress = native_stress[node_ids].mean(axis=0)
+        principal = np.linalg.eigvalsh(stress_tensor(stress))
+        centroid = coords.mean(axis=0)
+        row = {
+            "element_id": element_id,
+            "centroid_x_m": float(centroid[0]),
+            "centroid_y_m": float(centroid[1]),
+            "centroid_z_m": float(centroid[2]),
+            "principal_min_pa": float(principal[0]),
+            "principal_mid_pa": float(principal[1]),
+            "principal_max_pa": float(principal[2]),
+        }
+        element_rows.append(row)
+        if principal[2] > max_tension["value_pa"]:
+            max_tension = {
+                "element_id": element_id,
+                "value_pa": float(principal[2]),
+                "centroid_xyz_m": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+            }
+        if principal[0] < max_compression["value_pa"]:
+            max_compression = {
+                "element_id": element_id,
+                "value_pa": float(principal[0]),
+                "centroid_xyz_m": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+            }
+
+    if not element_rows:
+        raise ValueError("Solved result contains no volume elements")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "principal_stress_by_element.csv"
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(element_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(element_rows)
+
+    summary = {
+        "source_vtu": str(vtu_path),
+        "element_count": len(element_rows),
+        "max_tensile_principal_stress_pa": max_tension,
+        "max_compressive_principal_stress_pa": max_compression,
+        "tensile_strength_pa": tensile_strength_pa,
+        "tension_utilization": (max_tension["value_pa"] / tensile_strength_pa) if tensile_strength_pa else None,
+        "note": (
+            "Positive principal stress indicates tension. Negative principal stress indicates compression. "
+            "Successful execution or convergence is not engineering validation or proof of dam safety."
+        ),
+    }
+    summary_path = out_dir / "stress_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+
+    stress_plot_path = out_dir / "principal_stress_distribution.png"
+    plot_stress_distribution(element_rows, tensile_strength_pa, stress_plot_path)
+
+    sketch_path = out_dir / "dam_stress_sketch.png"
+    plot_dam_outline_sketch(
+        element_rows,
+        np.array(max_tension["centroid_xyz_m"]),
+        np.array(max_compression["centroid_xyz_m"]),
+        sketch_path,
+    )
+
+    return {
+        "stress_summary_path": str(summary_path),
+        "stress_csv_path": str(csv_path),
+        "stress_distribution_plot_path": str(stress_plot_path),
+        "stress_sketch_plot_path": str(sketch_path),
+        **summary,
+    }
 
 
 def load_tensile_strength(load_cases_path: Path) -> float:
