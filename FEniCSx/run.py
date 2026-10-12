@@ -9,9 +9,11 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 import traceback
 
 from configuration import load_scenarios
+from engineering_report import write_engineering_results
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -79,18 +81,115 @@ def write_json(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
+def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
+    """Run one isolated phase-field job from the authoritative dam configuration."""
+    sys.path.insert(0, str(ROOT))
+    from crack_field import (
+        crack_placement_report,
+        load_crack_specifications,
+        load_phase_field_solver_options,
+        refine_for_phase_field,
+        validate_crack_placement,
+    )
+    from dam_mesh import import_structure
+    from dam_phase_field import solve
+    from dolfinx import io
+    from structural_model import build_combined_structure
+    from Elmer.structure_assembly import apply_load_case
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    directory = output_root / "dam_phase_field" / timestamp
+    directory.mkdir(parents=True, exist_ok=False)
+    snapshot = directory / "config.json"
+    snapshot.write_bytes(dam_config.read_bytes())
+    manifest = {
+        "status": "running",
+        "analysis": "dam_phase_field",
+        "environment": versions,
+        "configuration_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+        "started_at_utc": timestamp,
+        "engineering_validated": False,
+    }
+    write_json(directory / "manifest.json", manifest)
+    try:
+        specifications = load_crack_specifications(snapshot)
+        options = load_phase_field_solver_options(snapshot)
+        # Existing geometry builders accept a root containing config.json. Use an
+        # isolated temporary root so a submitted job never rewrites repository data.
+        with tempfile.TemporaryDirectory() as temporary:
+            job_root = Path(temporary)
+            (job_root / "config.json").write_bytes(snapshot.read_bytes())
+            structure = build_combined_structure(job_root)
+        apply_load_case(structure, snapshot)
+        imported = import_structure(structure, maximum_volume_change=0.001)
+        write_json(directory / "import_report.json", imported.report)
+        placement = [
+            crack_placement_report(imported, specification)
+            for specification in specifications
+        ]
+        write_json(directory / "crack_placement.json", placement)
+        validate_crack_placement(imported, specifications)
+        refined = refine_for_phase_field(imported, specifications, options)
+        write_json(directory / "refinement_report.json", refined.report)
+        with io.XDMFFile(refined.domain.comm, directory / "mesh.xdmf", "w") as writer:
+            writer.write_mesh(refined.domain)
+            refined.cell_tags.name = "regions"
+            refined.facet_tags.name = "boundaries"
+            writer.write_meshtags(refined.cell_tags, refined.domain.geometry)
+            writer.write_meshtags(refined.facet_tags, refined.domain.geometry)
+        result = solve(refined, structure, specifications, options, directory)
+        completed_at = datetime.now(timezone.utc).isoformat()
+        write_engineering_results(
+            directory,
+            json.loads(snapshot.read_text(encoding="utf-8")),
+            result.report,
+            refined.report,
+            placement,
+            imported.report,
+            configuration_sha256=manifest["configuration_sha256"],
+            environment=versions,
+            started_at_utc=timestamp,
+            completed_at_utc=completed_at,
+        )
+        manifest.update(
+            {
+                "status": "completed_not_engineering_validated",
+                "completed_at_utc": completed_at,
+                "result": result.report,
+            }
+        )
+        write_json(directory / "manifest.json", manifest)
+        print(f"Wrote phase-field results to {directory}")
+    except Exception as error:
+        manifest.update(
+            {
+                "status": "failed",
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "error": f"{type(error).__name__}: {error}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+        write_json(directory / "manifest.json", manifest)
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("check", "inventory", "import-dam", "run"))
+    parser.add_argument("action", choices=("check", "inventory", "import-dam", "run", "run-fracture"))
     parser.add_argument("--config", type=Path, default=HERE / "cracking.json")
+    parser.add_argument("--dam-config", type=Path, default=LOAD_CASE)
+    parser.add_argument("--output", type=Path, default=HERE / "results")
     parser.add_argument("--scenario", help="Run one enabled scenario by id")
     args = parser.parse_args()
     scenarios = load_scenarios(args.config)
     versions = environment()
+    if args.action == "run-fracture":
+        run_fracture(args.dam_config.resolve(), args.output.resolve(), versions)
+        return 0
     if args.action == "check":
         print(json.dumps({"environment": versions, "scenarios": scenarios}, indent=2))
         return 0
-    output = HERE / "results"
+    output = args.output
     if args.action == "inventory":
         output.mkdir(exist_ok=True)
         write_json(output / "migration_inventory.json", inventory())
@@ -124,7 +223,7 @@ def main() -> int:
             "Dam crack contact is not implemented or verified yet. A reduced contact benchmark "
             "does not validate 3-D crack surfaces; complete that adapter before enabling crack scenarios."
         )
-    material = json.loads(LOAD_CASE.read_text())["material"]
+    material = json.loads(LOAD_CASE.read_text())["material"]["concrete"]
     config_hash = hashlib.sha256(args.config.read_bytes()).hexdigest()
     load_hash = hashlib.sha256(LOAD_CASE.read_bytes()).hexdigest()
     for scenario in selected:

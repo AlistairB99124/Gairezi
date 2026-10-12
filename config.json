@@ -153,6 +153,47 @@
   "outputs": {
     "max_displacement": true,
     "max_tensile_stress": true,
-    "cracking_risk": false
-  }
+    "cracking_risk": true
+  },
+  "crack_simulations": [{
+    "type": "phase_field",
+    "shape": "rectangular",
+    "central_crack_pos_m": {
+      "x": 76.7430082340184,
+      "y": 13.946708830164285,
+      "z": -25.0
+    },
+    "size_m": {
+      "x": 3,
+      "y": 5,
+      "z": 0.02
+    },
+    "orientation": {
+      "normal_x": 0.0,
+      "normal_y": 0.0,
+      "normal_z": 1.0
+    },
+    "phase_field_parameters": {
+      "model": "AT2",
+      "energy_split": "volumetric_deviatoric",
+      "length_scale_m": 0.1,
+      "critical_energy_release_rate_J_m2": 2700.0,
+      "residual_stiffness": 1e-8
+    },
+    "loading": {
+      "internal_pressure_pa": 0.0,
+      "load_steps": 10
+    },
+    "solver": {
+      "maximum_staggered_iterations": 50,
+      "staggered_tolerance": 1e-5,
+      "mechanics_relative_tolerance": 1e-8,
+      "mechanics_maximum_iterations": 2000,
+      "damage_gradient_tolerance": 1e-8,
+      "damage_maximum_iterations": 500,
+      "field_output_interval": 10,
+      "minimum_elements_per_length_scale": 0.9,
+      "maximum_refinement_levels": 3
+    }
+}]
 }

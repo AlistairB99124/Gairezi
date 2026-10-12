@@ -101,9 +101,10 @@ The new [FEniCSx workflow](FEniCSx/README.md) runs in Ubuntu/WSL2 and reads
 [cracking.json](FEniCSx/cracking.json) for task-driven scenario updates.
 It provides environment checks, a dam migration inventory, an exact elastic
 benchmark, a checked tetrahedral dam import and a provisional elastic comparison
-against Elmer, plus an exact two-bar normal-contact benchmark. A 3-D crack-surface
-adapter remains the next validation gate; enabled dam crack templates are
-currently blocked.
+against Elmer, an exact two-bar normal-contact benchmark, and a staggered hybrid
+AT2 phase-field fracture solver. Explicit 3-D crack-face contact remains
+unimplemented; the phase-field solver therefore does not prevent crack-face
+interpenetration under compression.
 
 ## Root dam configuration
 
@@ -122,6 +123,7 @@ the deleted `Elmer/load_cases.json` is read by these workflows.
 | `material.bedrock` | Rock material data; no rock volume is currently meshed |
 | `loads` | Gravity, water density, reference water depth, overflow and tailwater heads |
 | `outputs` | Requested result metadata; the existing solver/post-processor still writes its standard result fields |
+| `crack_simulations` | Optional; declared phase-field cracks consumed by [FEniCSx/crack_field.py](FEniCSx/crack_field.py) |
 
 Contour `height` is a signed elevation relative to crest z = 0, not a positive
 wall height. Plinth and bedrock stations must match and be strictly increasing.
@@ -137,6 +139,67 @@ unknown fields, non-numeric/nonfinite values, invalid geometry and material
 values, mismatched contour stations, incorrect support mappings, and invalid
 output-flag types. Validation errors include JSON-style field paths.
 
+### Crack simulations
+
+`crack_simulations` is an optional array describing pre-existing cracks. Each
+entry declares `type` (`phase_field`), `shape` (`rectangular`),
+`central_crack_pos_m`, `size_m`, an `orientation` normal,
+`phase_field_parameters`, loading increments and explicit solver/refinement
+controls. Only `model: AT2` and `energy_split: volumetric_deviatoric` are
+currently supported; unsupported alternatives fail validation.
+
+`size_m.x` and `size_m.y` span the crack plane while `size_m.z` is the opening
+measured **along the orientation normal**, so a crack is a thin rectangular box
+rather than a zero-thickness surface. The crack axes come from the shortest-arc
+rotation carrying global +z onto the configured normal, so the default normal
+`(0, 0, 1)` leaves `size_m.x`/`size_m.y` aligned with the global axes.
+
+[FEniCSx/crack_field.py](FEniCSx/crack_field.py) turns these entries into a
+`dolfinx.fem.Function` holding the regularised damage of the crack, built from
+the exact signed distance to that box. **Damage is 1 for fully cracked material
+and 0 for intact material**, the usual AT1/AT2 convention and the opposite of a
+stiffness-retention factor. The field is an *initial condition* representing a
+declared crack: it is neither a computed crack path nor a physical crack opening
+displacement, and producing it asserts nothing about dam safety.
+
+The initial field saturates at 1 inside the crack box and uses the AT2 optimal
+profile `exp(-d / l)` outside it. Overlapping cracks combine by maximum damage.
+The solver locally refines the diffuse band until the configured minimum
+elements per `length_scale_m` is reached or fails after the configured maximum
+levels. It preserves cell and exterior-facet tags through refinement.
+
+The checked-in serial WSL example targets `0.9` length scales per maximum
+tetrahedron diameter and at most three refinements. This produces a runnable
+preliminary mesh (`h_max` about `0.109 m` near this crack) but does **not**
+resolve `l=0.1 m` to the recommended 2-4 elements. Raising the target to `2.0`
+requires five refinements and generated approximately 12.5 million crack-band
+tetrahedra plus a 1.8 GB mesh in testing; that exceeded the available serial WSL
+memory. Use parallel/distributed meshing and solve resources for that target,
+then perform a mesh/length-scale convergence study.
+
+The staggered solve alternates degraded linear mechanics and a PETSc TAO
+bound-constrained AT2 damage minimisation. The lower bound is the damage from
+the previous converged load step, enforcing irreversibility. Gravity,
+hydrostatic boundary pressure and the existing directional support springs are
+included. Nonzero internal crack pressure uses the regularised force
+`-p*grad(alpha)`; this is not an explicit face traction. Outputs include
+displacement, damage, tensile-energy history, degraded stress, strain,
+crack-surface density, energies, convergence histories, reactions and force
+balance. Successful convergence is explicitly marked as not engineering
+validated.
+
+`solver.field_output_interval` controls expensive ParaView field snapshots;
+JSON convergence and energy diagnostics are still recorded at every load step.
+The default `10` writes the final fields for the current ten-step run and avoids
+multi-gigabyte per-step output.
+
+The configured central horizontal crack uses the existing scenario location at
+chainage `108.5 m`, elevation `-25 m`, mapped to the wall centreline by
+`(x, y) = (r sin(s/r), r cos(s/r))`. For `r=78 m` this is Cartesian centre
+`(76.743008, 13.946709, -25) m`. Placement validation confirms that centre and
+the diffuse band lie in concrete-wall region 2. Crack coordinates in this
+section are always global Cartesian coordinates, not chainage/radius values.
+
 | Field/capability | Combined Elmer workflow |
 |---|---|
 | `geometry.global_element_size_m` | Active; controls the shared mesh spacing |
@@ -149,6 +212,7 @@ output-flag types. Validation errors include JSON-style field paths.
 | `loads.water_height` and `loads.overflow_water_level` | Reference-depth metadata; the latter must equal their documented sum |
 | `outputs.*` flags | Validated metadata only; the current solver still writes its standard fields and reports |
 | `outputs.cracking_risk` | Not a crack/damage analysis; the elastic model does not implement crack propagation |
+| `crack_simulations[*]` | Active in the FEniCSx `run-fracture` action; placement, refinement, load stepping and solver controls are validated |
 
 The supplied model has a **4 m wall** at radii **76-80 m**, on a **6 m plinth**
 at radii **75-81 m**. Both centrelines are 78 m, with 1 m overhang on each side.

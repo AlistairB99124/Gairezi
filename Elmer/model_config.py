@@ -23,9 +23,45 @@ CONFIG_KEYS = {
     },
     "outputs": {"max_displacement", "max_tensile_stress", "cracking_risk"},
 }
+OPTIONAL_CONFIG_KEYS = {"crack_simulations"}
 MATERIAL_KEYS = {"density", "youngs_modulus", "poisson_ratio", "tensile_strength_pa"}
 RADIUS_KEYS = {"radial_width_m", "upstream_radius_m", "centerline_radius_m", "downstream_radius_m"}
 SUPPORT_KEYS = {"model", "material", "spring_n_per_m3"}
+CRACK_KEYS = {
+    "type",
+    "shape",
+    "central_crack_pos_m",
+    "size_m",
+    "orientation",
+    "phase_field_parameters",
+    "loading",
+    "solver",
+}
+VECTOR_KEYS = {"x", "y", "z"}
+ORIENTATION_KEYS = {"normal_x", "normal_y", "normal_z"}
+PHASE_FIELD_KEYS = {
+    "model",
+    "energy_split",
+    "length_scale_m",
+    "critical_energy_release_rate_J_m2",
+    "residual_stiffness",
+}
+CRACK_LOADING_KEYS = {"internal_pressure_pa", "load_steps"}
+PHASE_FIELD_SOLVER_KEYS = {
+    "maximum_staggered_iterations",
+    "staggered_tolerance",
+    "mechanics_relative_tolerance",
+    "mechanics_maximum_iterations",
+    "damage_gradient_tolerance",
+    "damage_maximum_iterations",
+    "field_output_interval",
+    "minimum_elements_per_length_scale",
+    "maximum_refinement_levels",
+}
+CRACK_TYPES = {"phase_field"}
+CRACK_SHAPES = {"rectangular"}
+PHASE_FIELD_MODELS = {"AT2"}
+ENERGY_SPLITS = {"volumetric_deviatoric"}
 SUPPORT_MODELS = {
     "plinth": ("distributed_elastic_concrete", "concrete"),
     "bedrock": ("distributed_elastic_granite", "bedrock"),
@@ -58,13 +94,14 @@ class _ConfigValidator:
         value: object,
         path: str,
         keys: set[str],
+        optional: set[str] | None = None,
     ) -> Mapping[str, object] | None:
         if not isinstance(value, dict):
             self.issue(path, "must be an object")
             return None
         for key in sorted(keys - value.keys()):
             self.issue(f"{path}.{key}" if path else key, "is required")
-        for key in sorted(value.keys() - keys):
+        for key in sorted(value.keys() - keys - (optional or set())):
             self.issue(f"{path}.{key}" if path else str(key), "is not a supported field")
         return value
 
@@ -190,8 +227,94 @@ class _ConfigValidator:
             for direction in ("x", "y", "z"):
                 self.field_number(springs, direction, f"{path}.spring_n_per_m3", nonnegative=True)
 
+    def validate_cracks(self, value: object) -> None:
+        """Validate declared crack simulations without reinterpreting their physical inputs."""
+        if not isinstance(value, list) or not value:
+            self.issue("crack_simulations", "must be a nonempty array")
+            return
+        for index, entry in enumerate(value):
+            path = f"crack_simulations[{index}]"
+            crack = self.object(entry, path, CRACK_KEYS)
+            if crack is None:
+                continue
+            if "type" in crack and crack["type"] not in CRACK_TYPES:
+                self.issue(f"{path}.type", f"must be one of {sorted(CRACK_TYPES)}")
+            if "shape" in crack and crack["shape"] not in CRACK_SHAPES:
+                self.issue(f"{path}.shape", f"must be one of {sorted(CRACK_SHAPES)}")
+
+            centre = self.object(crack.get("central_crack_pos_m"), f"{path}.central_crack_pos_m", VECTOR_KEYS)
+            for axis in sorted(VECTOR_KEYS):
+                self.field_number(centre, axis, f"{path}.central_crack_pos_m")
+
+            # size_m.x and size_m.y span the crack plane; size_m.z is the opening measured along the normal.
+            size = self.object(crack.get("size_m"), f"{path}.size_m", VECTOR_KEYS)
+            for axis in sorted(VECTOR_KEYS):
+                self.field_number(size, axis, f"{path}.size_m", positive=True)
+
+            orientation = self.object(crack.get("orientation"), f"{path}.orientation", ORIENTATION_KEYS)
+            components = [
+                self.field_number(orientation, key, f"{path}.orientation")
+                for key in sorted(ORIENTATION_KEYS)
+            ]
+            if all(component is not None for component in components):
+                if math.hypot(*components) <= 0.0:
+                    self.issue(f"{path}.orientation", "must define a nonzero crack normal")
+
+            parameters = self.object(
+                crack.get("phase_field_parameters"), f"{path}.phase_field_parameters", PHASE_FIELD_KEYS
+            )
+            for key in ("length_scale_m", "critical_energy_release_rate_J_m2"):
+                self.field_number(parameters, key, f"{path}.phase_field_parameters", positive=True)
+            residual = self.field_number(
+                parameters, "residual_stiffness", f"{path}.phase_field_parameters", positive=True
+            )
+            if residual is not None and residual >= 1:
+                self.issue(f"{path}.phase_field_parameters.residual_stiffness", "must be less than 1")
+            if parameters is not None:
+                if parameters.get("model") not in PHASE_FIELD_MODELS:
+                    self.issue(
+                        f"{path}.phase_field_parameters.model",
+                        f"must be one of {sorted(PHASE_FIELD_MODELS)}",
+                    )
+                if parameters.get("energy_split") not in ENERGY_SPLITS:
+                    self.issue(
+                        f"{path}.phase_field_parameters.energy_split",
+                        f"must be one of {sorted(ENERGY_SPLITS)}",
+                    )
+
+            loading = self.object(crack.get("loading"), f"{path}.loading", CRACK_LOADING_KEYS)
+            self.field_number(loading, "internal_pressure_pa", f"{path}.loading", nonnegative=True)
+            if loading is not None:
+                steps = loading.get("load_steps")
+                if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+                    self.issue(f"{path}.loading.load_steps", "must be a positive integer")
+
+            solver = self.object(crack.get("solver"), f"{path}.solver", PHASE_FIELD_SOLVER_KEYS)
+            if solver is not None:
+                for key in (
+                    "maximum_staggered_iterations",
+                    "mechanics_maximum_iterations",
+                    "damage_maximum_iterations",
+                    "field_output_interval",
+                    "maximum_refinement_levels",
+                ):
+                    value = solver.get(key)
+                    minimum = 0 if key == "maximum_refinement_levels" else 1
+                    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                        qualifier = "a non-negative" if minimum == 0 else "a positive"
+                        self.issue(f"{path}.solver.{key}", f"must be {qualifier} integer")
+                for key in (
+                    "staggered_tolerance",
+                    "mechanics_relative_tolerance",
+                    "damage_gradient_tolerance",
+                    "minimum_elements_per_length_scale",
+                ):
+                    value = self.field_number(solver, key, f"{path}.solver", positive=True)
+                    if value is not None and key != "minimum_elements_per_length_scale" and value >= 1:
+                        self.issue(f"{path}.solver.{key}", "must be less than 1")
+
     def validate(self, payload: object) -> list[ValidationIssue]:
-        root = self.object(payload, "", set(CONFIG_KEYS))
+        root = self.object(payload, "", set(CONFIG_KEYS), optional=OPTIONAL_CONFIG_KEYS)
         if root is None:
             return self.issues
 
@@ -277,6 +400,8 @@ class _ConfigValidator:
                 value = outputs.get(key)
                 if key in outputs and not isinstance(value, bool):
                     self.issue(f"outputs.{key}", "must be a boolean")
+        if "crack_simulations" in root:
+            self.validate_cracks(root["crack_simulations"])
         return self.issues
 
 

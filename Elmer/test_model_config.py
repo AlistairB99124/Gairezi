@@ -93,6 +93,29 @@ class ModelConfigTests(unittest.TestCase):
         self.payload["outputs"]["max_displacement"] = 1
         self.assert_invalid_at(self.payload, "outputs.max_displacement")
 
+    def test_phase_field_controls_are_explicit_and_validated(self):
+        crack = self.payload["crack_simulations"][0]
+        crack["phase_field_parameters"]["model"] = "AT1"
+        crack["phase_field_parameters"]["residual_stiffness"] = 1.0
+        crack["loading"]["load_steps"] = 0
+        crack["solver"]["field_output_interval"] = 0
+        crack["solver"]["staggered_tolerance"] = 1.0
+        crack["solver"]["maximum_refinement_levels"] = -1
+        with self.assertRaises(ConfigurationValidationError) as context:
+            validate_config(self.payload)
+        paths = {issue.path for issue in context.exception.issues}
+        prefix = "crack_simulations[0]"
+        self.assertIn(f"{prefix}.phase_field_parameters.model", paths)
+        self.assertIn(f"{prefix}.phase_field_parameters.residual_stiffness", paths)
+        self.assertIn(f"{prefix}.loading.load_steps", paths)
+        self.assertIn(f"{prefix}.solver.field_output_interval", paths)
+        self.assertIn(f"{prefix}.solver.staggered_tolerance", paths)
+        self.assertIn(f"{prefix}.solver.maximum_refinement_levels", paths)
+
+    def test_crack_solver_rejects_unknown_fields(self):
+        self.payload["crack_simulations"][0]["solver"]["silent_failure"] = True
+        self.assert_invalid_at(self.payload, "crack_simulations[0].solver.silent_failure")
+
     def test_water_reference_level_must_match_its_components(self):
         self.payload["loads"]["overflow_water_level"] = 35
         self.assert_invalid_at(self.payload, "loads.overflow_water_level")

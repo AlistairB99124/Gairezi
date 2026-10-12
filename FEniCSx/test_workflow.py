@@ -17,7 +17,7 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.scenarios = [s for s in json.loads((workflow.HERE / "cracking.json").read_text())
                           if s["kind"] in ("elastic_benchmark", "predefined_crack")]
-        self.material = json.loads(workflow.LOAD_CASE.read_text())["material"]
+        self.material = json.loads(workflow.LOAD_CASE.read_text())["material"]["concrete"]
 
     def test_elastic_solution_and_exported_stresses(self):
         with tempfile.TemporaryDirectory() as directory:

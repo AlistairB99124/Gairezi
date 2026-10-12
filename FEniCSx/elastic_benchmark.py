@@ -10,6 +10,8 @@ from petsc4py import PETSc
 
 
 def solve(scenario: dict, material: dict, output: Path) -> dict:
+    if "concrete" in material:
+        material = material["concrete"]
     young = float(material["youngs_modulus"])
     poisson = float(material["poisson_ratio"])
     if not np.isfinite(young) or young <= 0 or not np.isfinite(poisson) or not -1 < poisson < 0.5:

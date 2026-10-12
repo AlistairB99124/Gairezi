@@ -6,13 +6,15 @@ This directory is the new WSL-based adapter; the Elmer model is unchanged.
 The verified scope includes environment/configuration checking, a migration
 inventory, an exact elastic patch test, conforming dam import and a full-dam
 elastic comparison against the current Elmer run, and an analytically checked
-two-bar frictionless contact benchmark. **3-D predefined dam crack contact
-is not implemented yet.** Elastic acceptance limits are provisional porting
-criteria, not independent engineering validation.
+two-bar frictionless contact benchmark. It now also includes a staggered hybrid
+AT2 phase-field fracture solver with irreversible bound-constrained damage,
+local crack-band refinement and ParaView output. **3-D crack-face contact is
+not implemented.** Acceptance limits are provisional porting criteria, not
+independent engineering validation.
 
-The target is predefined cracks with configurable location, depth, initial opening
-and contact, not automatic crack initiation/propagation. Crack growth would require
-an additional fracture law and independently justified material data.
+The phase-field path supports evolution from a configured diffuse crack. The
+older `predefined_crack` template remains an explicit-surface/contact concept
+and is still blocked; these are different models and are not silently mixed.
 
 The shared source geometry reads [root config.json](../config.json): a 4 m wall
 (radii 76-80 m) centred on a 6 m plinth (radii 75-81 m), with 1 m overhang on
@@ -37,6 +39,7 @@ Use **Terminal > Run Task**:
 - **FEniCSx: Import and audit dam mesh**
 - **FEniCSx: Verify dam elastic parity**
 - **FEniCSx: Verify frictionless contact benchmark**
+- **FEniCSx: Run phase-field fracture**
 - **FEniCSx: Update configured results**
 
 The tasks invoke the Ubuntu `python3` directly through `wsl.exe`, with the current
@@ -50,6 +53,7 @@ wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py inventory
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py import-dam
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run --scenario dam_elastic_parity
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run --scenario frictionless_contact_benchmark
+wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run-fracture --dam-config config.json --output FEniCSx/results
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run
 ```
 
@@ -59,6 +63,7 @@ Or, from an Ubuntu shell in the repository:
 python3 -B FEniCSx/run.py check
 python3 -B FEniCSx/run.py inventory
 python3 -B FEniCSx/run.py import-dam
+python3 -B FEniCSx/run.py run-fracture --dam-config config.json --output FEniCSx/results
 python3 -B FEniCSx/run.py run
 python3 -B FEniCSx/run.py run --scenario elastic_benchmark
 python3 -B -m unittest discover -s FEniCSx -p 'test_*.py' -v
@@ -73,8 +78,8 @@ templates. Geometry bounds and mesh alignment must be validated by the future
 dam adapter; passing configuration validation does not prove geometric feasibility.
 
 The enabled `elastic_benchmark` scenario is a one-metre cube with affine
-uniaxial strain. It uses E and Poisson ratio from the current
-[Elmer load case](../Elmer/load_cases.json), **not the dam geometry or dam loads**.
+uniaxial strain. It uses concrete E and Poisson ratio from the root
+[dam configuration](../config.json), **not the dam geometry or dam loads**.
 It verifies relative L2 displacement error and strain-energy error against an exact
 solution using the configured threshold. The default limit is 1e-8.
 Its linear solver uses CG/Jacobi and the configured tolerance/iteration limit.
@@ -103,6 +108,54 @@ scenario**. Horizontal cracks use `chainage_m`, `z_m`, `width_m`, `depth_m` and
 All enabled crack scenarios currently fail before any solve/output is started.
 No penalty stiffness, friction law implementation, opening field or crack result
 is fabricated.
+
+## Phase-field fracture workflow
+
+`run-fracture` reads the root dam contract through an explicit `--dam-config`
+path and writes only beneath the explicit `--output` path. Every job receives a
+configuration snapshot, input hash, environment record, import and placement
+reports, and either a completed or failed manifest. A successful job also
+writes `results.md`, a civil-engineering-oriented summary generated directly
+from the configuration snapshot and numerical JSON reports. Repository
+`config.json` is never overwritten.
+
+The default single-process WSL job uses three local refinement levels and a
+preliminary target of `0.9` length scales per maximum tetrahedron diameter. The
+resulting `h_max` is about `0.109 m` for `l=0.1 m`, so it is explicitly
+under-resolved and unsuitable for mesh-independent conclusions. A target of
+`2.0` generated roughly 12.5 million crack-band tetrahedra and a 1.8 GB mesh,
+then exhausted serial WSL memory. That stricter target requires a parallel
+workflow and remains mandatory for a later convergence study.
+
+The solver uses `alpha=0` for intact and `alpha=1` for fully damaged material.
+Mechanics uses `g(alpha)=(1-alpha)^2+kappa`. A
+volumetric/deviatoric tensile history drives AT2 damage, while mechanics uses
+the hybrid full-stiffness degradation. This suppresses compression-driven
+damage but does not provide unilateral contact. Each load step alternates:
+
+1. degraded linear mechanics with gravity, water and spring supports;
+2. history update by pointwise maximum tensile energy;
+3. PETSc TAO trust-region damage minimisation with
+   `alpha_previous <= alpha <= 1`;
+4. a convergence check on displacement and damage changes.
+
+Nonconvergence, invalid placement, exhausted refinement, PETSc failure and
+nonfinite energy all fail the job explicitly. The final report includes an AT2
+homogeneous tensile-strength estimate because `E`, `Gc` and `l` jointly imply a
+strength that can differ from `material.concrete.tensile_strength_pa`; this is
+a calibration warning, not an automatic material-property rewrite.
+
+`solver.field_output_interval` controls VTK snapshots independently of the JSON
+diagnostics, which are retained for every load step. The default value `10`
+writes final fields for the ten-step example and avoids the roughly 3.5 GB
+produced when displacement, damage and history were written at every step.
+
+The checked-in horizontal crack uses the existing scenario location at
+chainage `108.5 m`, elevation `-25 m`, converted on the 78 m wall centreline to
+global Cartesian centre `(76.743008, 13.946709, -25) m`. The placement guard
+confirms it lies in wall region 2. Do not treat a converged run as a dam-safety
+assessment without independent engineering verification, mesh/length-scale
+sensitivity studies and fracture-property calibration.
 
 ## Reduced frictionless contact benchmark
 
