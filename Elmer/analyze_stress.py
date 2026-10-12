@@ -13,6 +13,7 @@ from plotly.subplots import make_subplots
 from PIL import Image
 import numpy as np
 
+from kaleido_safety import write_image_with_timeout
 from sketch_arch_dam_views import load_station_edges, plot_views, xyz
 
 
@@ -275,7 +276,7 @@ def plot_stress_distribution(element_rows: list[dict[str, float]], tensile_stren
         template="plotly_white",
     )
 
-    fig.write_image(str(out_path), scale=1.2)
+    write_image_with_timeout(fig, out_path, scale=1.2)
 
 
 def plot_critical_views(mesh_path: Path, tension_point: np.ndarray, compression_point: np.ndarray, out_path: Path) -> None:
@@ -347,7 +348,7 @@ def plot_critical_views(mesh_path: Path, tension_point: np.ndarray, compression_
         template="plotly_white",
     )
 
-    fig.write_image(str(out_path), scale=1.2)
+    write_image_with_timeout(fig, out_path, scale=1.2)
 
 
 def create_report_sheet(
@@ -493,7 +494,7 @@ def plot_dam_outline_sketch(
         template="plotly_white",
     )
 
-    fig.write_image(str(out_path), scale=1.2)
+    write_image_with_timeout(fig, out_path, scale=1.2)
 
 
 def analyze_result(
@@ -569,24 +570,44 @@ def analyze_result(
     summary_path = out_dir / "stress_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
+    # Kaleido (the headless-Chromium renderer behind fig.write_image) can
+    # intermittently fail to cleanly close/kill its browser subprocess on
+    # Windows after an image has already been rendered and written to disk.
+    # Treat each plot as independent and non-fatal: the numeric stress
+    # summary/CSV above is the authoritative result and must not be discarded
+    # just because a report image failed to render.
     stress_plot_path = out_dir / "principal_stress_distribution.png"
-    plot_stress_distribution(element_rows, tensile_strength_pa, stress_plot_path)
+    plot_error: str | None = None
+    try:
+        plot_stress_distribution(element_rows, tensile_strength_pa, stress_plot_path)
+    except Exception as error:  # noqa: BLE001 - a plotting failure must not discard the stress analysis
+        plot_error = f"principal_stress_distribution.png: {error}"
+        if not stress_plot_path.is_file():
+            stress_plot_path = None  # type: ignore[assignment]
 
     sketch_path = out_dir / "dam_stress_sketch.png"
-    plot_dam_outline_sketch(
-        element_rows,
-        np.array(max_tension["centroid_xyz_m"]),
-        np.array(max_compression["centroid_xyz_m"]),
-        sketch_path,
-    )
+    try:
+        plot_dam_outline_sketch(
+            element_rows,
+            np.array(max_tension["centroid_xyz_m"]),
+            np.array(max_compression["centroid_xyz_m"]),
+            sketch_path,
+        )
+    except Exception as error:  # noqa: BLE001 - a plotting failure must not discard the stress analysis
+        plot_error = f"{plot_error + '; ' if plot_error else ''}dam_stress_sketch.png: {error}"
+        if not sketch_path.is_file():
+            sketch_path = None  # type: ignore[assignment]
 
-    return {
+    result = {
         "stress_summary_path": str(summary_path),
         "stress_csv_path": str(csv_path),
-        "stress_distribution_plot_path": str(stress_plot_path),
-        "stress_sketch_plot_path": str(sketch_path),
+        "stress_distribution_plot_path": str(stress_plot_path) if stress_plot_path else None,
+        "stress_sketch_plot_path": str(sketch_path) if sketch_path else None,
         **summary,
     }
+    if plot_error is not None:
+        result["plot_error"] = plot_error
+    return result
 
 
 def load_tensile_strength(load_cases_path: Path) -> float:

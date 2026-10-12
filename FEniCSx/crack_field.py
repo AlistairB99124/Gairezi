@@ -51,6 +51,7 @@ class CrackSpecification:
     length_scale_m: float
     critical_energy_release_rate_j_m2: float
     internal_pressure_pa: float
+    name: str = ""
     model: str = "AT2"
     energy_split: str = "volumetric_deviatoric"
     residual_stiffness: float = 1e-8
@@ -94,6 +95,7 @@ def load_crack_specifications(config: Path | dict | None = None) -> list[CrackSp
         parameters = crack["phase_field_parameters"]
         specifications.append(
             CrackSpecification(
+                name=crack.get("name", ""),
                 type=crack["type"],
                 shape=crack["shape"],
                 centre_m=(float(centre["x"]), float(centre["y"]), float(centre["z"])),

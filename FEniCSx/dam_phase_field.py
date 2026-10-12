@@ -167,8 +167,12 @@ def solve(
         length_scale,
     )
     stress_values = stress.x.array.reshape(-1, 3, 3)
+    eigenvalues = np.linalg.eigvalsh(stress_values)
     maximum_tensile_stress = float(
-        domain.comm.allreduce(np.linalg.eigvalsh(stress_values)[:, -1].max(), op=MPI.MAX)
+        domain.comm.allreduce(eigenvalues[:, -1].max(), op=MPI.MAX)
+    )
+    maximum_compressive_stress = float(
+        domain.comm.allreduce(eigenvalues[:, 0].min(), op=MPI.MIN)
     )
     result.report.update(
         {
@@ -181,6 +185,7 @@ def solve(
                 domain.comm.allreduce(np.abs(stress.x.array).max(), op=MPI.MAX)
             ),
             "maximum_principal_tensile_stress_pa": maximum_tensile_stress,
+            "maximum_principal_compressive_stress_pa": maximum_compressive_stress,
             "crack_surface_measure_m2": integral(crack_density * dx),
             "configured_tensile_strength_pa": configured_strength,
             "at2_implied_homogeneous_tensile_strength_pa": implied_strength,

@@ -156,6 +156,7 @@
     "cracking_risk": true
   },
   "crack_simulations": [{
+    "name": "scenario_1",
     "type": "phase_field",
     "shape": "rectangular",
     "central_crack_pos_m": {

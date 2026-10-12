@@ -102,6 +102,7 @@ def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     snapshot = directory / "config.json"
     snapshot.write_bytes(dam_config.read_bytes())
+    specifications = load_crack_specifications(snapshot)
     manifest = {
         "status": "running",
         "analysis": "dam_phase_field",
@@ -109,10 +110,10 @@ def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
         "configuration_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
         "started_at_utc": timestamp,
         "engineering_validated": False,
+        "crack_scenario_names": [specification.name for specification in specifications],
     }
     write_json(directory / "manifest.json", manifest)
     try:
-        specifications = load_crack_specifications(snapshot)
         options = load_phase_field_solver_options(snapshot)
         # Existing geometry builders accept a root containing config.json. Use an
         # isolated temporary root so a submitted job never rewrites repository data.

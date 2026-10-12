@@ -28,6 +28,7 @@ MATERIAL_KEYS = {"density", "youngs_modulus", "poisson_ratio", "tensile_strength
 RADIUS_KEYS = {"radial_width_m", "upstream_radius_m", "centerline_radius_m", "downstream_radius_m"}
 SUPPORT_KEYS = {"model", "material", "spring_n_per_m3"}
 CRACK_KEYS = {
+    "name",
     "type",
     "shape",
     "central_crack_pos_m",
@@ -85,9 +86,13 @@ class ConfigurationValidationError(ValueError):
 class _ConfigValidator:
     def __init__(self) -> None:
         self.issues: list[ValidationIssue] = []
+        self.warnings: list[ValidationIssue] = []
 
     def issue(self, path: str, message: str) -> None:
         self.issues.append(ValidationIssue(path, message))
+
+    def warn(self, path: str, message: str) -> None:
+        self.warnings.append(ValidationIssue(path, message))
 
     def object(
         self,
@@ -173,6 +178,12 @@ class _ConfigValidator:
             poisson = self.field_number(values, "poisson_ratio", path)
             if poisson is not None and not -1 < poisson < 0.5:
                 self.issue(f"{path}.poisson_ratio", "must lie between -1 and 0.5")
+            if name == "bedrock":
+                self.warn(
+                    path,
+                    "is retained in configuration but no bedrock volume is currently meshed; "
+                    "these properties do not affect the analysis.",
+                )
 
     def validate_contours(
         self,
@@ -237,6 +248,9 @@ class _ConfigValidator:
             crack = self.object(entry, path, CRACK_KEYS)
             if crack is None:
                 continue
+            name = crack.get("name")
+            if not isinstance(name, str) or not name.strip():
+                self.issue(f"{path}.name", "must be a nonempty string")
             if "type" in crack and crack["type"] not in CRACK_TYPES:
                 self.issue(f"{path}.type", f"must be one of {sorted(CRACK_TYPES)}")
             if "shape" in crack and crack["shape"] not in CRACK_SHAPES:
@@ -344,6 +358,12 @@ class _ConfigValidator:
             plinth_upstream, plinth_downstream = self.validate_radii(plinth, "geometry.plinth")
             if wall is not None:
                 self.field_number(wall, "height_above_plinth_m", "geometry.wall")
+                if "height_above_plinth_m" in wall:
+                    self.warn(
+                        "geometry.wall.height_above_plinth_m",
+                        "is nominal metadata; it does not change the meshed geometry. "
+                        "Edit geometry.plinth.contours / geometry.bedrock.contours heights instead.",
+                    )
             if (
                 wall_downstream is not None
                 and plinth_downstream is not None
@@ -400,6 +420,14 @@ class _ConfigValidator:
                 value = outputs.get(key)
                 if key in outputs and not isinstance(value, bool):
                     self.issue(f"outputs.{key}", "must be a boolean")
+            # Output selections are not fully wired yet: toggling these flags
+            # does not currently change what the worker computes or reports.
+            if outputs.get("cracking_risk") is True:
+                self.warn(
+                    "outputs.cracking_risk",
+                    "is not fully implemented; enabling it does not add cracking-risk "
+                    "output to the analysis result.",
+                )
         if "crack_simulations" in root:
             self.validate_cracks(root["crack_simulations"])
         return self.issues
@@ -414,6 +442,17 @@ def validate_config(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise TypeError("validated configuration must be a JSON object")
     return payload
+
+
+def collect_warnings(payload: object) -> list[ValidationIssue]:
+    """Return non-fatal warnings for nominal or currently inactive configuration
+    properties (e.g. height_above_plinth_m, bedrock material, cracking_risk output)
+    without reinterpreting or rejecting the submitted values. Intended to be called
+    only once the configuration has already passed validate_config.
+    """
+    validator = _ConfigValidator()
+    validator.validate(payload)
+    return validator.warnings
 
 
 def load_config(source: Path | dict[str, object] = CONFIG_PATH) -> dict[str, object]:

@@ -143,16 +143,17 @@ def build_engineering_results(
         "",
         "## Configured cracks",
         "",
-        "| # | Centre (x, y, z), m | Nominal size (x, y, z), m | Normal | Placement valid |",
-        "|---:|---|---|---|---|",
+        "| # | Name | Centre (x, y, z), m | Nominal size (x, y, z), m | Normal | Placement valid |",
+        "|---:|---|---|---|---|---|",
     ]
     for index, crack in enumerate(cracks, start=1):
+        name = crack.get("name", "")
         centre = crack["central_crack_pos_m"]
         size = crack["size_m"]
         normal = crack["orientation"]
         is_valid = placement[index - 1]["valid"] if index <= len(placement) else False
         lines.append(
-            f"| {index} | ({centre['x']:.3f}, {centre['y']:.3f}, {centre['z']:.3f}) "
+            f"| {index} | {name} | ({centre['x']:.3f}, {centre['y']:.3f}, {centre['z']:.3f}) "
             f"| ({size['x']:.3f}, {size['y']:.3f}, {size['z']:.3f}) "
             f"| ({normal['normal_x']:.3f}, {normal['normal_y']:.3f}, "
             f"{normal['normal_z']:.3f}) | {'yes' if is_valid else 'no'} |"
@@ -206,6 +207,7 @@ def build_engineering_results(
             "|---|---:|",
             f"| Maximum degraded stress component magnitude | {result['maximum_degraded_stress_pa'] / 1e6:.3f} MPa |",
             f"| Maximum principal tensile stress | {tensile_stress / 1e6:.3f} MPa |",
+            f"| Maximum principal compressive stress | {result.get('maximum_principal_compressive_stress_pa', 0.0) / 1e6:.3f} MPa |",
             f"| Configured tensile strength | {strength / 1e6:.3f} MPa |",
             f"| Tensile stress / configured tensile strength | {strength_utilisation:.1%} |",
             f"| AT2 implied homogeneous tensile strength | {result['at2_implied_homogeneous_tensile_strength_pa'] / 1e6:.3f} MPa |",

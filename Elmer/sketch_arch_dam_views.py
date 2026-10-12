@@ -9,6 +9,8 @@ from pathlib import Path
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from kaleido_safety import write_image_with_timeout
+
 
 def read_gmsh_nodes(mesh_path: Path) -> list[tuple[float, float, float]]:
     lines = mesh_path.read_text().splitlines()
@@ -187,7 +189,7 @@ def plot_views(mesh_path: Path, out_path: Path) -> None:
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(out_path), scale=1.2)
+    write_image_with_timeout(fig, out_path, scale=1.2)
 
     html_path = out_path.with_suffix(".html")
     fig.write_html(str(html_path), include_plotlyjs="cdn")
