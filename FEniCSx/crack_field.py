@@ -56,6 +56,7 @@ class CrackSpecification:
     energy_split: str = "volumetric_deviatoric"
     residual_stiffness: float = 1e-8
     load_steps: int = 1
+    annular_sector: tuple[float, float, float, float] | None = None
 
     @property
     def half_extents_m(self) -> np.ndarray:
@@ -173,6 +174,14 @@ def signed_distance(points, specification: CrackSpecification) -> np.ndarray:
     if coordinates.ndim != 2 or coordinates.shape[1] != 3:
         raise ValueError("points must have shape (n, 3) or (3,)")
 
+    if specification.annular_sector is not None:
+        from automatic_crack import sector_signed_distance
+
+        distance = sector_signed_distance(
+            coordinates, specification.annular_sector, specification.centre_m[2], specification.size_m[2],
+        )
+        return distance[0] if single else distance
+
     frame = crack_frame(specification.normal)
     centre = np.asarray(specification.centre_m, dtype=float)
     # Components of each offset along the crack axes.
@@ -201,7 +210,7 @@ def damage_profile(distance, length_scale_m: float, model: str = "at2") -> np.nd
     raise ValueError(f"Unknown phase-field profile {model!r}; expected 'at1' or 'at2'")
 
 
-def resolution_report(domain, specification: CrackSpecification) -> dict:
+def resolution_report(domain, specification: CrackSpecification, eligible_cells=None) -> dict:
     """Report whether the mesh resolves the phase-field length scale near the crack."""
     dimension = domain.topology.dim
     domain.topology.create_connectivity(dimension, 0)
@@ -213,8 +222,15 @@ def resolution_report(domain, specification: CrackSpecification) -> dict:
     # half a cell so a band thinner than one element still reports the elements that span it.
     distance = signed_distance(midpoints, specification)
     band = distance <= 2.0 * specification.length_scale_m + diameters / 2.0
+    eligible = np.ones(len(cells), dtype=bool)
+    if eligible_cells is not None:
+        eligible[:] = False
+        eligible[eligible_cells] = True
+        if not eligible.any():
+            raise ValueError("No wall cells are available for crack resolution checks.")
+        band &= eligible
     if not band.any():
-        band = distance <= distance.min()
+        band = eligible & (distance <= distance[eligible].min())
     local = diameters[band]
     diameter = float(local.max())
     elements = specification.length_scale_m / diameter
@@ -317,8 +333,14 @@ def refine_for_phase_field(imported, specifications, options: PhaseFieldSolverOp
     domain, cell_tags, facet_tags = imported.domain, imported.cell_tags, imported.facet_tags
     levels = []
     for level in range(options.maximum_refinement_levels + 1):
-        reports = [resolution_report(domain, specification) for specification in specifications]
-        levels.append({"level": level, "cracks": reports})
+        wall_cells = cell_tags.find(2)
+        reports = [resolution_report(domain, specification, wall_cells) for specification in specifications]
+        levels.append({
+            "level": level, "cracks": reports,
+            "wall_cells": int(len(wall_cells)), "plinth_cells": int(len(cell_tags.find(1))),
+        })
+        print(f"Refinement level {level}: wall={len(wall_cells)}, plinth={len(cell_tags.find(1))}, "
+              f"wall resolution={[r['elements_per_length_scale'] for r in reports]}", flush=True)
         if all(
             report["elements_per_length_scale"] >= options.minimum_elements_per_length_scale
             for report in reports
@@ -340,6 +362,8 @@ def refine_for_phase_field(imported, specifications, options: PhaseFieldSolverOp
                         for report in reports
                     ),
                     "levels": levels,
+                    "refinement_region_id": 2,
+                    "non_wall_refinement": "conformity only",
                 },
             )
         if level == options.maximum_refinement_levels:
@@ -350,11 +374,19 @@ def refine_for_phase_field(imported, specifications, options: PhaseFieldSolverOp
         diameters = cell_diameters(domain._cpp_object, dimension, cells)
         midpoints = mesh.compute_midpoints(domain, dimension, cells)
         marked = np.zeros(len(cells), dtype=bool)
+        wall = np.zeros(len(cells), dtype=bool)
+        wall[wall_cells] = True
         for specification, report in zip(specifications, reports):
             if report["elements_per_length_scale"] < options.minimum_elements_per_length_scale:
                 distance = signed_distance(midpoints, specification)
-                marked |= distance <= 3.0 * specification.length_scale_m + diameters
+                marked |= (
+                    wall
+                    & (distance <= 3.0 * specification.length_scale_m + diameters)
+                    & (diameters > specification.length_scale_m / options.minimum_elements_per_length_scale)
+                )
         marked_cells = cells[marked]
+        levels[-1]["marked_wall_cells"] = int(len(marked_cells))
+        levels[-1]["marked_plinth_cells"] = 0
         if not len(marked_cells):
             raise RuntimeError("No cells were selected for required crack-band refinement")
         domain.topology.create_connectivity(dimension, 1)
@@ -394,8 +426,10 @@ def crack_phase_field(
     if not specifications:
         raise ValueError("At least one crack specification is required")
     for specification in specifications:
-        if specification.shape != "rectangular":
-            raise ValueError(f"Unsupported crack shape {specification.shape!r}; expected 'rectangular'")
+        if specification.shape not in ("rectangular", "annular_sector"):
+            raise ValueError(f"Unsupported crack shape {specification.shape!r}")
+        if specification.shape == "annular_sector" and specification.annular_sector is None:
+            raise ValueError("Annular-sector crack requires radial and angular bounds.")
         if specification.type != "phase_field":
             raise ValueError(f"Unsupported crack type {specification.type!r}; expected 'phase_field'")
 

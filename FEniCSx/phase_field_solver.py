@@ -80,6 +80,7 @@ def _solve_damage_obstacle(
     gc: float,
     length_scale: float,
     options: PhaseFieldSolverOptions,
+    fixed_damage_dofs=None,
 ) -> dict:
     """Minimise the quadratic AT2 functional subject to old <= alpha <= 1."""
     space = damage.function_space
@@ -99,6 +100,9 @@ def _solve_damage_obstacle(
     upper = damage.x.petsc_vec.duplicate()
     lower_bound.x.petsc_vec.copy(lower)
     upper.set(1.0)
+    if fixed_damage_dofs is not None:
+        with upper.localForm() as local:
+            local.array[fixed_damage_dofs] = 0.0
     work = damage.x.petsc_vec.duplicate()
 
     def objective_gradient(_tao, x, gradient):
@@ -156,6 +160,8 @@ def solve_staggered(
     support_form: Callable | None = None,
     boundary_conditions: Callable | None = None,
     output: Path | None = None,
+    damage_cell_tags=None,
+    damage_region_id: int = 2,
 ) -> PhaseFieldResult:
     """Solve mechanics and irreversible AT2 damage by alternate minimisation.
 
@@ -197,6 +203,16 @@ def solve_staggered(
         name="damage",
         check_resolution=False,
     )
+    fixed_damage_dofs = None
+    if damage_cell_tags is not None:
+        non_wall_cells = damage_cell_tags.indices[damage_cell_tags.values != damage_region_id]
+        if not len(damage_cell_tags.find(damage_region_id)):
+            raise ValueError("Damage region has no tagged cells.")
+        fixed_damage_dofs = fem.locate_dofs_topological(
+            damage_space, domain.topology.dim, non_wall_cells,
+        )
+        damage.x.array[fixed_damage_dofs] = 0.0
+        damage.x.scatter_forward()
     old_damage = fem.Function(damage_space, name="damage_lower_bound")
     old_damage.x.array[:] = damage.x.array
     old_damage.x.scatter_forward()
@@ -264,6 +280,7 @@ def solve_staggered(
                 first.critical_energy_release_rate_j_m2,
                 first.length_scale_m,
                 options,
+                fixed_damage_dofs,
             )
             displacement_change = _relative_change(displacement.x.array, previous_displacement)
             damage_change = _relative_change(damage.x.array, previous_damage)

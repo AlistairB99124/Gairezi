@@ -102,6 +102,8 @@ def solve(
         external_work,
         support_form=support_form,
         output=output,
+        damage_cell_tags=imported.cell_tags,
+        damage_region_id=2,
     )
 
     lam, mu, _ = elastic_parameters(material.youngs_modulus_pa, material.poissons_ratio)
@@ -177,6 +179,8 @@ def solve(
     result.report.update(
         {
             "crack_placement": placement,
+            "damage_region_id": 2,
+            "non_wall_damage": "fixed at zero, including shared interface DOFs",
             "applied_force_n": applied.tolist(),
             "ground_spring_reactions_n": reactions,
             "force_imbalance_n": imbalance.tolist(),
@@ -198,6 +202,7 @@ def solve(
                 "No unilateral crack-face contact or friction is enforced.",
                 "Diffuse pressure is an energy-consistent regularised traction, not an explicit face load.",
                 "Convergence and successful execution do not constitute engineering validation.",
+                "Damage is restricted to wall region 2; non-wall and shared interface damage DOFs are fixed at zero.",
             ],
         }
     )

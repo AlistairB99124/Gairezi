@@ -1,0 +1,17 @@
+{
+  "length_scale_m": 0.1,
+  "critical_energy_release_rate_j_m2": 2700.0,
+  "internal_pressure_pa": 0.0,
+  "load_steps": 10,
+  "solver": {
+    "maximum_staggered_iterations": 50,
+    "staggered_tolerance": 1e-5,
+    "mechanics_relative_tolerance": 1e-8,
+    "mechanics_maximum_iterations": 2000,
+    "damage_gradient_tolerance": 1e-8,
+    "damage_maximum_iterations": 500,
+    "field_output_interval": 10,
+    "minimum_elements_per_length_scale": 0.9,
+    "maximum_refinement_levels": 5
+  }
+}

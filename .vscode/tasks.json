@@ -5,10 +5,10 @@
       "label": "FEniCSx: Run phase-field fracture",
       "type": "process",
       "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "/home/alist/.venvs/dolfinx-external-operator/bin/python", "-B", "FEniCSx/run.py", "run-fracture", "--dam-config", "config.json", "--output", "FEniCSx/results"],
+      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "/home/alist/.venvs/dolfinx-external-operator/bin/python", "-u", "-B", "FEniCSx/run.py", "run-fracture", "--dam-config", "config.json", "--elmer-result", "Elmer/structure_output/combined_solver/results/combined_results_mpi_t0001.pvtu", "--output", "FEniCSx/results"],
       "problemMatcher": [],
       "group": "build",
-      "detail": "Validates crack placement, locally refines its diffuse band, and runs irreversible hybrid AT2 fracture."
+      "detail": "Consumes the existing Elmer PVTU, generates a peak-driven crack when no legacy scenario is supplied, refines its band, and runs hybrid AT2 fracture. Run Elmer first with the same configuration."
     },
     {
       "label": "FEniCSx: Verify frictionless contact benchmark",

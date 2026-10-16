@@ -111,6 +111,11 @@ def read_reference(structure, reference: Path):
                 displacement[selected[existing]], rtol=1e-6, atol=1e-10
             ):
                 raise ValueError("Elmer ghost-node displacement values disagree")
+            if np.any(existing) and not np.allclose(
+                stresses[source_ids[existing]] / counts[source_ids[existing], None],
+                stress[selected[existing]], rtol=1e-6, atol=1e-6,
+            ):
+                raise ValueError("Elmer ghost-node stress values disagree")
             np.add.at(values, source_ids, displacement[selected])
             np.add.at(stresses, source_ids, stress[selected])
             np.add.at(counts, source_ids, 1)

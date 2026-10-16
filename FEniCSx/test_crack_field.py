@@ -43,12 +43,31 @@ def specification(**overrides) -> CrackSpecification:
     return CrackSpecification(**values)
 
 
+def configured_test_case():
+    """Keep explicit-scenario compatibility tests independent of the scenario-free default."""
+    config = json.loads(CONFIG_PATH.read_text())
+    config["crack_simulations"] = [{
+        "name": "scenario_1", "type": "phase_field", "shape": "rectangular",
+        "central_crack_pos_m": {"x": 76.7430082340184, "y": 13.946708830164285, "z": -25.0},
+        "size_m": {"x": 3, "y": 5, "z": 0.02},
+        "orientation": {"normal_x": 0, "normal_y": 0, "normal_z": 1},
+        "phase_field_parameters": {
+            "model": "AT2", "energy_split": "volumetric_deviatoric", "length_scale_m": 0.1,
+            "critical_energy_release_rate_J_m2": 2700.0, "residual_stiffness": 1e-8,
+        },
+        "loading": {"internal_pressure_pa": 0, "load_steps": 10},
+        "solver": json.loads(Path(__file__).with_name("fracture_defaults.json").read_text())["solver"],
+    }]
+    return config
+
+
 class CrackConfigurationTests(unittest.TestCase):
     def test_reads_the_configured_crack_from_the_root_config(self):
-        cracks = load_crack_specifications()
+        config = configured_test_case()
+        cracks = load_crack_specifications(config)
         self.assertEqual(len(cracks), 1)
         crack = cracks[0]
-        declared = json.loads(CONFIG_PATH.read_text())["crack_simulations"][0]
+        declared = config["crack_simulations"][0]
         self.assertEqual(crack.type, "phase_field")
         self.assertEqual(crack.shape, "rectangular")
         self.assertEqual(crack.centre_m, (76.7430082340184, 13.946708830164285, -25.0))
@@ -62,7 +81,7 @@ class CrackConfigurationTests(unittest.TestCase):
         self.assertEqual(crack.internal_pressure_pa, declared["loading"]["internal_pressure_pa"])
 
     def test_rejects_a_crack_whose_normal_has_no_direction(self):
-        config = json.loads(CONFIG_PATH.read_text())
+        config = configured_test_case()
         config["crack_simulations"][0]["orientation"] = {"normal_x": 0.0, "normal_y": 0.0, "normal_z": 0.0}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
@@ -72,7 +91,7 @@ class CrackConfigurationTests(unittest.TestCase):
         self.assertIn("nonzero crack normal", str(error.exception))
 
     def test_rejects_a_crack_with_a_nonpositive_size(self):
-        config = json.loads(CONFIG_PATH.read_text())
+        config = configured_test_case()
         config["crack_simulations"][0]["size_m"]["z"] = 0.0
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

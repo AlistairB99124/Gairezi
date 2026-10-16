@@ -53,7 +53,7 @@ wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py inventory
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py import-dam
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run --scenario dam_elastic_parity
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run --scenario frictionless_contact_benchmark
-wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run-fracture --dam-config config.json --output FEniCSx/results
+wsl -d Ubuntu --cd "$PWD" --exec python3 -u -B FEniCSx/run.py run-fracture --dam-config config.json --elmer-result Elmer/structure_output/combined_solver/results/combined_results_mpi_t0001.pvtu --output FEniCSx/results
 wsl -d Ubuntu --cd "$PWD" --exec python3 -B FEniCSx/run.py run
 ```
 
@@ -63,13 +63,91 @@ Or, from an Ubuntu shell in the repository:
 python3 -B FEniCSx/run.py check
 python3 -B FEniCSx/run.py inventory
 python3 -B FEniCSx/run.py import-dam
-python3 -B FEniCSx/run.py run-fracture --dam-config config.json --output FEniCSx/results
+python3 -u -B FEniCSx/run.py run-fracture --dam-config config.json --elmer-result Elmer/structure_output/combined_solver/results/combined_results_mpi_t0001.pvtu --output FEniCSx/results
 python3 -B FEniCSx/run.py run
 python3 -B FEniCSx/run.py run --scenario elastic_benchmark
 python3 -B -m unittest discover -s FEniCSx -p 'test_*.py' -v
 ```
 
 ## Scenario configuration and outputs
+
+### Job-specific Elmer baseline handover
+
+The API passes the freshly validated baseline to `run-fracture` using
+`--elmer-result <job-result.pvtu>`. The API coordinates the processes; the
+consumer adapter in [elmer_baseline.py](elmer_baseline.py) owns parsing.
+Standalone runs with explicit legacy scenarios may omit the argument.
+Scenario-free runs require the baseline to generate the crack.
+
+The adapter uses the existing elastic-parity mapper to recover undeformed
+coordinates from Elmer's deformed output, match cells to the submitted
+configuration's rebuilt mesh, and preserve separate wall/plinth interface nodes.
+It rejects missing pieces/fields, paths escaping the result directory,
+nonfinite fields and mismatched geometry. The run records:
+
+- `elmer_baseline_fields.npz`: displacement and six stress components mapped
+  to source nodes, undeformed coordinates, and node region IDs.
+- `elmer_baseline.json`: input hashes, configuration hash, units and the
+  element-centroid location of the largest principal stress, calculated from
+  element-mean nodal tensors over all source volume elements.
+- `manifest.json` includes the baseline report; a handover error fails the
+  fracture run explicitly, while the API retains the successful Elmer result.
+
+**This imports a baseline reference, not a mechanical initial condition.**
+The phase-field solver still solves its own configured loading. An explicit stress/displacement/history transfer
+law and verification are required before using these arrays as initial state.
+The recorded peak can be compressive if the entire model is in compression;
+`has_tension` distinguishes this. These outputs are not engineering validation.
+
+### Automatic horizontal crack
+
+After each successful Elmer baseline, the API starts FEniCSx even without
+`crack_simulations`. The consumer uses the **global** maximum principal stress
+of element-mean nodal tensors and its **undeformed element-centroid Z**. It
+interpolates exactly two plinth chainage intersections at that signed elevation,
+using the authoritative wall centreline radius to convert chainage to angle.
+The initial crack is a horizontal annular-sector prism following the upstream
+wall between those angles, extending radially inward by **75% of wall thickness**
+with a **0.002 m vertical opening**. This is not a straight rectangular chord.
+
+The named result is `automatic_peak_tension`; existing result endpoints and
+ParaView controls discover it from the run manifest. `automatic_crack.json`
+records the source peak, upstream intersection coordinates, exact sector,
+generated specification and numerical settings. The submitted `config.json`
+is not rewritten.
+
+Fracture is restricted to **Wall, region 2**. Initial and evolving damage are
+fixed at zero on all non-wall cells' damage DOFs, including shared interface
+DOFs. This is an explicit no-fracture-in-plinth modelling assumption and imposes
+a zero-damage trace where wall and plinth share nodes; it is not a contact law.
+The plinth remains in the elastic mechanical solve.
+
+Only wall cells drive crack-resolution checks and refinement marking; only
+under-resolved wall cells near the crack are marked. Neighbouring cells may
+still be subdivided for conformity. Refinement reports and logs record wall and
+plinth cell counts separately, with marked plinth cells always zero. Automatic
+runs allow up to **five** refinement levels, stopping early when the unchanged
+resolution target is met.
+
+[fracture_defaults.json](fracture_defaults.json) preserves the previous workflow's
+AT2 settings: length scale 0.1 m, Gc 2700 J/m2, zero internal crack pressure,
+ten load steps and existing solver/refinement controls. These are explicit
+research defaults, not a new calibration or engineering validation. In
+particular, the retained 0.9 elements-per-length-scale target is preliminary.
+The 2 mm value defines the initial damaged prism thickness; the existing
+phase-field model does not enforce a physical 2 mm displacement discontinuity
+or unilateral crack-face contact.
+
+No tensile peak, an out-of-range Z, a horizontal coincident plinth segment or
+anything other than two unambiguous intersections fails the cracking stage
+explicitly; it does not clamp Z or substitute a default crack. The successful
+Elmer baseline remains available. API-launched Python uses unbuffered output.
+
+Example (Ubuntu shell):
+
+```bash
+python3 -B FEniCSx/run.py run-fracture --dam-config /path/job/config.json --elmer-result /path/job/output/combined_solver/results/combined_results_mpi_t0001.pvtu --output /path/job/cracking
+```
 
 [cracking.json](cracking.json) is an array. Each entry has a unique safe `id`,
 boolean `enabled` and explicit `kind`. Unknown fields, invalid units/ranges,

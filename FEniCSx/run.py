@@ -81,7 +81,9 @@ def write_json(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
-def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
+def run_fracture(
+    dam_config: Path, output_root: Path, versions: dict, elmer_result: Path | None = None,
+) -> None:
     """Run one isolated phase-field job from the authoritative dam configuration."""
     sys.path.insert(0, str(ROOT))
     from crack_field import (
@@ -102,6 +104,7 @@ def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     snapshot = directory / "config.json"
     snapshot.write_bytes(dam_config.read_bytes())
+    report_config = json.loads(snapshot.read_text(encoding="utf-8"))
     specifications = load_crack_specifications(snapshot)
     manifest = {
         "status": "running",
@@ -114,7 +117,6 @@ def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
     }
     write_json(directory / "manifest.json", manifest)
     try:
-        options = load_phase_field_solver_options(snapshot)
         # Existing geometry builders accept a root containing config.json. Use an
         # isolated temporary root so a submitted job never rewrites repository data.
         with tempfile.TemporaryDirectory() as temporary:
@@ -122,6 +124,30 @@ def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
             (job_root / "config.json").write_bytes(snapshot.read_bytes())
             structure = build_combined_structure(job_root)
         apply_load_case(structure, snapshot)
+        if elmer_result is not None:
+            from elmer_baseline import import_baseline
+
+            baseline = import_baseline(structure, elmer_result, snapshot, directory)
+            manifest["elmer_baseline"] = baseline
+            write_json(directory / "manifest.json", manifest)
+        if not specifications:
+            if elmer_result is None:
+                raise ValueError("Automatic crack generation requires --elmer-result.")
+            from automatic_crack import generate_crack
+
+            specification, options, generation = generate_crack(
+                json.loads(snapshot.read_text(encoding="utf-8")), baseline,
+            )
+            specifications = [specification]
+            generation["specification"] = asdict(specification)
+            report_config["crack_simulations"] = [generation["report_crack"]]
+            write_json(directory / "automatic_crack.json", generation)
+            manifest["automatic_crack"] = generation
+            manifest["crack_scenario_names"] = [specification.name]
+            write_json(directory / "manifest.json", manifest)
+            print(f"Generated {specification.name} at Z={specification.centre_m[2]:.6f} m", flush=True)
+        else:
+            options = load_phase_field_solver_options(snapshot)
         imported = import_structure(structure, maximum_volume_change=0.001)
         write_json(directory / "import_report.json", imported.report)
         placement = [
@@ -142,7 +168,7 @@ def run_fracture(dam_config: Path, output_root: Path, versions: dict) -> None:
         completed_at = datetime.now(timezone.utc).isoformat()
         write_engineering_results(
             directory,
-            json.loads(snapshot.read_text(encoding="utf-8")),
+            report_config,
             result.report,
             refined.report,
             placement,
@@ -179,13 +205,19 @@ def main() -> int:
     parser.add_argument("action", choices=("check", "inventory", "import-dam", "run", "run-fracture"))
     parser.add_argument("--config", type=Path, default=HERE / "cracking.json")
     parser.add_argument("--dam-config", type=Path, default=LOAD_CASE)
+    parser.add_argument("--elmer-result", type=Path, help="Elmer baseline PVTU for run-fracture")
     parser.add_argument("--output", type=Path, default=HERE / "results")
     parser.add_argument("--scenario", help="Run one enabled scenario by id")
     args = parser.parse_args()
+    if args.elmer_result is not None and args.action != "run-fracture":
+        parser.error("--elmer-result is supported only with run-fracture")
     scenarios = load_scenarios(args.config)
     versions = environment()
     if args.action == "run-fracture":
-        run_fracture(args.dam_config.resolve(), args.output.resolve(), versions)
+        run_fracture(
+            args.dam_config.resolve(), args.output.resolve(), versions,
+            args.elmer_result.resolve() if args.elmer_result is not None else None,
+        )
         return 0
     if args.action == "check":
         print(json.dumps({"environment": versions, "scenarios": scenarios}, indent=2))

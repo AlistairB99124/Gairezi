@@ -1,18 +1,74 @@
 """Small end-to-end dam-load adapter check independent of the full dam mesh."""
 from pathlib import Path
+from dataclasses import replace
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from dolfinx import mesh
+from dolfinx import fem, mesh
 from mpi4py import MPI
 import numpy as np
 
-from crack_field import CrackSpecification, PhaseFieldSolverOptions
+from crack_field import CrackSpecification, PhaseFieldSolverOptions, refine_for_phase_field, resolution_report
 from dam_phase_field import implied_at2_tensile_strength, solve
 
 
 class DamPhaseFieldTests(unittest.TestCase):
+    def test_refinement_marks_only_wall_and_reports_both_regions(self):
+        imported, _, crack, options = self.model()
+        domain = imported.domain
+        cells = imported.cell_tags.indices
+        midpoints = mesh.compute_midpoints(domain, domain.topology.dim, cells)
+        values = np.where(midpoints[:, 2] < 0.34, 1, 2).astype(np.int32)
+        imported.cell_tags = mesh.meshtags(domain, domain.topology.dim, cells, values)
+        crack = replace(crack, centre_m=(0.5, 0.5, 0.6))
+        wall = imported.cell_tags.find(2)
+        plinth = imported.cell_tags.find(1)
+        report = resolution_report(domain, crack, wall)
+        self.assertLessEqual(report["cells_in_damaged_band"], len(wall))
+        options = replace(options, minimum_elements_per_length_scale=0.7, maximum_refinement_levels=2)
+        with patch("crack_field.mesh.compute_incident_entities", wraps=mesh.compute_incident_entities) as marking:
+            refined = refine_for_phase_field(imported, [crack], options)
+        marked = marking.call_args_list[0].args[1]
+        self.assertTrue(set(marked).issubset(set(wall)))
+        self.assertFalse(set(marked) & set(plinth))
+        self.assertGreater(refined.report["levels"][0]["plinth_cells"], 0)
+        self.assertEqual(refined.report["levels"][0]["marked_plinth_cells"], 0)
+        self.assertGreater(refined.report["levels"][-1]["wall_cells"], len(wall))
+
+    def test_plinth_damage_stays_exactly_zero_during_real_solve(self):
+        imported, structure, crack, options = self.model()
+        domain = imported.domain
+        dimension = domain.topology.dim
+        cells = imported.cell_tags.indices
+        midpoints = mesh.compute_midpoints(domain, dimension, cells)
+        values = np.where(midpoints[:, 2] < 0.34, 1, 2).astype(np.int32)
+        imported.cell_tags = mesh.meshtags(domain, dimension, cells, values)
+        crack = replace(crack, centre_m=(0.5, 0.5, 0.6), length_scale_m=0.4)
+        with tempfile.TemporaryDirectory() as directory:
+            result = solve(imported, structure, [crack], options, Path(directory))
+        plinth_dofs = fem.locate_dofs_topological(
+            result.damage.function_space, dimension, imported.cell_tags.find(1),
+        )
+        self.assertGreater(len(plinth_dofs), 0)
+        np.testing.assert_array_equal(result.damage.x.array[plinth_dofs], 0)
+        self.assertGreater(result.damage.x.array.max(), 0)
+        self.assertEqual(result.report["damage_region_id"], 2)
+
+    def test_annular_sector_runs_real_phase_field_solver_and_writes_results(self):
+        imported, structure, crack, options = self.model()
+        crack = replace(
+            crack, shape="annular_sector", size_m=(0.4, 0.6, 0.002),
+            annular_sector=(0.5, 0.9, 0.3, 1.2),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = solve(imported, structure, [crack], options, Path(directory))
+            self.assertTrue((Path(directory) / "damage.pvd").is_file())
+            self.assertTrue((Path(directory) / "phase_field_report.json").is_file())
+        self.assertEqual(len(result.report["steps"]), 1)
+        self.assertFalse(result.report["engineering_validated"])
+
     def model(self):
         domain = mesh.create_unit_cube(MPI.COMM_WORLD, 3, 3, 3)
         dimension = domain.topology.dim
