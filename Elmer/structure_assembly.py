@@ -24,6 +24,7 @@ from Elmer.structural_model import (
 )
 
 from Elmer.regions.combined_structure import write_combined_gmsh, write_combined_vtu
+from Elmer.regions.tetrahedral import tetrahedralize_structure
 from Elmer.regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
 from Elmer.model_config import CONFIG_PATH
 from Elmer.regions.combined_structure import load_material, load_environment, load_foundation_support
@@ -252,8 +253,16 @@ def solve_combined_structure(
     if executable is None:
         raise RuntimeError("ElmerSolver_mpi was not found on PATH; install an MPI-enabled Elmer build.")
     launcher, process_option = mpi_launcher()
-    mesh = build_combined_structure(root)
-    apply_load_case(mesh, config_path if config_path is not None else root / "config.json")
+    hex_mesh = build_combined_structure(root)
+    apply_load_case(hex_mesh, config_path if config_path is not None else root / "config.json")
+    report = audit_combined_structure(hex_mesh)
+    mesh = tetrahedralize_structure(hex_mesh)
+    report["solver_mesh"] = {
+        "element_type": "tetrahedron",
+        "tetrahedra": len(mesh.cells),
+        "boundary_triangles": len(mesh.boundaries),
+        "source_cells": len(hex_mesh.cells),
+    }
     mesh_path = solver_dir / "combined_structure.msh"
     write_combined_gmsh(mesh, mesh_path)
     if not convert_with_elmergrid(
@@ -276,7 +285,6 @@ def solve_combined_structure(
     result_path = solver_dir / "results" / "combined_results_mpi_t0001.pvtu"
     if not result_path.is_file():
         raise RuntimeError(f"Elmer did not create {result_path}")
-    report = audit_combined_structure(mesh)
     report["solver_input"] = str(sif_path)
     report["stress_result"] = str(result_path)
 

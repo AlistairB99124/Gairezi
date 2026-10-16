@@ -101,6 +101,8 @@ class MpiLauncherTests(unittest.TestCase):
         ), patch.object(assembly, "mpi_launcher", return_value=("mpiexec.exe", "-n")), patch.object(
             assembly, "build_combined_structure"
         ), patch.object(assembly, "apply_load_case"), patch.object(
+            assembly, "tetrahedralize_structure"
+        ), patch.object(
             assembly, "write_combined_gmsh"
         ), patch.object(assembly, "convert_with_elmergrid", return_value=True), patch.object(
             assembly, "write_combined_solver_input"
