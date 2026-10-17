@@ -217,6 +217,17 @@ def build_engineering_results(
             f"| AT2 implied homogeneous tensile strength | {result['at2_implied_homogeneous_tensile_strength_pa'] / 1e6:.3f} MPa |",
             f"| AT2 implied / configured strength | {result['implied_to_configured_strength_ratio']:.3f} |",
             "",
+            (
+                "Principal-stress peaks use consistent L2 recovery to nodal tensors, "
+                "then element nodal-tensor averaging before eigenvalues, matching the "
+                "Elmer comparison convention. Raw element peaks remain in "
+                "`raw_element_stress`; `degraded_stress.pvd` is the raw DG0 field and "
+                "`recovered_stress.pvd` is the recovered nodal field. Recovery can "
+                "smooth localised crack-tip peaks; inspect both fields."
+                if "stress_recovery" in result
+                else "Historical report: stress-recovery metadata was not recorded."
+            ),
+            "",
             "The AT2 implied strength is a calibration diagnostic. If it differs materially",
             "from the intended concrete tensile strength, `Gc` and `l` are not a mutually",
             "calibrated parameter pair for that target. They should be selected from",

@@ -12,6 +12,7 @@ import ufl
 
 from crack_field import (
     CrackSpecification,
+    PhaseFieldParameters,
     PhaseFieldSolverOptions,
     validate_crack_placement,
 )
@@ -41,9 +42,14 @@ def solve(
     specifications: list[CrackSpecification],
     options: PhaseFieldSolverOptions,
     output: Path,
+    *,
+    parameters: PhaseFieldParameters | None = None,
 ) -> PhaseFieldResult:
     """Run the configured dam phase-field simulation on an imported/refined mesh."""
-    placement = validate_crack_placement(imported, specifications)
+    if not specifications and parameters is None:
+        raise ValueError("A crack specification or baseline phase-field parameters are required")
+    first = parameters if parameters is not None else specifications[0]
+    placement = validate_crack_placement(imported, specifications) if specifications else []
     domain = imported.domain
     dx = ufl.Measure("dx", domain=domain)
     ds = ufl.Measure("ds", domain=domain, subdomain_data=imported.facet_tags)
@@ -80,8 +86,8 @@ def solve(
                 result += stiffness * trial[component] * test[component] * ds(tag)
         return result
 
-    pressure_value = specifications[0].internal_pressure_pa
-    if any(specification.internal_pressure_pa != pressure_value for specification in specifications[1:]):
+    pressure_value = first.internal_pressure_pa
+    if any(specification.internal_pressure_pa != pressure_value for specification in specifications):
         raise ValueError("All cracks in one diffuse pressure solve must use the same internal pressure")
 
     def external_work(test, load_factor, damage):
@@ -104,6 +110,7 @@ def solve(
         output=output,
         damage_cell_tags=imported.cell_tags,
         damage_region_id=2,
+        parameters=parameters,
     )
 
     lam, mu, _ = elastic_parameters(material.youngs_modulus_pa, material.poissons_ratio)
@@ -111,7 +118,7 @@ def solve(
     stress = fem.Function(tensor_space, name="degraded_stress_pa")
     stress.interpolate(
         fem.Expression(
-            degradation(result.damage, specifications[0].residual_stiffness)
+            degradation(result.damage, first.residual_stiffness)
             * undamaged_stress(result.displacement, lam, mu),
             tensor_space.element.interpolation_points,
         )
@@ -122,7 +129,7 @@ def solve(
     )
     scalar_space = fem.functionspace(domain, ("DG", 0))
     crack_density = fem.Function(scalar_space, name="crack_surface_density_per_m")
-    length_scale = specifications[0].length_scale_m
+    length_scale = first.length_scale_m
     crack_density.interpolate(
         fem.Expression(
             result.damage**2 / (2.0 * length_scale)
@@ -165,7 +172,7 @@ def solve(
     configured_strength = material.tensile_strength_pa
     implied_strength = implied_at2_tensile_strength(
         material.youngs_modulus_pa,
-        specifications[0].critical_energy_release_rate_j_m2,
+        first.critical_energy_release_rate_j_m2,
         length_scale,
     )
     stress_values = stress.x.array.reshape(-1, 3, 3)
@@ -206,6 +213,18 @@ def solve(
             ],
         }
     )
+    from stress_recovery import recover_stress
+
+    result.report["raw_element_stress"] = {
+        "maximum_principal_tensile_stress_pa": maximum_tensile_stress,
+        "maximum_principal_compressive_stress_pa": maximum_compressive_stress,
+    }
+    result.report.update(recover_stress(
+        domain,
+        degradation(result.damage, first.residual_stiffness)
+        * undamaged_stress(result.displacement, lam, mu),
+        output,
+    ))
     if domain.comm.rank == 0:
         (output / "phase_field_report.json").write_text(
             json.dumps(result.report, indent=2, allow_nan=False) + "\n"

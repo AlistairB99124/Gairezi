@@ -20,7 +20,7 @@ import numpy as np
 from petsc4py import PETSc
 import ufl
 
-from crack_field import CrackSpecification, PhaseFieldSolverOptions, crack_phase_field
+from crack_field import CrackSpecification, PhaseFieldParameters, PhaseFieldSolverOptions, crack_phase_field
 
 
 @dataclass
@@ -162,6 +162,7 @@ def solve_staggered(
     output: Path | None = None,
     damage_cell_tags=None,
     damage_region_id: int = 2,
+    parameters: PhaseFieldParameters | None = None,
 ) -> PhaseFieldResult:
     """Solve mechanics and irreversible AT2 damage by alternate minimisation.
 
@@ -169,10 +170,10 @@ def solve_staggered(
     ``support_form(trial, test)`` may return a spring bilinear form.
     ``boundary_conditions(space, load_factor)`` may return displacement BCs.
     """
-    if not specifications:
+    if not specifications and parameters is None:
         raise ValueError("At least one crack specification is required")
-    first = specifications[0]
-    for specification in specifications[1:]:
+    first = parameters if parameters is not None else specifications[0]
+    for specification in specifications:
         if (
             specification.model != first.model
             or specification.energy_split != first.energy_split
@@ -197,17 +198,16 @@ def solve_staggered(
     damage_space = fem.functionspace(domain, ("Lagrange", 1))
     history_space = fem.functionspace(domain, ("DG", 0))
     displacement = fem.Function(displacement_space, name="displacement_m")
-    damage = crack_phase_field(
-        domain,
-        specifications,
-        name="damage",
-        check_resolution=False,
+    damage = (
+        crack_phase_field(domain, specifications, name="damage", check_resolution=False)
+        if specifications else fem.Function(damage_space, name="damage")
     )
     fixed_damage_dofs = None
     if damage_cell_tags is not None:
         non_wall_cells = damage_cell_tags.indices[damage_cell_tags.values != damage_region_id]
         if not len(damage_cell_tags.find(damage_region_id)):
             raise ValueError("Damage region has no tagged cells.")
+        domain.topology.create_connectivity(domain.topology.dim, domain.topology.dim)
         fixed_damage_dofs = fem.locate_dofs_topological(
             damage_space, domain.topology.dim, non_wall_cells,
         )
@@ -355,6 +355,7 @@ def solve_staggered(
         "irreversibility": "PETSc TAO bound-constrained minimisation: alpha_n <= alpha <= 1",
         "compression_contact": False,
         "engineering_validated": False,
+        "initial_damage": "configured cracks" if specifications else "zero everywhere; no seeded crack",
         "steps": step_reports,
     }
     if output is not None and domain.comm.rank == 0:

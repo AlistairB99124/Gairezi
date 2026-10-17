@@ -30,6 +30,8 @@ class DamElasticityTests(unittest.TestCase):
         np.testing.assert_allclose(report["applied_force_n"], [0, 0, -10000], atol=1e-8)
         np.testing.assert_allclose(report["ground_spring_reactions_n"]["1"], [0, 0, 10000], atol=1e-6)
         self.assertLess(report["relative_force_balance_error"], 1e-10)
+        self.assertIn("stress_recovery", report)
+        self.assertIn("raw_element_stress", report)
         self.assertTrue(np.all(displacement[:, 2] < 0))
         bottom = np.asarray(triangles(structure.boundaries[0][1]))
         xyz = structure.nodes[bottom]

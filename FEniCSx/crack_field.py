@@ -70,6 +70,19 @@ class CrackSpecification:
 
 
 @dataclass(frozen=True)
+class PhaseFieldParameters:
+    """Constitutive and loading controls for an initially intact baseline."""
+
+    length_scale_m: float
+    critical_energy_release_rate_j_m2: float
+    internal_pressure_pa: float
+    load_steps: int
+    model: str = "AT2"
+    energy_split: str = "volumetric_deviatoric"
+    residual_stiffness: float = 1e-8
+
+
+@dataclass(frozen=True)
 class PhaseFieldSolverOptions:
     maximum_staggered_iterations: int = 50
     staggered_tolerance: float = 1e-5

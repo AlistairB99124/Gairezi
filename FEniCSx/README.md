@@ -71,11 +71,87 @@ python3 -B -m unittest discover -s FEniCSx -p 'test_*.py' -v
 
 ## Scenario configuration and outputs
 
+### Stress comparison convention
+
+Principal-stress peaks in new elastic baseline and fracture reports use
+[stress_recovery.py](stress_recovery.py): consistent L2 projection of the
+Cauchy stress tensor into a continuous P1 tensor space, followed by averaging
+the four nodal tensors of each tetrahedron, then taking eigenvalues and global
+extrema. This matches the Elmer nodal-stress/element-average reporting sequence.
+The Elmer stress solver uses a mass-matrix nodal projection; see upstream
+[StressSolve.F90](https://github.com/ElmerCSC/elmerfem/blob/devel/fem/src/modules/StressSolve.F90).
+The projection integrates the actual degraded stress expression for phase-field
+runs, rather than first sampling it into a DG0 field.
+
+The same operator applies to NoPhase, initially intact Phase, and seeded-crack
+runs. No material, loading, support, mesh, or damage parameters are calibrated to
+force stress agreement. Separate coincident interface nodes remain separate.
+The current adapter and recovery require one MPI process.
+
+`recovered_stress.pvd` contains recovered nodal stress in Pa.
+Existing `stress.pvd`/`degraded_stress.pvd` retain the raw DG0 stress.
+Reports retain its principal extrema under `raw_element_stress`, and record the
+recovery method, solver tolerance, and undeformed peak-centroid locations under
+`stress_recovery`. Recovered peaks can smooth local crack-tip concentrations:
+use the recovered values for like-for-like Elmer comparison, but inspect the raw
+fields and mesh sensitivity when interpreting local cracking.
+
+Historical reports/CSV exports are not rewritten. Run new jobs to obtain the
+recovered comparison metrics. A below-5% intact-baseline peak difference is a
+numerical parity criterion, not an engineering-validation certificate; real
+crack-induced stress differences must not be forced below that limit.
+
+### Isolated uncracked baselines
+
+The normal API flow is Elmer -> uncracked FEniCSx baseline -> FEniCSx fracture.
+The baseline is mandatory, not an environment-selected debug mode.
+Its `Baseline_NoPhase` report supplies the Comparison table's
+**Baseline Not Phased (FEniCSx)** column. Difference is cracked FEniCSx minus
+uncracked FEniCSx; Elmer remains a separate corroboration column.
+Both FEniCSx stages use the same job's immutable submitted configuration.
+The elastic baseline uses the Elmer tetrahedral solver mesh; fracture retains
+its existing crack-band refinement, recorded in the refinement report.
+Failure to produce a completed, matching, finite baseline report blocks fracture.
+Both stages append to the job's `cracking.log`, with distinct stage markers.
+The API records baseline status/errors independently and preserves completed
+baselines when fracture fails. Historical single-mode jobs are not rewritten.
+
+Standalone baseline commands remain available directly from Ubuntu:
+
+```bash
+python3 FEniCSx/run.py run-baseline --dam-config config.json --output FEniCSx/results
+python3 FEniCSx/run.py run-fracture --baseline-phase --dam-config config.json --output FEniCSx/results
+```
+
+`run-baseline` produces `Baseline_NoPhase` in
+`dam_elastic_baseline/<timestamp>/baseline_report.json`.
+The standalone diagnostic `run-fracture --baseline-phase` produces `Baseline_Phase` in
+`dam_phase_field/<timestamp>/phase_field_report.json`.
+Both write a configuration snapshot, manifest, import report, ParaView fields
+and `results.md`; failures retain a failed manifest and traceback.
+The API can still read both historical report types. The API no longer selects
+either mode through `Baseline_Phase`/`Baseline_NoPhase` environment variables.
+
+Neither mode generates or seeds a crack or consumes an Elmer result.
+The phase baseline starts with damage zero everywhere and permits AT2 damage
+evolution in wall region 2; plinth/shared-interface damage remains fixed at zero.
+It uses the existing [fracture defaults](fracture_defaults.json), recorded in
+its report. It retains the shared Elmer solver mesh without local crack-band
+refinement and emits a warning and resolution diagnostic when that mesh does
+not resolve the configured length scale. Convergence is not mesh independence
+or engineering validation.
+
 ### Job-specific Elmer baseline handover
 
 The API passes the freshly validated baseline to `run-fracture` using
 `--elmer-result <job-result.pvtu>`. The API coordinates the processes; the
 consumer adapter in [elmer_baseline.py](elmer_baseline.py) owns parsing.
+The submitted configuration is rebuilt using Elmer's shared
+`tetrahedralize_structure` conversion before matching result cells. The
+fracture mesh and CLI elastic-parity reference check use that same solver
+topology. Old mixed-cell reference files must be regenerated for the current
+tetrahedral Elmer workflow; the mapper still supports explicitly supplied
+matching mixed-cell structures, but never bypasses a topology mismatch.
 Standalone runs with explicit legacy scenarios may omit the argument.
 Scenario-free runs require the baseline to generate the crack.
 

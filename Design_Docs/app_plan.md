@@ -252,6 +252,20 @@ Visual Studio installation at implementation time.
 
 ## 7. Result contract
 
+The normal comparison flow is Elmer uncracked baseline, FEniCSx uncracked
+linear-elastic baseline, then FEniCSx fracture, all isolated under the same job
+and submitted configuration snapshot. The uncracked FEniCSx stage is required,
+not selected by environment/debug flags. Its failure blocks fracture while
+preserving Elmer results; fracture failure preserves both completed baselines.
+Track each FEniCSx stage's status and error, validate completed reports and
+configuration hashes, and never substitute stale results.
+
+The comparison table contains Baseline (Elmer), Baseline Not Phased (FEniCSx),
+Crack Scenario (FEniCSx), and Difference. Difference is cracked FEniCSx minus
+uncracked FEniCSx, not cracked FEniCSx minus Elmer. Historical jobs without the
+FEniCSx baseline remain viewable with an explicit missing-baseline message and
+no difference. Never borrow another job's baseline.
+
 Create a small backend-independent results DTO containing:
 
 - Job ID, backend, configuration hash and completion status.

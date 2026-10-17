@@ -110,4 +110,12 @@ def solve(imported, structure, options: dict, output: Path):
         "maximum_displacement_m": float(np.linalg.norm(source_displacement, axis=1).max()),
         "wall_plinth_model": "wall-side grounded spring, exactly as current Elmer SIF; not interbody coupling",
     }
+    from stress_recovery import recover_stress
+
+    raw_principal = np.linalg.eigvalsh(sigma.x.array.reshape(-1, 3, 3))
+    report["raw_element_stress"] = {
+        "maximum_principal_tensile_stress_pa": float(raw_principal[:, -1].max()),
+        "maximum_principal_compressive_stress_pa": float(raw_principal[:, 0].min()),
+    }
+    report.update(recover_stress(domain, stress(displacement), output))
     return source_displacement, sigma, report

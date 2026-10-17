@@ -81,6 +81,115 @@ def write_json(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
+def submitted_structure(config: Path):
+    """Rebuild the exact Elmer solver topology without modifying checkout inputs."""
+    sys.path.insert(0, str(ROOT))
+    from structural_model import build_combined_structure
+    from Elmer.structure_assembly import apply_load_case
+    from Elmer.regions.tetrahedral import tetrahedralize_structure
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "config.json").write_bytes(config.read_bytes())
+        structure = build_combined_structure(root)
+    apply_load_case(structure, config)
+    return tetrahedralize_structure(structure)
+
+
+def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: bool = False) -> None:
+    """Solve the submitted uncracked dam, with or without evolving AT2 damage."""
+    from automatic_crack import DEFAULTS
+    from crack_field import PhaseFieldParameters, PhaseFieldSolverOptions
+    from dam_mesh import import_structure
+
+    scenario = "Baseline_Phase" if phase else "Baseline_NoPhase"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    directory = output_root / ("dam_phase_field" if phase else "dam_elastic_baseline") / timestamp
+    directory.mkdir(parents=True, exist_ok=False)
+    snapshot = directory / "config.json"
+    snapshot.write_bytes(dam_config.read_bytes())
+    manifest = {
+        "status": "running", "scenario_name": scenario,
+        "crack_scenario_names": [scenario], "environment": versions,
+        "configuration_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+        "started_at_utc": timestamp, "engineering_validated": False,
+    }
+    write_json(directory / "manifest.json", manifest)
+    try:
+        structure = submitted_structure(snapshot)
+        imported = import_structure(structure, maximum_volume_change=0.001)
+        write_json(directory / "import_report.json", imported.report)
+        defaults = json.loads(DEFAULTS.read_text(encoding="utf-8"))
+        options = PhaseFieldSolverOptions(**defaults.pop("solver"))
+        if phase:
+            from dam_phase_field import solve
+            from dolfinx.cpp.mesh import h
+
+            parameters = PhaseFieldParameters(**defaults)
+            cells = imported.cell_tags.find(2)
+            maximum_diameter = float(h(imported.domain._cpp_object, 3, cells).max())
+            resolution = parameters.length_scale_m / maximum_diameter
+            if resolution < options.minimum_elements_per_length_scale:
+                print(
+                    f"WARNING: {scenario} has only {resolution:.3g} elements per length scale "
+                    f"(recommended {options.minimum_elements_per_length_scale:g}); "
+                    "damage results are not mesh-resolved.",
+                    flush=True,
+                )
+            result = solve(imported, structure, [], options, directory, parameters=parameters)
+            report = result.report
+            report["phase_field_parameters"] = asdict(parameters)
+            report["mesh_resolution"] = {
+                "minimum_elements_per_length_scale": resolution,
+                "recommended_minimum": options.minimum_elements_per_length_scale,
+                "meets_recommendation": resolution >= options.minimum_elements_per_length_scale,
+                "refinement": "none; baseline uses the same tetrahedral mesh as Elmer",
+            }
+            report_name = "phase_field_report.json"
+        else:
+            from dam_elasticity import solve
+
+            _, _, report = solve(imported, structure, {
+                "relative_tolerance": options.mechanics_relative_tolerance,
+                "maximum_iterations": options.mechanics_maximum_iterations,
+            }, directory)
+            report.update({
+                "model": "linear isotropic elasticity; phase field disabled",
+                "configured_tensile_strength_pa": structure.material.tensile_strength_pa,
+                "crack_surface_measure_m2": 0.0,
+            })
+            report_name = "baseline_report.json"
+        report.update({
+            "scenario_name": scenario, "engineering_validated": False,
+            "configuration_sha256": manifest["configuration_sha256"],
+            "initial_cracks": [], "internal_crack_pressure_pa": 0.0,
+        })
+        write_json(directory / report_name, report)
+        (directory / "results.md").write_text(
+            f"# {scenario}\n\n"
+            "Uncracked dam with submitted material, gravity, water loads and spring supports.\n\n"
+            + ("Damage starts at zero and may evolve under load; no crack is seeded.\n\n"
+               "The baseline mesh is not adaptively refined; inspect mesh_resolution in the report.\n\n"
+               if phase else "Phase-field damage is disabled.\n\n")
+            + "This is a numerical baseline, not engineering validation or a dam-safety assessment.\n\n"
+            "Principal-stress peaks use consistent L2 nodal recovery followed by "
+            "element tensor averaging before eigenvalues, matching the Elmer comparison. "
+            "Raw element peaks remain in raw_element_stress; recovered_stress.pvd "
+            "contains the recovered nodal tensor field.\n\n"
+            f"Diagnostics and SI-unit results: [{report_name}]({report_name}).\n",
+            encoding="utf-8",
+        )
+        manifest.update(status="completed_not_engineering_validated",
+                        completed_at_utc=datetime.now(timezone.utc).isoformat())
+        write_json(directory / "manifest.json", manifest)
+        print(f"{scenario}: completed_not_engineering_validated; results at {directory}", flush=True)
+    except Exception as error:
+        manifest.update(status="failed", error=f"{type(error).__name__}: {error}",
+                        traceback=traceback.format_exc())
+        write_json(directory / "manifest.json", manifest)
+        raise
+
+
 def run_fracture(
     dam_config: Path, output_root: Path, versions: dict, elmer_result: Path | None = None,
 ) -> None:
@@ -96,8 +205,6 @@ def run_fracture(
     from dam_mesh import import_structure
     from dam_phase_field import solve
     from dolfinx import io
-    from structural_model import build_combined_structure
-    from Elmer.structure_assembly import apply_load_case
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     directory = output_root / "dam_phase_field" / timestamp
@@ -117,13 +224,7 @@ def run_fracture(
     }
     write_json(directory / "manifest.json", manifest)
     try:
-        # Existing geometry builders accept a root containing config.json. Use an
-        # isolated temporary root so a submitted job never rewrites repository data.
-        with tempfile.TemporaryDirectory() as temporary:
-            job_root = Path(temporary)
-            (job_root / "config.json").write_bytes(snapshot.read_bytes())
-            structure = build_combined_structure(job_root)
-        apply_load_case(structure, snapshot)
+        structure = submitted_structure(snapshot)
         if elmer_result is not None:
             from elmer_baseline import import_baseline
 
@@ -202,23 +303,30 @@ def run_fracture(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("check", "inventory", "import-dam", "run", "run-fracture"))
+    parser.add_argument("action", choices=("check", "inventory", "import-dam", "run", "run-fracture", "run-baseline"))
     parser.add_argument("--config", type=Path, default=HERE / "cracking.json")
     parser.add_argument("--dam-config", type=Path, default=LOAD_CASE)
     parser.add_argument("--elmer-result", type=Path, help="Elmer baseline PVTU for run-fracture")
+    parser.add_argument("--baseline-phase", action="store_true",
+                        help="Run an initially intact phase-field baseline without generating a crack")
     parser.add_argument("--output", type=Path, default=HERE / "results")
     parser.add_argument("--scenario", help="Run one enabled scenario by id")
     args = parser.parse_args()
     if args.elmer_result is not None and args.action != "run-fracture":
         parser.error("--elmer-result is supported only with run-fracture")
-    scenarios = load_scenarios(args.config)
+    if args.baseline_phase and (args.action != "run-fracture" or args.elmer_result is not None):
+        parser.error("--baseline-phase requires run-fracture without --elmer-result")
     versions = environment()
+    if args.action == "run-baseline" or args.baseline_phase:
+        run_baseline(args.dam_config.resolve(), args.output.resolve(), versions, phase=args.baseline_phase)
+        return 0
     if args.action == "run-fracture":
         run_fracture(
             args.dam_config.resolve(), args.output.resolve(), versions,
             args.elmer_result.resolve() if args.elmer_result is not None else None,
         )
         return 0
+    scenarios = load_scenarios(args.config)
     if args.action == "check":
         print(json.dumps({"environment": versions, "scenarios": scenarios}, indent=2))
         return 0

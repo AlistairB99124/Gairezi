@@ -34,17 +34,23 @@ class BaselineTests(unittest.TestCase):
         self.reference = self.root / "result.pvtu"
         self.write_pieces()
 
-    def write_pieces(self, missing_stress=False, nonfinite=False, shift=0):
+    def write_pieces(self, missing_stress=False, nonfinite=False, shift=0, tetrahedral=False):
         for index in range(2):
             ids = slice(index * 8, (index + 1) * 8)
             points = vtk.vtkPoints()
             points.SetData(numpy_to_vtk(self.points[ids] + self.displacement[ids] + shift, deep=True))
             grid = vtk.vtkUnstructuredGrid()
             grid.SetPoints(points)
-            nodes = vtk.vtkIdList()
-            for node in range(8):
-                nodes.InsertNextId(node)
-            grid.InsertNextCell(vtk.VTK_HEXAHEDRON, nodes)
+            if tetrahedral:
+                from Elmer.regions.tetrahedral import split_cell
+                cells = split_cell(self.points[ids], 5, tuple(range(8)))
+            else:
+                cells = [tuple(range(8))]
+            for cell in cells:
+                nodes = vtk.vtkIdList()
+                for node in cell:
+                    nodes.InsertNextId(node)
+                grid.InsertNextCell(vtk.VTK_TETRA if tetrahedral else vtk.VTK_HEXAHEDRON, nodes)
             array = numpy_to_vtk(self.displacement[ids], deep=True)
             array.SetName("displacement")
             grid.GetPointData().AddArray(array)
@@ -80,6 +86,26 @@ class BaselineTests(unittest.TestCase):
             np.testing.assert_allclose(fields["displacement_m"], self.displacement)
             np.testing.assert_array_equal(fields["node_regions"], [1] * 8 + [2] * 8)
         self.assertEqual(json.loads((self.root / "elmer_baseline.json").read_text()), result)
+
+    def test_tetrahedral_solver_results_require_the_same_source_topology(self):
+        from Elmer.regions.tetrahedral import split_cell
+
+        self.write_pieces(tetrahedral=True)
+        with self.assertRaisesRegex(ValueError, "cells do not match"):
+            import_baseline(self.structure, self.reference, self.config, self.root)
+        self.structure.cells = [
+            (4, tetrahedron)
+            for _, cell in self.structure.cells
+            for tetrahedron in split_cell(self.points, 5, cell)
+        ]
+        self.structure.region_ids = [1] * 6 + [2] * 6
+        report = import_baseline(self.structure, self.reference, self.config, self.root)
+        self.assertEqual(report["element_count"], 12)
+        self.assertEqual(report["max_principal_stress"]["value_pa"], 20)
+        with np.load(self.root / report["field_archive"]) as fields:
+            np.testing.assert_allclose(fields["coordinates_m"], self.points)
+            np.testing.assert_allclose(fields["displacement_m"], self.displacement)
+            np.testing.assert_array_equal(fields["node_regions"], [1] * 8 + [2] * 8)
 
     def test_missing_piece_is_rejected(self):
         (self.root / "piece1.vtu").unlink()

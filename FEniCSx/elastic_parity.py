@@ -16,10 +16,12 @@ def reference_structure(root: Path, load_case: Path, reference: Path):
     from structural_model import build_combined_structure, audit_combined_structure
     from Elmer.structure_assembly import apply_load_case, write_combined_solver_input
     from Elmer.regions.combined_structure import write_combined_gmsh
+    from Elmer.regions.tetrahedral import tetrahedralize_structure
 
     structure = build_combined_structure(root)
     apply_load_case(structure, load_case)
     audit_combined_structure(structure)
+    structure = tetrahedralize_structure(structure)
     directory = reference.parent.parent
     source_mesh = directory / "combined_structure.msh"
     source_sif = directory / "dam_model.sif"

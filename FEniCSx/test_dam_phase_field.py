@@ -10,11 +10,34 @@ from dolfinx import fem, mesh
 from mpi4py import MPI
 import numpy as np
 
-from crack_field import CrackSpecification, PhaseFieldSolverOptions, refine_for_phase_field, resolution_report
+from crack_field import (
+    CrackSpecification, PhaseFieldParameters, PhaseFieldSolverOptions,
+    refine_for_phase_field, resolution_report,
+)
 from dam_phase_field import implied_at2_tensile_strength, solve
 
 
 class DamPhaseFieldTests(unittest.TestCase):
+    def test_initially_intact_baseline_evolves_damage_without_seeding_a_crack(self):
+        imported, structure, crack, options = self.model()
+        parameters = PhaseFieldParameters(
+            length_scale_m=crack.length_scale_m,
+            critical_energy_release_rate_j_m2=crack.critical_energy_release_rate_j_m2,
+            internal_pressure_pa=0,
+            load_steps=2,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "phase_field_solver.crack_phase_field",
+            side_effect=AssertionError("An intact baseline must not seed a crack"),
+        ):
+            result = solve(imported, structure, [], options, Path(directory), parameters=parameters)
+        self.assertEqual(result.report["initial_damage"], "zero everywhere; no seeded crack")
+        self.assertEqual(result.report["crack_placement"], [])
+        self.assertGreater(result.damage.x.array.max(), 0)
+        self.assertLess(result.damage.x.array.max(), 1)
+        self.assertEqual(len(result.report["steps"]), 2)
+        self.assertEqual(result.report["internal_pressure_model"], "disabled (0 Pa)")
+
     def test_refinement_marks_only_wall_and_reports_both_regions(self):
         imported, _, crack, options = self.model()
         domain = imported.domain
@@ -139,6 +162,8 @@ class DamPhaseFieldTests(unittest.TestCase):
         self.assertTrue(result.report["crack_placement"][0]["valid"])
         self.assertIn("relative_force_balance_error", result.report)
         self.assertIn("maximum_principal_tensile_stress_pa", result.report)
+        self.assertIn("stress_recovery", result.report)
+        self.assertIn("raw_element_stress", result.report)
         self.assertGreater(result.report["crack_surface_measure_m2"], 0.0)
         expected = implied_at2_tensile_strength(1000.0, 1.0, 0.3)
         self.assertAlmostEqual(result.report["at2_implied_homogeneous_tensile_strength_pa"], expected)
