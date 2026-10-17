@@ -2,7 +2,10 @@
 
 ## Current milestone
 
-This directory is the new WSL-based adapter; the Elmer model is unchanged.
+This directory is the WSL-based adapter. **The current intact reference now
+uses a provisional fully bonded wall/plinth in both Elmer and FEniCSx.**
+Earlier split-interface results below are historical and must not be combined
+with the new reference.
 The verified scope includes environment/configuration checking, a migration
 inventory, an exact elastic patch test, conforming dam import and a full-dam
 elastic comparison against the current Elmer run, and an analytically checked
@@ -11,6 +14,72 @@ AT2 phase-field fracture solver with irreversible bound-constrained damage,
 local crack-band refinement and ParaView output. **3-D crack-face contact is
 not implemented.** Acceptance limits are provisional porting criteria, not
 independent engineering validation.
+
+### Bonded intact reference and fracture hold (17 October 2026)
+
+The conforming source mesh now shares wall/plinth nodes. The interface is
+internal, not two free exterior surfaces. The audit requires exactly one
+face-connected body and shared region-1/region-2 faces, with no duplicate
+coordinates or exterior tags 8/9. The deterministic tetrahedral subdivision
+retains that conformity.
+
+Only foundation tag 1 has directional ground springs. The wall-ground bypass
+has been removed from the Elmer SIF and the new FEniCSx baseline.
+`geometry.plinth.support` remains in the configuration for compatibility but
+is explicitly inactive in this reference; `geometry.bedrock.support` remains
+active. No material values or loads have been retuned. Fully bonded means
+continuous displacement, including tensile/shear transfer: **no joint opening,
+sliding, friction or uplift at an opening interface is represented**. Construction
+details and independent engineering review are still needed.
+
+New app jobs run Elmer and `Baseline_NoPhase`, then persist
+`cracking_status = blocked` with a review reason. The desktop displays the
+baseline-only result and hold, not a fictitious successful crack run.
+`run-fracture`, `--baseline-phase` and the MPI entry point reject newly generated
+bonded fracture models. Historical jobs are unchanged. Low-level benchmark
+solvers remain available for research; their availability does not release
+the production hold.
+
+Verification on the unchanged 4 m wall / 6 m plinth configuration:
+
+| Check | Result |
+|---|---|
+| Source connected components / shared interface quads | 1 / 3,520 |
+| Tetrahedral nodes / cells | 117,128 / 606,984 |
+| Shared interface triangles after subdivision | 7,040; none exterior |
+| FEniCSx true relative equilibrium residual | 6.4983e-10 |
+| FEniCSx relative global force imbalance | 7.1415e-12 |
+| Elmer/FEniCSx displacement relative L2 difference | 6.3932e-11 |
+| Foundation reaction relative difference | 3.0766e-11 |
+| Plinth mean raw stress `(xx, yy, zz, xy, yz, xz)` MPa | `(-0.16016, -0.27719, -0.26642, 0.01458, -0.09359, -0.32101)` |
+| Maximum displacement | 7.9398 mm |
+| Recovered principal tension / compression peaks | +3.6040 / -4.6723 MPa |
+
+The foundation alone balances the applied resultant: approximately
+`(+393.8110, +115.5963, +328.6838)` MN. Elmer reactions are reconstructed from
+nodal displacement and spring laws, not native solver reaction output.
+The raw plinth mean tensor differs from Elmer's recovered nodal mean by 0.4401%;
+the measures are not identical stress-recovery operations. A separate **3-D
+vector elasticity wall-only-load benchmark** verifies that a 10 kN wall crown
+load reaches the plinth foundation, with no plinth body load or wall support.
+This distinguishes actual interbody transfer from plinth self-weight response.
+
+The client-confirmed **allowable tensile peak is 1.2 MPa (1,200,000 Pa)**,
+superseding the early 2 MPa suggestion as an acceptance threshold.
+**Any maximum principal tensile stress strictly above 1.2 MPa is a FAILURE
+of the tensile acceptance criterion**, independently of solver convergence.
+Equality does not exceed this limit but does not establish overall acceptance.
+Assess recovered and raw peaks separately when both are reported; do not
+select a lower measure to conceal an exceedance.
+The +3.6040 MPa recovered peak is 3.003 times the
+allowable and **FAILS that tensile criterion**. The configured 2 MPa reporting input
+remains unchanged; it is neither the allowable nor a constitutive stress cap.
+Possible singularity, mesh sensitivity and joint assumptions require investigation,
+not dismissal of the exceedance. This is not a calibrated physical-failure
+prediction or a dam-safety verdict. Solver parity establishes matching
+implementations of the chosen assumptions, not that those assumptions are correct.
+The source configuration hash for this verification is
+`afd99de14023eedebdf8d2481695f1d588701b6738a24a32b6a8f767a0c831e4`.
 
 The phase-field path supports evolution from a configured diffuse crack. The
 older `predefined_crack` template remains an explicit-surface/contact concept
@@ -21,6 +90,78 @@ The shared source geometry reads [root config.json](../config.json): a 4 m wall
 each side and centreline radius 78 m. Regenerate the Elmer reference and reimport the dam;
 previous dam meshes and parity results are historical, not validation of
 these updated dimensions.
+
+### Automatic-crack sensitivity investigation
+
+Before the bonded-reference hold, cracking jobs solved an additional **zero-damage elastic baseline after
+refinement and before seeding/evolving damage**, using the exact same mesh,
+material, external water/gravity loads and ground springs as the crack solve.
+Internal crack pressure is absent from this uncracked reference. This does not
+change either the original Elmer-parity baseline or the fracture law.
+
+The completed report embeds `refined_mesh_baseline` and saves its independent
+report and ParaView fields under `refined_baseline/`. The baseline report is
+retained if subsequent cracking fails; no completed crack report is fabricated.
+Both serial and MPI paths perform this solve, checking the true linear
+equilibrium residual. The job stage identifies `fenicsx_refined_baseline`
+before returning to `cracking`.
+
+The desktop comparison retains the original mesh baseline, adds **Refined
+Uncracked**, and defines **Crack difference = cracked - refined uncracked**.
+Historical jobs without the refined baseline show an unavailable difference,
+never a silent fallback to the coarse mesh. Raw element peaks, mesh counts,
+global-peak coordinates, and cracked stresses evaluated at the refined
+baseline's two fixed peak locations provide additional context. Fixed-point
+stresses use the same recovered nodal tensor field as the global peak report.
+Global extrema can move; negative compression means larger compressive
+magnitude. These measures do not replace field inspection, a mesh-convergence
+study, calibration or engineering review.
+
+The automatic crack is regenerated from the **Elmer peak-stress element
+centroid**, not a fixed physical crack prescription. Changes to element type
+or stress recovery can therefore change the fracture scenario even when the
+authoritative configuration is identical. In the October 16/17 comparison,
+its elevation changed from `-27.75` to `-27.875` m, halving clearance above the
+local `-28` m plinth from `0.25` to `0.125` m. Its arc extent also changed from
+approximately `16.9743` to `16.0352` m; depth remained `3` m.
+
+Two fresh eight-rank full-dam diagnostic runs isolated this change without
+continuing interrupted checkpoints or changing materials/loads:
+
+| Case, using the current production hybrid solver | Outcome | Runtime |
+| --- | --- | --- |
+| Historical successful mesh and historical crack | All ten steps converged | 233.71 s |
+| New tetrahedral mesh and historical crack | All ten steps converged | 198.13 s |
+
+The historical replay reproduced peak displacement `0.009623352645` m
+(relative difference `6.51e-8` from the historical output) and maximum strain
+norm `0.002192971`. The newer mesh with the same historical seed gave
+`0.009623147674` m, maximum strain norm `0.002192547`, final staggered
+residual `3.2265e-6` (limit `1e-5`), and mechanics relative true residual
+`6.1226e-9` (limit `1e-8`). Dam configurations were checked equal before
+the controlled comparison. These tests demonstrate that the current solver
+still solves the formerly successful prescription, including on the newer
+tetrahedral mesh. The current automatic seed instead produced the reported
+gross hybrid strain breakdown; the comparisons do not establish an admissible
+solution for that changed scenario.
+
+Neither diagnostic substitutes the historical seed into new app jobs.
+Automatic generation and physical configuration remain unchanged. Do not
+move the crack, weaken guards or change fracture properties solely to force
+success. Selecting a different physical prescription requires an explicit
+modelling decision; the unresolved near-interface propagation is not a
+dam-safety verdict.
+
+`automatic_crack.json` and the run manifest now include `placement_provenance`
+with peak chainage, interpolated plinth elevation at that location, and
+clearance in metres and length scales. If the seed is within two length
+scales above the interface at the peak location, an explicit warning is
+also written to the report and job log. Two length scales is the existing
+diffuse-band reporting extent, **not an engineering acceptance threshold**.
+Plinth-side damage remains fixed at zero. The actual split wall/plinth mesh has
+no shared interface DOFs; this does not constrain wall-side damage to zero.
+This records proximity rather
+than claiming that plinth damage or mesh refinement caused the failure.
 
 ## Environment
 
@@ -134,7 +275,9 @@ either mode through `Baseline_Phase`/`Baseline_NoPhase` environment variables.
 
 Neither mode generates or seeds a crack or consumes an Elmer result.
 The phase baseline starts with damage zero everywhere and permits AT2 damage
-evolution in wall region 2; plinth/shared-interface damage remains fixed at zero.
+evolution in wall region 2; non-wall damage remains fixed at zero. Where an
+import has shared interface nodes those DOFs are also fixed, but the current
+split wall/plinth model has no such shared interface nodes.
 It uses the existing [fracture defaults](fracture_defaults.json), recorded in
 its report. It retains the shared Elmer solver mesh without local crack-band
 refinement and emits a warning and resolution diagnostic when that mesh does
@@ -197,6 +340,10 @@ fixed at zero on all non-wall cells' damage DOFs, including shared interface
 DOFs. This is an explicit no-fracture-in-plinth modelling assumption and imposes
 a zero-damage trace where wall and plinth share nodes; it is not a contact law.
 The plinth remains in the elastic mechanical solve.
+In the actual combined mesh the wall base has duplicate coincident nodes, not
+shared ones. Its damage is therefore not fixed by the plinth-side constraint.
+The separate regions are grounded independently, as described below; geometric
+coincidence is not mechanical coupling.
 
 Only wall cells drive crack-resolution checks and refinement marking; only
 under-resolved wall cells near the crack are marked. Neighbouring cells may
@@ -284,8 +431,9 @@ workflow and remains mandatory for a later convergence study.
 The solver uses `alpha=0` for intact and `alpha=1` for fully damaged material.
 Mechanics uses `g(alpha)=(1-alpha)^2+kappa`. A
 volumetric/deviatoric tensile history drives AT2 damage, while mechanics uses
-the hybrid full-stiffness degradation. This suppresses compression-driven
-damage but does not provide unilateral contact. Each load step alternates:
+the hybrid full-stiffness degradation. Volumetric compression is excluded from
+the driving energy, but deviatoric energy remains active in compressive/shear
+states. This does not provide unilateral contact. Each load step alternates:
 
 1. degraded linear mechanics with gravity, water and spring supports;
 2. history update by pointwise maximum tensile energy;
@@ -293,11 +441,331 @@ damage but does not provide unilateral contact. Each load step alternates:
    `alpha_previous <= alpha <= 1`;
 4. a convergence check on displacement and damage changes.
 
+Fracture mechanics uses restarted GMRES (restart 100), right-preconditioned
+GAMG and the six rigid-body near-nullspace modes also used by the elastic
+baseline. Unlike CG, GMRES does not require a positive-definite AMG
+preconditioner. A refined, seeded-crack dam previously triggered PETSc's
+`Diverged due to indefinite preconditioner` with CG and no elasticity
+near-nullspace. This solver change does not alter the mesh, spring supports,
+loads, fracture properties or configured residual tolerance.
+The configured mechanics iteration limit remains enforced. Krylov exhaustion,
+residual-check failure and the outer runtime deadline remain failures, not
+successful comparison results.
+Each mechanics solution is independently checked using the unpreconditioned
+residual `norm(Au-b)/norm(b)` against `mechanics_relative_tolerance`.
+
+`mechanics_diagnostics.jsonl` and the console log record the load step,
+staggered iteration, start/completion/failure, Krylov iterations and true
+relative residual. The final report retains these residuals and identifies
+the solver configuration. A failure includes its step and iteration and
+never produces a successful report as a fallback.
+Mechanics warm-starts from the previous displacement. Diagnostics include
+timestamps, mechanics construction/solve timings and damage setup/solve timings.
+The mechanics solve timing includes matrix assembly and AMG setup as well as
+Krylov iterations; it must not be interpreted as Krylov-only time.
+The diagnostics also record actual TAO gradient norms, staggered residuals,
+displacement maxima and counts of nearly fully damaged degrees of freedom.
+Damage convergence uses absolute projected-gradient tolerance or reduction
+relative to the initial projected gradient, with an explicit post-solve check.
+Objective-relative gradient convergence is disabled: the quadratic objective
+omits a history-dependent constant, so its magnitude is not a valid convergence
+scale. In particular, a large negative objective must not relax the configured
+gradient criterion.
+Mechanics reuses its assembled-system storage and GAMG hierarchy between
+staggered iterations instead of rebuilding a hierarchy on every solve. The
+matrix and right-hand side are still reassembled for current damage and loading,
+and every solution must pass the same explicit true-residual tolerance. A
+Krylov iteration count exceeding twice the problem's first solve requests a
+fresh preconditioner on the next iteration rather than indefinitely reusing a
+hierarchy that no longer represents the current stiffness. When
+damage changes nodal degradation by a factor greater than two, the next
+mechanics solve likewise rebuilds GAMG, even if its preceding solve was cheap.
+When load-dependent Dirichlet conditions are provided, a new problem is constructed
+at each load step to apply those conditions correctly.
+For serial runs, `iteration_checkpoint.npz` atomically retains displacement,
+damage, history and previous-load-step damage bounds at the start of the
+latest mechanics iteration, along with mesh coordinate/order identifiers.
+MPI runs retain one `iteration_checkpoint_rank<N>.npz` per rank, including
+rank/process-count metadata. A separate `checkpoint_layout[...].npz` records
+input cell/vertex IDs, geometry connectivity and each function's cell-to-DOF
+maps. MPI partitioning can change between launches even at the same process
+count; local field arrays must be remapped using these identifiers, not copied
+by rank or coordinate order. A coherent rank set must also have matching load
+step and iteration metadata. A replay/remapping tool is not provided yet.
+It is diagnostic state, not a completed result or an automatic restart file.
+`load_step_progress.json` preserves converged steps without claiming final
+completion. These files allow late-load failures to be investigated without
+discarding every preceding iteration's evidence.
+
+API-launched stages run under a ten-minute process deadline (TERM at 595 seconds
+and up to five seconds termination grace). Timeouts preserve completed baseline
+results but mark the interrupted FEniCSx stage failed. Standalone CLI commands
+should likewise be run with an explicit timeout during investigation.
+
+`run-fracture --fracture-processes N` keeps configuration reconstruction,
+Elmer handover and mesh refinement in the serial coordinator, then delegates
+the saved mesh to `N` MPI workers for the coupled solve and stress recovery.
+The standalone CLI default remains one process; `N=0` selects up to eight
+local CPUs. Displacement/damage convergence checks, crack placement, load
+elevations and recovered stress extrema use collective reductions. Worker
+errors are preserved in rank-specific JSON files and propagated to the
+coordinator's failed manifest. The worker group inherits the outer execution
+deadline; it does not receive a fresh time budget.
+
 Nonconvergence, invalid placement, exhausted refinement, PETSc failure and
 nonfinite energy all fail the job explicitly. The final report includes an AT2
 homogeneous tensile-strength estimate because `E`, `Gc` and `l` jointly imply a
 strength that can differ from `material.concrete.tensile_strength_pa`; this is
 a calibration warning, not an automatic material-property rewrite.
+
+After every converged mechanics solve, the solver checks the strain Frobenius
+norm before updating tensile history or damage. Nonfinite strain or a norm
+of at least `1.0` is rejected as gross breakdown of small-strain kinematics,
+with the load step/iteration, offending cell centroid and principal strains in
+the error. The diagnostic also records the cell's vertex damage values, so
+compressive and tensile breakdown can be distinguished without guessing from
+a scalar norm. Nonfinite strain on any MPI rank is a collective failure.
+This deliberately loose guard is
+not an engineering allowable strain and does not validate responses below it.
+It prevents metre-scale/local order-unity-strain runaway from being processed
+as a valid small-strain fracture comparison. Such a response requires review
+of fracture, unilateral contact and kinematic assumptions; it does not prove
+that the physical dam is safe or unsafe.
+
+The reduced 3-D compression patch regression
+`ConstitutiveTests.test_hybrid_compression_patch_loses_stiffness_without_creating_tensile_history`
+isolates a limitation of the current law. A uniformly damaged unit cube under
+uniform pressure has the exact affine contraction
+`u = -p*x/(3*K*((1-alpha)^2+kappa))`. Tests on two tetrahedral resolutions
+verify this displacement, the mechanics residual, zero tensile driving history
+and no additional damage. Nevertheless, at `alpha=1`, compressive compliance
+is amplified by `1/kappa` (100 million for `kappa=1e-8`). Excluding volumetric
+compression from damage growth does not restore compressive load transfer
+through an existing damaged zone. This benchmark demonstrates the constitutive
+limitation; it is not a contact benchmark or proof that this alone causes the
+dam's local runaway. Neither a contact law nor a different degradation model
+is silently substituted for the configured hybrid model.
+
+### Experimental compression-preserving mechanics
+
+The Python `solve_staggered` and dam-adapter `solve` functions accept the
+explicit keyword `mechanics_formulation="experimental_amor"`. This is an
+investigation gate, not a new app, API or CLI default. The default remains
+`"hybrid"`; there is no environment-variable override.
+Standalone `run-fracture --fracture-mechanics experimental_amor` opts in
+explicitly and records the choice in the run manifest and worker request.
+The flag is rejected for baselines and unrelated actions. The app/API keeps
+hybrid as its default; its explicitly labelled experimental checkbox passes
+this flag for the cracking stage only, with up to eight MPI workers. The
+selection is stored in parent job metadata and is not a dam material input.
+`--accelerate-damage` additionally selects bounded scalar Aitken relaxation
+for that experimental formulation only. The factor is computed collectively
+from owned damage DOFs, bounded to `[0.5, 2]`, and reset at each load step.
+Growing same-direction increments would give a negative Aitken factor;
+these use the original minimisation update (factor `1`) rather than
+clamping a negative extrapolation to artificial under-relaxation.
+Intermediate iterates are projected onto the previous-load damage bounds and
+`alpha <= 1`; fixed non-wall DOFs remain zero. Convergence uses the **unrelaxed**
+fixed-point residual. No extrapolation is applied to an accepted iteration,
+which must still pass the original mechanics, obstacle and staggered checks.
+Obstacle diagnostics describe the minimised candidate before intermediate
+relaxation, not a second optimisation of the extrapolated field.
+Reduced tests compare stepwise elastic/fracture energies and final fields,
+and verify that plinth damage remains zero. These are not full-dam validation:
+the eight-rank saved-mesh accelerated replay reached the final load step but
+was terminated at 590 seconds. Its last completed staggered iteration (13)
+had unrelaxed damage change `0.048585`, versus the required `1e-5`;
+the residual was increasing despite relaxation reaching its lower bound.
+Mechanics equilibrium passed at that iteration, so this trial does not
+support further linear-solver tuning alone as a cure. Do not resume that
+checkpoint or extend the timeout to claim a successful bounded analysis.
+
+`--fracture-final-substeps N` is an explicit load-increment investigation
+option (default `1`, preserving the configured uniform ramp). It divides
+only the final configured load interval into `N` equal increments; e.g. ten
+configured steps with `N=4` retain `0.1,...,0.9`, then apply
+`0.925,0.95,0.975,1.0`. Reports retain both the configured count and actual
+load factors. All accepted increments use the same equilibrium, damage and
+staggered tolerances, advancing the irreversible lower bound only after
+convergence. Final VTK fields are written at full load even if the resulting
+step count is not a multiple of the output interval. This is not an automatic
+retry, checkpoint restart, change to material data, or validated app default.
+The bounded eight-rank subdivision replay also failed the runtime requirement:
+at 92.5% load its last completed iteration (17) had damage change `1.18465e-5`.
+It had not reached full load when the 590-second deadline stopped it.
+
+The experiment uses the Amor energy
+`g(alpha)*(K*<tr(eps)>_+^2/2 + mu*dev(eps):dev(eps))`
+`+ K*<tr(eps)>_-^2/2`.
+Only negative volumetric energy is undegraded. Deviatoric stiffness still
+degrades, so this is **not unilateral crack-face contact**, friction or
+compression/crushing modelling. Material properties, crack seed and loading
+are unchanged. History-driven irreversible AT2 damage and the gross
+small-strain guard remain active.
+For the experimental formulation, the tensile history at each staggered
+iteration is `max(H_previous_accepted_load, psi_plus(u_current))`.
+Intermediate trial peaks are not committed as irreversible load history;
+the accepted history advances only when the load step converges. This
+matters when relaxation or extrapolation causes a trial overshoot.
+The hybrid default retains its existing running-maximum history convention.
+Reports identify the convention. A fresh bounded full-dam test of the
+accepted-step convention still failed at final load: the last completed
+iteration (13) had damage change `0.048603` before the 590-second cutoff.
+This correction is not evidence that history overshoot caused the observed
+dam failure, nor a successful full-dam repair.
+Resetting negative Aitken extrapolations to the original minimisation
+update also failed the bounded full-dam test. At final-load iteration 11,
+damage change remained `0.048571`; mechanics passed its independent
+equilibrium test but needed six Newton corrections and 191 Krylov
+iterations (41.76 seconds for that mechanics update). The run stopped
+at 590 seconds. Inspection of its saved, unconverged state found principal
+strains approximately `[-0.001077, -0.000010, 0.012340]` near
+`(78.2161, 15.7248, -27.8906)` m, with vertex damage
+`[1, 1, 1, 0.97925]`. Unlike the original hybrid runaway, the largest
+principal strain here is tensile. This does not prove contact deficiency,
+an unstable equilibrium, physical failure, or validity of a completed
+fracture solution. No complete result was produced by these trials.
+
+A fresh one-increment, full-load diagnostic (same mesh, seed, materials and
+final loads, without Aitken) also hit the 590-second development deadline.
+At iteration 19 damage change was `0.048649`; the preceding mechanics
+update passed equilibrium but took 60.38 seconds. This diagnostic changes
+the loading path and cannot replace or validate the configured ten-step run.
+
+`ForceControlledPatchTests` in `test_phase_field_solver` verifies a separate
+analytical load-control limitation. In homogeneous positive dilation
+`eps=e*I`, the AT2 stationary damage is
+`alpha=c*e^2/(1+c*e^2)`, where `c=9*K*ell/Gc`. With zero residual stiffness,
+the applied tensile pressure is `p=3*K*e/(1+c*e^2)^2`, peaking at
+`e=sqrt(Gc/(27*K*ell))`, `alpha=1/4`. The implemented small residual
+stiffness does not make the high-strain branch a valid small-strain result.
+A 3-D traction-driven patch below the peak matches affine displacement,
+damage and traction analytically; one above the peak develops runaway
+tensile strain and is rejected, rather than reported as successful.
+These synthetic tests show why more runtime, a smaller linear residual,
+or undegraded compression need not cure tensile load-controlled softening.
+They do **not** establish that the dam has exceeded its physical capacity,
+or prove that no admissible dam equilibrium exists. A validated continuation
+or fracture/contact treatment requires separate verification; do not infer
+one from solver iteration changes or silently substitute a different law.
+
+Fixed-damage mechanics uses PETSc SNES Newton with backtracking and an explicit
+semismooth tangent (the tensile-side bulk derivative at zero trace).
+Automatic differentiation of both positive/negative parts at zero can
+otherwise omit the bulk tangent. GMRES/GAMG solves the tangent systems.
+The nonlinear residual is reassembled independently before acceptance;
+its absolute and load-relative tolerances are retained in each iteration's
+`nonlinear_mechanics` record. The reference is the assembled applied load
+vector on free DOFs, not the sometimes tiny residual of a nearly converged
+warm start. Zero-applied-load, displacement-driven tests instead use the
+initial residual and absolute tolerance. Energy, raw stress and recovered stress all use
+the selected law, and reports explicitly identify the experimental model.
+The coupled solver retains its nonlinear system between staggered iterations;
+matrix, residual and applied load are still reassembled. GAMG may be reused
+for the first Newton correction of a nearby state. Further Newton corrections,
+nodal degradation changing by more than a factor of two, or Krylov iteration
+growth request a fresh hierarchy. Displacement boundary-condition changes
+recreate the mechanics problem at each load step. Reuse never bypasses the
+independent equilibrium check.
+Each Newton linear correction uses an absolute residual tolerance of one
+tenth of the current load-scaled equilibrium tolerance. This avoids solving
+every correction to the much smaller residual of a nearly converged warm
+start. The outer, independently reassembled equilibrium requirement is
+unchanged; the selected inner tolerance is included in the diagnostic report.
+Reuse is controlled at SNES level with persistent preconditioner lagging:
+setting only the KSP preconditioner's reuse flag is insufficient because
+SNES otherwise rebuilds it on the first Jacobian of each solve. A requested
+refresh uses PETSc's `-2` lag (build next, then retain); nonlinear tolerances
+are preserved when changing these options.
+
+`test_compression_preserving` checks pressure-driven 3-D opening, closure
+and reopening on two tetrahedral meshes, exact affine displacement and
+energy, energy/stress consistency, unchanged damage during fixed-damage
+mechanics and explicit failure propagation. Small direct-LU checks include
+`alpha=1`; iterative checks cover `alpha=0` and `0.99`. Direct factorisation
+is selected explicitly only by the benchmark, never used as a fallback.
+Fully damaged material combines undegraded bulk stiffness with residual
+shear stiffness, which makes the tangent nearly incompressible and can
+defeat GAMG. Passing the small direct tests is not evidence that the
+full-dam iterative solve or runtime requirement is satisfied.
+Current full-dam verification is incomplete: bounded saved-mesh trials were
+stopped by the runtime deadline before all ten load steps completed.
+Partial progress, including a converged fixed-damage full-load probe, must
+not be presented as a successful complete fracture analysis. Do not promote
+this experiment to the app/API default on the strength of these tests.
+The optional Python `solve_parallel` coordinator also accepts
+`mechanics_formulation="experimental_amor"` and persists that choice in the
+isolated worker request. Serial/two-rank tests check matching displacement,
+damage, energy and recovered stress for both formulations.
+
+### Experimental principal-strain spectral investigation
+
+Standalone `run-fracture --fracture-mechanics experimental_spectral` selects
+an additional investigation law; this is **not an app/API option or default**.
+The optional `--accelerate-damage` flag also accepts this experimental law.
+It uses
+`psi_plus=lambda*<tr(eps)>_+^2/2 + mu*eps_plus:eps_plus` and
+`psi_minus=lambda*<tr(eps)>_-^2/2 + mu*eps_minus:eps_minus`,
+where `eps_plus`/`eps_minus` are positive/negative principal-strain tensor
+parts. The mechanics energy is `g(alpha)*psi_plus + psi_minus`, with the
+same `psi_plus` driving damage history. Negative principal strains, not
+merely negative volume change, retain their stiffness. This still does not
+implement unilateral crack-face contact, friction or crushing.
+
+`spectral_split.py` evaluates strain eigensystems in DG0, which is exact
+cellwise for affine P1 tetrahedra. Other displacement orders or curved/non-tet
+geometry are rejected; the experimental energy also requires nonnegative
+lambda. Nodal damage and its degradation remain P1/quadratic expressions,
+not cell-averaged substitutes. A divided-difference spectral derivative
+provides the consistent semismooth tangent, including repeated eigenvalues;
+zero eigenvalues use the tensile-side generalized derivative. Public DOLFINx
+residual/Jacobian callbacks synchronize displacement and update coefficients
+before each assembly, including line-search trial residuals and the independent
+final equilibrium check. Non-finite strain is rejected collectively.
+Mechanics, history, internal energy, exported stress and recovered stress use
+the same selected law. Both manifest and report retain its experimental name.
+
+`test_spectral_split` verifies rotated/repeated principal-strain branches,
+finite-difference energy/stress/tangent consistency, fully damaged
+nonhydrostatic compression, explicit failure acceptance, and accelerated versus
+unaccelerated coupled fields/energies. The parallel tests also check spectral
+serial/two-rank agreement in energy, displacement, damage and recovered stress.
+These checks do not establish full-dam convergence or engineering validity.
+
+All three fresh eight-rank full-dam spectral diagnostics were stopped by the
+590-second development deadline, with no complete report:
+
+| Loading/iteration strategy | Last completed state | Damage change |
+|---|---|---|
+| Original ten steps, no acceleration | 90% load, iteration 5 | 0.001041 |
+| Original ten steps, bounded Aitken | Full load, iteration 3 | 0.006581 |
+| One full-load increment, bounded Aitken | Full load, iteration 22 | 0.042066 |
+
+The last trial changed the loading path and cannot replace the configured
+analysis. Its final recorded strain norm was approximately 0.01184 and
+mechanics still passed equilibrium, but damage had not settled. Do not call
+these trials a working fix or claim that undegraded compression alone cures
+the coupled response. The ten-minute cutoff belongs to local agent development
+only; the app/API does not impose it on user jobs. No checkpoint continuation
+was used to bypass that development rule.
+
+Saved-state audit of the single-increment spectral trial confirmed plinth
+damage was exactly zero and the seed lower bound was retained to roundoff
+(maximum removal approximately `1.1e-13`). Damage increased by more than
+`0.1` at 17,973 wall DOFs, with maximum increase `0.5874` near
+`(78.1990, 15.9654, -28.0)` m. No additional DOFs had reached `alpha>=0.99`.
+The maximum-strain cell was predominantly tensile (principal strains
+approximately `[-6.11e-5, -9.17e-6, 0.01184]`). This is evidence of evolving
+wall damage in an unconverged state, not proof of crack propagation stability,
+loss of global equilibrium, or physical dam failure.
+
+Each staggered diagnostic/report now includes `damage_change_location`:
+the coordinate and signed largest **unrelaxed** damage update, previous
+iterate, minimised candidate and previous-load lower bound. Selection uses
+owned DOFs collectively, excluding duplicate ghosts. It is captured before
+any Aitken extrapolation. Consecutive locations/updates can distinguish an
+oscillating region from a moving region of damage growth; neither pattern
+alone establishes an admissible completed fracture solution.
 
 `solver.field_output_interval` controls VTK snapshots independently of the JSON
 diagnostics, which are retained for every load step. The default value `10`
@@ -429,11 +897,55 @@ and `boundaries`. DOLFINx performs this compiled HDF5 I/O in Ubuntu; Windows
 
 The dam solve uses small-strain isotropic elasticity, CG/GAMG with rigid-body
 near-nullspace modes, gravity, upstream pressure, tailwater and crest surcharge.
-Foundation springs act on tag 1. **The current Elmer SIF grounds wall-side tag 8
+Foundation springs act on tag 1. **The historical split-interface Elmer SIF grounded wall-side tag 8
 with directional springs; it does not couple wall displacement to plinth
-displacement.** The adapter reproduces that behavior, leaves tag 9 free and does
-not silently bond the regions. Revising this physical assumption would be a
-separate model change requiring a new reference.
+displacement.** Saved split meshes remain identifiable in the low-level adapter
+as `legacy_split_grounded`, retaining their two support laws. Newly generated
+meshes instead use the separately identified bonded reference above.
+
+### Read-only wall/plinth load-path audit
+
+`load_path_audit.py` checks a saved serial crack run without solving, resuming
+or changing its data. It verifies region connectivity, tagged surface areas,
+checkpoint mapping and the last pre-iteration strain/damage state. It requires
+the new refined-baseline artifacts and refuses an existing output filename.
+The checkpoint is **not an accepted final state** and precedes the failed
+mechanics update.
+
+From the `FEniCSx` directory in Ubuntu:
+
+```bash
+python3 load_path_audit.py --run /path/to/isolated/crack/run --output /path/to/new-audit.json
+python3 -m unittest test_load_path_audit test_contact_benchmark
+```
+
+The October 17 failed job `d84722f4cce34ef7920f0547241b698b` has zero shared
+wall/plinth vertices, 3,969 coincident coordinates and separate exterior faces
+on tags 8/9. Each face set has area approximately 659.99548 m2, but refinement
+leaves different facet counts (36,196 wall-side versus 5,280 plinth-side).
+Those surfaces cannot simply be paired by triangle index or welded without
+checking conformity.
+
+Its checkpoint before step 10 iteration 21 has strain norm 0.10591, principal
+compression -0.10542, and hotspot vertex damage 0.9989466-1.0. Hybrid vertex
+stiffness fractions are approximately 1e-8 to 1.12e-6. Wall-base damage reaches
+0.9997813; plinth damage is zero. This contradicts an explanation based on a
+shared, zero-damage wall-side trace in this particular mesh.
+
+The scalar split-versus-bonded regression applies a unit wall-only load:
+independent ground supports produce zero plinth response; a bonded block
+transfers that load to the plinth foundation. This verifies connectivity
+semantics, **not 3D elasticity, friction, separation or dam behaviour**.
+The existing two-bar unilateral-contact benchmark remains separate.
+
+The physical connection must ultimately be justified from construction evidence:
+bonded connection for an intact monolithic idealisation, or an interface law
+for an opening/sliding joint. A controlled bonded reference is a useful
+diagnostic, but not a substitute for a joint model when separation is intended.
+Do not silently retain the wall-ground bypass spring in a bonded reference:
+that would provide a second, different support path. Both Elmer and FEniCSx
+now use the newly checked bonded reference above. Permitting plinth damage alone
+cannot create the missing mechanical connection.
 
 Elmer exports deformed coordinates and includes surface cells. The comparator
 subtracts its displacement field to recover source positions, filters volume
@@ -471,11 +983,11 @@ grounded joint remain necessary before relying on fracture scenarios.
    mixed element types, units, current material/load data and spring definitions.
    `results/migration_inventory.json` captures the actual model counts.
 2. **Import (implemented)**: resolve mixed-cell compatibility with checked subdivision;
-   export/inspect geometry and tags in ParaView. Preserve separate coincident
-   wall/plinth nodes and tags `WALL_PLINTH_WALL`/`WALL_PLINTH_PLINTH`.
-3. **Elastic dam parity (provisional checks passed)**: reproduce the current Elmer foundation and wall/plinth
+   export/inspect geometry and tags in ParaView. New meshes preserve shared bonded
+   wall/plinth nodes; historical split nodes remain distinct when reading old fields.
+3. **Elastic dam parity (bonded reference checked)**: reproduce the current Elmer foundation
    directional springs, gravity, hydrostatic pressure, tailwater and overflow.
-   Do not silently turn the joint into a bonded or fixed support. Compare matching
+   The provisional bond is an explicit model change, not a contact model. Compare matching
    displacement probes, reactions, equilibrium and stress recovery.
 4. **Contact benchmark (reduced 1-D checks implemented)**: verify an explicitly selected unilateral contact
    formulation, gap convention, closure/opening, friction when requested and

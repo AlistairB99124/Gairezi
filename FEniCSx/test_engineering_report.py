@@ -147,6 +147,26 @@ class EngineeringReportTests(unittest.TestCase):
                 "`2026-10-12T07:09:09+00:00`", "`finish`"
             ))
 
+    def test_mesh_controlled_comparison_and_matched_point_context(self):
+        self.result["maximum_principal_compressive_stress_pa"] = -3e6
+        self.result["refined_mesh_baseline"] = {
+            "maximum_principal_tensile_stress_pa": 1.7e6,
+            "maximum_principal_compressive_stress_pa": -2.9e6,
+        }
+        self.result["matched_point_stresses"] = {
+            "refined_baseline_tensile_peak": {
+                "coordinate_xyz_m": [78, 17, -27.875], "principal_stresses_pa": [-1e5, 0, 2e5],
+            },
+            "refined_baseline_compressive_peak": {
+                "coordinate_xyz_m": [78, 15, -0.25], "principal_stresses_pa": [-3e6, -2e5, 0],
+            },
+        }
+        report = self.build()
+        self.assertIn("Mesh-controlled crack comparison", report)
+        self.assertIn("| Tension | 1.7e+06 | 1.815e+06 | 115000 |", report)
+        self.assertIn("(78.000, 17.000, -27.875)", report)
+        self.assertIn("their difference is not local stress relief", report)
+
 
 if __name__ == "__main__":
     unittest.main()

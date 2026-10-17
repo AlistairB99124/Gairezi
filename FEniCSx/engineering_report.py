@@ -323,6 +323,46 @@ def build_engineering_results(
             "",
         ]
     )
+    refined = result.get("refined_mesh_baseline")
+    if refined is not None:
+        lines.extend([
+            "## Mesh-controlled crack comparison",
+            "",
+            "The uncracked refined baseline was solved before introducing damage,",
+            "on the identical mesh with the same material, external loads and supports.",
+            "See [refined baseline report](./refined_baseline/baseline_report.json)",
+            "and [refined baseline stress field](./refined_baseline/recovered_stress.pvd).",
+            "",
+            "| Recovered global peak | Refined uncracked, Pa | Cracked, Pa | Cracked minus refined, Pa |",
+            "|---|---:|---:|---:|",
+        ])
+        for label, key in (
+            ("Tension", "maximum_principal_tensile_stress_pa"),
+            ("Compression (signed)", "maximum_principal_compressive_stress_pa"),
+        ):
+            lines.append(
+                f"| {label} | {refined[key]:.6g} | {result[key]:.6g} | {result[key] - refined[key]:.6g} |"
+            )
+        lines.extend([
+            "",
+            "Global extrema can move: their difference is not local stress relief.",
+            "Negative compression means larger compressive magnitude. Raw element",
+            "stresses and recovered stresses are distinct measures; compare like with like.",
+            "The configured tensile strength is a reporting reference, not an imposed stress cap.",
+            "",
+            "| Fixed refined-baseline location | Coordinates, m | Baseline stress, Pa | Cracked stress, Pa |",
+            "|---|---|---:|---:|",
+        ])
+        for label, name, index, key in (
+            ("Tensile peak", "refined_baseline_tensile_peak", 2, "maximum_principal_tensile_stress_pa"),
+            ("Compressive peak", "refined_baseline_compressive_peak", 0, "maximum_principal_compressive_stress_pa"),
+        ):
+            sample = result["matched_point_stresses"][name]
+            point = ", ".join(f"{value:.3f}" for value in sample["coordinate_xyz_m"])
+            lines.append(
+                f"| {label} | ({point}) | {refined[key]:.6g} | {sample['principal_stresses_pa'][index]:.6g} |"
+            )
+        lines.append("")
     return "\n".join(lines)
 
 

@@ -68,15 +68,22 @@ def convert_with_elmergrid(
         return False
     if output_dir.exists():
         shutil.rmtree(output_dir)
-    command = [executable, "14", "2", str(mesh_path), "-autoclean"]
+    command = [executable, "14", "2", str(mesh_path.resolve()), "-autoclean"]
     if partition_count is not None:
         command.extend(["-metiskway", str(partition_count)])
-    command.extend(["-out", str(output_dir)])
+    # ElmerGrid truncates absolute -out paths at a dotted ancestor such as .copilot.
+    command.extend(["-out", output_dir.name])
     subprocess.run(
         command,
         check=True,
-        cwd=mesh_path.parent,
+        cwd=output_dir.parent,
     )
+    header = (
+        output_dir / f"partitioning.{partition_count}" / "part.1.header"
+        if partition_count is not None else output_dir / "mesh.header"
+    )
+    if not header.is_file():
+        raise RuntimeError(f"ElmerGrid did not create the expected mesh header: {header}")
     return True
 
 
@@ -121,10 +128,8 @@ def write_combined_solver_input(mesh, path: Path) -> None:
     foundation_spring_x = foundation_support.spring_x_n_per_m3
     foundation_spring_y = foundation_support.spring_y_n_per_m3
     foundation_spring_z = foundation_support.spring_z_n_per_m3
-    plinth_support = mesh.plinth_support
-    plinth_spring_x = plinth_support.spring_x_n_per_m3
-    plinth_spring_y = plinth_support.spring_y_n_per_m3
-    plinth_spring_z = plinth_support.spring_z_n_per_m3
+    if any(tag in (8, 9) for tag, _ in mesh.boundaries):
+        raise ValueError("Bonded solver input cannot contain separate wall/plinth spring faces; regenerate mesh")
     water_density = mesh.loads.water_density_kg_m3
     tailwater_head = mesh.loads.tailwater_head_m
     overflow_head = mesh.loads.overflow_head_m
@@ -133,7 +138,9 @@ def write_combined_solver_input(mesh, path: Path) -> None:
     water_pressure_gradient = water_density * abs(mesh.loads.gravity_z_m_s2)
     overflow_surcharge = water_pressure_gradient * overflow_head
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f'''Header
+    path.write_text(f'''! Provisional bonded wall/plinth: shared nodes, no joint opening/sliding.
+! Foundation support only; geometry.plinth.support is inactive.
+Header
     CHECK KEYWORDS Warn
     Mesh DB "mesh" "/"
     Results Directory "results"
@@ -234,13 +241,6 @@ Boundary Condition 4
     Normal Force = Real -{overflow_surcharge:.12g}
 End
 
-Boundary Condition 5
-    Name = "WallPlinthSpring"
-    Target Boundaries(1) = 8
-    Spring 1 = Real {plinth_spring_x:.12g}
-    Spring 2 = Real {plinth_spring_y:.12g}
-    Spring 3 = Real {plinth_spring_z:.12g}
-End
 ''')
 
 

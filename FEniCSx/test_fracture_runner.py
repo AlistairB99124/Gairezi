@@ -12,6 +12,50 @@ import test_engineering_report
 
 
 class FractureRunnerTests(unittest.TestCase):
+    def setUp(self):
+        # Runner orchestration remains testable independently of the production model-review hold.
+        hold = patch("run.assert_fracture_ready")
+        hold.start()
+        self.addCleanup(hold.stop)
+
+    def test_parallel_cli_only_delegates_the_fracture_solve(self):
+        with (
+            patch("sys.argv", ["run.py", "run-fracture", "--fracture-processes", "2",
+                               "--dam-config", str(LOAD_CASE)]),
+            patch("run.environment", return_value={"test": True}),
+            patch("run.run_fracture") as fracture,
+        ):
+            self.assertEqual(main(), 0)
+            self.assertEqual(fracture.call_args.kwargs, {
+                "processes": 2, "mechanics_formulation": "hybrid", "damage_acceleration": False,
+                "final_load_substeps": 1,
+            })
+
+    def test_experimental_mechanics_cli_requires_explicit_opt_in(self):
+        with (
+            patch("sys.argv", ["run.py", "run-fracture", "--fracture-mechanics", "experimental_amor",
+                               "--accelerate-damage", "--fracture-final-substeps", "4",
+                               "--fracture-processes", "2", "--dam-config", str(LOAD_CASE)]),
+            patch("run.environment", return_value={"test": True}),
+            patch("run.run_fracture") as fracture,
+        ):
+            self.assertEqual(main(), 0)
+            self.assertEqual(fracture.call_args.kwargs, {
+                "processes": 2, "mechanics_formulation": "experimental_amor", "damage_acceleration": True,
+                "final_load_substeps": 4,
+            })
+
+    def test_spectral_mechanics_cli_routes_only_an_explicit_cracking_request(self):
+        with (
+            patch("sys.argv", ["run.py", "run-fracture", "--fracture-mechanics", "experimental_spectral",
+                               "--accelerate-damage", "--dam-config", str(LOAD_CASE)]),
+            patch("run.environment", return_value={"test": True}),
+            patch("run.run_fracture") as fracture,
+        ):
+            self.assertEqual(main(), 0)
+            self.assertEqual(fracture.call_args.kwargs["mechanics_formulation"], "experimental_spectral")
+            self.assertTrue(fracture.call_args.kwargs["damage_acceleration"])
+
     def test_automatic_run_records_generated_scenario_without_changing_dam_snapshot(self):
         fixture = test_engineering_report.EngineeringReportTests()
         fixture.setUp()
@@ -33,6 +77,10 @@ class FractureRunnerTests(unittest.TestCase):
             run = next((output / "dam_phase_field").iterdir())
             manifest = json.loads((run / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "completed_not_engineering_validated")
+            self.assertEqual(manifest["mechanics_formulation"], "hybrid")
+            self.assertEqual(solve.call_args.kwargs["mechanics_formulation"], "hybrid")
+            self.assertTrue(solve.call_args.kwargs["refined_baseline"])
+            self.assertTrue(manifest["refined_baseline_required"])
             self.assertEqual(manifest["crack_scenario_names"], ["automatic_peak_tension"])
             self.assertEqual((run / "config.json").read_bytes(), config.read_bytes())
             generated = json.loads((run / "automatic_crack.json").read_text())
@@ -65,6 +113,18 @@ class FractureRunnerTests(unittest.TestCase):
             ["run-baseline", "--baseline-phase"],
             ["run", "--baseline-phase"],
             ["run-fracture", "--baseline-phase", "--elmer-result", "result.pvtu"],
+            ["run-baseline", "--fracture-processes", "2"],
+            ["run-fracture", "--baseline-phase", "--fracture-processes", "2"],
+            ["run-baseline", "--fracture-mechanics", "experimental_amor"],
+            ["run-fracture", "--baseline-phase", "--fracture-mechanics", "experimental_amor"],
+            ["run", "--fracture-mechanics", "experimental_amor"],
+            ["run-fracture", "--accelerate-damage"],
+            ["run-baseline", "--accelerate-damage"],
+            ["run-fracture", "--fracture-final-substeps", "0"],
+            ["run-baseline", "--fracture-final-substeps", "2"],
+            ["run-fracture", "--baseline-phase", "--fracture-final-substeps", "2"],
+            ["run-baseline", "--fracture-mechanics", "experimental_spectral"],
+            ["run-fracture", "--baseline-phase", "--fracture-mechanics", "experimental_spectral"],
         ):
             with self.subTest(arguments=arguments), patch("sys.argv", ["run.py", *arguments]):
                 with self.assertRaises(SystemExit) as error:

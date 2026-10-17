@@ -39,7 +39,7 @@ def file_hash(path: Path) -> str:
 
 
 def import_baseline(structure, reference: Path, config: Path, directory: Path) -> dict:
-    """Map Elmer fields to source nodes, retaining separate region interfaces.
+    """Map Elmer fields preserving either bonded or legacy split topology.
 
     Coordinates are undeformed metres; stress is Pa and tension is positive.
     The existing fracture solve remains independently loaded from config.
@@ -89,6 +89,7 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
         "has_tension": peak["value_pa"] > 0,
         "peak_method": "maximum principal eigenvalue of element-mean nodal stress tensor",
         "field_archive": "elmer_baseline_fields.npz",
+        "node_regions_encoding": "membership bits: 1=plinth, 2=wall, 3=shared bonded node",
         "usage": "baseline fields are not fracture initial conditions; peak-driven geometry is recorded separately",
         "engineering_validated": False,
     }

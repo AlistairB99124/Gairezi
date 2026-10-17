@@ -12,6 +12,58 @@ from Elmer import structure_assembly as assembly
 from Elmer.regions.combined_structure import load_environment, load_material, load_foundation_support
 
 
+class BondedTopologyTests(unittest.TestCase):
+    def test_elmergrid_uses_local_output_name_under_dotted_ancestor(self):
+        with tempfile.TemporaryDirectory(suffix=".case") as directory:
+            root = Path(directory)
+            output = root / "mesh"
+            header = output / "partitioning.4" / "part.1.header"
+            def conversion(*args, **kwargs):
+                header.parent.mkdir(parents=True)
+                header.write_text("test")
+            with patch.object(assembly.shutil, "which", return_value="ElmerGrid"), patch.object(
+                assembly.subprocess, "run", side_effect=conversion,
+            ) as worker:
+                self.assertTrue(assembly.convert_with_elmergrid(root / "source.msh", output, 4))
+                self.assertEqual(worker.call_args.args[0][-2:], ["-out", "mesh"])
+                self.assertEqual(worker.call_args.kwargs["cwd"], root)
+
+    def test_elmergrid_missing_expected_output_is_not_success(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            assembly.shutil, "which", return_value="ElmerGrid",
+        ), patch.object(assembly.subprocess, "run"):
+            root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "expected mesh header"):
+                assembly.convert_with_elmergrid(root / "source.msh", root / "mesh", 4)
+
+    def test_generated_wall_plinth_are_one_body_before_and_after_tetrahedralization(self):
+        from collections import Counter
+        from Elmer.regions.combined_structure import audit_combined_structure, build_combined_structure
+        from Elmer.regions.tetrahedral import tetrahedralize_structure
+
+        source = build_combined_structure(assembly.ROOT)
+        audit = audit_combined_structure(source)
+        self.assertEqual(audit["face_connected_components"], 1)
+        self.assertGreater(audit["wall_plinth_interface_faces"], 0)
+        self.assertEqual(audit["wall_plinth_connection"], "bonded_intact_provisional")
+        self.assertEqual(len({tuple(round(x, 9) for x in xyz) for xyz in source.nodes}), len(source.nodes))
+        self.assertFalse(any(tag in (8, 9) for tag, _ in source.boundaries))
+        mesh = tetrahedralize_structure(source)
+        faces = Counter()
+        regions = {}
+        for (_, tet), region in zip(mesh.cells, mesh.region_ids):
+            for pattern in ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)):
+                face = tuple(sorted(tet[i] for i in pattern))
+                faces[face] += 1
+                regions.setdefault(face, set()).add(region)
+        self.assertEqual(max(faces.values()), 2)
+        interface = {face for face, membership in regions.items() if membership == {1, 2}}
+        self.assertEqual(len(interface), 2 * audit["wall_plinth_interface_faces"])
+        exterior = {tuple(sorted(face)) for _, face in mesh.boundaries}
+        self.assertFalse(interface & exterior)
+        self.assertEqual(exterior, {face for face, count in faces.items() if count == 1})
+
+
 class RaisedReservoirTests(unittest.TestCase):
     def test_active_load_case_and_generated_pressure_law(self):
         root = assembly.ROOT
@@ -22,6 +74,7 @@ class RaisedReservoirTests(unittest.TestCase):
             material=load_material(environment),
             foundation_support=support, plinth_support=support,
             nodes=[(80.0, 0.0, -31.0), (80.0, 0.0, 0.0)],
+            boundaries=[],
         )
         payload = json.loads(assembly.LOAD_CASES_PATH.read_text())
         self.assertEqual(payload["loads"]["water_height"], 31)
@@ -38,6 +91,8 @@ class RaisedReservoirTests(unittest.TestCase):
         for z, pressure in ((-31, -333540), (-30, -323730), (0, -29430), (3, 0)):
             self.assertAlmostEqual(eval(expression, {"__builtins__": {}}, {"tx": z}), pressure)
         self.assertIn("Normal Force = Real -29430", text)
+        self.assertNotIn("WallPlinthSpring", text)
+        self.assertNotIn("Target Boundaries(1) = 8", text)
 
 
 class MpiLauncherTests(unittest.TestCase):

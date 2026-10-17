@@ -138,17 +138,6 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
 
     wall = build_wall(root, extra_radial_fractions)
     plinth = build_conforming_plinth(root, [wall])
-    wall_base_nodes = {
-        node_id
-        for boundary_id, face in wall.boundaries
-        if boundary_id == FACE_GROUP_IDS["FOUNDATION"]
-        for node_id in face
-    }
-    wall_base_coordinate_faces = {
-        tuple(sorted(tuple(round(value, 9) for value in wall.nodes[node_id - 1]) for node_id in face))
-        for boundary_id, face in wall.boundaries
-        if boundary_id == FACE_GROUP_IDS["FOUNDATION"]
-    }
     regions = [
         (REGION_GROUP_IDS["PLINTH"], "plinth", plinth),
         (REGION_GROUP_IDS["WALL"], "wall", wall),
@@ -158,12 +147,10 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
         local_to_global: dict[int, int] = {}
         for local_id, coordinate in enumerate(mesh.nodes, start=1):
             key = tuple(round(value, 9) for value in coordinate)
-            separate_spring_interface_node = region_name == "wall" and local_id in wall_base_nodes
-            if key not in coordinate_nodes or separate_spring_interface_node:
+            if key not in coordinate_nodes:
                 node_id = len(nodes)
                 nodes.append(coordinate)
-                if not separate_spring_interface_node:
-                    coordinate_nodes[key] = node_id
+                coordinate_nodes[key] = node_id
             else:
                 node_id = coordinate_nodes[key]
             local_to_global[local_id] = node_id
@@ -184,13 +171,6 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
         if len(entries) != 1:
             continue
         region_id, boundary_id, oriented_face = entries[0]
-        coordinate_face = tuple(sorted(tuple(round(value, 9) for value in nodes[node_id]) for node_id in oriented_face))
-        if coordinate_face in wall_base_coordinate_faces:
-            boundary_id = (
-                FACE_GROUP_IDS["WALL_PLINTH_WALL"]
-                if region_id == REGION_GROUP_IDS["WALL"]
-                else FACE_GROUP_IDS["WALL_PLINTH_PLINTH"]
-            )
         boundaries.append((boundary_id, oriented_face))
     if any(len(entries) > 2 for entries in boundary_faces.values()):
         raise ValueError("More than two regions share a boundary face")
@@ -354,15 +334,6 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     expected_cells = sum(mesh.region_cell_counts.values())
     if len(mesh.cells) != expected_cells or len(mesh.region_ids) != expected_cells:
         raise ValueError("Combined cell arrays do not preserve all regional cells")
-    coincident_interface_nodes = {
-        node_id
-        for boundary_id, face in mesh.boundaries
-        if boundary_id in (
-            FACE_GROUP_IDS["WALL_PLINTH_WALL"],
-            FACE_GROUP_IDS["WALL_PLINTH_PLINTH"],
-        )
-        for node_id in face
-    }
     coordinate_node_ids: dict[tuple[float, float, float], list[int]] = {}
     for node_id, point in enumerate(mesh.nodes):
         coordinate_node_ids.setdefault(tuple(round(value, 9) for value in point), []).append(node_id)
@@ -372,8 +343,8 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         if len(node_ids) > 1
         for node_id in node_ids
     }
-    if duplicate_nodes - coincident_interface_nodes:
-        raise ValueError("Combined structure contains duplicate coordinates outside the wall/plinth interface")
+    if duplicate_nodes:
+        raise ValueError("Bonded structure contains duplicate coordinates; regenerate a conforming mesh")
     face_patterns = {
         4: ((0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)),
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
@@ -416,7 +387,7 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
             else:
                 face_owners[face] = cell_index
     component_count = len({find(cell_index) for cell_index in range(len(mesh.cells))})
-    if component_count not in (1, 2):
+    if component_count != 1:
         raise ValueError(f"Combined structure has {component_count} face-connected components")
     foundation_node_count = len({
         node_id
@@ -438,8 +409,9 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         1 for boundary_id, _ in mesh.boundaries
         if boundary_id == FACE_GROUP_IDS["WALL_PLINTH_PLINTH"]
     )
-    if wall_interface_face_count == 0 or wall_interface_face_count != plinth_interface_face_count:
-        raise ValueError("Wall/plinth interface faces are missing or unpaired")
+    bonded_interface_count = region_interfaces[(REGION_GROUP_IDS["PLINTH"], REGION_GROUP_IDS["WALL"])]
+    if wall_interface_face_count or plinth_interface_face_count or not bonded_interface_count:
+        raise ValueError("Bonded wall/plinth interface must be internal shared faces, without ground-spring bypass")
     wall_node_ids = {
         node_id
         for (_, cell), region_id in zip(mesh.cells, mesh.region_ids)
@@ -456,7 +428,12 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "triangular_prisms": element_counts[6],
         "pyramids": element_counts[7],
         "face_connected_components": component_count,
-        "wall_plinth_interface_faces": wall_interface_face_count,
+        "wall_plinth_interface_faces": bonded_interface_count,
+        "wall_plinth_connection": "bonded_intact_provisional",
+        "connection_assumption": "Shared displacement nodes; no opening/sliding; construction details require review",
+        "active_support": "geometry.bedrock.support on foundation tag 1 only",
+        "inactive_inputs": ["geometry.plinth.support: retained for legacy cases; no wall-ground bypass"],
+        "fracture_hold_reason": "Cracking is on hold pending review of the corrected bonded intact reference.",
         "region_interface_faces": {
             f"{first_region}-{second_region}": count
             for (first_region, second_region), count in sorted(region_interfaces.items())

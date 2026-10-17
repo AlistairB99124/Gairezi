@@ -1,4 +1,5 @@
 """Automatic crack geometry and its connection to the phase-field distance."""
+import copy
 import json
 import math
 from pathlib import Path
@@ -54,6 +55,32 @@ class AutomaticCrackTests(unittest.TestCase):
         crack, _, _ = generate_crack(self.config, self.baseline)
         self.assertEqual(crack.centre_m[2], -20)
 
+    def test_peak_shift_changes_prescription_and_warns_without_moving_crack(self):
+        original = copy.deepcopy(self.config)
+        self.baseline["max_principal_stress"]["centroid_xyz_m"] = [78.03, 17.04, -27.75]
+        old, _, old_report = generate_crack(self.config, self.baseline)
+        self.baseline["max_principal_stress"]["centroid_xyz_m"][2] = -27.875
+        new, _, new_report = generate_crack(self.config, self.baseline)
+        self.assertEqual(old.centre_m[2], -27.75)
+        self.assertEqual(new.centre_m[2], -27.875)
+        self.assertEqual(old.annular_sector[:2], new.annular_sector[:2])
+        self.assertLess(new.size_m[1], old.size_m[1])
+        np.testing.assert_allclose(
+            [old.size_m[1], new.size_m[1]], [16.974299945743915, 16.03522689593621],
+            atol=1e-9,
+        )
+        for report, clearance in ((old_report, 0.25), (new_report, 0.125)):
+            placement = report["placement_provenance"]
+            self.assertTrue(placement["regenerated_for_each_baseline"])
+            self.assertAlmostEqual(placement["plinth_elevation_at_peak_m"], -28)
+            self.assertAlmostEqual(placement["clearance_above_plinth_at_peak_m"], clearance)
+            self.assertAlmostEqual(placement["clearance_in_length_scales"], clearance / 0.1)
+            json.dumps(report, allow_nan=False)
+        self.assertEqual(old_report["warnings"], [])
+        self.assertEqual(len(new_report["warnings"]), 1)
+        self.assertIn("interface where damage is fixed at zero", new_report["warnings"][0])
+        self.assertEqual(self.config, original)
+
     def test_invalid_sections_fail_instead_of_clamping(self):
         contours = self.config["geometry"]["plinth"]["contours"]
         for z in (-30, 1, -28):
@@ -68,6 +95,12 @@ class AutomaticCrackTests(unittest.TestCase):
         self.baseline["max_principal_stress"]["value_pa"] = -1
         with self.assertRaisesRegex(ValueError, "no positive tensile"):
             generate_crack(self.config, self.baseline)
+
+    def test_placement_provenance_rejects_invalid_peak_coordinates_without_clamping(self):
+        for position in ([float("nan"), 17, -25], [79, float("inf"), -25], [79, 0], [-79, 0, -25]):
+            with self.subTest(position=position), self.assertRaisesRegex(ValueError, "peak position|peak chainage"):
+                self.baseline["max_principal_stress"]["centroid_xyz_m"] = position
+                generate_crack(self.config, self.baseline)
 
 
 if __name__ == "__main__":

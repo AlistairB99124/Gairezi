@@ -46,17 +46,20 @@ def reference_structure(root: Path, load_case: Path, reference: Path):
 
 
 def read_reference(structure, reference: Path):
+    """Map by region membership (1=plinth, 2=wall, 3=shared), not coordinates alone."""
     points = np.asarray(structure.nodes)
     node_regions = np.zeros(len(points), dtype=np.int32)
     for (kind, cell), region in zip(structure.cells, structure.region_ids):
-        if np.any((node_regions[list(cell)] != 0) & (node_regions[list(cell)] != region)):
-            raise ValueError("Reference mapper expects separate wall/plinth nodes")
-        node_regions[list(cell)] = region
+        if region not in (1, 2):
+            raise ValueError(f"Unexpected structural region {region}")
+        node_regions[list(cell)] |= region
     source_centres = np.asarray([points[list(cell)].mean(axis=0) for _, cell in structure.cells])
     tree = cKDTree(source_centres)
     nodal_trees = {}
-    for region in np.unique(node_regions):
-        ids = np.flatnonzero(node_regions == region)
+    for region in (1, 2, 3):
+        ids = np.flatnonzero((node_regions & region) == region)
+        if not len(ids):
+            continue
         nodal_trees[int(region)] = (ids, cKDTree(points[ids]))
     values = np.zeros((len(points), 3))
     stresses = np.zeros((len(points), 6))
@@ -91,9 +94,7 @@ def read_reference(structure, reference: Path):
             selected[volume_cells] = regions == region
             selected_connectivity = np.repeat(selected, sizes)
             ids = np.unique(connectivity[selected_connectivity])
-            if np.any((point_regions[ids] != 0) & (point_regions[ids] != region)):
-                raise ValueError("Elmer piece merged distinct region nodes")
-            point_regions[ids] = region
+            point_regions[ids] |= int(region)
         stress_names = ("stress_xx", "stress_yy", "stress_zz", "stress_xy", "stress_yz", "stress_xz")
         if any(grid.GetPointData().GetArray(name) is None for name in stress_names):
             raise ValueError("Elmer reference is missing stress components")
@@ -101,6 +102,8 @@ def read_reference(structure, reference: Path):
         for region in np.unique(point_regions):
             if region == 0:
                 continue
+            if int(region) not in nodal_trees:
+                raise ValueError("Elmer piece merged wall/plinth nodes that are separate in the source mesh")
             selected = np.flatnonzero(point_regions == region)
             ids, nodal_tree = nodal_trees[int(region)]
             distance, nearest = nodal_tree.query(xyz[selected])
@@ -147,10 +150,10 @@ def compare(imported, structure, displacement, sigma, reference, settings):
 
     error = np.sqrt(norm_squared(displacement - expected) / norm_squared(expected))
     elmer_reactions = {}
-    for tag, support in ((1, structure.foundation_support), (8, structure.plinth_support)):
-        coefficients = np.asarray([
-            support.spring_x_n_per_m3, support.spring_y_n_per_m3, support.spring_z_n_per_m3
-        ])
+    from dam_elasticity import ground_supports
+
+    for tag, coefficients in ground_supports(imported, structure)[0].items():
+        coefficients = np.asarray(coefficients)
         from dolfinx import mesh
         facets = imported.facet_tags.find(tag)
         geometry_nodes = mesh.entities_to_geometry(imported.domain, 2, facets)
@@ -162,7 +165,7 @@ def compare(imported, structure, displacement, sigma, reference, settings):
         ).sum(axis=0)).tolist()
     probes = []
     for probe in settings["probes"]:
-        candidates = np.flatnonzero(node_regions[:original_node_count] == probe["region_id"])
+        candidates = np.flatnonzero((node_regions[:original_node_count] & probe["region_id"]) != 0)
         target = np.asarray(probe["point_m"], dtype=float)
         distances = np.linalg.norm(imported.points[candidates] - target, axis=1)
         node = int(candidates[np.argmin(distances)])
@@ -196,7 +199,7 @@ def compare(imported, structure, displacement, sigma, reference, settings):
         }
     return {
         "relative_l2_displacement_difference": float(error),
-        "norm_definition": "exact tetrahedral L2 norm of P1 interpolants of both nodal solutions; not the native Elmer hex field",
+        "norm_definition": "exact tetrahedral L2 norm of P1 interpolants of both nodal solutions; mixed-cell references are not their native hex fields",
         "displacement_limit": settings["maximum_relative_l2_difference"],
         "probe_limit": settings["maximum_probe_relative_difference"],
         "displacement_checks_passed": bool(error <= settings["maximum_relative_l2_difference"]

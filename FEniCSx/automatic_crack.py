@@ -45,7 +45,10 @@ def generate_crack(config: dict, baseline: dict):
     peak = baseline["max_principal_stress"]
     if not math.isfinite(peak["value_pa"]) or peak["value_pa"] <= 0:
         raise ValueError("Elmer baseline has no positive tensile-stress peak; no automatic crack can be placed.")
-    z = float(peak["centroid_xyz_m"][2])
+    peak_position = np.asarray(peak["centroid_xyz_m"], dtype=float)
+    if peak_position.shape != (3,) or not np.isfinite(peak_position).all():
+        raise ValueError("Elmer peak position must contain three finite coordinates.")
+    z = float(peak_position[2])
     geometry = config["geometry"]
     wall = geometry["wall"]
     upstream = float(wall["upstream_radius_m"])
@@ -72,6 +75,27 @@ def generate_crack(config: dict, baseline: dict):
         annular_sector=(inner, upstream, theta0, theta1),
         **defaults,
     )
+    peak_x, peak_y, _ = peak_position
+    peak_chainage = chainage_radius * math.atan2(peak_x, peak_y)
+    contours = geometry["plinth"]["contours"]
+    if not float(contours[0]["chainage"]) <= peak_chainage <= float(contours[-1]["chainage"]):
+        raise ValueError("Elmer peak chainage lies outside the configured plinth contours.")
+    plinth_at_peak = float(np.interp(
+        peak_chainage,
+        [float(row["chainage"]) for row in contours],
+        [float(row["height"]) for row in contours],
+    ))
+    clearance = z - plinth_at_peak
+    warnings = []
+    if clearance < 2 * specification.length_scale_m:
+        warnings.append(
+            f"At the Elmer peak location, the automatic crack is {clearance:.6g} m "
+            f"above the plinth ({clearance / specification.length_scale_m:.6g} length scales). "
+            "The 2-length-scale reporting band reaches the interface where damage is fixed at zero. "
+            "The crack is regenerated from the peak element: changing the mesh or stress recovery "
+            "can change its elevation and arc extent even with identical dam configuration. "
+            "This is not evidence of physical dam failure."
+        )
     report = {
         "method": "horizontal annular-sector crack at global peak principal-stress element centroid Z",
         "source_peak": peak,
@@ -84,6 +108,15 @@ def generate_crack(config: dict, baseline: dict):
         "depth_fraction": 0.75,
         "depth_m": upstream - inner,
         "annular_sector": list(specification.annular_sector),
+        "placement_provenance": {
+            "elevation_source": "Elmer peak-stress element centroid; not a fixed physical prescription",
+            "peak_chainage_m": peak_chainage,
+            "plinth_elevation_at_peak_m": plinth_at_peak,
+            "clearance_above_plinth_at_peak_m": clearance,
+            "clearance_in_length_scales": clearance / specification.length_scale_m,
+            "regenerated_for_each_baseline": True,
+        },
+        "warnings": warnings,
         "defaults": json.loads(DEFAULTS.read_text(encoding="utf-8")),
         "report_crack": {
             "name": specification.name,

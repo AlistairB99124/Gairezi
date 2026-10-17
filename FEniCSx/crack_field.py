@@ -272,6 +272,7 @@ def crack_placement_report(imported, specification: CrackSpecification, required
     candidates = geometry.compute_collisions_points(tree, centre)
     colliding = geometry.compute_colliding_cells(domain, candidates, centre)
     centre_cells = colliding.links(0)
+    centre_cells = centre_cells[centre_cells < domain.topology.index_map(dimension).size_local]
     required_cells = set(map(int, imported.cell_tags.find(required_region)))
     region_by_cell = {
         int(cell): int(value)
@@ -289,16 +290,27 @@ def crack_placement_report(imported, specification: CrackSpecification, required
     band_cells = cells[band]
     required_band_cells = np.asarray([cell for cell in band_cells if int(cell) in required_cells], dtype=np.int32)
     bounds = [domain.geometry.x.min(axis=0).tolist(), domain.geometry.x.max(axis=0).tolist()]
+    from mpi4py import MPI
+
+    bounds = [
+        [float(domain.comm.allreduce(value, op=MPI.MIN)) for value in bounds[0]],
+        [float(domain.comm.allreduce(value, op=MPI.MAX)) for value in bounds[1]],
+    ]
+    centre_regions = sorted({
+        value for region_ids in domain.comm.allgather(centre_regions) for value in region_ids
+    })
     report = {
         "centre_m": list(specification.centre_m),
         "mesh_bounds_m": bounds,
-        "centre_cell_count": int(len(centre_cells)),
+        "centre_cell_count": int(domain.comm.allreduce(len(centre_cells), op=MPI.SUM)),
         "centre_region_ids": centre_regions,
-        "diffuse_band_cell_count": int(len(band_cells)),
+        "diffuse_band_cell_count": int(domain.comm.allreduce(len(band_cells), op=MPI.SUM)),
         "required_region_id": required_region,
-        "required_region_band_cell_count": int(len(required_band_cells)),
-        "centre_in_required_region": any(int(cell) in required_cells for cell in centre_cells),
-        "minimum_cell_midpoint_signed_distance_m": float(distance.min()),
+        "required_region_band_cell_count": int(domain.comm.allreduce(len(required_band_cells), op=MPI.SUM)),
+        "centre_in_required_region": domain.comm.allreduce(
+            any(int(cell) in required_cells for cell in centre_cells), op=MPI.LOR,
+        ),
+        "minimum_cell_midpoint_signed_distance_m": float(domain.comm.allreduce(distance.min(), op=MPI.MIN)),
     }
     report["valid"] = (
         report["centre_in_required_region"] and report["required_region_band_cell_count"] > 0

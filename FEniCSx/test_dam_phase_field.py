@@ -1,5 +1,6 @@
 """Small end-to-end dam-load adapter check independent of the full dam mesh."""
 from pathlib import Path
+import json
 from dataclasses import replace
 import tempfile
 from types import SimpleNamespace
@@ -18,6 +19,89 @@ from dam_phase_field import implied_at2_tensile_strength, solve
 
 
 class DamPhaseFieldTests(unittest.TestCase):
+    def test_refined_baseline_is_zero_damage_same_mesh_before_cracking_and_preserved_on_failure(self):
+        imported, structure, crack, options = self.model()
+        with tempfile.TemporaryDirectory() as directory:
+            result = solve(imported, structure, [crack], options, Path(directory), refined_baseline=True)
+            baseline = result.report["refined_mesh_baseline"]
+            self.assertEqual(baseline["scenario_name"], "Refined_NoPhase")
+            self.assertEqual(baseline["crack_surface_measure_m2"], 0)
+            self.assertEqual(baseline["mesh_nodes"], result.report["mesh_nodes"])
+            self.assertEqual(baseline["mesh_cells"], result.report["mesh_cells"])
+            self.assertEqual(
+                result.report["matched_point_stresses"]["refined_baseline_tensile_peak"]["coordinate_xyz_m"],
+                baseline["stress_recovery"]["tensile_peak_centroid_xyz_m"],
+            )
+            self.assertLessEqual(baseline["relative_true_residual"], options.mechanics_relative_tolerance)
+            self.assertLess(baseline["relative_force_balance_error"], 1e-6)
+            self.assertTrue((Path(directory) / "refined_baseline" / "baseline_report.json").is_file())
+            self.assertFalse((Path(directory) / "refined_baseline" / "damage.pvd").exists())
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "dam_phase_field.solve_staggered", side_effect=RuntimeError("cracking failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cracking failed"):
+                solve(imported, structure, [crack], options, Path(directory), refined_baseline=True)
+            saved = json.loads((Path(directory) / "refined_baseline" / "baseline_report.json").read_text())
+            self.assertEqual(saved["scenario_name"], "Refined_NoPhase")
+            self.assertFalse((Path(directory) / "phase_field_report.json").exists())
+
+    def test_experimental_amor_adapter_preserves_equilibrium_and_matching_stresses(self):
+        from compression_preserving import stress
+        from phase_field_solver import elastic_parameters
+
+        imported, structure, crack, options = self.model()
+        with tempfile.TemporaryDirectory() as directory:
+            result = solve(
+                imported, structure, [crack], options, Path(directory),
+                mechanics_formulation="experimental_amor",
+            )
+        self.assertEqual(result.report["mechanics_formulation"], "experimental_amor")
+        self.assertFalse(result.report["engineering_validated"])
+        self.assertLess(result.report["relative_force_balance_error"], 1e-6)
+        _, mu, bulk = elastic_parameters(
+            structure.material.youngs_modulus_pa, structure.material.poissons_ratio,
+        )
+        tensor_space = fem.functionspace(imported.domain, ("DG", 0, (3, 3)))
+        tensor = fem.Function(tensor_space)
+        tensor.interpolate(fem.Expression(
+            stress(result.displacement, result.damage, bulk, mu, crack.residual_stiffness),
+            tensor_space.element.interpolation_points,
+        ))
+        self.assertAlmostEqual(
+            result.report["raw_element_stress"]["maximum_principal_tensile_stress_pa"],
+            np.linalg.eigvalsh(tensor.x.array.reshape(-1, 3, 3))[:, -1].max(),
+        )
+
+    def test_reused_mechanics_problem_updates_loads_at_every_step(self):
+        from dolfinx.fem.petsc import LinearProblem
+
+        imported, structure, crack, options = self.model()
+        parameters = PhaseFieldParameters(
+            length_scale_m=crack.length_scale_m,
+            critical_energy_release_rate_j_m2=1e9,
+            internal_pressure_pa=0,
+            load_steps=3,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "phase_field_solver.LinearProblem", wraps=LinearProblem,
+        ) as constructor:
+            result = solve(imported, structure, [], options, Path(directory), parameters=parameters)
+        self.assertEqual(constructor.call_count, 1)
+        steps = result.report["steps"]
+        final_displacement = steps[-1]["maximum_displacement_m"]
+        self.assertGreater(final_displacement, 0)
+        for step in steps:
+            self.assertAlmostEqual(
+                step["maximum_displacement_m"] / final_displacement,
+                step["load_factor"], places=6,
+            )
+            for iteration in step["iterations"]:
+                self.assertLessEqual(
+                    iteration["mechanics_relative_true_residual"],
+                    options.mechanics_relative_tolerance,
+                )
+                self.assertLess(iteration["damage_solver"]["gradient_norm"], 1e-6)
+
     def test_initially_intact_baseline_evolves_damage_without_seeding_a_crack(self):
         imported, structure, crack, options = self.model()
         parameters = PhaseFieldParameters(
@@ -69,15 +153,19 @@ class DamPhaseFieldTests(unittest.TestCase):
         values = np.where(midpoints[:, 2] < 0.34, 1, 2).astype(np.int32)
         imported.cell_tags = mesh.meshtags(domain, dimension, cells, values)
         crack = replace(crack, centre_m=(0.5, 0.5, 0.6), length_scale_m=0.4)
-        with tempfile.TemporaryDirectory() as directory:
-            result = solve(imported, structure, [crack], options, Path(directory))
-        plinth_dofs = fem.locate_dofs_topological(
-            result.damage.function_space, dimension, imported.cell_tags.find(1),
-        )
-        self.assertGreater(len(plinth_dofs), 0)
-        np.testing.assert_array_equal(result.damage.x.array[plinth_dofs], 0)
-        self.assertGreater(result.damage.x.array.max(), 0)
-        self.assertEqual(result.report["damage_region_id"], 2)
+        for formulation, acceleration in (("hybrid", False), ("experimental_amor", True)):
+            with self.subTest(formulation=formulation), tempfile.TemporaryDirectory() as directory:
+                result = solve(
+                    imported, structure, [crack], options, Path(directory),
+                    mechanics_formulation=formulation, damage_acceleration=acceleration,
+                )
+                plinth_dofs = fem.locate_dofs_topological(
+                    result.damage.function_space, dimension, imported.cell_tags.find(1),
+                )
+                self.assertGreater(len(plinth_dofs), 0)
+                np.testing.assert_array_equal(result.damage.x.array[plinth_dofs], 0)
+                self.assertGreater(result.damage.x.array.max(), 0)
+                self.assertEqual(result.report["damage_region_id"], 2)
 
     def test_annular_sector_runs_real_phase_field_solver_and_writes_results(self):
         imported, structure, crack, options = self.model()

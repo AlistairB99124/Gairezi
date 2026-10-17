@@ -50,12 +50,22 @@ class StressRecoveryTests(unittest.TestCase):
         imported = import_structure(DamMeshTests().cube(), 1e-12)
         tensor = np.array([[2e6, 0.3e6, 0], [0.3e6, -3e6, 0], [0, 0, 1e6]])
         with tempfile.TemporaryDirectory() as temporary:
-            report = recover_stress(imported.domain, ufl.as_matrix(tensor.tolist()), Path(temporary))
+            report = recover_stress(
+                imported.domain, ufl.as_matrix(tensor.tolist()), Path(temporary),
+                sample_points={"centre": [0.5, 0.5, 0.5]},
+            )
         principal = np.linalg.eigvalsh(tensor)
         np.testing.assert_allclose(
             [report["maximum_principal_tensile_stress_pa"], report["maximum_principal_compressive_stress_pa"]],
             [principal[-1], principal[0]], rtol=1e-10,
         )
+        np.testing.assert_allclose(report["matched_point_stresses"]["centre"]["principal_stresses_pa"], principal)
+
+    def test_point_outside_mesh_is_not_reported_as_zero_stress(self):
+        imported = import_structure(DamMeshTests().cube(), 1e-12)
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "outside the mesh"):
+            recover_stress(imported.domain, ufl.Identity(3), Path(temporary),
+                           sample_points={"outside": [100, 100, 100]})
 
     def test_coincident_interface_nodes_do_not_share_recovered_stress(self):
         structure = DamMeshTests().cube()

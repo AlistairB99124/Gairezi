@@ -3,11 +3,26 @@ from pathlib import Path
 
 from dolfinx import fem, io
 from dolfinx.fem.petsc import LinearProblem
+from mpi4py import MPI
 import numpy as np
 import ufl
 
 
-def solve(imported, structure, options: dict, output: Path):
+def ground_supports(imported, structure):
+    """Retain explicit legacy split meshes; new bonded meshes have foundation only."""
+    supports = {1: structure.foundation_support}
+    legacy = imported.domain.comm.allreduce(len(imported.facet_tags.find(8)), op=MPI.SUM) > 0
+    if legacy:
+        supports[8] = structure.plinth_support
+    return {
+        tag: (support.spring_x_n_per_m3, support.spring_y_n_per_m3, support.spring_z_n_per_m3)
+        for tag, support in supports.items()
+    }, (
+        "legacy_split_grounded" if legacy else "bonded_intact_provisional"
+    )
+
+
+def solve(imported, structure, options: dict, output: Path, *, save_source_displacement: bool = True):
     domain = imported.domain
     space = fem.functionspace(domain, ("Lagrange", 1, (3,)))
     trial, test = ufl.TrialFunction(space), ufl.TestFunction(space)
@@ -23,10 +38,8 @@ def solve(imported, structure, options: dict, output: Path):
     ds = ufl.Measure("ds", domain=domain, subdomain_data=imported.facet_tags)
     dx = ufl.Measure("dx", domain=domain)
     a = ufl.inner(stress(trial), ufl.sym(ufl.grad(test))) * dx
-    springs = {}
-    for tag, support in ((1, structure.foundation_support), (8, structure.plinth_support)):
-        coefficients = (support.spring_x_n_per_m3, support.spring_y_n_per_m3, support.spring_z_n_per_m3)
-        springs[tag] = coefficients
+    springs, connection = ground_supports(imported, structure)
+    for tag, coefficients in springs.items():
         for component, stiffness in enumerate(coefficients):
             a += stiffness * trial[component] * test[component] * ds(tag)
     loads = structure.loads
@@ -35,7 +48,9 @@ def solve(imported, structure, options: dict, output: Path):
     normal = ufl.FacetNormal(domain)
     pressure_gradient = loads.water_density_kg_m3 * abs(loads.gravity_z_m_s2)
     water_gradient = loads.water_density_kg_m3 * abs(loads.gravity_z_m_s2)
-    tailwater_elevation = float(imported.points[:, 2].min()) + loads.tailwater_head_m
+    tailwater_elevation = float(domain.comm.allreduce(
+        domain.geometry.x[:, 2].min(), op=MPI.MIN,
+    )) + loads.tailwater_head_m
     pressures = {
         2: pressure_gradient * ufl.max_value(loads.overflow_head_m - z, 0),
         3: water_gradient * ufl.max_value(tailwater_elevation - z, 0),
@@ -47,35 +62,34 @@ def solve(imported, structure, options: dict, output: Path):
     problem = LinearProblem(
         a, L, petsc_options_prefix="dam_elastic_",
         petsc_options={
-            "ksp_type": "cg", "pc_type": "gamg", "ksp_rtol": options["relative_tolerance"],
+            "ksp_type": "cg", "pc_type": "gamg", "ksp_rtol": 0.1 * options["relative_tolerance"],
+            "ksp_norm_type": "unpreconditioned",
             "ksp_max_it": options["maximum_iterations"], "ksp_error_if_not_converged": True,
         },
     )
-    # AMG needs the six rigid-body modes of a 3-D elastic body.
-    from dolfinx import la
-    from petsc4py import PETSc
-    coordinates = space.tabulate_dof_coordinates()
-    modes = [la.vector(space.dofmap.index_map, bs=3) for _ in range(6)]
-    for mode in modes:
-        mode.array[:] = 0
-    for component in range(3):
-        modes[component].array[component::3] = 1
-    x, y, z_coord = coordinates.T
-    modes[3].array[0::3], modes[3].array[1::3] = -y, x
-    modes[4].array[0::3], modes[4].array[2::3] = z_coord, -x
-    modes[5].array[1::3], modes[5].array[2::3] = -z_coord, y
-    la.orthonormalize(modes)
-    vectors = [PETSc.Vec().createWithArray(mode.array, comm=domain.comm) for mode in modes]
-    nullspace = PETSc.NullSpace().create(vectors=vectors, comm=domain.comm)
+    from elasticity_solver import rigid_body_near_nullspace
+
+    nullspace = rigid_body_near_nullspace(space)
     problem.A.setNearNullSpace(nullspace)
     displacement = problem.solve()
     displacement.x.scatter_forward()
     reason = problem.solver.getConvergedReason()
     if reason <= 0:
         raise RuntimeError(f"Elastostatic solve failed: PETSc reason {reason}")
+    residual = problem.b.duplicate()
+    try:
+        problem.A.mult(problem.x, residual)
+        residual.axpy(-1, problem.b)
+        rhs_norm = float(problem.b.norm())
+        true_residual = float(residual.norm())
+        relative_residual = true_residual / rhs_norm if rhs_norm else true_residual
+    finally:
+        residual.destroy()
+    if not np.isfinite(relative_residual) or relative_residual > options["relative_tolerance"]:
+        raise RuntimeError(f"Elastostatic true residual {relative_residual} exceeds tolerance")
 
     def integral(expression):
-        return float(fem.assemble_scalar(fem.form(expression)))
+        return float(domain.comm.allreduce(fem.assemble_scalar(fem.form(expression)), op=MPI.SUM))
 
     applied = np.asarray([
         integral(gravity[i] * dx) + sum(integral(-p * normal[i] * ds(tag)) for tag, p in pressures.items())
@@ -96,26 +110,47 @@ def solve(imported, structure, options: dict, output: Path):
     sigma.interpolate(fem.Expression(stress(displacement), tensor_space.element.interpolation_points))
     with io.VTKFile(domain.comm, output / "stress.pvd", "w") as writer:
         writer.write_function(sigma)
-    local_source = imported.domain.geometry.input_global_indices
-    source_displacement = np.empty((len(imported.points), 3))
-    geometry_nodes = domain.geometry.dofmaps[0]
-    field_nodes = space.dofmap.list.reshape(-1, 4)
-    source_displacement[local_source[geometry_nodes]] = displacement.x.array.reshape(-1, 3)[field_nodes]
-    np.savez(output / "nodal_displacement.npz", points=imported.points, displacement=source_displacement)
+    source_displacement = displacement.x.array.reshape(-1, 3)
+    if save_source_displacement:
+        if domain.comm.size != 1:
+            raise ValueError("Source-order displacement archive requires a serial mesh")
+        local_source = imported.domain.geometry.input_global_indices
+        source_displacement = np.empty((len(imported.points), 3))
+        geometry_nodes = domain.geometry.dofmaps[0]
+        field_nodes = space.dofmap.list.reshape(-1, 4)
+        source_displacement[local_source[geometry_nodes]] = displacement.x.array.reshape(-1, 3)[field_nodes]
+        np.savez(output / "nodal_displacement.npz", points=imported.points, displacement=source_displacement)
     report = {
         "petsc_convergence_reason": reason, "iterations": problem.solver.getIterationNumber(),
         "residual_norm": problem.solver.getResidualNorm(),
+        "relative_true_residual": relative_residual,
         "applied_force_n": applied.tolist(), "ground_spring_reactions_n": reactions,
         "force_imbalance_n": imbalance.tolist(), "relative_force_balance_error": relative_balance,
-        "maximum_displacement_m": float(np.linalg.norm(source_displacement, axis=1).max()),
-        "wall_plinth_model": "wall-side grounded spring, exactly as current Elmer SIF; not interbody coupling",
+        "maximum_displacement_m": float(domain.comm.allreduce(
+            np.linalg.norm(source_displacement, axis=1).max(), op=MPI.MAX,
+        )),
+        "mesh_nodes": int(space.dofmap.index_map.size_global),
+        "mesh_cells": int(domain.topology.index_map(3).size_global),
+        "wall_plinth_connection": connection,
+        "wall_plinth_model": (
+            "legacy wall-side grounded spring; not interbody coupling"
+            if connection == "legacy_split_grounded" else
+            "provisional fully bonded wall/plinth; foundation springs only; no opening/sliding"
+        ),
+        "inactive_inputs": (
+            ["geometry.plinth.support: no wall-ground spring in the bonded reference"]
+            if connection == "bonded_intact_provisional" else []
+        ),
     }
     from stress_recovery import recover_stress
 
-    raw_principal = np.linalg.eigvalsh(sigma.x.array.reshape(-1, 3, 3))
+    owned_cells = domain.topology.index_map(3).size_local
+    raw_principal = np.linalg.eigvalsh(
+        sigma.x.array.reshape(-1, 3, 3)[tensor_space.dofmap.list[:owned_cells, 0]],
+    )
     report["raw_element_stress"] = {
-        "maximum_principal_tensile_stress_pa": float(raw_principal[:, -1].max()),
-        "maximum_principal_compressive_stress_pa": float(raw_principal[:, 0].min()),
+        "maximum_principal_tensile_stress_pa": float(domain.comm.allreduce(raw_principal[:, -1].max(), op=MPI.MAX)),
+        "maximum_principal_compressive_stress_pa": float(domain.comm.allreduce(raw_principal[:, 0].min(), op=MPI.MIN)),
     }
     report.update(recover_stress(domain, stress(displacement), output))
     return source_displacement, sigma, report

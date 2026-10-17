@@ -44,6 +44,10 @@ def solve(
     output: Path,
     *,
     parameters: PhaseFieldParameters | None = None,
+    mechanics_formulation: str = "hybrid",
+    damage_acceleration: bool = False,
+    final_load_substeps: int = 1,
+    refined_baseline: bool = False,
 ) -> PhaseFieldResult:
     """Run the configured dam phase-field simulation on an imported/refined mesh."""
     if not specifications and parameters is None:
@@ -51,6 +55,42 @@ def solve(
     first = parameters if parameters is not None else specifications[0]
     placement = validate_crack_placement(imported, specifications) if specifications else []
     domain = imported.domain
+    baseline_report = None
+    def record_stage(stage):
+        if domain.comm.rank == 0:
+            output.mkdir(parents=True, exist_ok=True)
+            temporary = output / "analysis_stage.tmp.json"
+            temporary.write_text(json.dumps({"stage": stage}) + "\n")
+            temporary.replace(output / "analysis_stage.json")
+
+    if refined_baseline:
+        from dam_elasticity import solve as solve_elastic
+
+        baseline_output = output / "refined_baseline"
+        baseline_output.mkdir(parents=True, exist_ok=True)
+        record_stage("fenicsx_refined_baseline")
+        if domain.comm.rank == 0:
+            print("=== FEniCSx refined-mesh uncracked baseline (before cracking) ===", flush=True)
+        _, _, baseline_report = solve_elastic(
+            imported, structure,
+            {"relative_tolerance": options.mechanics_relative_tolerance,
+             "maximum_iterations": options.mechanics_maximum_iterations},
+            baseline_output, save_source_displacement=False,
+        )
+        baseline_report.update(
+            scenario_name="Refined_NoPhase",
+            model="linear isotropic elasticity; zero damage; same mesh as crack scenario",
+            configured_tensile_strength_pa=structure.material.tensile_strength_pa,
+            crack_surface_measure_m2=0.0,
+            engineering_validated=False,
+            comparison_basis="identical mesh, material, external loads and spring supports; no crack pressure",
+        )
+        if domain.comm.rank == 0:
+            (baseline_output / "baseline_report.json").write_text(
+                json.dumps(baseline_report, indent=2, allow_nan=False) + "\n",
+            )
+            print("=== Refined-mesh baseline completed; starting FEniCSx cracking ===", flush=True)
+        record_stage("cracking")
     dx = ufl.Measure("dx", domain=domain)
     ds = ufl.Measure("ds", domain=domain, subdomain_data=imported.facet_tags)
     loads = structure.loads
@@ -59,25 +99,16 @@ def solve(
     z = ufl.SpatialCoordinate(domain)[2]
     normal = ufl.FacetNormal(domain)
     pressure_gradient = loads.water_density_kg_m3 * abs(loads.gravity_z_m_s2)
-    minimum_elevation = float(domain.geometry.x[:, 2].min())
+    minimum_elevation = float(domain.comm.allreduce(domain.geometry.x[:, 2].min(), op=MPI.MIN))
     tailwater_elevation = minimum_elevation + loads.tailwater_head_m
     pressures = {
         2: pressure_gradient * ufl.max_value(loads.overflow_head_m - z, 0),
         3: pressure_gradient * ufl.max_value(tailwater_elevation - z, 0),
         4: pressure_gradient * loads.overflow_head_m,
     }
-    springs = {
-        1: (
-            structure.foundation_support.spring_x_n_per_m3,
-            structure.foundation_support.spring_y_n_per_m3,
-            structure.foundation_support.spring_z_n_per_m3,
-        ),
-        8: (
-            structure.plinth_support.spring_x_n_per_m3,
-            structure.plinth_support.spring_y_n_per_m3,
-            structure.plinth_support.spring_z_n_per_m3,
-        ),
-    }
+    from dam_elasticity import ground_supports
+
+    springs, _ = ground_supports(imported, structure)
 
     def support_form(trial, test):
         result = 0
@@ -111,15 +142,34 @@ def solve(
         damage_cell_tags=imported.cell_tags,
         damage_region_id=2,
         parameters=parameters,
+        mechanics_formulation=mechanics_formulation,
+        damage_acceleration=damage_acceleration,
+        final_load_substeps=final_load_substeps,
     )
 
-    lam, mu, _ = elastic_parameters(material.youngs_modulus_pa, material.poissons_ratio)
+    lam, mu, bulk = elastic_parameters(material.youngs_modulus_pa, material.poissons_ratio)
+    stress_expression = (
+        degradation(result.damage, first.residual_stiffness)
+        * undamaged_stress(result.displacement, lam, mu)
+    )
+    if mechanics_formulation == "experimental_amor":
+        from compression_preserving import stress as compression_preserving_stress
+
+        stress_expression = compression_preserving_stress(
+            result.displacement, result.damage, bulk, mu, first.residual_stiffness,
+        )
+    elif mechanics_formulation == "experimental_spectral":
+        from spectral_split import SpectralSplit
+
+        spectral = SpectralSplit(
+            result.displacement, result.damage, bulk, mu, first.residual_stiffness,
+        )
+        stress_expression = spectral.stress
     tensor_space = fem.functionspace(domain, ("DG", 0, (3, 3)))
     stress = fem.Function(tensor_space, name="degraded_stress_pa")
     stress.interpolate(
         fem.Expression(
-            degradation(result.damage, first.residual_stiffness)
-            * undamaged_stress(result.displacement, lam, mu),
+            stress_expression,
             tensor_space.element.interpolation_points,
         )
     )
@@ -175,7 +225,9 @@ def solve(
         first.critical_energy_release_rate_j_m2,
         length_scale,
     )
-    stress_values = stress.x.array.reshape(-1, 3, 3)
+    owned_cells = domain.topology.index_map(domain.topology.dim).size_local
+    owned_stress_dofs = tensor_space.dofmap.list[:owned_cells, 0]
+    stress_values = stress.x.array.reshape(-1, 3, 3)[owned_stress_dofs]
     eigenvalues = np.linalg.eigvalsh(stress_values)
     maximum_tensile_stress = float(
         domain.comm.allreduce(eigenvalues[:, -1].max(), op=MPI.MAX)
@@ -193,7 +245,7 @@ def solve(
             "force_imbalance_n": imbalance.tolist(),
             "relative_force_balance_error": relative_balance,
             "maximum_degraded_stress_pa": float(
-                domain.comm.allreduce(np.abs(stress.x.array).max(), op=MPI.MAX)
+                domain.comm.allreduce(np.abs(stress_values).max(), op=MPI.MAX)
             ),
             "maximum_principal_tensile_stress_pa": maximum_tensile_stress,
             "maximum_principal_compressive_stress_pa": maximum_compressive_stress,
@@ -205,7 +257,11 @@ def solve(
                 "diffuse pressure force -p*grad(alpha)" if pressure_value else "disabled (0 Pa)"
             ),
             "limitations": [
-                "Hybrid AT2 degrades full stiffness but only tensile energy drives damage.",
+                (
+                    "Hybrid AT2 degrades full stiffness but only tensile energy drives damage."
+                    if mechanics_formulation == "hybrid"
+                    else "Experimental Amor mechanics preserves negative volumetric energy only; shear remains degraded."
+                ),
                 "No unilateral crack-face contact or friction is enforced.",
                 "Diffuse pressure is an energy-consistent regularised traction, not an explicit face load.",
                 "Convergence and successful execution do not constitute engineering validation.",
@@ -221,10 +277,17 @@ def solve(
     }
     result.report.update(recover_stress(
         domain,
-        degradation(result.damage, first.residual_stiffness)
-        * undamaged_stress(result.displacement, lam, mu),
+        stress_expression,
         output,
+        sample_points={
+            "refined_baseline_tensile_peak": baseline_report["stress_recovery"]["tensile_peak_centroid_xyz_m"],
+            "refined_baseline_compressive_peak": baseline_report["stress_recovery"]["compressive_peak_centroid_xyz_m"],
+        } if baseline_report is not None else None,
     ))
+    result.report["mesh_nodes"] = int(result.damage.function_space.dofmap.index_map.size_global)
+    result.report["mesh_cells"] = int(domain.topology.index_map(3).size_global)
+    if baseline_report is not None:
+        result.report["refined_mesh_baseline"] = baseline_report
     if domain.comm.rank == 0:
         (output / "phase_field_report.json").write_text(
             json.dumps(result.report, indent=2, allow_nan=False) + "\n"
