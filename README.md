@@ -4,6 +4,111 @@ This repository is the clean v2 working copy for the Gairedzi dam study.
 
 The purpose of this repo is to separate the newer plinth-based geometry work from the earlier baseline model and keep the design assumptions explicit.
 
+## Three-body bedrock geometry review (Elmer scope)
+
+**The standard combined solver result contains only wall and plinth.** Its
+bedrock support is a spring boundary condition, not a visible rock volume.
+Changing the bedrock contours does not add a rock body to that solve or its
+stress CSV. Do not use the geometry preview as a bedrock stress result.
+
+Run **Elmer: Preview wall, plinth and bedrock (geometry only)** from VS Code,
+or generate the standalone ParaView geometry preview in PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m Elmer.bedrock_preview --output "$env:LOCALAPPDATA\Lamb\bedrock-preview"
+```
+
+Open `three_body_geometry.pvtu` and colour by cell `RegionId`: 1 = plinth,
+2 = wall, 6 = bedrock. All three adjacent VTU files are required. Concrete
+uses `material.concrete`; rock uses `material.bedrock` from `config.json`.
+The rock starts from the approved 80 m-survey chord section, extruded through
+the concrete's upstream/downstream bounds. Its top
+matches the existing plinth underside exactly at the seat, with a triangulated
+transition to the projected canyon profile at the outer perimeter. By default
+the rock uses `geometry.bedrock.domain` from `config.json`:
+
+| Domain setting | Current 2H candidate |
+|---|---:|
+| `stream_margin_m` | 58 m upstream and downstream of the concrete's projected depth bounds |
+| `bank_margin_m` | 58 m beyond each end of the survey/concrete cross-valley span |
+| `bottom_z_m` | -87 m: 58 m below the deepest contact at -29 m |
+
+These are explicit dimensions based on H = 29 m (crest to deepest dam/rock
+contact), not a claim of compliance with a universal design rule. They do not
+automatically change if the contours are edited. A domain-size and boundary-condition
+sensitivity study is still required. Beyond the survey endpoints, the bank terrain
+is assumed flat at the end survey heights; no additional site geology is implied.
+The canyon section is held constant upstream/downstream outside the seat transition.
+The current bedrock profile reaches z = +5 m
+at chainages 0 and 180, above the z = +3 m surcharge water surface, while the
+plinth still ends at chainages 6 and 174. The diagnostic below accepts the same
+options. `--stream-margin-m`, `--bank-margin-m` and `--bottom-z-m` override the
+configured dimensions for either command without rewriting the configuration.
+Configurations without the optional `domain` section retain the legacy 20 m
+stream margins, 5 m bank margins and -31 m bottom.
+
+**This is geometry only, not an Elmer solution or a connected analysis mesh.**
+The bedrock uses `geometry.global_element_size_m`, currently **0.5 m nominal
+spacing**, for parallel surface rows and vertical layer spacing. This is a length,
+not a target volume of 0.5 m³: a 0.5 m-sided cube is 0.125 m³, and triangular
+wedges have different volumes. Exterior rows run parallel to the local cross-valley
+X direction (the `across_unit_vector_xy` in the geometry report), not ParaView's
+global X axis. The terrain is resampled onto a regular grid rather than repeatedly
+subdividing the original fan triangles. The existing plinth seat retains its exact
+nodes and faces; a short unstructured transition joins it to the parallel rows.
+The spacing is nominal and interface alignment takes priority. Triangular cells
+still have diagonal edges. Resampling retains elevations of the original terrain
+at the new nodes, rather than applying a physical terrain-smoothing filter.
+For the configured domain, retain fine horizontal spacing over the projected
+plinth bounding box plus 5 m, and fine vertical spacing down to 5 m below the
+lowest rock-top node. Beyond that near field, axis steps grow by a factor of
+1.2 to at most 5 m (or the configured spacing if larger). Rows remain parallel
+while their spacing varies. The seat is never coarsened. This is a meshing
+policy, not geological data or a mesh-convergence result.
+Layers close at the terrain with pyramids and tetrahedra instead of collapsing
+elements or subdividing shallow rock into full-height layer counts.
+The preview uses the confirmed 80 m
+survey reference to convert chainage to angle for concrete, retaining configured
+physical radii, thicknesses, elevations and topology. This differs from the legacy
+production builder's 78 m chainage reference. Review `geometry_review.json` for
+the exact seat-match error, body counts, volume and extent. A matching geometric
+surface is not an assigned contact/bond law or a solver-ready conforming mesh.
+The interface behaviour and outer rock restraints must be agreed before
+static-solver integration. The optional `bedrock_top_cross_section` draft is
+validated and retained, but not used as a second source of survey data.
+No API, FEniCSx, existing support or production solver changes are made by this
+preview command.
+
+### Isolated bonded three-body static diagnostic
+
+```powershell
+.\.venv\Scripts\python.exe -m Elmer.three_body_diagnostic --output "$env:LOCALAPPDATA\Lamb\three-body-diagnostic-new"
+```
+
+Use a new empty directory. This runs four MPI ranks of Elmer with concrete
+and rock self-weight and the existing concrete water loads. The wall/plinth
+and plinth/rock interfaces are bonded for this diagnostic only; the rock bottom
+at the configured bottom (currently z = -87 m) is fixed, rock sides are free,
+and uplift is zero. Existing
+grounded springs are not active. The concrete tailwater datum is preserved.
+The rock uses the same configured domain and graded mesh as the preview, rather
+than four coarse vertical layers. Enlarging the domain does not validate the
+fixed-bottom/free-side assumptions. This is not a mesh-converged engineering result.
+It does not implement the selected opening/sliding law.
+
+The solved PVTU is `results/three_body_diagnostic_t0001.pvtu`.
+ParaView's `pvpython` must be available on PATH or in its standard Windows
+installation directory for body attribution. That step uses VTK to preserve
+Elmer field arrays, removes auxiliary surface cells, and matches volume cells
+to the source mesh after subtracting displacement from Elmer's deformed output
+coordinates. Displacement and stress values are not recomputed.
+Its cell `GeometryIds` identifies 1 = plinth, 2 = wall, 3 = bedrock.
+Unlike the preview's region 6, solver body IDs are contiguous to prevent
+ElmerGrid renumbering. `diagnostic.json`, the configuration snapshot, SIF,
+mesh and `solver.log` record the run. The development solve has a 480-second
+limit and terminates its own process tree if exceeded; this does not set an
+app/API timeout or change the production workflow.
+
 ## Python environment setup
 
 The local environment needs NumPy, Matplotlib, and meshio. It does not require

@@ -49,13 +49,27 @@ def load_contours(path: Path, crest_raise_m: float = 0.0) -> list[ContourPoint]:
         raise ValueError("Crest raise must be finite")
     geometry = load_config(path)["geometry"]
     rows = geometry["plinth"]["contours"]
-    bedrock = {float(row["chainage"]): float(row["height"]) for row in geometry["bedrock"]["contours"]}
-    if len(bedrock) != len(geometry["bedrock"]["contours"]) or set(bedrock) != {float(row["chainage"]) for row in rows}:
-        raise ValueError("Plinth and bedrock contours must have matching unique chainages")
+    bedrock_rows = geometry["bedrock"]["contours"]
+    bedrock = [
+        (float(row["chainage"]), float(row["height"])) for row in bedrock_rows
+    ]
+    plinth_chainages = [float(row["chainage"]) for row in rows]
+    if bedrock[0][0] > plinth_chainages[0] or bedrock[-1][0] < plinth_chainages[-1]:
+        raise ValueError("Bedrock contours must cover the full plinth chainage range")
+
+    def bedrock_elevation(chainage_m: float) -> float:
+        for (left_chainage, left_height), (right_chainage, right_height) in zip(
+            bedrock, bedrock[1:],
+        ):
+            if left_chainage <= chainage_m <= right_chainage:
+                fraction = (chainage_m - left_chainage) / (right_chainage - left_chainage)
+                return left_height + fraction * (right_height - left_height)
+        raise ValueError(f"Plinth chainage {chainage_m:g} is outside the bedrock contour range")
+
     contours = [
         ContourPoint(
             float(row["chainage"]),
-            bedrock[float(row["chainage"])] - crest_raise_m,
+            bedrock_elevation(float(row["chainage"])) - crest_raise_m,
             float(row["height"]) - crest_raise_m,
         )
         for row in rows

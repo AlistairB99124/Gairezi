@@ -62,6 +62,7 @@ def convert_with_elmergrid(
     mesh_path: Path,
     output_dir: Path,
     partition_count: int | None = None,
+    partition_options: tuple[str, ...] = (),
 ) -> bool:
     executable = shutil.which("ElmerGrid")
     if executable is None:
@@ -70,7 +71,7 @@ def convert_with_elmergrid(
         shutil.rmtree(output_dir)
     command = [executable, "14", "2", str(mesh_path.resolve()), "-autoclean"]
     if partition_count is not None:
-        command.extend(["-metiskway", str(partition_count)])
+        command.extend(["-metiskway", str(partition_count), *partition_options])
     # ElmerGrid truncates absolute -out paths at a dotted ancestor such as .copilot.
     command.extend(["-out", output_dir.name])
     subprocess.run(

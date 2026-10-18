@@ -13,6 +13,7 @@ from Elmer.model_config import (
     load_config,
     validate_config,
 )
+from Elmer.regions.plinth import load_contours
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -29,11 +30,36 @@ class ModelConfigTests(unittest.TestCase):
         from_object = load_config(copy.deepcopy(self.payload))
         self.assertEqual(from_file, from_object)
 
+    def test_bedrock_domain_is_optional_and_validated(self):
+        domain = self.payload["geometry"]["bedrock"]["domain"]
+        self.assertEqual(domain, {"stream_margin_m": 58., "bank_margin_m": 58., "bottom_z_m": -87.})
+        domain["stream_margin_m"] = -1.
+        domain["bank_margin_m"] = True
+        domain["bottom_z_m"] = -29.
+        with self.assertRaises(ConfigurationValidationError) as context:
+            validate_config(self.payload)
+        paths = {issue.path for issue in context.exception.issues}
+        self.assertTrue({
+            "geometry.bedrock.domain.stream_margin_m",
+            "geometry.bedrock.domain.bank_margin_m",
+            "geometry.bedrock.domain.bottom_z_m",
+        } <= paths)
+        del self.payload["geometry"]["bedrock"]["domain"]
+        self.assertIs(validate_config(self.payload), self.payload)
     def test_validation_does_not_rewrite_configuration_values(self):
         original = copy.deepcopy(self.payload)
         validated = validate_config(self.payload)
         self.assertIs(validated, self.payload)
         self.assertEqual(self.payload, original)
+
+    def test_draft_bedrock_section_accepts_placeholder_but_validates_points(self):
+        bedrock = self.payload["geometry"]["bedrock"]
+        bedrock["bedrock_top_cross_section"] = [{"chainage": 6, "height": 0}]
+        self.assertIs(validate_config(self.payload), self.payload)
+        bedrock["bedrock_top_cross_section"][0]["height"] = float("nan")
+        self.assert_invalid_at(
+            self.payload, "geometry.bedrock.bedrock_top_cross_section[0].height",
+        )
 
     def test_file_loader_accepts_explicit_configuration_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -67,18 +93,35 @@ class ModelConfigTests(unittest.TestCase):
         self.assertIn("geometry.wall.radial_width_m", paths)
         self.assertIn("geometry.plinth.upstream_radius_m", paths)
 
-    def test_contours_must_have_matching_increasing_stations_and_bedrock_below(self):
-        self.payload["geometry"]["bedrock"]["contours"][1]["chainage"] = 38
+    def test_contours_must_increase_and_bedrock_must_remain_below_plinth(self):
+        self.payload["geometry"]["bedrock"]["contours"][2]["chainage"] = 38
         self.payload["geometry"]["plinth"]["contours"][2]["chainage"] = 37
         with self.assertRaises(ConfigurationValidationError) as context:
             validate_config(self.payload)
         paths = {issue.path for issue in context.exception.issues}
         self.assertIn("geometry.plinth.contours", paths)
-        self.assertIn("geometry.bedrock.contours", paths)
+        self.assertNotIn("geometry.bedrock.contours", paths)
 
         self.payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        self.payload["geometry"]["bedrock"]["contours"][0]["height"] = 1
-        self.assert_invalid_at(self.payload, "geometry.bedrock.contours[0].height")
+        self.payload["geometry"]["bedrock"]["contours"][1]["height"] = 1
+        with self.assertRaises(ConfigurationValidationError) as context:
+            validate_config(self.payload)
+        paths = {issue.path for issue in context.exception.issues}
+        self.assertIn("geometry.bedrock.contours[1].height", paths)
+
+        self.payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        self.payload["geometry"]["bedrock"]["contours"][0]["chainage"] = 7
+        self.assert_invalid_at(self.payload, "geometry.bedrock.contours")
+
+    def test_extended_bedrock_profile_loads_and_interpolates_to_plinth_stations(self):
+        self.assertIs(validate_config(self.payload), self.payload)
+        contours = load_contours(CONFIG_PATH)
+        self.assertEqual(
+            [point.chainage_m for point in contours],
+            [row["chainage"] for row in self.payload["geometry"]["plinth"]["contours"]],
+        )
+        self.assertEqual(contours[0].bedrock_z_m, 0)
+        self.assertEqual(contours[-1].bedrock_z_m, 0)
 
     def test_support_requires_expected_material_model_and_xyz_springs(self):
         del self.payload["geometry"]["plinth"]["support"]["spring_n_per_m3"]["y"]
@@ -88,6 +131,21 @@ class ModelConfigTests(unittest.TestCase):
         paths = {issue.path for issue in context.exception.issues}
         self.assertIn("geometry.plinth.support.spring_n_per_m3.y", paths)
         self.assertIn("geometry.bedrock.support.model", paths)
+
+    def test_interface_springs_require_known_model_and_positive_stiffness(self):
+        interfaces = self.payload["interfaces"]
+        self.assertEqual(interfaces["wall_plinth"]["stiffness_n_per_m3"], 7e11)
+        self.assertEqual(interfaces["plinth_bedrock"]["stiffness_n_per_m3"], 7e11)
+        interfaces["wall_plinth"]["stiffness_n_per_m3"] = 0
+        interfaces["plinth_bedrock"]["model"] = "friction"
+        with self.assertRaises(ConfigurationValidationError) as context:
+            validate_config(self.payload)
+        paths = {issue.path for issue in context.exception.issues}
+        self.assertIn("interfaces.wall_plinth.stiffness_n_per_m3", paths)
+        self.assertIn("interfaces.plinth_bedrock.model", paths)
+
+        del self.payload["interfaces"]
+        self.assertIs(validate_config(self.payload), self.payload)
 
     def test_output_flags_must_be_booleans(self):
         self.payload["outputs"]["max_displacement"] = 1

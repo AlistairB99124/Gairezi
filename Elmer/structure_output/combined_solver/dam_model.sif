@@ -1,3 +1,5 @@
+! Provisional bonded wall/plinth: shared nodes, no joint opening/sliding.
+! Foundation support only; geometry.plinth.support is inactive.
 Header
     CHECK KEYWORDS Warn
     Mesh DB "mesh" "/"
@@ -99,10 +101,3 @@ Boundary Condition 4
     Normal Force = Real -29430
 End
 
-Boundary Condition 5
-    Name = "WallPlinthSpring"
-    Target Boundaries(1) = 8
-    Spring 1 = Real 1250000000
-    Spring 2 = Real 1250000000
-    Spring 3 = Real 3000000000
-End

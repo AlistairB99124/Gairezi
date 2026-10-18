@@ -23,7 +23,10 @@ CONFIG_KEYS = {
     },
     "outputs": {"max_displacement", "max_tensile_stress", "cracking_risk"},
 }
-OPTIONAL_CONFIG_KEYS = {"crack_simulations"}
+OPTIONAL_CONFIG_KEYS = {"crack_simulations", "interfaces"}
+INTERFACE_NAMES = {"wall_plinth", "plinth_bedrock"}
+INTERFACE_KEYS = {"model", "stiffness_n_per_m3"}
+INTERFACE_MODELS = {"isotropic_linear_spring"}
 MATERIAL_KEYS = {"density", "youngs_modulus", "poisson_ratio", "tensile_strength_pa"}
 RADIUS_KEYS = {"radial_width_m", "upstream_radius_m", "centerline_radius_m", "downstream_radius_m"}
 SUPPORT_KEYS = {"model", "material", "spring_n_per_m3"}
@@ -181,7 +184,8 @@ class _ConfigValidator:
             if name == "bedrock":
                 self.warn(
                     path,
-                    "is retained in configuration but no bedrock volume is currently meshed; "
+                    "is retained in configuration; the bedrock volume is generated only for "
+                    "the unsolved geometry preview and is not part of the solver mesh, so "
                     "these properties do not affect the analysis.",
                 )
 
@@ -189,17 +193,19 @@ class _ConfigValidator:
         self,
         geometry: Mapping[str, object] | None,
         region: str,
+        key: str = "contours",
+        minimum_stations: int = 2,
     ) -> list[tuple[float, float]] | None:
-        path = f"geometry.{region}.contours"
+        path = f"geometry.{region}.{key}"
         region_values = geometry.get(region) if geometry is not None else None
         if not isinstance(region_values, dict):
             return None
-        rows = region_values.get("contours")
+        rows = region_values.get(key)
         if not isinstance(rows, list):
             self.issue(path, "must be an array")
             return None
-        if len(rows) < 2:
-            self.issue(path, "must contain at least two stations")
+        if len(rows) < minimum_stations:
+            self.issue(path, f"must contain at least {minimum_stations} stations")
         stations: list[tuple[float, float]] = []
         for index, row in enumerate(rows):
             row_path = f"{path}[{index}]"
@@ -353,7 +359,26 @@ class _ConfigValidator:
                 geometry.get("bedrock"),
                 "geometry.bedrock",
                 {"contours", "support"},
+                {"bedrock_top_cross_section", "domain"},
             )
+            domain_bottom = None
+            if bedrock is not None and "domain" in bedrock:
+                domain = self.object(
+                    bedrock["domain"], "geometry.bedrock.domain",
+                    {"stream_margin_m", "bank_margin_m", "bottom_z_m"},
+                )
+                for key in ("stream_margin_m", "bank_margin_m"):
+                    self.field_number(domain, key, "geometry.bedrock.domain", nonnegative=True)
+                domain_bottom = self.field_number(domain, "bottom_z_m", "geometry.bedrock.domain")
+            if bedrock is not None and "bedrock_top_cross_section" in bedrock:
+                self.validate_contours(
+                    geometry, "bedrock", "bedrock_top_cross_section", minimum_stations=1,
+                )
+                self.warn(
+                    "geometry.bedrock.bedrock_top_cross_section",
+                    "is a draft profile, not an active solver input. The geometry preview "
+                    "derives its section from geometry.bedrock.contours.",
+                )
             wall_upstream, wall_downstream = self.validate_radii(wall, "geometry.wall")
             plinth_upstream, plinth_downstream = self.validate_radii(plinth, "geometry.plinth")
             if wall is not None:
@@ -381,17 +406,62 @@ class _ConfigValidator:
             self.validate_support(geometry, "bedrock")
             plinth_stations = self.validate_contours(geometry, "plinth")
             bedrock_stations = self.validate_contours(geometry, "bedrock")
+            if domain_bottom is not None and bedrock_stations:
+                if domain_bottom >= min(height for _, height in bedrock_stations):
+                    self.issue(
+                        "geometry.bedrock.domain.bottom_z_m",
+                        "must be below every bedrock contour elevation",
+                    )
             if plinth_stations is not None and bedrock_stations is not None:
-                plinth_by_chainage = {chainage: height for chainage, height in plinth_stations}
-                bedrock_by_chainage = {chainage: height for chainage, height in bedrock_stations}
-                if plinth_by_chainage.keys() != bedrock_by_chainage.keys():
-                    self.issue("geometry.bedrock.contours", "must use the same chainages as geometry.plinth.contours")
-                else:
-                    for index, (chainage, bedrock_height) in enumerate(bedrock_stations):
-                        if bedrock_height > plinth_by_chainage[chainage]:
+                plinth_start, plinth_end = plinth_stations[0][0], plinth_stations[-1][0]
+                bedrock_start, bedrock_end = bedrock_stations[0][0], bedrock_stations[-1][0]
+                if bedrock_start > plinth_start or bedrock_end < plinth_end:
+                    self.issue(
+                        "geometry.bedrock.contours",
+                        "must cover the full chainage range of geometry.plinth.contours",
+                    )
+                elif all(
+                    left[0] < right[0]
+                    for stations in (plinth_stations, bedrock_stations)
+                    for left, right in zip(stations, stations[1:])
+                ):
+                    def interpolate(
+                        stations: list[tuple[float, float]], chainage: float,
+                    ) -> float:
+                        for (left_chainage, left_height), (right_chainage, right_height) in zip(
+                            stations, stations[1:],
+                        ):
+                            if left_chainage <= chainage <= right_chainage:
+                                fraction = (
+                                    (chainage - left_chainage)
+                                    / (right_chainage - left_chainage)
+                                )
+                                return left_height + fraction * (right_height - left_height)
+                        raise ValueError(f"Chainage {chainage:g} is outside the contour range")
+
+                    check_stations = sorted({
+                        chainage for chainage, _ in plinth_stations
+                    } | {
+                        chainage for chainage, _ in bedrock_stations
+                        if plinth_start <= chainage <= plinth_end
+                    })
+                    for chainage in check_stations:
+                        if interpolate(bedrock_stations, chainage) > interpolate(plinth_stations, chainage):
+                            bedrock_index = next(
+                                (
+                                    index for index, (station, _) in enumerate(bedrock_stations)
+                                    if station == chainage
+                                ),
+                                None,
+                            )
+                            path = (
+                                f"geometry.bedrock.contours[{bedrock_index}].height"
+                                if bedrock_index is not None
+                                else "geometry.bedrock.contours"
+                            )
                             self.issue(
-                                f"geometry.bedrock.contours[{index}].height",
-                                "must not be above the plinth elevation at the same chainage",
+                                path,
+                                "must not be above the plinth elevation within their shared chainage range",
                             )
 
         self.validate_material(self.object(root.get("material"), "material", CONFIG_KEYS["material"]))
@@ -430,7 +500,29 @@ class _ConfigValidator:
                 )
         if "crack_simulations" in root:
             self.validate_cracks(root["crack_simulations"])
+        if "interfaces" in root:
+            self.validate_interfaces(root["interfaces"])
         return self.issues
+
+    def validate_interfaces(self, value: object) -> None:
+        # Joint springs: traction per unit relative displacement (N/m^3), the
+        # same in every direction. Only the three-body diagnostic reads them.
+        interfaces = self.object(value, "interfaces", INTERFACE_NAMES)
+        if interfaces is None:
+            return
+        for name in sorted(INTERFACE_NAMES & interfaces.keys()):
+            path = f"interfaces.{name}"
+            interface = self.object(interfaces[name], path, INTERFACE_KEYS)
+            if interface is None:
+                continue
+            if "model" in interface and interface["model"] not in INTERFACE_MODELS:
+                self.issue(f"{path}.model", f"must be one of {sorted(INTERFACE_MODELS)}")
+            self.field_number(interface, "stiffness_n_per_m3", path, positive=True)
+        self.warn(
+            "interfaces",
+            "is used only by the Elmer three-body diagnostic; the submitted "
+            "Elmer and FEniCSx analyses still bond the joints.",
+        )
 
 
 def validate_config(payload: object) -> dict[str, object]:

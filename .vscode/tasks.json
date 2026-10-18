@@ -101,7 +101,28 @@
         "panel": "dedicated",
         "clear": true
       },
-      "detail": "Builds the combined mesh, runs the Elmer stress solver, and writes the result VTU into Elmer/structure_output/combined_solver/results."
+      "detail": "Solves the wall and plinth with bedrock foundation springs, not a bedrock volume. Writes results into Elmer/structure_output/combined_solver/results. Use the separate geometry preview task to view the bedrock."
+    },
+    {
+      "label": "Elmer: Preview wall, plinth and bedrock (geometry only)",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "Elmer.bedrock_preview",
+        "--output",
+        "${env:LOCALAPPDATA}\\Lamb\\bedrock-preview"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "Exports unsolved wall, plinth and bedrock geometry from config.json. Open %LOCALAPPDATA%\\Lamb\\bedrock-preview\\three_body_geometry.pvtu in ParaView and colour by cell RegionId (bedrock = 6). Does not change solver results."
     },
     {
       "label": "Elmer: Regenerate combined client results",

@@ -124,7 +124,8 @@ to work.
 | `overflow_head` | Actual water surface above crest; changes hydrostatic loading |
 | `overflow_water_level` | Derived reference depth: water height plus overflow head |
 | Explicit directional springs | Actual support stiffness; material modulus does not recalculate springs |
-| Bedrock material | Retain in configuration; no bedrock volume is currently meshed |
+| Bedrock material | Retain in configuration; the unsolved geometry preview includes a bedrock volume, but the solver mesh does not |
+| `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation for the geometry preview and isolated three-body diagnostic; not used by the standard wall/plinth solve |
 | Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |
 
 No silent physical reinterpretation as part of the API work. If actual-height
