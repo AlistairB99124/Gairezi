@@ -188,6 +188,7 @@ def seated_bedrock_geometry(
     element_size_m: float = 0.5,
     bottom_z_m: float = -31.,
     grade_mesh: bool = False,
+    resample_surface: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     """Use the actual plinth underside as the rock seat, extending the canyon outside it.
 
@@ -306,10 +307,12 @@ def seated_bedrock_geometry(
     centroids = points_2d[all_triangles].mean(axis=1)
     exterior = all_triangles[~outline.contains_points(centroids)]
     seat = np.array([[foundation_map[n] for n in tri] for tri in face_triangles])
-    surface, exterior = parallel_rock_surface(
-        np.column_stack((points_2d, tops)), exterior, required_edges,
-        outline, element_size_m, grade_mesh=grade_mesh,
-    )
+    surface = np.column_stack((points_2d, tops))
+    if resample_surface:
+        surface, exterior = parallel_rock_surface(
+            surface, exterior, required_edges,
+            outline, element_size_m, grade_mesh=grade_mesh,
+        )
     points_2d = surface[:, :2]
     triangles = np.vstack((seat, exterior))
     first_edges = points_2d[triangles[:, 1]] - points_2d[triangles[:, 0]]
@@ -586,6 +589,23 @@ def bedrock_layer_options(report: dict) -> dict[str, float]:
     return {"fine_layer_bottom_z_m": grading["fine_layer_bottom_z_m"]} if grading else {}
 
 
+def configured_rock_mesh(config, concrete, foundation_faces, *overrides):
+    """Shared preview/solver volume mesh; retain old configs' layered defaults."""
+    from .graded_bedrock import RockMesh, build_graded_rock
+    if "mesh" in config["geometry"]["bedrock"]:
+        return build_graded_rock(config, concrete, foundation_faces, *overrides)
+    points, wedges, report = configured_bedrock_geometry(
+        config, concrete, foundation_faces, *overrides,
+    )
+    count = len(points) // 2
+    points, blocks, layers = layered_bedrock_geometry(
+        points, wedges, float(config["geometry"]["global_element_size_m"]),
+        **bedrock_layer_options(report),
+    )
+    report["vertical_layers"] = layers
+    return RockMesh(points, blocks, wedges[:, :3], wedges[:, :3] + count, report)
+
+
 def attributed_mesh(
     points: np.ndarray,
     cells: list[tuple[str, np.ndarray]],
@@ -627,16 +647,12 @@ def export_preview(
         np.asarray(structure.nodes),
         float(config["geometry"]["wall"]["centerline_radius_m"]), 80.,
     )
-    rock_points, rock_cells, report = configured_bedrock_geometry(
+    rock = configured_rock_mesh(
         config, concrete_points,
         [face for tag, face in structure.boundaries if tag == 1],
         stream_margin_m, bank_margin_m, bottom_z_m,
     )
-    rock_points, rock_blocks, layers = layered_bedrock_geometry(
-        rock_points, rock_cells, float(config["geometry"]["global_element_size_m"]),
-        **bedrock_layer_options(report),
-    )
-    report["vertical_layers"] = layers
+    rock_points, rock_blocks, report = rock.points, rock.blocks, rock.report
     output.mkdir(parents=True, exist_ok=True)
     manifest = ET.Element("VTKFile", type="PUnstructuredGrid", version="0.1",
                           byte_order="LittleEndian")
@@ -696,12 +712,13 @@ def export_preview(
         "concrete_chainage_reference_radius_m": 80.,
         "legacy_concrete_chainage_reference_radius_m":
             config["geometry"]["wall"]["centerline_radius_m"],
-        "bedrock_mesh": (
+        "bedrock_mesh": report.get("mesh_method") or (
             "Surface-refined, vertically layered wedges with pyramid/tetrahedron terrain "
             "closures; configured near-field spacing with far-field grading when "
             "mesh_grading is set; unsolved"
         ),
         "matching_plinth_rock_surface": True,
+        "wall_plinth_cutback": structure.wall_plinth_cutback,
         "solver_interface_law_assigned": False,
         "materials_source": str((root / "config.json").resolve()),
     })

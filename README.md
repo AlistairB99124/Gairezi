@@ -4,9 +4,211 @@ This repository is the clean v2 working copy for the Gairedzi dam study.
 
 The purpose of this repo is to separate the newer plinth-based geometry work from the earlier baseline model and keep the design assumptions explicit.
 
+## Integrated wall/plinth/bedrock solver
+
+This is now the canonical **WPF app/API** model as well as the CLI model.
+New app submissions use the existing isolated job directories, preserve all
+configured cutback/domain/mesh/spring data, and run `Elmer.three_body_solver`
+through its `--config-root`, `--output-dir`, `--report-path` job adapter.
+The desktop opens the 5 m reporting VTU by default, retains a full-domain
+ParaView action, and shows separate wall/plinth/near-field rock principal
+stresses. Bedrock is read-only in the editor. Historical jobs retain their
+old result paths; legacy FEniCSx baseline/fracture is explicitly blocked for
+new three-body jobs, not silently run with incompatible joints. Restart the
+updated API and rebuild/relaunch the desktop. See the parent app README.
+
+**Elmer: Run solver** (the default build task) and **Elmer: Run combined solver**
+now run all three bodies, including the approved graded 2H bedrock domain.
+Equivalent PowerShell command:
+
+```powershell
+.\.venv\Scripts\python.exe -m Elmer.three_body_solver
+```
+
+Each invocation snapshots `config.json` and creates a fresh run under
+`%LOCALAPPDATA%\Lamb\three-body-solver\<timestamp-and-unique-id>\`.
+The command prints the run directory before preparation and the solved result
+path after verification. `run.json` records preparing/prepared/solving/succeeded
+or failed status, and errors propagate as a failed command. `latest-run.json`
+in the output root points only to the last successfully verified run; check the
+current run's status, not that pointer, to establish whether a new run succeeded.
+
+Open the printed `model\results\three_body_results_t0001.pvtu` in ParaView.
+Keep its adjacent VTU pieces. Colour by cell `GeometryIds`: **1 = plinth,
+2 = wall, 3 = bedrock**, or select displacement and stress fields. These are
+solved fields, unlike the geometry-only preview below.
+
+### Stress reporting region: concrete and nearby bedrock
+
+Three-body runs also generate `model\reporting\structure_and_near_rock.vtu`
+and `model\reporting\stress_summary.json`. **Use this VTU for stress review**:
+it contains all wall and plinth cells and only bedrock within **5 m of the
+nearest wall or plinth surface**, in undeformed coordinates. All solved fields
+are retained. Rescale ParaView's colour map to this filtered dataset; do not
+reuse the full-domain colour range.
+
+The full-domain PVTU is preserved and remains `result` in the run manifest.
+`reporting_result` and `stress_summary` identify the filtered deliverables.
+This is post-processing only: it does not shorten the rock domain, alter
+restraints or rerun the solver. Remote bottom stresses are excluded from the
+filtered bedrock summary, **not erased from the full solution**. Fixed-boundary
+stresses can include physical overburden as well as restraint/domain effects;
+hiding them does not establish that the 5 m region is free of boundary effects.
+Foundation-domain sensitivity and geostatic initialization remain separate
+verification tasks.
+
+Surface distance is computed at rock vertices; the 5 m boundary is clipped
+using linearly interpolated distances within cells. Boundary fields are
+interpolated too, and principal stresses are recomputed from the interpolated
+stress tensor. This is a mesh-dependent approximation to the exact distance
+offset, not a bounding-box or centroid selection. Mesh refinement is needed
+if a more exact offset is required. The summary records these limitations and
+reports each body's tensile/compressive principal stress peaks and locations.
+
+For an existing attributed result, use ParaView's Python (PowerShell):
+
+```powershell
+& "C:\Program Files\ParaView 6.2.0\bin\pvpython.exe" .\Elmer\stress_reporting_region.py --result "C:\path\to\model\results\three_body_results_t0001.pvtu" --output "C:\path\to\new-reporting-folder"
+```
+
+The output directory must be new or empty; source results are never rewritten.
+`--distance-m` defaults to 5. Run the focused VTK tests using
+`pvpython.exe -m unittest Elmer.test_stress_reporting_region` from the repository.
+
+The analysis uses the same 80 m survey reference, seat and graded rock mesh as
+the approved preview. Concrete cells are subdivided into conforming linear
+tetrahedra without adding or moving nodes, following the legacy solver's concrete
+element formulation; rock uses conforming distance-graded linear tetrahedra.
+The supplied configuration enables the plinth cutbacks described below; the
+shared concrete builder is used by both this solver and the geometry preview.
+It uses each body's configured density, Young's modulus
+and Poisson ratio and applies self-weight to all three bodies. Interface springs
+use the existing directional support values with separate coincident nodes:
+
+| Joint | Configuration source | Current x / y / z stiffness (N/m³) |
+|---|---|---|
+| Wall / plinth | `geometry.plinth.support.spring_n_per_m3` | 1.25e9 / 1.25e9 / 3e9 |
+| Plinth / bedrock | `geometry.bedrock.support.spring_n_per_m3` | 1e9 / 1e9 / 5e9 |
+
+Directions are **global Cartesian x/y/z**, not local normal/tangential axes.
+For each component, traction = configured stiffness times the relative
+displacement between the two bodies. Zero stiffness releases that component;
+an inadequately restrained model can fail to solve. No stiffness is inferred
+from Young's modulus. These coefficients are applied only between bodies:
+the old grounded foundation/plinth springs are **not also applied**.
+The temporary top-level `interfaces` section has been removed and is rejected
+by validation rather than silently overriding the support values. Remove that
+obsolete section from older input configurations before starting new runs.
+Each new run snapshots its directional values and records their source paths
+in `diagnostic.json`; already-running jobs keep their original snapshots/SIFs.
+The gap plausibility check uses the corresponding directional stiffness
+and rejects any component implying traction above 100 MPa. This is not a design
+acceptance criterion. Interface springs carry tension; they are not a
+compression-only, frictional or opening/sliding contact law.
+
+Initial boundary/load assumptions retained from the three-body diagnostic:
+
+- All displacement components fixed at the configured rock bottom (-87 m).
+- Outer rock sides and exposed rock top traction-free.
+- Existing upstream/downstream concrete water loads, preserving the concrete
+  tailwater datum rather than lowering it to the new rock bottom.
+- Gravity and water loads applied simultaneously; no geostatic initialization.
+- Zero uplift and no direct hydrostatic pressure on exposed rock.
+
+`model\diagnostic.json` records these assumptions, mesh dimensions, cell/body
+counts, joint stiffnesses and checks. Its historical filename is retained because
+the integrated solver reuses that preparation/verification implementation.
+`model\solver.log` contains the MPI solver output. The task relays new log output
+and prints an elapsed-time heartbeat every 30 seconds while solving; a heartbeat
+means the process is still running, not that assembly or convergence is advancing.
+Ctrl+C in the task terminal stops that run's MPI process tree and records
+`cancelled` in `run.json`. Successful runs require solver
+success, complete source-cell coverage, finite displacement/stress fields, and
+both spring joints passing the existing gap plausibility checks. These checks
+are not equilibrium, mesh-convergence or dam-safety certification.
+
+Install Python meshing dependencies with `pip install -r client_requirements.txt`
+(including Gmsh 4.15.x). ElmerGrid, MPI-enabled ElmerSolver, Microsoft MPI and ParaView's `pvpython` must
+be installed. Spring partitioning keeps both sides of the joints on the same
+rank; this may limit parallel scaling. The integrated solve retains the legacy
+BiCGStabl method and 1e-10 convergence tolerance, but uses **ILU1** with
+`Linear System ILU Factor = 0.01`. This relaxes the preconditioner diagonal only,
+not the physical stiffness matrix or spring values. Fixed-level ILU fill replaces
+the previous 1e-8 ILUT threshold: that threshold caused severe memory pressure
+on the approved rock mesh (about 83 GiB committed on a 32 GiB machine).
+ILU1 limits graph-level fill, not absolute RAM usage, and full-resolution
+convergence must still be checked. Residuals are printed every 20 iterations.
+The selected settings are recorded in `model\diagnostic.json`.
+`--partitions 1` uses an unpartitioned
+mesh and wraps serial output in a labelled PVTU.
+The configured graded mesh contains approximately
+215,000 rock tetrahedra (rather than the former 6.56 million layered cells).
+It can still require substantial RAM and runtime. User runs
+have **no automatic ten-minute cap**. `--timeout-s` explicitly requests a solver
+timeout; agent development checks remain separately limited to ten minutes.
+Other options are `--root`, `--output-root`, `--partitions` and `--prepare-only`.
+Preparation-only runs never advertise a solved result.
+
+If an older run is already paging heavily, cancel it before restarting with the
+new task; source changes do not update an already-loaded SIF. Do not run two
+full-resolution jobs concurrently. Check RAM, committed memory and the latest
+residuals rather than assuming that an active CPU means useful progress.
+
+The prior two-body CLI `Elmer\structure_assembly.py combined-solve` and its
+defaults remain unchanged, available as **Elmer: Run legacy wall/plinth
+foundation-spring solver**. Legacy client reports and the existing FEniCSx
+tasks still consume that two-body result; they are not three-body post-processing.
+Use the labelled ParaView fields for the new analysis, not the legacy
+concrete-only report generator.
+
+### Wall/plinth corner cutbacks
+
+`geometry.plinth.wall_interface` selects the longitudinal joint topology:
+
+- `"cutback_45deg"` (enabled in the supplied configuration) removes the upper
+  triangular corner of each staircase plinth step and assigns that same volume
+  to the wall only beneath the original wall footprint. Outside that footprint,
+  the shoulder corner wedges are removed and left empty.
+- `"stepped"`, or omitting the optional setting, retains the previous geometry.
+
+Each current 0.5 m rise is replaced by a 0.5 m run in **design chainage/elevation
+coordinates**. This is nominally 45 degrees; on the curved wall, physical slopes
+vary slightly across the radial width and with the 80 m survey mapping.
+Cutback generation fails explicitly if the adjacent mesh run and step rise
+do not match. It does not silently alter contour elevations or move nodes.
+
+The shared builder replaces selected hexahedra by matching triangular prisms.
+The cutback spans the **full plinth width, including both radial shoulders**.
+Wall fills only the cutbacks within its original 4 m footprint; the two 1 m
+shoulder cutbacks remain empty. The wall does not widen. Plinth volume is
+reduced by both the transferred wall wedges and the removed shoulder wedges;
+total concrete volume decreases by the latter. The exact bedrock seat is
+preserved. Newly exposed shoulder slopes and wall sides receive the existing
+upstream/downstream water-pressure law for their respective side; this does not
+introduce an uplift model. The three-body solver then tetrahedralizes
+the concrete and applies the configured wall/plinth springs on the new matching
+inclined faces, using separate coincident nodes.
+Spring values and their global x/y/z interpretation do not change.
+
+`wall_plinth_cutback` in the preview and preparation reports records the number
+of steps, transferred volume and reference radius. That volume is measured in
+the builder coordinates **before** survey remapping. Start a fresh run to use
+the revised joint; existing snapshots and results are unchanged. Cutbacks can
+reduce corner stress concentrations but do not prove their elimination or
+replace a mesh-convergence study and engineering review.
+
+For inspection, colour **cell** `RegionId` in the geometry preview or cell
+`GeometryIds` in solver results. Threshold value **1** to isolate plinth and hide
+the original source. The wall fills the cutbacks, so a single solid colour for
+the entire concrete envelope can still conceal the internal joint beneath the
+wall, but the shoulder slopes are exposed. The report identifies the current
+revision with `shoulder_fill: empty_outside_original_wall_footprint` and records
+`removed_shoulder_volume_m3`. Earlier runs either retained stepped shoulders or
+filled them with wall; regenerate rather than reusing those results.
+
 ## Three-body bedrock geometry review (Elmer scope)
 
-**The standard combined solver result contains only wall and plinth.** Its
+**The legacy combined solver result contains only wall and plinth.** Its
 bedrock support is a spring boundary condition, not a visible rock volume.
 Changing the bedrock contours does not add a rock body to that solve or its
 stress CSV. Do not use the geometry preview as a bedrock stress result.
@@ -47,36 +249,55 @@ configured dimensions for either command without rewriting the configuration.
 Configurations without the optional `domain` section retain the legacy 20 m
 stream margins, 5 m bank margins and -31 m bottom.
 
-**This is geometry only, not an Elmer solution or a connected analysis mesh.**
-The bedrock uses `geometry.global_element_size_m`, currently **0.5 m nominal
-spacing**, for parallel surface rows and vertical layer spacing. This is a length,
-not a target volume of 0.5 m³: a 0.5 m-sided cube is 0.125 m³, and triangular
-wedges have different volumes. Exterior rows run parallel to the local cross-valley
-X direction (the `across_unit_vector_xy` in the geometry report), not ParaView's
-global X axis. The terrain is resampled onto a regular grid rather than repeatedly
-subdividing the original fan triangles. The existing plinth seat retains its exact
-nodes and faces; a short unstructured transition joins it to the parallel rows.
-The spacing is nominal and interface alignment takes priority. Triangular cells
-still have diagonal edges. Resampling retains elevations of the original terrain
-at the new nodes, rather than applying a physical terrain-smoothing filter.
-For the configured domain, retain fine horizontal spacing over the projected
-plinth bounding box plus 5 m, and fine vertical spacing down to 5 m below the
-lowest rock-top node. Beyond that near field, axis steps grow by a factor of
-1.2 to at most 5 m (or the configured spacing if larger). Rows remain parallel
-while their spacing varies. The seat is never coarsened. This is a meshing
-policy, not geological data or a mesh-convergence result.
-Layers close at the terrain with pyramids and tetrahedra instead of collapsing
-elements or subdividing shallow rock into full-height layer counts.
+**The preview is geometry only, not an Elmer solution.**
+Both preview and three-body solver now use the same Gmsh **conforming 3-D
+tetrahedral rock mesh**, controlled by `geometry.bedrock.mesh`:
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `near_size_m` | 0.5 | Nominal near-interface element length |
+| `far_size_m` | 15 | Nominal remote-rock element length |
+| `near_distance_m` | 2 | Fine buffer from the plinth underside |
+| `far_distance_m` | 50 | Distance at which the far-field target is reached |
+
+A Gmsh `Distance` field samples the actual triangulated plinth-seat **surfaces**
+(`SurfacesList`, not `VolumesList`); a `Threshold` field grades linearly between
+these distances in all three dimensions. Existing seat nodes and all seat
+triangles are locked, including their diagonals. The rock exterior retains the
+underlying faceted terrain/control profile instead of resampling it onto a
+tensor-product grid. No terrain-smoothing filter is applied.
+Fine surface nodes no longer force fine columns all the way down to the bottom.
+The volume is generated from a closed discrete shell to avoid artificial CAD
+seams trapping flat tetrahedra. Mesh generation verifies exact seat faces, positive
+cell volumes, nondegenerate scaled Jacobians, total volume, paired interior faces
+and a closed exterior matching the generated surface mesh.
+
+These are **nominal lengths, not cell volumes or maximum-edge guarantees**:
+tetrahedron diagonals and locked seat edges can be longer. The surface/internal
+mesh is unstructured, so the old parallel-row appearance is intentionally not
+retained. Configurations without `geometry.bedrock.mesh` retain the previous
+layered-mesh policy for compatibility.
+For the current configuration, a full preview and integrated preparation produced
+**215,042 rock tetrahedra**, versus 6,561,612 old layered cells (96.7% fewer).
+All **6,600 seat triangles** matched; sampled near/far median edge lengths were
+approximately **0.70 m / 15.0 m**. The minimum scaled Jacobian was about **0.0108**;
+positive quality is not a mesh-convergence study or engineering acceptance.
+`geometry_review.json` records the counts, quality and deterministic spacing
+sample (centroid distance to nearest seat vertex, an approximation to surface
+distance). Full four-rank ElmerGrid conversion and spring partition checks passed;
+this does not establish convergence of the full dam solve.
+A small flat-terrain, reduced-load fixture also passed the complete four-rank
+solve, source-cell attribution, finite stress/displacement and spring-gap checks.
 The preview uses the confirmed 80 m
 survey reference to convert chainage to angle for concrete, retaining configured
 physical radii, thicknesses, elevations and topology. This differs from the legacy
 production builder's 78 m chainage reference. Review `geometry_review.json` for
 the exact seat-match error, body counts, volume and extent. A matching geometric
-surface is not an assigned contact/bond law or a solver-ready conforming mesh.
-The interface behaviour and outer rock restraints must be agreed before
-static-solver integration. The optional `bedrock_top_cross_section` draft is
+surface alone does not assign a contact/bond law. The integrated solver assigns
+the configured spring laws and the bottom restraint described above.
+The optional `bedrock_top_cross_section` draft is
 validated and retained, but not used as a second source of survey data.
-No API, FEniCSx, existing support or production solver changes are made by this
+No API, FEniCSx, existing support or solver changes are made by this
 preview command.
 
 ### Isolated bonded three-body static diagnostic

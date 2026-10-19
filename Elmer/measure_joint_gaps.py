@@ -24,6 +24,7 @@ def measure(result: Path) -> dict[str, object]:
     by_location: dict[tuple[float, ...], dict[int, np.ndarray]] = {}
     peak = {name: 0.0 for name in BODY_NAMES.values()}
     finite = True
+    finite_stress = True
     for piece in grid.findall("Piece"):
         reader = vtkXMLUnstructuredGridReader()
         reader.SetFileName(str(result.parent / piece.attrib["Source"]))
@@ -35,6 +36,11 @@ def measure(result: Path) -> dict[str, object]:
         bodies = vtk_to_numpy(bodies)
         displacement = vtk_to_numpy(mesh.GetPointData().GetArray("displacement")).astype(float)
         finite = finite and bool(np.isfinite(displacement).all())
+        for name in ("stress_xx", "stress_yy", "stress_zz", "stress_xy", "stress_yz", "stress_xz"):
+            values = mesh.GetPointData().GetArray(name)
+            if values is None:
+                raise ValueError(f"Missing solved stress field: {name}")
+            finite_stress = finite_stress and bool(np.isfinite(vtk_to_numpy(values)).all())
         # Elmer writes deformed coordinates; recover the reference position.
         reference = np.round(vtk_to_numpy(mesh.GetPoints().GetData()) - displacement, 6)
         cells = mesh.GetCells()
@@ -42,9 +48,13 @@ def measure(result: Path) -> dict[str, object]:
         connectivity = vtk_to_numpy(cells.GetConnectivityArray())
         for body in np.unique(bodies):
             members = np.flatnonzero(bodies == body)
-            points = np.unique(np.concatenate(
-                [connectivity[offsets[c]:offsets[c + 1]] for c in members],
-            ))
+            used = np.zeros(len(reference), dtype=bool)
+            for start in range(0, len(members), 20000):
+                chunk = members[start:start + 20000]
+                used[np.concatenate(
+                    [connectivity[offsets[c]:offsets[c + 1]] for c in chunk],
+                )] = True
+            points = np.flatnonzero(used)
             name = BODY_NAMES[int(body)]
             peak[name] = max(peak[name], float(np.linalg.norm(displacement[points], axis=1).max()))
             for point in points:
@@ -58,11 +68,13 @@ def measure(result: Path) -> dict[str, object]:
         joints[name] = {
             "locations": int(len(gaps)),
             "max_abs_gap_m": float(np.linalg.norm(gaps, axis=1).max()) if len(gaps) else 0.0,
+            "max_abs_gap_by_axis_m": np.abs(gaps).max(axis=0).tolist() if len(gaps) else None,
             "mean_gap_m": gaps.mean(axis=0).tolist() if len(gaps) else None,
             "min_gap_z_m": float(gaps[:, 2].min()) if len(gaps) else None,
             "max_gap_z_m": float(gaps[:, 2].max()) if len(gaps) else None,
         }
-    return {"finite_displacement": finite, "max_displacement_m": peak, "joints": joints}
+    return {"finite_displacement": finite, "finite_stress": finite_stress,
+            "max_displacement_m": peak, "joints": joints}
 
 
 if __name__ == "__main__":

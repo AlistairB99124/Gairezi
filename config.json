@@ -10,6 +10,7 @@
       "downstream_radius_m": 76.0
     },
     "plinth": {
+      "wall_interface": "cutback_45deg",
       "radial_width_m": 6.0,
       "upstream_radius_m": 81.0,
       "centerline_radius_m": 78.0,
@@ -71,6 +72,12 @@
       }
     },
     "bedrock": {
+      "mesh": {
+        "near_size_m": 0.5,
+        "far_size_m": 15.0,
+        "near_distance_m": 2.0,
+        "far_distance_m": 50.0
+      },
       "domain": {
         "stream_margin_m": 58.0,
         "bank_margin_m": 58.0,
@@ -153,16 +160,6 @@
       "youngs_modulus": 50000000000.0,
       "poisson_ratio": 0.25,
       "tensile_strength_pa": 25000000.0
-    }
-  },
-  "interfaces": {
-    "wall_plinth": {
-      "model": "isotropic_linear_spring",
-      "stiffness_n_per_m3": 700000000000.0
-    },
-    "plinth_bedrock": {
-      "model": "isotropic_linear_spring",
-      "stiffness_n_per_m3": 700000000000.0
     }
   },
   "loads": {

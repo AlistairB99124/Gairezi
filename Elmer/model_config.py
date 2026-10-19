@@ -23,10 +23,7 @@ CONFIG_KEYS = {
     },
     "outputs": {"max_displacement", "max_tensile_stress", "cracking_risk"},
 }
-OPTIONAL_CONFIG_KEYS = {"crack_simulations", "interfaces"}
-INTERFACE_NAMES = {"wall_plinth", "plinth_bedrock"}
-INTERFACE_KEYS = {"model", "stiffness_n_per_m3"}
-INTERFACE_MODELS = {"isotropic_linear_spring"}
+OPTIONAL_CONFIG_KEYS = {"crack_simulations"}
 MATERIAL_KEYS = {"density", "youngs_modulus", "poisson_ratio", "tensile_strength_pa"}
 RADIUS_KEYS = {"radial_width_m", "upstream_radius_m", "centerline_radius_m", "downstream_radius_m"}
 SUPPORT_KEYS = {"model", "material", "spring_n_per_m3"}
@@ -354,13 +351,34 @@ class _ConfigValidator:
                 geometry.get("plinth"),
                 "geometry.plinth",
                 RADIUS_KEYS | {"contours", "support"},
+                {"wall_interface"},
             )
+            if plinth is not None and "wall_interface" in plinth:
+                if plinth["wall_interface"] not in ("stepped", "cutback_45deg"):
+                    self.issue("geometry.plinth.wall_interface", "must be 'stepped' or 'cutback_45deg'")
             bedrock = self.object(
                 geometry.get("bedrock"),
                 "geometry.bedrock",
                 {"contours", "support"},
-                {"bedrock_top_cross_section", "domain"},
+                {"bedrock_top_cross_section", "domain", "mesh"},
             )
+            if bedrock is not None and "mesh" in bedrock:
+                path = "geometry.bedrock.mesh"
+                settings = self.object(
+                    bedrock["mesh"], path,
+                    {"near_size_m", "far_size_m", "near_distance_m", "far_distance_m"},
+                )
+                values = {
+                    key: self.field_number(settings, key, path, positive=True)
+                    for key in ("near_size_m", "far_size_m", "far_distance_m")
+                }
+                near_distance = self.field_number(settings, "near_distance_m", path, nonnegative=True)
+                if all(values.get(key) is not None for key in ("near_size_m", "far_size_m")):
+                    if values["far_size_m"] < values["near_size_m"]:
+                        self.issue(f"{path}.far_size_m", "must not be smaller than near_size_m")
+                if near_distance is not None and values["far_distance_m"] is not None:
+                    if values["far_distance_m"] <= near_distance:
+                        self.issue(f"{path}.far_distance_m", "must exceed near_distance_m")
             domain_bottom = None
             if bedrock is not None and "domain" in bedrock:
                 domain = self.object(
@@ -500,29 +518,7 @@ class _ConfigValidator:
                 )
         if "crack_simulations" in root:
             self.validate_cracks(root["crack_simulations"])
-        if "interfaces" in root:
-            self.validate_interfaces(root["interfaces"])
         return self.issues
-
-    def validate_interfaces(self, value: object) -> None:
-        # Joint springs: traction per unit relative displacement (N/m^3), the
-        # same in every direction. Only the three-body diagnostic reads them.
-        interfaces = self.object(value, "interfaces", INTERFACE_NAMES)
-        if interfaces is None:
-            return
-        for name in sorted(INTERFACE_NAMES & interfaces.keys()):
-            path = f"interfaces.{name}"
-            interface = self.object(interfaces[name], path, INTERFACE_KEYS)
-            if interface is None:
-                continue
-            if "model" in interface and interface["model"] not in INTERFACE_MODELS:
-                self.issue(f"{path}.model", f"must be one of {sorted(INTERFACE_MODELS)}")
-            self.field_number(interface, "stiffness_n_per_m3", path, positive=True)
-        self.warn(
-            "interfaces",
-            "is used only by the Elmer three-body diagnostic; the submitted "
-            "Elmer and FEniCSx analyses still bond the joints.",
-        )
 
 
 def validate_config(payload: object) -> dict[str, object]:
@@ -536,7 +532,7 @@ def validate_config(payload: object) -> dict[str, object]:
     return payload
 
 
-def collect_warnings(payload: object) -> list[ValidationIssue]:
+def collect_warnings(payload: object, *, three_body: bool = False) -> list[ValidationIssue]:
     """Return non-fatal warnings for nominal or currently inactive configuration
     properties (e.g. height_above_plinth_m, bedrock material, cracking_risk output)
     without reinterpreting or rejecting the submitted values. Intended to be called
@@ -544,7 +540,10 @@ def collect_warnings(payload: object) -> list[ValidationIssue]:
     """
     validator = _ConfigValidator()
     validator.validate(payload)
-    return validator.warnings
+    return [
+        warning for warning in validator.warnings
+        if not (three_body and warning.path == "material.bedrock")
+    ]
 
 
 def load_config(source: Path | dict[str, object] = CONFIG_PATH) -> dict[str, object]:

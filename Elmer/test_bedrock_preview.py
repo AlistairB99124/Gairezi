@@ -71,11 +71,13 @@ class BedrockPreviewTests(unittest.TestCase):
 
     def test_manifest_has_three_readable_attributed_bodies(self):
         self.config["geometry"]["global_element_size_m"] = .25
+        del self.config["geometry"]["bedrock"]["mesh"]
         structure = SimpleNamespace(
             nodes=[(0., 0., -29.), (1., 0., -29.), (0., 1., -29.), (0., 0., 0.)],
             cells=[(4, (0, 1, 2, 3)), (4, (0, 1, 2, 3))],
             region_ids=[1, 2],
             boundaries=[],
+            wall_plinth_cutback=None,
         )
         rock = np.array([
             [0., 0., -31.], [1., 0., -31.], [0., 1., -31.],

@@ -132,26 +132,36 @@ class ModelConfigTests(unittest.TestCase):
         self.assertIn("geometry.plinth.support.spring_n_per_m3.y", paths)
         self.assertIn("geometry.bedrock.support.model", paths)
 
-    def test_interface_springs_require_known_model_and_positive_stiffness(self):
-        interfaces = self.payload["interfaces"]
-        self.assertEqual(interfaces["wall_plinth"]["stiffness_n_per_m3"], 7e11)
-        self.assertEqual(interfaces["plinth_bedrock"]["stiffness_n_per_m3"], 7e11)
-        interfaces["wall_plinth"]["stiffness_n_per_m3"] = 0
-        interfaces["plinth_bedrock"]["model"] = "friction"
-        with self.assertRaises(ConfigurationValidationError) as context:
-            validate_config(self.payload)
-        paths = {issue.path for issue in context.exception.issues}
-        self.assertIn("interfaces.wall_plinth.stiffness_n_per_m3", paths)
-        self.assertIn("interfaces.plinth_bedrock.model", paths)
-
-        del self.payload["interfaces"]
+    def test_obsolete_interface_overrides_are_rejected(self):
+        self.assertNotIn("interfaces", self.payload)
         self.assertIs(validate_config(self.payload), self.payload)
+        self.payload["interfaces"] = {
+            "wall_plinth": {"model": "isotropic_linear_spring", "stiffness_n_per_m3": 7e11},
+            "plinth_bedrock": {"model": "isotropic_linear_spring", "stiffness_n_per_m3": 7e11},
+        }
+        self.assert_invalid_at(self.payload, "interfaces")
+
+    def test_support_springs_accept_zero_but_reject_invalid_directional_values(self):
+        for region in ("plinth", "bedrock"):
+            for axis in ("x", "y", "z"):
+                springs = self.payload["geometry"][region]["support"]["spring_n_per_m3"]
+                original = springs[axis]
+                springs[axis] = 0.
+                validate_config(self.payload)
+                for value in (-1., True, float("inf"), float("nan")):
+                    springs[axis] = value
+                    with self.subTest(region=region, axis=axis, value=value):
+                        self.assert_invalid_at(
+                            self.payload, f"geometry.{region}.support.spring_n_per_m3.{axis}",
+                        )
+                springs[axis] = original
 
     def test_output_flags_must_be_booleans(self):
         self.payload["outputs"]["max_displacement"] = 1
         self.assert_invalid_at(self.payload, "outputs.max_displacement")
 
     def test_phase_field_controls_are_explicit_and_validated(self):
+        self.add_legacy_crack_fixture()
         crack = self.payload["crack_simulations"][0]
         crack["phase_field_parameters"]["model"] = "AT1"
         crack["phase_field_parameters"]["residual_stiffness"] = 1.0
@@ -171,8 +181,24 @@ class ModelConfigTests(unittest.TestCase):
         self.assertIn(f"{prefix}.solver.maximum_refinement_levels", paths)
 
     def test_crack_solver_rejects_unknown_fields(self):
+        self.add_legacy_crack_fixture()
         self.payload["crack_simulations"][0]["solver"]["silent_failure"] = True
         self.assert_invalid_at(self.payload, "crack_simulations[0].solver.silent_failure")
+
+    def add_legacy_crack_fixture(self):
+        self.payload["crack_simulations"] = [{
+            "name": "scenario_1", "type": "phase_field", "shape": "rectangular",
+            "central_crack_pos_m": {"x": 76.7430082340184, "y": 13.946708830164285, "z": -25.0},
+            "size_m": {"x": 3, "y": 5, "z": 0.02},
+            "orientation": {"normal_x": 0, "normal_y": 0, "normal_z": 1},
+            "phase_field_parameters": {
+                "model": "AT2", "energy_split": "volumetric_deviatoric", "length_scale_m": 0.1,
+                "critical_energy_release_rate_J_m2": 2700.0, "residual_stiffness": 1e-8,
+            },
+            "loading": {"internal_pressure_pa": 0, "load_steps": 10},
+            "solver": json.loads((CONFIG_PATH.parent / "FEniCSx" / "fracture_defaults.json").read_text())["solver"],
+        }]
+        validate_config(self.payload)
 
     def test_water_reference_level_must_match_its_components(self):
         self.payload["loads"]["overflow_water_level"] = 35

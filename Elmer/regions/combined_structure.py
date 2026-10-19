@@ -81,6 +81,7 @@ class CombinedStructure:
     foundation_support: FoundationSupport
     plinth_support: FoundationSupport
     region_cell_counts: dict[str, int]
+    wall_plinth_cutback: dict[str, object] | None = None
 
 
 def load_material(path: Path) -> MaterialProperties:
@@ -174,7 +175,7 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
         boundaries.append((boundary_id, oriented_face))
     if any(len(entries) > 2 for entries in boundary_faces.values()):
         raise ValueError("More than two regions share a boundary face")
-    return CombinedStructure(
+    combined = CombinedStructure(
         nodes=nodes,
         cells=cells,
         boundaries=boundaries,
@@ -185,6 +186,12 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
         plinth_support=plinth_support,
         region_cell_counts=region_cell_counts,
     )
+    if load_config(root / "config.json")["geometry"]["plinth"].get("wall_interface") == "cutback_45deg":
+        from .interface_cutback import cutback_wall_plinth
+        combined = cutback_wall_plinth(
+            combined, float(load_config(root / "config.json")["geometry"]["wall"]["centerline_radius_m"]),
+        )
+    return combined
 
 
 def write_combined_gmsh(mesh: CombinedStructure, path: Path) -> None:
@@ -326,11 +333,11 @@ def write_combined_vtu(mesh: CombinedStructure, path: Path) -> None:
 def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     element_counts = Counter(element_type for element_type, _ in mesh.cells)
     if any(
-        element_type != 5
+        element_type not in ((5, 6) if mesh.wall_plinth_cutback else (5,))
         for (element_type, _), region_id in zip(mesh.cells, mesh.region_ids)
         if region_id == REGION_GROUP_IDS["WALL"]
     ):
-        raise ValueError("Wall contains non-hexahedral cells")
+        raise ValueError("Wall contains unsupported cells")
     expected_cells = sum(mesh.region_cell_counts.values())
     if len(mesh.cells) != expected_cells or len(mesh.region_ids) != expected_cells:
         raise ValueError("Combined cell arrays do not preserve all regional cells")
@@ -369,6 +376,7 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         if (
             mesh.region_ids[cell_index] == REGION_GROUP_IDS["PLINTH"]
             and element_type != 5
+            and not (mesh.wall_plinth_cutback and element_type == 6)
             and not set(cell) & plinth_boundary_nodes
         ):
             raise ValueError("Plinth has a non-hexahedral cell outside the bedrock closure")
@@ -420,6 +428,9 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     }
     wall_radii = [math.hypot(*mesh.nodes[node_id][:2]) for node_id in wall_node_ids]
     wall_min_radius, wall_max_radius = min(wall_radii), max(wall_radii)
+    locally_widened = bool(
+        mesh.wall_plinth_cutback and mesh.wall_plinth_cutback.get("shoulder_wall_wedges", 0)
+    )
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
@@ -429,6 +440,7 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "pyramids": element_counts[7],
         "face_connected_components": component_count,
         "wall_plinth_interface_faces": bonded_interface_count,
+        "wall_plinth_cutback": mesh.wall_plinth_cutback,
         "wall_plinth_connection": "bonded_intact_provisional",
         "connection_assumption": "Shared displacement nodes; no opening/sliding; construction details require review",
         "active_support": "geometry.bedrock.support on foundation tag 1 only",
@@ -443,7 +455,9 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "wall_geometry": {
             "downstream_radius_m": wall_min_radius,
             "upstream_radius_m": wall_max_radius,
-            "uniform_thickness_m": wall_max_radius - wall_min_radius,
+            "uniform_thickness_m": None if locally_widened else wall_max_radius - wall_min_radius,
+            "maximum_radial_extent_m": wall_max_radius - wall_min_radius,
+            "locally_widened_at_cutbacks": locally_widened,
             "wall_base_elevation_m": min(mesh.nodes[node_id][2] for node_id in wall_node_ids),
         },
         "foundation_nodes": foundation_node_count,

@@ -39,7 +39,7 @@ class BondedTopologyTests(unittest.TestCase):
     def test_generated_wall_plinth_are_one_body_before_and_after_tetrahedralization(self):
         from collections import Counter
         from Elmer.regions.combined_structure import audit_combined_structure, build_combined_structure
-        from Elmer.regions.tetrahedral import tetrahedralize_structure
+        from Elmer.regions.tetrahedral import _CELL_FACES, split_face, tetrahedralize_structure
 
         source = build_combined_structure(assembly.ROOT)
         audit = audit_combined_structure(source)
@@ -48,6 +48,15 @@ class BondedTopologyTests(unittest.TestCase):
         self.assertEqual(audit["wall_plinth_connection"], "bonded_intact_provisional")
         self.assertEqual(len({tuple(round(x, 9) for x in xyz) for xyz in source.nodes}), len(source.nodes))
         self.assertFalse(any(tag in (8, 9) for tag, _ in source.boundaries))
+        source_faces = {}
+        for (kind, cell), region in zip(source.cells, source.region_ids, strict=True):
+            for pattern in _CELL_FACES[kind]:
+                oriented = tuple(cell[i] for i in pattern)
+                source_faces.setdefault(tuple(sorted(oriented)), []).append((region, oriented))
+        expected_triangles = sum(
+            len(split_face(entries[0][1])) for entries in source_faces.values()
+            if {region for region, _ in entries} == {1, 2}
+        )
         mesh = tetrahedralize_structure(source)
         faces = Counter()
         regions = {}
@@ -58,7 +67,7 @@ class BondedTopologyTests(unittest.TestCase):
                 regions.setdefault(face, set()).add(region)
         self.assertEqual(max(faces.values()), 2)
         interface = {face for face, membership in regions.items() if membership == {1, 2}}
-        self.assertEqual(len(interface), 2 * audit["wall_plinth_interface_faces"])
+        self.assertEqual(len(interface), expected_triangles)
         exterior = {tuple(sorted(face)) for _, face in mesh.boundaries}
         self.assertFalse(interface & exterior)
         self.assertEqual(exterior, {face for face, count in faces.items() if count == 1})

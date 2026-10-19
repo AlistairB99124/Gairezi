@@ -64,12 +64,13 @@
     {
       "label": "Elmer: Run solver",
       "type": "process",
-      "command": "ElmerSolver.exe",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "args": [
-        "dam_model.sif"
+        "-m",
+        "Elmer.three_body_solver"
       ],
       "options": {
-        "cwd": "${workspaceFolder}\\Elmer"
+        "cwd": "${workspaceFolder}"
       },
       "problemMatcher": [],
       "group": {
@@ -81,15 +82,15 @@
         "panel": "dedicated",
         "clear": true
       },
-      "detail": "Runs the Elmer solver against the local dam model and writes VTU output into Elmer/results."
+      "detail": "Solves wall, plinth and the configured 2H bedrock with configured interface springs. Writes fresh runs under %LOCALAPPDATA%\\Lamb\\three-body-solver; prints the result path. Fixed rock bottom, free sides, zero uplift."
     },
     {
       "label": "Elmer: Run combined solver",
       "type": "process",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "args": [
-        "Elmer\\structure_assembly.py",
-        "combined-solve"
+        "-m",
+        "Elmer.three_body_solver"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -101,7 +102,16 @@
         "panel": "dedicated",
         "clear": true
       },
-      "detail": "Solves the wall and plinth with bedrock foundation springs, not a bedrock volume. Writes results into Elmer/structure_output/combined_solver/results. Use the separate geometry preview task to view the bedrock."
+      "detail": "Same three-body analysis as Elmer: Run solver, including the approved bedrock volume and configured interface springs. Results are isolated under %LOCALAPPDATA%\\Lamb\\three-body-solver."
+    },
+    {
+      "label": "Elmer: Run legacy wall/plinth foundation-spring solver",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": ["Elmer\\structure_assembly.py", "combined-solve"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": [],
+      "detail": "Legacy two-body comparison only: grounded foundation springs, no bedrock volume. Writes Elmer/structure_output/combined_solver/results; existing CLI defaults are unchanged."
     },
     {
       "label": "Elmer: Preview wall, plinth and bedrock (geometry only)",
@@ -125,7 +135,7 @@
       "detail": "Exports unsolved wall, plinth and bedrock geometry from config.json. Open %LOCALAPPDATA%\\Lamb\\bedrock-preview\\three_body_geometry.pvtu in ParaView and colour by cell RegionId (bedrock = 6). Does not change solver results."
     },
     {
-      "label": "Elmer: Regenerate combined client results",
+      "label": "Elmer: Regenerate legacy wall/plinth client results",
       "type": "process",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "args": [
@@ -147,7 +157,7 @@
         "panel": "dedicated",
         "clear": true
       },
-      "detail": "Regenerates client stress plots, CSV, JSON, and report files from the latest combined solver PVTU."
+      "detail": "Legacy two-body results only; does not consume new three-body runs. Three-body stresses and GeometryIds are available directly in ParaView."
     },
     {
       "label": "Code_Aster: Docker build MED mesh",

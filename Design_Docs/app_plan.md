@@ -109,6 +109,37 @@ Before HTTP submission can be reliable:
 Preserve the existing CLI defaults so VS Code tasks and command-line runs continue
 to work.
 
+The explicit `Elmer.three_body_solver` entry point and current VS Code solver
+tasks now include the approved rock volume and configured interface springs.
+They snapshot configuration and use unique external run directories. The
+existing `structure_assembly.py combined-solve` CLI remains the legacy two-body
+workflow. The app/API now explicitly launch the three-body entry point for
+new jobs using `--config-root`, `--output-dir` and `--report-path`; historical
+jobs without a `model_kind` retain legacy paths. The worker preserves the job's
+snapshot and rejects nonempty output/report paths. API success requires the
+full PVTU partitions, 5 m reporting VTU and matching finite per-body summary.
+The WPF schema/model preserve cutbacks and rock domain/mesh settings through
+load/save/submission, while bedrock remains read-only in the editor. Default
+ParaView opening uses the reporting VTU, with a separate full-domain action.
+Headline stress extrema/utilization cover concrete only; the table also shows
+near-field bedrock separately. The desktop rejects older API versions lacking
+`canonical_model: three_body` before submission.
+
+Legacy FEniCSx consumers are **not** migrated: new three-body jobs record
+`cracking_status: blocked` with an incompatibility reason and do not start a
+FEniCSx elastic/fracture process. Historical results remain readable. There is
+no automatic time limit on user app jobs; cancellation stops only the selected
+job's worker tree. API dependency staging includes Gmsh. See the
+README for three-body restraints, load omissions and post-processing limitations.
+
+Three-body stress review uses a separate reporting export: all wall/plinth and
+rock within 5 m of their nearest surface in reference coordinates. Keep the
+full-domain solution for audit; never replace or truncate the solver domain to
+implement this display filter. The filtered VTU and per-body stress summary are
+recorded separately in the run manifest. Distance and fields are interpolated
+at clipped-cell boundaries, and remote-boundary influence still requires
+independent sensitivity verification. See the README for existing-run export.
+
 ## 4. Configuration contract and validation
 
 ### Preserve current physical meanings
@@ -117,15 +148,17 @@ to work.
 |---|---|
 | Wall/plinth radii and radial width | Validate width and midpoint relationships; display units in metres |
 | Contour `height` | Label as signed elevation relative to crest z = 0 |
+| `geometry.plinth.wall_interface` | Optional `stepped` (also the omitted default) or `cutback_45deg`. Plinth corners are cut across the full width with 1:1 design-chainage/elevation drops. Wall fills only within its original footprint; shoulder cutbacks remain empty, reducing total concrete volume without widening wall. Rock seat is unchanged. Newly exposed faces use their side's existing upstream/downstream hydrostatic law, not an added uplift model. Preview and Elmer concrete builders share the setting. Rise/run mismatches fail explicitly. Transferred and removed volumes use builder coordinates before survey mapping; `shoulder_fill: empty_outside_original_wall_footprint` identifies this revision. Spring stiffnesses remain unchanged. Existing jobs require fresh runs. |
 | `height_above_plinth_m` | Clearly identify current nominal metadata; contours control the actual height |
 | Global element size | Controls the shared combined mesh |
 | Local element size | Identify which generator uses it; do not imply it refines the current combined mesh |
 | `water_height` | Reference depth only, not reservoir surface elevation |
 | `overflow_head` | Actual water surface above crest; changes hydrostatic loading |
 | `overflow_water_level` | Derived reference depth: water height plus overflow head |
-| Explicit directional springs | Actual support stiffness; material modulus does not recalculate springs |
-| Bedrock material | Retain in configuration; the unsolved geometry preview includes a bedrock volume, but the solver mesh does not |
-| `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation for the geometry preview and isolated three-body diagnostic; not used by the standard wall/plinth solve |
+| Explicit directional springs | Three-body wall/plinth joint uses `geometry.plinth.support.spring_n_per_m3`; plinth/bedrock uses `geometry.bedrock.support.spring_n_per_m3`, in global x/y/z, on relative displacement only (no grounded spring bypass). Legacy wall/plinth solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
+| Bedrock material | Active in the integrated three-body solver; the legacy wall/plinth solve represents the foundation with grounded springs instead |
+| `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall/plinth solve |
+| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: 0.5 m target within 2 m of the locked plinth seat, grading to 15 m by 50 m; shared by preview and three-body preparation. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
 | Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |
 
 No silent physical reinterpretation as part of the API work. If actual-height

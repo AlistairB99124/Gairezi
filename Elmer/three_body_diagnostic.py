@@ -10,15 +10,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 import numpy as np
 
-from .bedrock_preview import (
-    bedrock_layer_options, configured_bedrock_geometry,
-    layered_bedrock_geometry, survey_coordinates,
-)
-from .model_config import load_config
+from .bedrock_preview import configured_rock_mesh, survey_coordinates
+from .model_config import load_config, validate_config
 from .regions.combined_structure import build_combined_structure, write_combined_gmsh
-from .regions.tetrahedral import _CELL_FACES
+from .regions.tetrahedral import _CELL_FACES, tetrahedralize_structure
 from .structure_assembly import (
     convert_with_elmergrid, mpi_launcher, write_combined_solver_input,
 )
@@ -28,6 +26,7 @@ JOINT_MODELS = ("bonded", "spring")
 # Boundary tags for the two sides of each spring joint (8/9 follow FACE_GROUP_IDS).
 WALL_SIDE, PLINTH_TOP, PLINTH_SEAT, ROCK_SEAT = 8, 9, 11, 12
 SPRING_PAIRS = {"wall_plinth": (WALL_SIDE, PLINTH_TOP), "plinth_bedrock": (PLINTH_SEAT, ROCK_SEAT)}
+SPRING_SUPPORTS = {"wall_plinth": "plinth", "plinth_bedrock": "bedrock"}
 
 
 def split_wall_from_plinth(concrete) -> tuple[list, list, list, int]:
@@ -71,11 +70,16 @@ def split_wall_from_plinth(concrete) -> tuple[list, list, list, int]:
     return nodes, cells, boundaries, len(joint)
 
 
-def interface_stiffness(config: dict[str, object]) -> dict[str, float]:
-    interfaces = config.get("interfaces")
-    if not isinstance(interfaces, dict):
-        raise ValueError("Spring joints need the interfaces section in config.json")
-    return {name: float(interfaces[name]["stiffness_n_per_m3"]) for name in SPRING_PAIRS}
+def interface_stiffness(config: dict) -> dict[str, dict[str, float]]:
+    """Directional traction/jump coefficients in global Cartesian axes (N/m^3)."""
+    validate_config(config)
+    return {
+        name: {
+            axis: float(config["geometry"][region]["support"]["spring_n_per_m3"][axis])
+            for axis in ("x", "y", "z")
+        }
+        for name, region in SPRING_SUPPORTS.items()
+    }
 
 
 def prepare(
@@ -83,24 +87,29 @@ def prepare(
     stream_margin_m: float | None = None, bank_margin_m: float | None = None,
     joints: str = "bonded",
     bottom_z_m: float | None = None,
+    *,
+    integrated: bool = False,
 ) -> dict[str, object]:
     if joints not in JOINT_MODELS:
         raise ValueError(f"joints must be one of {JOINT_MODELS}")
     if output.exists() and any(output.iterdir()):
         raise ValueError("Use a new empty output directory to exclude stale results")
     output.mkdir(parents=True, exist_ok=True)
-    config = load_config(root / "config.json")
     shutil.copy2(root / "config.json", output / "config.json")
-    concrete = build_combined_structure(root)
+    config = load_config(output / "config.json")
+    concrete = build_combined_structure(output)
     concrete.nodes = [tuple(p) for p in survey_coordinates(
         np.asarray(concrete.nodes),
         config["geometry"]["wall"]["centerline_radius_m"], 80.,
     )]
-    rock_points, rock_wedges, geometry = configured_bedrock_geometry(
+    if integrated:
+        concrete = tetrahedralize_structure(concrete)
+    rock = configured_rock_mesh(
         config, np.asarray(concrete.nodes),
         [face for tag, face in concrete.boundaries if tag == 1],
         stream_margin_m, bank_margin_m, bottom_z_m,
     )
+    rock_points, rock_blocks, geometry = rock.points, rock.blocks, rock.report
     stiffness = interface_stiffness(config) if joints == "spring" else {}
     seat_faces = [face for tag, face in concrete.boundaries if tag == 1]
     if joints == "spring":
@@ -114,15 +123,9 @@ def prepare(
         wall_joint_faces = 0
         index = {tuple(round(v, 8) for v in p): i for i, p in enumerate(nodes)}
     mapping = []
-    count = len(rock_points) // 2
-    rock_points, rock_blocks, layers = layered_bedrock_geometry(
-        rock_points, rock_wedges, float(config["geometry"]["global_element_size_m"]),
-        **bedrock_layer_options(geometry),
-    )
-    geometry["vertical_layers"] = layers
-    for node, coordinates in enumerate(rock_points):
+    for coordinates in rock_points:
         point = tuple(coordinates)
-        key = tuple(round(v, 8) for v in point) if node < 2 * count else None
+        key = tuple(round(v, 8) for v in point)
         if key in index:
             mapping.append(index[key])
         else:
@@ -147,9 +150,8 @@ def prepare(
                 key = tuple(sorted(tri))
                 face_counts[key] += 1
                 memberships.setdefault(key, set()).add(region)
-    # The rock is a conforming extrusion; only its top can meet concrete.
-    # Auditing every interior rock layer would duplicate millions of faces.
-    top_faces = [tuple(mapping[int(n)] for n in tri) for tri in rock_wedges[:, :3]]
+    # Only rock-top faces can meet the concrete. The mesher audits rock volume.
+    top_faces = [tuple(mapping[int(n)] for n in tri) for tri in rock.top_faces]
     for face in top_faces:
         key = tuple(sorted(face))
         face_counts[key] += 1
@@ -175,7 +177,7 @@ def prepare(
     if joints == "spring":
         boundaries.extend((PLINTH_SEAT, face) for face in seat_faces)
         boundaries.extend((ROCK_SEAT, face) for face in rock_seat)
-    bottom_faces = [tuple(mapping[count + int(n)] for n in tri) for tri in rock_wedges[:, :3]]
+    bottom_faces = [tuple(mapping[int(n)] for n in tri) for tri in rock.bottom_faces]
     boundaries.extend((10, face) for face in bottom_faces)
     boundary_map = {tag: i+1 for i, tag in enumerate(sorted({tag for tag, _ in boundaries}))}
     mesh = replace(
@@ -185,7 +187,7 @@ def prepare(
     )
     write_combined_gmsh(mesh, output / "three_body.msh")
     # Preserve concrete water datum; the added rock must not lower tailwater.
-    path = output / "diagnostic.sif"
+    path = output / ("dam_model.sif" if integrated else "diagnostic.sif")
     write_combined_solver_input(concrete, path)
     text = path.read_text()
     start = text.index("Boundary Condition 1\n")
@@ -223,6 +225,16 @@ End
         r"Target Boundaries\(1\) = (\d+)",
         lambda match: f"Target Boundaries(1) = {boundary_map[int(match.group(1))]}", text,
     )
+    if integrated:
+        # Fixed-level fill avoids the runaway ILUT factors on the full rock mesh.
+        text = text.replace(
+            "Linear System Preconditioning = ILUT",
+            "Linear System Preconditioning = ILU1\n"
+            "    Linear System ILU Factor = Real 0.01",
+        ).replace(
+            "Linear System ILUT Tolerance = 1.0e-4",
+            "Linear System Residual Output = 20",
+        )
     if joints == "spring":
         text = text.replace(
             "    Variable DOFs = 3\n",
@@ -230,28 +242,47 @@ End
         )
         text += spring_conditions(text, boundary_map, stiffness)
     joint_note = (
-        f"isotropic springs k={stiffness['wall_plinth']:.4g}/{stiffness['plinth_bedrock']:.4g} "
-        "N/m^3 at wall/plinth and plinth/rock"
+        f"directional springs (global x/y/z) {stiffness} "
+        "N/m^3 from geometry.plinth/bedrock.support at wall/plinth and plinth/rock"
         if joints == "spring" else "bonded interfaces"
     )
+    result_name = "three_body_results" if integrated else "three_body_diagnostic"
+    text = text.replace(
+        "! Provisional bonded wall/plinth: shared nodes, no joint opening/sliding.\n"
+        "! Foundation support only; geometry.plinth.support is inactive.\n",
+        "",
+    )
     path.write_text(
-        f"! DIAGNOSTIC ONLY: {joint_note}; fixed rock bottom; zero uplift.\n"
-        "! Free outer rock sides. Configured global mesh spacing. Not a frictional/design result.\n"
-        + text.replace("combined_results_mpi", "three_body_diagnostic"),
+        f"! {'THREE-BODY ANALYSIS' if integrated else 'DIAGNOSTIC ONLY'}: "
+        f"{joint_note}; fixed rock bottom; zero uplift.\n"
+        "! Free outer rock sides. Configured graded rock mesh. Not a frictional/design result.\n"
+        + text.replace("combined_results_mpi", result_name),
     )
     report = {
         "assumptions": [
-            "linear isotropic springs (carry tension) at wall/plinth and plinth/rock"
+            "linear directional springs in global x/y/z (carry tension) at wall/plinth and plinth/rock"
             if joints == "spring" else "bonded wall/plinth and plinth/rock",
             "zero uplift",
             f"fixed rock bottom z={geometry['bottom_z_m']:g} m", "free rock sides",
             "simultaneous gravity and existing concrete water loads",
             "80 m chainage reference",
-            f"nominal rock spacing {geometry['element_size_m']:g} m; {layers} vertical layers",
+            (
+                f"distance-graded rock: {geometry['mesh_grading']}"
+                if geometry.get("mesh_method") else
+                f"nominal rock spacing {geometry['element_size_m']:g} m; "
+                f"{geometry['vertical_layers']} vertical layers"
+            ),
         ],
-        "purpose": "Solver integration diagnostic, NOT engineering validation",
+        "purpose": (
+            "Initial three-body linear analysis, NOT engineering validation"
+            if integrated else "Solver integration diagnostic, NOT engineering validation"
+        ),
         "joints": joints,
         "interface_stiffness_n_per_m3": stiffness,
+        "interface_stiffness_sources": {
+            name: f"geometry.{region}.support.spring_n_per_m3"
+            for name, region in SPRING_SUPPORTS.items()
+        } if joints == "spring" else {},
         "nodes": len(nodes),
         "cells_by_body": dict(Counter(regions)),
         "solver_body_ids": {"plinth": 1, "wall": 2, "bedrock": 3},
@@ -259,6 +290,17 @@ End
         "wall_plinth_joint_faces": wall_joint_faces,
         "plinth_rock_seat_triangles": seat_count,
         "geometry": geometry,
+        "concrete_element_types": sorted({kind for kind, _ in concrete_cells}),
+        "wall_plinth_cutback": concrete.wall_plinth_cutback,
+        "linear_solver": (
+            {"method": "BiCGStabl", "preconditioner": "ILU1",
+             "ilu_factor": 0.01, "convergence_tolerance": 1e-10}
+            if integrated else
+            {"method": "BiCGStabl", "preconditioner": "ILUT",
+             "ilut_tolerance": 1e-4, "convergence_tolerance": 1e-10}
+        ),
+        "solver_input": path.name,
+        "result_name": result_name,
         "result": None,
     }
     (output / "diagnostic.json").write_text(json.dumps(report, indent=2))
@@ -266,7 +308,7 @@ End
 
 
 def spring_conditions(
-    text: str, boundary_map: dict[int, int], stiffness: dict[str, float],
+    text: str, boundary_map: dict[int, int], stiffness: dict[str, dict[str, float]],
 ) -> str:
     """Mortar spring pairs: traction = k * (relative displacement), N/m^3."""
     first = max(int(n) for n in re.findall(r"^Boundary Condition (\d+)$", text, re.M)) + 1
@@ -274,8 +316,8 @@ def spring_conditions(
     for offset, (name, (slave, master)) in enumerate(SPRING_PAIRS.items()):
         slave_bc, master_bc = first + 2 * offset, first + 2 * offset + 1
         coefficients = "".join(
-            f"    Mortar BC Coefficient Displacement {i} = Real {stiffness[name]:.12g}\n"
-            for i in (1, 2, 3)
+            f"    Mortar BC Coefficient Displacement {i} = Real {stiffness[name][axis]:.12g}\n"
+            for i, axis in enumerate(("x", "y", "z"), start=1)
         )
         sections.append(
             f"\nBoundary Condition {slave_bc}\n"
@@ -312,63 +354,110 @@ def check_spring_partitions(mesh: Path, partitions: int, boundary_map: dict[int,
             raise RuntimeError(f"{name} spring sides were split across ranks {ranks}")
 
 
-def solve(output: Path, timeout: int = 480, partitions: int = 4) -> Path:
+def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
+    if partitions < 1 or (timeout is not None and timeout <= 0):
+        raise ValueError("Partitions and optional solver timeout must be positive")
     report_path = output / "diagnostic.json"
     report = json.loads(report_path.read_text())
-    spring = report.get("joints") == "spring"
-    boundary_map = {int(k): v for k, v in report["boundary_id_map"].items()}
-    options = spring_partition_options(boundary_map) if spring else ()
-    if not convert_with_elmergrid(output / "three_body.msh", output / "mesh", partitions, options):
-        raise RuntimeError("ElmerGrid unavailable")
-    if spring:
-        check_spring_partitions(output / "mesh", partitions, boundary_map)
+    if (output / "results").exists():
+        raise ValueError("Results directory already exists; prepare a fresh run to exclude stale results")
     executable = shutil.which("ElmerSolver_mpi")
     if executable is None:
         raise RuntimeError("ElmerSolver_mpi unavailable")
     launcher, option = mpi_launcher()
+    pvpython_executable()
+    spring = report.get("joints") == "spring"
+    boundary_map = {int(k): v for k, v in report["boundary_id_map"].items()}
+    options = spring_partition_options(boundary_map) if spring else ()
+    print(f"Converting and partitioning three-body mesh ({partitions} rank(s))...", flush=True)
+    if not convert_with_elmergrid(
+        output / "three_body.msh", output / "mesh",
+        partitions if partitions > 1 else None, options if partitions > 1 else (),
+    ):
+        raise RuntimeError("ElmerGrid unavailable")
+    if spring and partitions > 1:
+        check_spring_partitions(output / "mesh", partitions, boundary_map)
     (output / "results").mkdir()
     environment = os.environ.copy()
-    environment["ELMER_HOME"] = str(Path(executable).resolve().parent.parent)
-    with (output / "solver.log").open("w") as log:
+    environment.setdefault("ELMER_HOME", str(Path(executable).resolve().parent.parent))
+    log_path = output / "solver.log"
+    print(f"Starting Elmer; live output below is also saved to {log_path}", flush=True)
+    with log_path.open("w") as log:
         worker = subprocess.Popen(
-            [launcher, option, str(partitions), executable, "diagnostic.sif"], cwd=output,
+            [launcher, option, str(partitions), executable,
+             report.get("solver_input", "diagnostic.sif")], cwd=output,
             env=environment, stdout=log, stderr=subprocess.STDOUT,
         )
         try:
-            code = worker.wait(timeout=timeout)
+            code = wait_for_solver(worker, log_path, timeout)
         except subprocess.TimeoutExpired:
             subprocess.run(["taskkill", "/PID", str(worker.pid), "/T", "/F"], check=True)
-            raise RuntimeError("Diagnostic exceeded its development time limit; inspect solver.log")
+            raise RuntimeError("Solver exceeded the requested time limit; inspect solver.log")
+        except KeyboardInterrupt:
+            subprocess.run(["taskkill", "/PID", str(worker.pid), "/T", "/F"], check=True)
+            raise
     if code != 0:
         raise RuntimeError(f"Elmer exited {code}; inspect {output / 'solver.log'}")
-    result = output / "results" / "three_body_diagnostic_t0001.pvtu"
-    if not result.is_file():
+    result = output / "results" / f"{report.get('result_name', 'three_body_diagnostic')}_t0001.pvtu"
+    if not result.is_file() and not (partitions == 1 and result.with_suffix(".vtu").is_file()):
         raise RuntimeError("Elmer did not produce its expected PVTU")
-    attribute_result(output, result)
-    gaps = measure_joint_gaps(result)
+    attribute_result(output, result, timeout=None if timeout is None else 90)
+    gaps = measure_joint_gaps(result, timeout=None if timeout is None else 120)
+    if not gaps["finite_displacement"]:
+        raise RuntimeError("Solved displacement contains non-finite values")
+    if not gaps["finite_stress"]:
+        raise RuntimeError("Solved stress contains non-finite values")
+    if spring:
+        check_spring_gaps(gaps, report["interface_stiffness_n_per_m3"])
     report["result"] = str(result)
     report["solver_exit_code"] = code
     report["partitions"] = partitions
     report["joint_gaps"] = gaps
     report_path.write_text(json.dumps(report, indent=2))
-    if not gaps["finite_displacement"]:
-        raise RuntimeError("Solved displacement contains non-finite values")
-    if spring:
-        check_spring_gaps(gaps, report["interface_stiffness_n_per_m3"])
     return result
 
 
-def check_spring_gaps(gaps: dict[str, object], stiffness: dict[str, float]) -> None:
+def wait_for_solver(
+    worker: subprocess.Popen, log_path: Path, timeout: int | None,
+) -> int:
+    """Relay solver output and heartbeats without imposing a default run limit."""
+    started = time.monotonic()
+    with log_path.open(encoding="utf-8", errors="replace") as stream:
+        while True:
+            elapsed = time.monotonic() - started
+            if timeout is not None and elapsed >= timeout:
+                raise subprocess.TimeoutExpired(worker.args, timeout)
+            interval = 30. if timeout is None else min(30., timeout - elapsed)
+            try:
+                code = worker.wait(timeout=interval)
+            except subprocess.TimeoutExpired:
+                text = stream.read()
+                if text:
+                    print(text, end="" if text.endswith("\n") else "\n", flush=True)
+                print(f"Elmer running: {time.monotonic() - started:.0f} s elapsed"
+                      " (no automatic timeout unless requested).", flush=True)
+            else:
+                text = stream.read()
+                if text:
+                    print(text, end="" if text.endswith("\n") else "\n", flush=True)
+                return code
+
+
+def check_spring_gaps(gaps: dict, stiffness: dict[str, dict[str, float]]) -> None:
     """Reject the silent-garbage pattern: missing joints or implausible openings.
 
-    1 MPa of joint traction opens a 7e11 N/m^3 spring by ~1.4 um; 100 MPa is a
-    generous ceiling for this load case, far above any credible joint stress.
+    Check each global-axis traction using its configured stiffness. The 100 MPa
+    component ceiling is a plausibility check, not an engineering acceptance limit.
     """
     for name in SPRING_PAIRS:
         joint = gaps["joints"][name]
         if joint["locations"] == 0:
             raise RuntimeError(f"No {name} joint locations found in the result")
-        if joint["max_abs_gap_m"] * stiffness[name] > 100e6:
+        maximum = np.asarray(joint["max_abs_gap_by_axis_m"], dtype=float)
+        if maximum.shape != (3,) or not np.isfinite(maximum).all() or np.any(maximum < 0):
+            raise RuntimeError(f"Invalid {name} directional joint gaps")
+        coefficients = np.array([stiffness[name][axis] for axis in ("x", "y", "z")])
+        if np.any(maximum * coefficients > 100e6):
             raise RuntimeError(f"{name} joint gap implies >100 MPa traction; result rejected")
 
 
@@ -385,19 +474,19 @@ def pvpython_executable() -> str:
     return executable
 
 
-def measure_joint_gaps(result: Path) -> dict[str, object]:
+def measure_joint_gaps(result: Path, timeout: int | None = 120) -> dict[str, object]:
     completed = subprocess.run(
         [pvpython_executable(), str(Path(__file__).with_name("measure_joint_gaps.py")), str(result)],
-        check=True, timeout=120, capture_output=True, text=True,
+        check=True, timeout=timeout, capture_output=True, text=True,
     )
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
-def attribute_result(output: Path, result: Path) -> None:
+def attribute_result(output: Path, result: Path, timeout: int | None = 90) -> None:
     """Attach body labels by exact source-cell coordinates, not spatial guesses."""
     subprocess.run(
         [pvpython_executable(), str(Path(__file__).with_name("attribute_diagnostic_result.py")),
-         str(output), str(result)], check=True, timeout=90,
+         str(output), str(result)], check=True, timeout=timeout,
     )
 
 
