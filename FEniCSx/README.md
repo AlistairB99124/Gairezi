@@ -453,39 +453,37 @@ law and verification are required before using these arrays as initial state.
 The recorded peak can be compressive if the entire model is in compression;
 `has_tension` distinguishes this. These outputs are not engineering validation.
 
-### Automatic horizontal crack
+### User-selected horizontal crack
 
-After each successful Elmer baseline, the API starts FEniCSx even without
-`crack_simulations`. For the three-body model the consumer uses the largest
-**nodal** maximum principal stress over **wall and plinth** nodes (bedrock nodes
-are excluded) and that node's undeformed position. A nodal value is used because
-element means smear the wall/plinth corner peak: for the reference job the
-concrete nodal peak is 1.99 MPa in the plinth at r 79.5 m, chainage 98.0 m,
-Z -27.5 m, while the wall element-mean peak lies at Z -17.1 m. The corner peak
-is mesh sensitive. Legacy two-body runs keep the element-mean centroid peak.
+The crack location is **chosen by the user**; there is no automatic placement.
+After the verified three-body elastic baseline, `run-baseline` writes
+`crack_selection_map.json` next to the baseline manifest. It contains the Elmer
+nodal maximum principal stress (MPa, tension positive) over **wall and plinth**
+nodes, binned 1.0 m in Y by 0.5 m in Z (maximum over the radial thickness),
+with the tension and compression peaks of each body and the plinth-top and
+rock-seat contour outlines. Each node is projected to `y = R cos(theta)` at the
+wall centreline radius `R`, so a selected Y maps uniquely to chainage
+`R acos(y / R)`. The API pauses the job (`stage` `awaiting_crack_location`) and
+the app shows this Z-Y plot; the user clicks a point and presses Continue.
 
-The initial crack is a **local** horizontal annular-sector prism at the peak Z,
-using the authoritative wall centreline radius to convert chainage to angle.
-It is seeded from the concrete face nearer the peak (upstream if the peak radius
-is at or beyond the centreline radius, otherwise downstream). Radially it runs
-from that face of whichever concrete body is wider (wall or plinth) to **75% of
-wall thickness** into the wall, e.g. r 77-81 m for an upstream seed. It has a
-**0.002 m vertical opening** and an arc of **4 m**
-(`automatic_crack.arc_length_m` in [fracture_defaults.json](fracture_defaults.json)).
-The arc is positioned to contain both the peak and the nearest wall/plinth
-junction chainage at that elevation (the wall-end intersection of the plinth top
-contours), so the crack passes through **both wall and plinth**. It is centred on
-the peak where possible, kept at least `min(2 l, arc/4)` from the junction on each
-side and kept inside the concrete extent given by the plinth underside contours.
-If one 4 m arc cannot contain both peak and junction, or the wall does not reach
-the peak elevation, generation fails rather than moving the crack. For the
-reference job the arc is chainage 95.99-99.99 m about the junction at 98.44 m.
-This is not a straight rectangular chord.
+`run-fracture --crack-location Y Z` (metres) then seeds a **local** horizontal
+annular-sector prism at the selected Z, centred on the selected chainage. The
+Z-Y view cannot distinguish faces, so the seed face is the face of the concrete
+node with the highest baseline principal stress within the arc and 0.5 m of Z
+(upstream if that node's radius is at or beyond the centreline radius). Radially
+it runs from that face (the plinth face where plinth is present) to **75% of
+wall thickness** into the wall. It has a **0.002 m vertical opening** and an
+arc of **4 m** (`automatic_crack.arc_length_m` in
+[fracture_defaults.json](fracture_defaults.json)). Near the abutments the arc is
+shortened to the concrete width or shifted to stay above the rock seat, with a
+warning. A point outside the concrete section, or whose band crosses no wall or
+plinth nodes, fails rather than moving the crack. Clicking the plinth peak (for
+example Z -27.5 m) puts the band through both plinth and wall.
 
-The named result is `automatic_peak_tension`; existing result endpoints and
-ParaView controls discover it from the run manifest. `automatic_crack.json`
-records the source peak, seed face, concrete and wall chainage extents, junction
-chainage, crack chainage range, exact sector, generated specification,
+The named result is `user_located_crack`; existing result endpoints and
+ParaView controls discover it from the run manifest. `crack_location.json`
+records the selected Y/Z and chainage, seed face and its source node, concrete
+chainage extent, crack chainage range, exact sector, damaged bodies, warnings,
 numerical settings and limitations. The submitted `config.json` is not rewritten.
 
 In the three-body model fracture is permitted in **plinth (region 1) and wall
@@ -503,8 +501,8 @@ For legacy two-body runs damage remains restricted to wall region 2.
 Damage-region cells (plinth and wall for three-body) drive crack-resolution
 checks and refinement marking; only under-resolved damage-region cells near the
 crack are marked. Neighbouring cells may still be subdivided for conformity.
-Automatic three-body placement must put diffuse-band cells in both plinth and
-wall. Refinement reports and logs record wall and plinth cell counts and marked
+The user-located three-body crack must put diffuse-band cells in every body its
+seed band crosses (`required_region_ids` in `crack_location.json`). Refinement reports and logs record wall and plinth cell counts and marked
 cells separately. For the reference job refinement resolved in 4 levels to
 2.54 M cells (1.26 M wall, 1.08 M plinth) at 2.31 elements per length scale.
 Automatic runs allow up to **five** refinement levels, stopping early when the

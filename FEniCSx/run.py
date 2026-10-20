@@ -7,6 +7,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -190,7 +191,7 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
                     raise ValueError("Three-body baseline verification requires --elmer-result")
                 from elastic_parity import read_reference
                 import numpy as np
-                expected, reference_components, _ = read_reference(structure, elmer_result)
+                expected, reference_components, reference_regions = read_reference(structure, elmer_result)
                 reference_stress = np.empty((len(reference_components), 3, 3))
                 for component, (i, j) in enumerate(((0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (0, 2))):
                     reference_stress[:, i, j] = reference_stress[:, j, i] = reference_components[:, component]
@@ -229,6 +230,13 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
                 if not verification["passed"]:
                     write_json(directory / "baseline_report.json", report)
                     raise RuntimeError(f"Three-body elastic verification failed: {verification}")
+                from crack_selection import selection_map
+
+                # The app plots this map so the user selects the crack location before cracking.
+                write_json(directory / "crack_selection_map.json", selection_map(
+                    np.asarray(structure.nodes, dtype=float), reference_components, reference_regions,
+                    json.loads(snapshot.read_text(encoding="utf-8")),
+                ))
         report.update({
             "scenario_name": scenario, "engineering_validated": False,
             "configuration_sha256": manifest["configuration_sha256"],
@@ -275,8 +283,13 @@ def run_fracture(
     *, processes: int = 1, mechanics_formulation: str = "hybrid", damage_acceleration: bool = False,
     final_load_substeps: int = 1,
     model_directory: Path | None = None, verified_baseline: Path | None = None,
+    crack_location: tuple[float, float] | None = None,
 ) -> None:
-    """Run one isolated phase-field job from the authoritative dam configuration."""
+    """Run one isolated phase-field job from the authoritative dam configuration.
+
+    Without configured crack_simulations, ``crack_location`` (Y, Z in metres, chosen by the
+    user on the baseline Z-Y plot) is required; the crack location is never chosen automatically.
+    """
     if mechanics_formulation not in ("hybrid", "experimental_amor", "experimental_spectral"):
         raise ValueError(f"Unknown fracture mechanics formulation: {mechanics_formulation!r}")
     if damage_acceleration and mechanics_formulation == "hybrid":
@@ -338,25 +351,39 @@ def run_fracture(
             baseline = import_baseline(structure, elmer_result, snapshot, directory)
             manifest["elmer_baseline"] = baseline
             write_json(directory / "manifest.json", manifest)
-        generated = not specifications
+        generated = crack_location is not None
+        if generated and specifications:
+            raise ValueError("--crack-location cannot be combined with configured crack_simulations.")
+        if not specifications and not generated:
+            raise ValueError(
+                "No crack location was selected. Choose the location on the baseline Z-Y plot "
+                "(--crack-location Y Z) or configure crack_simulations."
+            )
         if generated:
             if elmer_result is None:
-                raise ValueError("Automatic crack generation requires --elmer-result.")
-            from automatic_crack import generate_crack
+                raise ValueError("A user-located crack requires --elmer-result.")
+            import numpy as np
+            from automatic_crack import locate_crack
 
-            specification, options, generation = generate_crack(
-                json.loads(snapshot.read_text(encoding="utf-8")), baseline,
+            with np.load(directory / baseline["field_archive"]) as archive:
+                fields = (archive["coordinates_m"], archive["stress_pa"], archive["node_regions"])
+            specification, options, generation = locate_crack(
+                json.loads(snapshot.read_text(encoding="utf-8")), crack_location, fields,
             )
             specifications = [specification]
             generation["specification"] = asdict(specification)
             report_config["crack_simulations"] = [generation["report_crack"]]
-            write_json(directory / "automatic_crack.json", generation)
-            manifest["automatic_crack"] = generation
+            write_json(directory / "crack_location.json", generation)
+            manifest["crack_location"] = generation
             manifest["crack_scenario_names"] = [specification.name]
             write_json(directory / "manifest.json", manifest)
-            print(f"Generated {specification.name} at Z={specification.centre_m[2]:.6f} m", flush=True)
+            print(
+                f"User-located crack at Y={crack_location[0]:.6f} m, Z={crack_location[1]:.6f} m "
+                f"(chainage {generation['selected_chainage_m']:.6f} m, {generation['seed_face']} face)",
+                flush=True,
+            )
             for warning in generation["warnings"]:
-                print(f"Automatic crack warning: {warning}", flush=True)
+                print(f"Crack location warning: {warning}", flush=True)
         else:
             options = load_phase_field_solver_options(snapshot)
         if is_three_body(structure):
@@ -367,8 +394,11 @@ def run_fracture(
         write_json(directory / "import_report.json", imported.report)
         from three_body_model import DAMAGE_REGION_IDS
         damage_regions = DAMAGE_REGION_IDS if is_three_body(structure) else (2,)
-        # The automatic crack is placed to cross the wall/plinth junction, so it must reach both.
-        required_regions = damage_regions if generated else (2,)
+        # The selected crack must reach every damageable concrete body its band crosses.
+        required_regions = (
+            tuple(region for region in generation["required_region_ids"] if region in damage_regions)
+            or damage_regions
+        ) if generated else (2,)
         placement = [
             crack_placement_report(imported, specification, required_regions, damage_regions)
             for specification in specifications
@@ -458,7 +488,14 @@ def main() -> int:
                         help="Subdivide the final configured load interval (default: 1, unchanged ramp)")
     parser.add_argument("--output", type=Path, default=HERE / "results")
     parser.add_argument("--scenario", help="Run one enabled scenario by id")
+    parser.add_argument("--crack-location", type=float, nargs=2, metavar=("Y", "Z"),
+                        help="User-selected crack location on the baseline Z-Y plot (global metres)")
     args = parser.parse_args()
+    if args.crack_location is not None and (
+        args.action != "run-fracture" or args.baseline_phase or args.elmer_result is None
+        or not all(math.isfinite(value) for value in args.crack_location)
+    ):
+        parser.error("--crack-location requires a cracking run-fracture with --elmer-result and finite Y Z")
     if args.elmer_model is not None and args.action not in ("run-baseline", "run-fracture"):
         parser.error("--elmer-model applies only to run-baseline or run-fracture")
     if args.verified_baseline is not None and (args.action != "run-fracture" or args.baseline_phase):
@@ -495,6 +532,8 @@ def main() -> int:
             source_options["model_directory"] = args.elmer_model.resolve()
         if args.verified_baseline is not None:
             source_options["verified_baseline"] = args.verified_baseline.resolve()
+        if args.crack_location is not None:
+            source_options["crack_location"] = tuple(args.crack_location)
         run_fracture(
             args.dam_config.resolve(), args.output.resolve(), versions,
             args.elmer_result.resolve() if args.elmer_result is not None else None,

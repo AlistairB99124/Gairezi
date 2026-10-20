@@ -1,0 +1,130 @@
+{
+  "geometry": {
+    "global_element_size_m": 0.5,
+    "local_element_size_m": 0.1,
+    "wall": {
+      "radial_width_m": 4.0,
+      "height_above_bedrock_m": 29.0,
+      "total_height_m": "geometry.wall.height_above_bedrock_m + geometry.bedrock.key.depth_m",
+      "upstream_radius_m": 80.0,
+      "centerline_radius_m": 78.0,
+      "downstream_radius_m": 76.0
+    },
+    "bedrock": {
+      "mesh": {
+        "near_size_m": 0.5,
+        "far_size_m": 15.0,
+        "near_distance_m": 2.0,
+        "far_distance_m": 50.0
+      },
+      "domain": {
+        "stream_margin_m": 58.0,
+        "bank_margin_m": 58.0,
+        "bottom_z_m": -87.0
+      },
+      "contours": [
+        {
+          "chainage": 0,
+          "height": 5
+        },
+        {
+          "chainage": 6,
+          "height": 0
+        },
+        {
+          "chainage": 37,
+          "height": -10
+        },
+        {
+          "chainage": 62,
+          "height": -21
+        },
+        {
+          "chainage": 92,
+          "height": -28
+        },
+        {
+          "chainage": 101,
+          "height": -29
+        },
+        {
+          "chainage": 116,
+          "height": -29
+        },
+        {
+          "chainage": 131,
+          "height": -26
+        },
+        {
+          "chainage": 146,
+          "height": -18
+        },
+        {
+          "chainage": 155,
+          "height": -14
+        },
+        {
+          "chainage": 166,
+          "height": -6
+        },
+        {
+          "chainage": 174,
+          "height": 0
+        },
+        {
+          "chainage": 180,
+          "height": 5
+        }
+      ],
+      "support": {
+        "model": "distributed_elastic_granite",
+        "material": "bedrock",
+        "spring_n_per_m3": {
+          "x": 1250000000.0,
+          "y": 1250000000.0,
+          "z": 3000000000.0
+        }
+      },
+      "key": {
+        "depth_m": 1.0,
+        "width_m": "geometry.wall.radial_width_m"
+      }
+    }
+  },
+  "material": {
+    "concrete": {
+      "density": 2400,
+      "youngs_modulus": 35000000000.0,
+      "poisson_ratio": 0.2,
+      "tensile_strength_pa": 2000000.0
+    },
+    "bedrock": {
+      "density": 2700,
+      "youngs_modulus": 50000000000.0,
+      "poisson_ratio": 0.25,
+      "tensile_strength_pa": 25000000.0,
+      "support": {
+        "model": "rollers",
+        "material": "bedrock",
+        "spring_n_per_m3": {
+          "x": 1000000000000.0,
+          "y": 1000000000000.0,
+          "z": 1000000000000.0
+        }
+      }
+    }
+  },
+  "loads": {
+    "gravity": -9.81,
+    "water_height": 31.0,
+    "tailwater_head": 3.0,
+    "overflow_head": 3.0,
+    "overflow_water_level": 34.0,
+    "water_density": 1000.0
+  },
+  "outputs": {
+    "max_displacement": true,
+    "max_tensile_stress": true,
+    "cracking_risk": true
+  }
+}

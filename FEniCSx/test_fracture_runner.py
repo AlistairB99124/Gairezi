@@ -1,6 +1,5 @@
 """Integration checks for isolated phase-field job setup and failure reporting."""
 import json
-import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -57,26 +56,35 @@ class FractureRunnerTests(unittest.TestCase):
             self.assertEqual(fracture.call_args.kwargs["mechanics_formulation"], "experimental_spectral")
             self.assertTrue(fracture.call_args.kwargs["damage_acceleration"])
 
-    def test_automatic_run_records_generated_scenario_without_changing_dam_snapshot(self):
+    def test_user_located_run_records_selected_scenario_without_changing_dam_snapshot(self):
+        import numpy as np
+        from test_automatic_crack import location, synthetic_fields
+
         fixture = test_engineering_report.EngineeringReportTests()
         fixture.setUp()
-        theta = 97.988 / 78
-        baseline = {"max_principal_stress": {
-            "value_pa": 2e6, "position_xyz_m": [79.5 * math.sin(theta), 79.5 * math.cos(theta), -27.5],
-            "node_id": 1, "region_id": 1,
-        }}
+
+        def import_baseline(structure, result, snapshot, directory):
+            points, stress, regions = synthetic_fields()
+            np.savez_compressed(directory / "fields.npz", coordinates_m=points, stress_pa=stress,
+                                node_regions=regions)
+            return {"field_archive": "fields.npz"}
+
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             config = output / "submitted.json"
             config.write_bytes(LOAD_CASE.read_bytes())
+            with self.assertRaisesRegex(ValueError, "No crack location was selected"):
+                with patch("elmer_baseline.import_baseline", side_effect=import_baseline):
+                    run_fracture(config, output / "unselected", {"test_environment": True}, output / "fake.pvtu")
             with (
-                patch("elmer_baseline.import_baseline", return_value=baseline) as importer,
+                patch("elmer_baseline.import_baseline", side_effect=import_baseline) as importer,
                 patch("crack_field.refine_for_phase_field", side_effect=lambda imported, specifications, options, *_:
                       SimpleNamespace(domain=imported.domain, cell_tags=imported.cell_tags,
                                       facet_tags=imported.facet_tags, report=fixture.refinement)),
                 patch("dam_phase_field.solve", return_value=SimpleNamespace(report=fixture.result)) as solve,
             ):
-                run_fracture(config, output, {"test_environment": True}, output / "fake.pvtu")
+                run_fracture(config, output, {"test_environment": True}, output / "fake.pvtu",
+                             crack_location=location(97.988, -27.5))
             run = next((output / "dam_phase_field").iterdir())
             manifest = json.loads((run / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "completed_not_engineering_validated")
@@ -84,14 +92,36 @@ class FractureRunnerTests(unittest.TestCase):
             self.assertEqual(solve.call_args.kwargs["mechanics_formulation"], "hybrid")
             self.assertTrue(solve.call_args.kwargs["refined_baseline"])
             self.assertTrue(manifest["refined_baseline_required"])
-            self.assertEqual(manifest["crack_scenario_names"], ["automatic_peak_tension"])
+            self.assertEqual(manifest["crack_scenario_names"], ["user_located_crack"])
             self.assertEqual((run / "config.json").read_bytes(), config.read_bytes())
-            generated = json.loads((run / "automatic_crack.json").read_text())
+            generated = json.loads((run / "crack_location.json").read_text())
             self.assertEqual(generated["opening_m"], 0.002)
             self.assertEqual(generated["depth_m"], 3)
+            self.assertAlmostEqual(generated["selected_location_m"]["z"], -27.5)
             self.assertTrue((run / "results.md").is_file())
             self.assertEqual(solve.call_args.args[2][0].shape, "annular_sector")
+            self.assertEqual(solve.call_args.args[2][0].centre_m[2], -27.5)
             self.assertEqual({kind for kind, _ in importer.call_args.args[0].cells}, {4})
+
+    def test_crack_location_cli_is_forwarded_and_rejected_elsewhere(self):
+        with (
+            patch("sys.argv", ["run.py", "run-fracture", "--dam-config", str(LOAD_CASE),
+                               "--elmer-result", "result.pvtu", "--crack-location", "24.5", "-27.5"]),
+            patch("run.environment", return_value={"test": True}),
+            patch("run.run_fracture") as fracture,
+        ):
+            self.assertEqual(main(), 0)
+            self.assertEqual(fracture.call_args.kwargs["crack_location"], (24.5, -27.5))
+        for arguments in (
+            ["run-fracture", "--crack-location", "24.5", "-27.5"],
+            ["run-baseline", "--elmer-result", "r.pvtu", "--crack-location", "24.5", "-27.5"],
+            ["run-fracture", "--elmer-result", "r.pvtu", "--crack-location", "nan", "-27.5"],
+            ["run-fracture", "--elmer-result", "r.pvtu", "--crack-location", "24.5"],
+        ):
+            with self.subTest(arguments=arguments), patch("sys.argv", ["run.py", *arguments]):
+                with self.assertRaises(SystemExit) as error:
+                    main()
+                self.assertEqual(error.exception.code, 2)
 
     def test_baseline_cli_routes_the_exact_api_commands(self):
         for arguments, phase in (
@@ -105,7 +135,7 @@ class FractureRunnerTests(unittest.TestCase):
                 patch("run.environment", return_value={"test": True}),
                 patch("run.run_baseline") as baseline,
                 patch("run.load_scenarios", side_effect=AssertionError("Unrelated scenarios loaded")),
-                patch("automatic_crack.generate_crack", side_effect=AssertionError("Crack generated")),
+                patch("automatic_crack.locate_crack", side_effect=AssertionError("Crack generated")),
             ):
                 self.assertEqual(main(), 0)
                 self.assertEqual(baseline.call_args.kwargs, {"phase": phase})
@@ -154,7 +184,7 @@ class FractureRunnerTests(unittest.TestCase):
                 original = snapshot.read_bytes()
                 with (
                     patch("run.submitted_structure", return_value=structure),
-                    patch("automatic_crack.generate_crack", side_effect=AssertionError("Crack generated")),
+                    patch("automatic_crack.locate_crack", side_effect=AssertionError("Crack generated")),
                 ):
                     run_baseline(snapshot, output, {"test": True}, phase=phase)
                 root = output / ("dam_phase_field" if phase else "dam_elastic_baseline")

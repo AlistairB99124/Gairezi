@@ -117,7 +117,7 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
         ),
         "field_archive": "elmer_baseline_fields.npz",
         "node_regions_encoding": "membership bits: 1=plinth, 2=wall, 4=bedrock; combined bits for shared nodes",
-        "usage": "baseline fields are not fracture initial conditions; peak-driven geometry is recorded separately",
+        "usage": "baseline fields are not fracture initial conditions; the user-selected crack location is recorded separately",
         "engineering_validated": False,
     }
     np.savez_compressed(

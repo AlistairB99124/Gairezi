@@ -166,7 +166,8 @@ def audit(run: Path) -> dict:
         ufl.sqrt(ufl.inner(strain(u), strain(u))), norms.function_space.element.interpolation_points,
     ))
     report["checkpoint"]["strain_peak"] = _strain_breakdown_details(u, alpha, norms)
-    residual = manifest["automatic_crack"]["specification"]["residual_stiffness"]
+    crack_record = manifest.get("crack_location", manifest.get("automatic_crack"))
+    residual = crack_record["specification"]["residual_stiffness"]
     peak_damage = np.asarray(report["checkpoint"]["strain_peak"]["damage_at_vertices"])
     report["checkpoint"]["strain_peak"]["hybrid_vertex_stiffness_fraction_range"] = [
         float(((1 - peak_damage)**2 + residual).min()),

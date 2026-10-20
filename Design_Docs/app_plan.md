@@ -140,11 +140,19 @@ tensor parity (each relative error <= 1e-4), explicit nodal peak metadata,
 force equilibrium (<= 1e-6), crack-band resolution and a converged refined
 zero-damage baseline. Canonical headline peaks use recovered nodes, not
 element-mean tensors; the desktop warns about historical unlike measures.
-Canonical elastic solves use GMRES/right GAMG instead of CG. Automatic fracture
-requires 2.0 elements per length scale with the unchanged 0.1 m length scale
-and five refinement levels; lower explicit canonical targets are rejected.
+Canonical elastic solves use GMRES/right GAMG instead of CG. Fracture requires
+2.0 elements per length scale (0.25 m length scale, up to five refinement levels
+and 4,000,000 cells); lower explicit canonical targets are rejected.
 If the limit is exhausted, stop rather than accept an under-resolved solve.
-Only wall damage evolves; plinth/rock and interface springs remain elastic.
+Wall and plinth damage evolve; bedrock and interface springs remain elastic.
+The crack location is never chosen automatically. After the verified elastic
+baseline the job pauses at stage `awaiting_crack_location` (cracking status
+`awaiting_location`); `GET /jobs/{id}/crack-selection` returns the binned
+Z-Y wall/plinth maximum principal stress map with peaks, the desktop plots it,
+and the user's click is submitted with `POST /jobs/{id}/crack-location`
+(`y_m`, `z_m`; rejected unless the point lies on a concrete bin). The API then
+runs `run-fracture --crack-location Y Z`. Cancelling while paused skips cracking
+and keeps the completed baselines.
 Failures preserve the completed Elmer result and expose the failed FEniCSx
 stage. Hybrid and explicit experimental Amor are supported; the historical
 bonded-reference hold remains for legacy jobs. Full-size elastic parity and
@@ -229,6 +237,8 @@ compatibility with the project's selected Python interpreter.
 | `GET /jobs/{id}` | State, stage, timestamps, warnings and failure information |
 | `GET /jobs/{id}/logs?offset=...` | Incremental bounded log retrieval |
 | `POST /jobs/{id}/cancel` | Request cancellation of that job's process tree |
+| `GET /jobs/{id}/crack-selection` | Baseline Z-Y stress map for user crack-location selection (409 until the verified baseline map exists) |
+| `POST /jobs/{id}/crack-location` | Submit the selected `y_m`, `z_m` and start cracking (only while awaiting) |
 | `GET /jobs/{id}/results` | Structured metrics and available artifact manifest |
 | `GET /jobs/{id}/artifacts/{artifact-id}` | Serve an allowlisted file belonging to that job |
 

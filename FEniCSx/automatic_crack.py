@@ -1,4 +1,4 @@
-"""Generate a local horizontal crack through wall and plinth at the Elmer concrete peak tension."""
+"""Local horizontal crack through concrete at the user-selected Z-Y location (no automatic placement)."""
 from __future__ import annotations
 
 import json
@@ -38,23 +38,24 @@ def plinth_intersections(contours: list[dict], z: float) -> tuple[float, float]:
     return left, right
 
 
-def generate_crack(config: dict, baseline: dict):
-    """Seed a local horizontal crack across the wall/plinth junction at the concrete peak.
+def locate_crack(config: dict, location, fields):
+    """Seed a local horizontal crack at the user-selected Z-Y location.
 
-    The peak is the baseline's concrete (wall and plinth) maximum principal stress. The crack
-    lies at the peak elevation, runs inward from the concrete face nearer the peak, and its
-    arc is centred on the peak but shifted so it also spans the wall/plinth junction.
+    ``location`` is the (y, z) point picked on the baseline Z-Y plot (see crack_selection):
+    z is the crack elevation and y selects the chainage R acos(y/R) at the wall centreline
+    radius R. ``fields`` is (coordinates_m, stress_pa, node_regions) from the Elmer baseline;
+    they choose the seeded face (the face of the highest local principal stress) and confirm
+    which concrete bodies the crack crosses. No location is chosen automatically.
     """
     from crack_field import CrackSpecification, PhaseFieldSolverOptions
+    from crack_selection import plan_angle, principal_stresses
 
-    peak = baseline["max_principal_stress"]
-    if not math.isfinite(peak["value_pa"]) or peak["value_pa"] <= 0:
-        raise ValueError("Elmer baseline has no positive tensile-stress peak; no automatic crack can be placed.")
-    # Three-body baselines report a nodal position; older single-body ones an element centroid.
-    peak_position = np.asarray(peak.get("position_xyz_m", peak.get("centroid_xyz_m")), dtype=float)
-    if peak_position.shape != (3,) or not np.isfinite(peak_position).all():
-        raise ValueError("Elmer peak position must contain three finite coordinates.")
-    z = float(peak_position[2])
+    try:
+        y, z = (float(value) for value in location)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Crack location must be two numbers: Y and Z in metres.") from error
+    if not (math.isfinite(y) and math.isfinite(z)):
+        raise ValueError("Crack location Y and Z must be finite.")
     geometry = config["geometry"]
     wall, plinth = geometry["wall"], geometry["plinth"]
     upstream = float(wall["upstream_radius_m"])
@@ -69,6 +70,9 @@ def generate_crack(config: dict, baseline: dict):
     downstream = upstream - thickness
     if downstream <= 0:
         raise ValueError("Wall downstream radius must be positive.")
+    if not -chainage_radius <= y <= chainage_radius:
+        raise ValueError(f"Selected Y={y} m lies outside the +/-{chainage_radius} m centreline projection.")
+    chainage = chainage_radius * math.acos(y / chainage_radius)
     defaults = json.loads(DEFAULTS.read_text(encoding="utf-8"))
     options = PhaseFieldSolverOptions(**defaults.pop("solver"))
     placement = defaults.pop("automatic_crack")
@@ -79,73 +83,84 @@ def generate_crack(config: dict, baseline: dict):
     if not math.isfinite(arc_length) or arc_length <= 0:
         raise ValueError("automatic_crack.arc_length_m must be finite and positive.")
     depth = depth_fraction * thickness
-    peak_x, peak_y, _ = peak_position
-    peak_radius = math.hypot(peak_x, peak_y)
-    peak_chainage = chainage_radius * math.atan2(peak_x, peak_y)
-    contours = plinth["contours"]
-    if not float(contours[0]["chainage"]) <= peak_chainage <= float(contours[-1]["chainage"]):
-        raise ValueError("Elmer peak chainage lies outside the configured plinth contours.")
-    # Concrete exists above the rock seat; the wall exists above the plinth top contour.
-    concrete_left, concrete_right = plinth_intersections(geometry["bedrock"]["contours"], z)
-    if not concrete_left <= peak_chainage <= concrete_right:
-        raise ValueError("Elmer peak chainage lies outside the concrete section at the peak elevation.")
-    try:
-        wall_left, wall_right = plinth_intersections(contours, z)
-    except ValueError as error:
-        raise ValueError(
-            f"The wall does not reach the peak elevation Z={z}; a crack through wall and plinth "
-            f"cannot be placed ({error})"
-        ) from error
-    junction = min((wall_left, wall_right), key=lambda chainage: abs(chainage - peak_chainage))
-    # Seed from the concrete face carrying the peak; plinth shoulders extend beyond the wall faces.
-    seed_face = "upstream" if peak_radius >= chainage_radius else "downstream"
-    if seed_face == "upstream":
-        inner, outer = upstream - depth, max(upstream, plinth_upstream)
-    else:
-        inner, outer = min(downstream, plinth_downstream), downstream + depth
-    if not inner <= peak_radius <= outer:
-        raise ValueError("Automatic crack depth does not reach the Elmer peak radius.")
-    span = min(arc_length, concrete_right - concrete_left)
     length_scale = float(defaults["length_scale_m"])
-    margin = min(2 * length_scale, span / 4)
-    # Admissible arc starts keep the arc in concrete, containing the peak and the junction.
-    lowest = max(concrete_left, peak_chainage - span, junction + margin - span)
-    highest = min(concrete_right - span, peak_chainage, junction - margin)
-    if lowest > highest:
+    # Concrete exists above the rock seat.
+    try:
+        concrete_left, concrete_right = plinth_intersections(geometry["bedrock"]["contours"], z)
+    except ValueError as error:
+        raise ValueError(f"No concrete section exists at the selected Z={z} m ({error})") from error
+    if not concrete_left <= chainage <= concrete_right:
         raise ValueError(
-            f"A {span:.6g} m crack arc cannot contain both the peak (chainage {peak_chainage:.6g} m) "
-            f"and the wall/plinth junction (chainage {junction:.6g} m) at Z={z}."
+            f"Selected location (Y={y} m, chainage {chainage:.6g} m) lies outside the concrete "
+            f"section at Z={z} m (chainage {concrete_left:.6g} to {concrete_right:.6g} m)."
         )
-    start = min(max(peak_chainage - span / 2, lowest), highest)
+    span = min(arc_length, concrete_right - concrete_left)
+    start = min(max(chainage - span / 2, concrete_left), concrete_right - span)
     end = start + span
+    warnings = []
+    if span < arc_length:
+        warnings.append(f"Crack arc shortened to the {span:.6g} m concrete width at Z={z} m.")
+    if not math.isclose(start, chainage - span / 2, abs_tol=1e-9):
+        warnings.append("Crack arc shifted along the dam to stay inside the concrete section.")
+
+    points, stress, node_regions = (np.asarray(array) for array in fields)
+    if (points.ndim != 2 or points.shape[1] != 3 or stress.shape != (len(points), 6)
+            or node_regions.shape != (len(points),)):
+        raise ValueError("Baseline fields must be nodal coordinates, six stress components and regions.")
+    node_chainage = chainage_radius * plan_angle(points)
+    node_radius = np.hypot(points[:, 0], points[:, 1])
+    concrete = (node_regions & 3) > 0
+    along = (node_chainage >= start) & (node_chainage <= end)
+    nearby = np.flatnonzero(concrete & along & (np.abs(points[:, 2] - z) <= 0.5))
+    if not len(nearby):
+        raise ValueError(f"No wall or plinth baseline nodes lie near the selected location (Y={y} m, Z={z} m).")
+    principal = principal_stresses(stress[nearby])[:, -1]
+    face_node = int(nearby[int(np.argmax(principal))])
+    seed_face = "upstream" if node_radius[face_node] >= chainage_radius else "downstream"
+    plinth_nearby = bool(np.any(node_regions[nearby] & 1))
+    # Plinth shoulders extend beyond the wall faces; reach the plinth face when it is present.
+    if seed_face == "upstream":
+        inner, outer = upstream - depth, max(upstream, plinth_upstream) if plinth_nearby else upstream
+    else:
+        inner, outer = min(downstream, plinth_downstream) if plinth_nearby else downstream, downstream + depth
+    crossed = concrete & along & (np.abs(points[:, 2] - z) <= length_scale / 2) & (
+        (node_radius >= inner) & (node_radius <= outer)
+    )
+    required_regions = [region for region in (1, 2) if np.any(node_regions[crossed] & region)]
+    if not required_regions:
+        raise ValueError(
+            f"The {seed_face} crack band at the selected location (Y={y} m, Z={z} m) contains no wall "
+            "or plinth nodes."
+        )
     theta0, theta1 = start / chainage_radius, end / chainage_radius
     if not 0 < theta1 - theta0 < math.pi:
-        raise ValueError("Automatic crack requires an angular span between zero and pi.")
+        raise ValueError("Crack requires an angular span between zero and pi.")
     middle = (theta0 + theta1) / 2
     radius = (inner + outer) / 2
     specification = CrackSpecification(
-        name="automatic_peak_tension", type="phase_field", shape="annular_sector",
+        name="user_located_crack", type="phase_field", shape="annular_sector",
         centre_m=(radius * math.sin(middle), radius * math.cos(middle), z),
         size_m=(outer - inner, radius * (theta1 - theta0), 0.002),
         normal=(0.0, 0.0, 1.0),
         annular_sector=(inner, outer, theta0, theta1),
         **defaults,
     )
-    plinth_top_at_peak = float(np.interp(
-        peak_chainage,
-        [float(row["chainage"]) for row in contours],
-        [float(row["height"]) for row in contours],
-    ))
+    names = {1: "plinth", 2: "wall"}
     report = {
         "method": (
-            "local horizontal annular-sector crack at the wall/plinth nodal peak principal stress, "
-            "seeded from the nearer concrete face and spanning the wall/plinth junction"
+            "local horizontal annular-sector crack at the user-selected Z-Y location, seeded from "
+            "the concrete face carrying the highest nearby baseline principal stress"
         ),
-        "source_peak": peak,
+        "selected_location_m": {"y": y, "z": z},
+        "selection_projection": "chainage = R acos(y / R) at the wall centreline radius R",
+        "selected_chainage_m": chainage,
         "seed_face": seed_face,
+        "seed_face_source": {
+            "node_id": face_node + 1,
+            "position_xyz_m": points[face_node].tolist(),
+            "max_principal_stress_pa": float(principal.max()),
+        },
         "concrete_chainage_extent_m": [concrete_left, concrete_right],
-        "wall_chainage_intersections_m": [wall_left, wall_right],
-        "wall_plinth_junction_chainage_m": junction,
         "crack_chainage_m": [start, end],
         "arc_length_m": end - start,
         "opening_m": 0.002,
@@ -153,22 +168,19 @@ def generate_crack(config: dict, baseline: dict):
         "depth_m": depth,
         "radial_extent_m": outer - inner,
         "annular_sector": list(specification.annular_sector),
-        "damaged_bodies": ["plinth", "wall"],
+        "required_region_ids": required_regions,
+        "damaged_bodies": [names[region] for region in required_regions],
         "placement_provenance": {
-            "elevation_source": "Elmer concrete nodal peak stress; not a fixed physical prescription",
-            "peak_body": {1: "plinth", 2: "wall"}.get(peak.get("region_id"), "unknown"),
-            "peak_radius_m": peak_radius,
-            "peak_chainage_m": peak_chainage,
-            "plinth_top_contour_at_peak_m": plinth_top_at_peak,
-            "junction_margin_m": margin,
-            "regenerated_for_each_baseline": True,
+            "elevation_source": "user selection on the baseline Z-Y stress plot; not chosen automatically",
+            "chainage_radius_m": chainage_radius,
         },
-        "warnings": [],
+        "warnings": warnings,
         "limitations": [
             "The wall and plinth are separate meshes joined by springs: damage is computed in each "
             "body, but the phase-field gradient does not couple across the joint and the joint "
             "springs do not soften.",
-            "The peak is a nodal value at the cut-back wall/plinth corner and is mesh sensitive.",
+            "The Z-Y view cannot distinguish faces; the seeded face follows the baseline stress near "
+            "the selected point.",
         ],
         "defaults": json.loads(DEFAULTS.read_text(encoding="utf-8")),
         "report_crack": {
@@ -189,6 +201,7 @@ def generate_crack(config: dict, baseline: dict):
         "engineering_validated": False,
     }
     return specification, options, report
+
 
 def sector_signed_distance(points: np.ndarray, sector: tuple, z: float, opening: float) -> np.ndarray:
     """Exact distance to a horizontal annular-sector prism (x=r sin(theta))."""
