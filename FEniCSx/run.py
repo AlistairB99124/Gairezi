@@ -155,6 +155,7 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
         write_json(directory / "import_report.json", imported.report)
         defaults = json.loads(DEFAULTS.read_text(encoding="utf-8"))
         options = PhaseFieldSolverOptions(**defaults.pop("solver"))
+        defaults.pop("automatic_crack")
         if phase:
             from dam_phase_field import solve
             from dolfinx.cpp.mesh import h
@@ -337,7 +338,8 @@ def run_fracture(
             baseline = import_baseline(structure, elmer_result, snapshot, directory)
             manifest["elmer_baseline"] = baseline
             write_json(directory / "manifest.json", manifest)
-        if not specifications:
+        generated = not specifications
+        if generated:
             if elmer_result is None:
                 raise ValueError("Automatic crack generation requires --elmer-result.")
             from automatic_crack import generate_crack
@@ -363,13 +365,17 @@ def run_fracture(
             require_fracture_resolution(options)
         imported = import_structure(structure, maximum_volume_change=0.001)
         write_json(directory / "import_report.json", imported.report)
+        from three_body_model import DAMAGE_REGION_IDS
+        damage_regions = DAMAGE_REGION_IDS if is_three_body(structure) else (2,)
+        # The automatic crack is placed to cross the wall/plinth junction, so it must reach both.
+        required_regions = damage_regions if generated else (2,)
         placement = [
-            crack_placement_report(imported, specification)
+            crack_placement_report(imported, specification, required_regions, damage_regions)
             for specification in specifications
         ]
         write_json(directory / "crack_placement.json", placement)
-        validate_crack_placement(imported, specifications)
-        refined = refine_for_phase_field(imported, specifications, options)
+        validate_crack_placement(imported, specifications, required_regions, damage_regions)
+        refined = refine_for_phase_field(imported, specifications, options, damage_regions)
         write_json(directory / "refinement_report.json", refined.report)
         with io.XDMFFile(refined.domain.comm, directory / "mesh.xdmf", "w") as writer:
             writer.write_mesh(refined.domain)

@@ -169,7 +169,7 @@ class ThreeBodyTests(unittest.TestCase):
         for target in (2., 3.):
             require_fracture_resolution(replace(options, minimum_elements_per_length_scale=target))
 
-    def test_nonwall_stiffness_is_not_degraded_or_scaled_by_residual_stiffness(self):
+    def test_bedrock_stiffness_is_not_degraded_or_scaled_by_residual_stiffness(self):
         from dolfinx import fem
         from three_body_model import materials
         from compression_preserving import stress as amor_stress
@@ -192,17 +192,19 @@ class ThreeBodyTests(unittest.TestCase):
             tensor.interpolate(fem.Expression(expression, tensor_space.element.interpolation_points))
             for tag, young in ((1, 1e7), (2, 1e7), (3, 2e7)):
                 dofs = tensor_space.dofmap.list[imported.cell_tags.find(tag), 0]
-                expected = young * np.diag((.01, .02, .03)) * (.36 if tag == 2 else 1.)
+                # Wall (2) and plinth (1) concrete degrade; bedrock (3) keeps full stiffness.
+                expected = young * np.diag((.01, .02, .03)) * (.36 if tag in (1, 2) else 1.)
                 np.testing.assert_allclose(tensor.x.array.reshape(-1, 3, 3)[dofs],
                                            np.broadcast_to(expected, (len(dofs), 3, 3)), atol=1e-8)
 
-    def test_automatic_seed_ignores_larger_plinth_and_bedrock_peaks(self):
+    def test_automatic_seed_uses_concrete_nodal_peak_and_ignores_bedrock(self):
         from unittest.mock import patch
         from elmer_baseline import import_baseline
         structure = column()
         regions = np.asarray([4]*8 + [1]*8 + [2]*8)
         stress = np.zeros((24, 6))
-        stress[:, 0] = np.repeat((100e6, 10e6, 1e6), 8)
+        stress[:, 0] = np.repeat((100e6, 1e6, 1e6), 8)
+        stress[11, 0] = 10e6
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             reference = root / "result.pvtu"
@@ -212,8 +214,10 @@ class ThreeBodyTests(unittest.TestCase):
             config.write_text("{}")
             with patch("elmer_baseline.read_reference", return_value=(np.zeros((24, 3)), stress, regions)):
                 baseline = import_baseline(structure, reference, config, root)
-            self.assertEqual(baseline["max_principal_stress"]["region_id"], 2)
-            self.assertEqual(baseline["max_principal_stress"]["value_pa"], 1e6)
+            peak = baseline["max_principal_stress"]
+            self.assertEqual((peak["region_id"], peak["node_id"], peak["value_pa"]), (1, 12, 10e6))
+            self.assertEqual(peak["position_xyz_m"], list(structure.nodes[11]))
+            self.assertIn("wall and plinth nodes", baseline["peak_method"])
 
     def test_fracture_rejects_missing_failed_stale_and_nonfinite_baseline_evidence(self):
         from three_body_model import require_verified_baseline
@@ -330,7 +334,7 @@ class ThreeBodyTests(unittest.TestCase):
         self.assertEqual(report["linear_solver"], {"method": "gmres", "preconditioner": "gamg"})
         self.assertEqual(set(report["body_stress"]), {"wall", "plinth", "bedrock"})
 
-    def test_refined_nonmatching_interfaces_and_wall_only_damage(self):
+    def test_refined_nonmatching_interfaces_and_concrete_only_damage(self):
         from crack_field import refine_for_phase_field
         from test_dam_phase_field import DamPhaseFieldTests
         structure = column()
@@ -415,9 +419,10 @@ def check_phase(imported, structure, output, formulation):
         damage_gradient_tolerance=1e-8, damage_maximum_iterations=1000)
     result = solve(imported, structure, [], options, output, parameters=parameters,
                    mechanics_formulation=formulation, refined_baseline=True)
-    nonwall = imported.cell_tags.indices[imported.cell_tags.values != 2]
-    dofs = fem.locate_dofs_topological(result.damage.function_space, 3, nonwall)
+    bedrock = imported.cell_tags.indices[imported.cell_tags.values == 3]
+    dofs = fem.locate_dofs_topological(result.damage.function_space, 3, bedrock)
     np.testing.assert_array_equal(result.damage.x.array[dofs], 0.)
+    assert result.report["damage_region_ids"] == [1, 2]
     assert result.report["steps"][-1]["maximum_damage"] > 0
     return result.report
 

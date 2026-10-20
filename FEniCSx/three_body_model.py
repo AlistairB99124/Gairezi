@@ -9,6 +9,9 @@ import meshio
 from mpi4py import MPI
 import numpy as np
 
+# Concrete bodies (1=plinth, 2=wall) may crack; bedrock (3) stays intact.
+DAMAGE_REGION_IDS = (1, 2)
+
 
 def is_three_body(structure):
     return getattr(structure, "three_body_config", None) is not None
@@ -139,10 +142,11 @@ def materials(imported, structure):
     fields["mu"] = young / (2 * (1 + poisson))
     fields["lam"] = young * poisson / ((1 + poisson) * (1 - 2 * poisson))
     fields["bulk"] = fields["lam"] + 2 * fields["mu"] / 3
-    wall = fem.Function(space, name="wall_damage_mask")
-    wall.x.array[space.dofmap.list[imported.cell_tags.find(2), 0]] = 1.
-    wall.x.scatter_forward()
-    fields["damage_mask"] = wall
+    concrete = fem.Function(space, name="concrete_damage_mask")
+    for tag in DAMAGE_REGION_IDS:
+        concrete.x.array[space.dofmap.list[imported.cell_tags.find(tag), 0]] = 1.
+    concrete.x.scatter_forward()
+    fields["damage_mask"] = concrete
     regions = fem.Function(space, name="body_id")
     regions.x.array[space.dofmap.list[imported.cell_tags.indices, 0]] = imported.cell_tags.values
     regions.x.scatter_forward()

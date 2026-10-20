@@ -343,7 +343,10 @@ class _ConfigValidator:
                 if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
                     self.issue(f"{path}.loading.load_steps", "must be a positive integer")
 
-            solver = self.object(crack.get("solver"), f"{path}.solver", PHASE_FIELD_SOLVER_KEYS)
+            solver = self.object(
+                crack.get("solver"), f"{path}.solver", PHASE_FIELD_SOLVER_KEYS,
+                optional={"maximum_refined_cells"},
+            )
             if solver is not None:
                 for key in (
                     "maximum_staggered_iterations",
@@ -351,7 +354,10 @@ class _ConfigValidator:
                     "damage_maximum_iterations",
                     "field_output_interval",
                     "maximum_refinement_levels",
+                    "maximum_refined_cells",
                 ):
+                    if key == "maximum_refined_cells" and key not in solver:
+                        continue
                     value = solver.get(key)
                     minimum = 0 if key == "maximum_refinement_levels" else 1
                     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:

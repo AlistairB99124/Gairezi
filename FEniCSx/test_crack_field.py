@@ -5,6 +5,7 @@ import math
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import warnings
 
 from dolfinx import fem, mesh
@@ -65,7 +66,9 @@ class CrackConfigurationTests(unittest.TestCase):
     def test_automatic_defaults_require_two_elements_per_length_scale(self):
         defaults = json.loads(Path(__file__).with_name("fracture_defaults.json").read_text())
         self.assertEqual(defaults["solver"]["minimum_elements_per_length_scale"], 2.0)
-        self.assertEqual(defaults["length_scale_m"], 0.1)
+        self.assertEqual(defaults["length_scale_m"], 0.25)
+        self.assertEqual(defaults["solver"]["maximum_refined_cells"], 4_000_000)
+        self.assertEqual(defaults["automatic_crack"], {"depth_fraction": 0.75, "arc_length_m": 4.0})
 
     def test_reads_the_configured_crack_from_the_root_config(self):
         config = configured_test_case()
@@ -365,6 +368,26 @@ class CrackPlacementAndRefinementTests(unittest.TestCase):
         self.assertIn("mesh_bounds", str(context.exception))
         self.assertIn("concrete wall", str(context.exception))
 
+    def test_junction_crack_must_reach_both_plinth_and_wall(self):
+        imported = self.imported_box()
+        domain = imported.domain
+        cells = imported.cell_tags.indices
+        midpoints = mesh.compute_midpoints(domain, domain.topology.dim, cells)
+        # Lower half plinth (1), upper half wall (2), junction at z=0.5.
+        values = np.where(midpoints[:, 2] < 0.5, 1, 2).astype(np.int32)
+        imported.cell_tags = mesh.meshtags(domain, domain.topology.dim, cells, values)
+        spanning = specification(centre_m=(0.5, 0.5, 0.45), size_m=(0.4, 0.4, 0.02), length_scale_m=0.2)
+        report = crack_placement_report(imported, spanning, (1, 2), (1, 2))
+        self.assertTrue(report["valid"])
+        self.assertEqual(report["centre_region_ids"], [1])
+        self.assertGreater(report["band_cell_count_by_region"]["1"], 0)
+        self.assertGreater(report["band_cell_count_by_region"]["2"], 0)
+        # Wall-only placement rules reject a centre in the plinth.
+        self.assertFalse(crack_placement_report(imported, spanning)["valid"])
+        plinth_only = specification(centre_m=(0.5, 0.5, 0.1), size_m=(0.4, 0.4, 0.02), length_scale_m=0.02)
+        with self.assertRaisesRegex(ValueError, "concrete plinth and concrete wall"):
+            validate_crack_placement(imported, plinth_only, (1, 2), (1, 2))
+
     def test_local_refinement_preserves_region_and_boundary_tags(self):
         imported = self.imported_box()
         crack = specification(
@@ -397,6 +420,17 @@ class CrackPlacementAndRefinementTests(unittest.TestCase):
                 PhaseFieldSolverOptions(
                     minimum_elements_per_length_scale=2.0, maximum_refinement_levels=0,
                 ),
+            )
+
+    def test_cell_budget_stops_refinement_before_it_is_attempted(self):
+        imported = self.imported_box()
+        crack = specification(centre_m=(0.5, 0.5, 0.5), length_scale_m=0.1)
+        total = imported.domain.topology.index_map(3).size_global
+        with patch("crack_field.mesh.refine", side_effect=AssertionError("refined")), \
+                self.assertRaisesRegex(RuntimeError, "level 1 predicted at least .* maximum_refined_cells"):
+            refine_for_phase_field(
+                imported, crack,
+                PhaseFieldSolverOptions(maximum_refinement_levels=3, maximum_refined_cells=total + 1),
             )
 
 

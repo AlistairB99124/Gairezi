@@ -521,7 +521,11 @@ resolve `l=0.1 m` to the recommended 2-4 elements. Raising the target to `2.0`
 requires five refinements and generated approximately 12.5 million crack-band
 tetrahedra plus a 1.8 GB mesh in testing; that exceeded the available serial WSL
 memory. Use parallel/distributed meshing and solve resources for that target,
-then perform a mesh/length-scale convergence study.
+then perform a mesh/length-scale convergence study. The automatic app workflow
+instead seeds a local 4 m crack at the wall/plinth nodal peak tension, spanning
+the wall/plinth junction so that both concrete bodies (but not bedrock) can
+damage, with a 0.25 m length scale and a 4,000,000-cell refinement budget; see
+[FEniCSx/README.md](FEniCSx/README.md).
 
 The staggered solve alternates degraded linear mechanics and a PETSc TAO
 bound-constrained AT2 damage minimisation. The lower bound is the damage from

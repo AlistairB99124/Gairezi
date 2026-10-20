@@ -1,5 +1,6 @@
 """Integration checks for isolated phase-field job setup and failure reporting."""
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -59,8 +60,10 @@ class FractureRunnerTests(unittest.TestCase):
     def test_automatic_run_records_generated_scenario_without_changing_dam_snapshot(self):
         fixture = test_engineering_report.EngineeringReportTests()
         fixture.setUp()
+        theta = 97.988 / 78
         baseline = {"max_principal_stress": {
-            "value_pa": 2e6, "centroid_xyz_m": [79, 0, -25], "element_id": 1, "region_id": 2,
+            "value_pa": 2e6, "position_xyz_m": [79.5 * math.sin(theta), 79.5 * math.cos(theta), -27.5],
+            "node_id": 1, "region_id": 1,
         }}
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
@@ -68,7 +71,7 @@ class FractureRunnerTests(unittest.TestCase):
             config.write_bytes(LOAD_CASE.read_bytes())
             with (
                 patch("elmer_baseline.import_baseline", return_value=baseline) as importer,
-                patch("crack_field.refine_for_phase_field", side_effect=lambda imported, specifications, options:
+                patch("crack_field.refine_for_phase_field", side_effect=lambda imported, specifications, options, *_:
                       SimpleNamespace(domain=imported.domain, cell_tags=imported.cell_tags,
                                       facet_tags=imported.facet_tags, report=fixture.refinement)),
                 patch("dam_phase_field.solve", return_value=SimpleNamespace(report=fixture.result)) as solve,

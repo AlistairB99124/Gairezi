@@ -38,6 +38,29 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def concrete_nodal_peak(points: np.ndarray, stress: np.ndarray, node_regions: np.ndarray) -> dict:
+    """Peak nodal principal stress over wall and plinth, matching the displayed Elmer field.
+
+    Wall and plinth nodes are distinct across the spring joint, so each nodal tensor belongs
+    to one concrete body. Nodes also belonging to rock (bonded seat) count as plinth.
+    """
+    concrete = np.flatnonzero((node_regions & 3) > 0)
+    if not len(concrete):
+        raise ValueError("Elmer baseline has no wall or plinth nodes.")
+    xx, yy, zz, xy, yz, xz = stress[concrete].T
+    tensors = np.stack((
+        np.stack((xx, xy, xz), axis=-1), np.stack((xy, yy, yz), axis=-1), np.stack((xz, yz, zz), axis=-1),
+    ), axis=-2)
+    principal = np.linalg.eigvalsh(tensors)[:, -1]
+    index = int(concrete[int(np.argmax(principal))])
+    return {
+        "node_id": index + 1,
+        "region_id": 1 if node_regions[index] & 1 else 2,
+        "value_pa": float(principal.max()),
+        "position_xyz_m": points[index].tolist(),
+    }
+
+
 def import_baseline(structure, reference: Path, config: Path, directory: Path) -> dict:
     """Map Elmer fields preserving either bonded or legacy split topology.
 
@@ -58,10 +81,9 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
         or not all(np.isfinite(array).all() for array in (points, displacement, stress))
     ):
         raise ValueError("Elmer baseline has invalid shapes or nonfinite coordinates/fields.")
-    peak = None
-    for element_id, (_, nodes) in enumerate(structure.cells, start=1):
-        if getattr(structure, "three_body_config", None) is not None and structure.region_ids[element_id - 1] != 2:
-            continue
+    three_body = getattr(structure, "three_body_config", None) is not None
+    peak = concrete_nodal_peak(points, stress, node_regions) if three_body else None
+    for element_id, (_, nodes) in enumerate([] if three_body else structure.cells, start=1):
         ids = list(nodes)
         xx, yy, zz, xy, yz, xz = stress[ids].mean(axis=0)
         principal = float(np.linalg.eigvalsh(
@@ -89,7 +111,10 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
         "stress_components": ["xx", "yy", "zz", "xy", "yz", "xz"],
         "max_principal_stress": peak,
         "has_tension": peak["value_pa"] > 0,
-        "peak_method": "maximum principal eigenvalue of element-mean nodal stress tensor",
+        "peak_method": (
+            "maximum principal eigenvalue of the Elmer nodal stress tensor over wall and plinth nodes"
+            if three_body else "maximum principal eigenvalue of element-mean nodal stress tensor"
+        ),
         "field_archive": "elmer_baseline_fields.npz",
         "node_regions_encoding": "membership bits: 1=plinth, 2=wall, 4=bedrock; combined bits for shared nodes",
         "usage": "baseline fields are not fracture initial conditions; peak-driven geometry is recorded separately",

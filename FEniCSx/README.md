@@ -408,7 +408,8 @@ either mode through `Baseline_Phase`/`Baseline_NoPhase` environment variables.
 
 Neither mode generates or seeds a crack or consumes an Elmer result.
 The phase baseline starts with damage zero everywhere and permits AT2 damage
-evolution in wall region 2; non-wall damage remains fixed at zero. Where an
+evolution in wall region 2 (plinth and wall, regions 1-2, for the three-body
+model); other damage remains fixed at zero. Where an
 import has shared interface nodes those DOFs are also fixed, but the current
 split wall/plinth model has no such shared interface nodes.
 It uses the existing [fracture defaults](fracture_defaults.json), recorded in
@@ -440,8 +441,9 @@ nonfinite fields and mismatched geometry. The run records:
 - `elmer_baseline_fields.npz`: displacement and six stress components mapped
   to source nodes, undeformed coordinates, and node region IDs.
 - `elmer_baseline.json`: input hashes, configuration hash, units and the
-  element-centroid location of the largest principal stress, calculated from
-  element-mean nodal tensors over all source volume elements.
+  location of the largest principal stress: for three-body models the largest
+  nodal value over wall and plinth nodes; otherwise the element centroid of the
+  largest element-mean nodal tensor over all source volume elements.
 - `manifest.json` includes the baseline report; a handover error fails the
   fracture run explicitly, while the API retains the successful Elmer result.
 
@@ -454,43 +456,76 @@ The recorded peak can be compressive if the entire model is in compression;
 ### Automatic horizontal crack
 
 After each successful Elmer baseline, the API starts FEniCSx even without
-`crack_simulations`. The consumer uses the **global** maximum principal stress
-of element-mean nodal tensors and its **undeformed element-centroid Z**. It
-interpolates exactly two plinth chainage intersections at that signed elevation,
+`crack_simulations`. For the three-body model the consumer uses the largest
+**nodal** maximum principal stress over **wall and plinth** nodes (bedrock nodes
+are excluded) and that node's undeformed position. A nodal value is used because
+element means smear the wall/plinth corner peak: for the reference job the
+concrete nodal peak is 1.99 MPa in the plinth at r 79.5 m, chainage 98.0 m,
+Z -27.5 m, while the wall element-mean peak lies at Z -17.1 m. The corner peak
+is mesh sensitive. Legacy two-body runs keep the element-mean centroid peak.
+
+The initial crack is a **local** horizontal annular-sector prism at the peak Z,
 using the authoritative wall centreline radius to convert chainage to angle.
-The initial crack is a horizontal annular-sector prism following the upstream
-wall between those angles, extending radially inward by **75% of wall thickness**
-with a **0.002 m vertical opening**. This is not a straight rectangular chord.
+It is seeded from the concrete face nearer the peak (upstream if the peak radius
+is at or beyond the centreline radius, otherwise downstream). Radially it runs
+from that face of whichever concrete body is wider (wall or plinth) to **75% of
+wall thickness** into the wall, e.g. r 77-81 m for an upstream seed. It has a
+**0.002 m vertical opening** and an arc of **4 m**
+(`automatic_crack.arc_length_m` in [fracture_defaults.json](fracture_defaults.json)).
+The arc is positioned to contain both the peak and the nearest wall/plinth
+junction chainage at that elevation (the wall-end intersection of the plinth top
+contours), so the crack passes through **both wall and plinth**. It is centred on
+the peak where possible, kept at least `min(2 l, arc/4)` from the junction on each
+side and kept inside the concrete extent given by the plinth underside contours.
+If one 4 m arc cannot contain both peak and junction, or the wall does not reach
+the peak elevation, generation fails rather than moving the crack. For the
+reference job the arc is chainage 95.99-99.99 m about the junction at 98.44 m.
+This is not a straight rectangular chord.
 
 The named result is `automatic_peak_tension`; existing result endpoints and
 ParaView controls discover it from the run manifest. `automatic_crack.json`
-records the source peak, upstream intersection coordinates, exact sector,
-generated specification and numerical settings. The submitted `config.json`
-is not rewritten.
+records the source peak, seed face, concrete and wall chainage extents, junction
+chainage, crack chainage range, exact sector, generated specification,
+numerical settings and limitations. The submitted `config.json` is not rewritten.
 
-Fracture is restricted to **Wall, region 2**. Initial and evolving damage are
-fixed at zero on all non-wall cells' damage DOFs, including shared interface
-DOFs. This is an explicit no-fracture-in-plinth modelling assumption and imposes
-a zero-damage trace where wall and plinth share nodes; it is not a contact law.
-The plinth remains in the elastic mechanical solve.
-In the actual combined mesh the wall base has duplicate coincident nodes, not
-shared ones. Its damage is therefore not fixed by the plinth-side constraint.
-The separate regions are grounded independently, as described below; geometric
-coincidence is not mechanical coupling.
+In the three-body model fracture is permitted in **plinth (region 1) and wall
+(region 2)**; bedrock (region 3) damage DOFs, including any shared bonded-seat
+interface DOFs, are fixed at zero. The damage mask degrades plinth and wall
+stiffness and lets their tensile energy drive damage; bedrock stays elastic and
+undegraded. This is a physical modelling change from the earlier wall-only
+assumption and uses the same concrete Gc and length scale for the plinth. The
+wall and plinth are separate meshes with duplicate coincident nodes joined by
+interface springs: damage evolves in each body, but the phase-field gradient does
+not couple across the joint and the joint springs do not soften, so a crack
+crossing the junction is represented as two separately damaged bands.
+For legacy two-body runs damage remains restricted to wall region 2.
 
-Only wall cells drive crack-resolution checks and refinement marking; only
-under-resolved wall cells near the crack are marked. Neighbouring cells may
-still be subdivided for conformity. Refinement reports and logs record wall and
-plinth cell counts separately, with marked plinth cells always zero. Automatic
-runs allow up to **five** refinement levels, stopping early when the required
-resolution target is met and failing if that limit is exhausted.
+Damage-region cells (plinth and wall for three-body) drive crack-resolution
+checks and refinement marking; only under-resolved damage-region cells near the
+crack are marked. Neighbouring cells may still be subdivided for conformity.
+Automatic three-body placement must put diffuse-band cells in both plinth and
+wall. Refinement reports and logs record wall and plinth cell counts and marked
+cells separately. For the reference job refinement resolved in 4 levels to
+2.54 M cells (1.26 M wall, 1.08 M plinth) at 2.31 elements per length scale.
+Automatic runs allow up to **five** refinement levels, stopping early when the
+required resolution target is met and failing if that limit is exhausted.
+Refinement also fails cleanly, with a `maximum_refined_cells` message, when a
+level is predicted (lower bound: each marked tetrahedron becomes 8) or found to
+exceed **4,000,000** global cells. Previously such runs were killed by the
+operating system for lack of memory (exit code 9).
 
-[fracture_defaults.json](fracture_defaults.json) preserves the previous workflow's
-AT2 settings: length scale 0.1 m, Gc 2700 J/m2, zero internal crack pressure,
-ten load steps and existing solver/refinement controls. These are explicit
-research defaults, not a new calibration or engineering validation. The target
-is now **2.0 elements per length scale** (`h_max <= 0.05 m` at `l=0.1 m`),
-not the previous preliminary 0.9. The physical length scale is unchanged.
+[fracture_defaults.json](fracture_defaults.json) holds the automatic workflow's
+AT2 settings: length scale **0.25 m**, Gc 2700 J/m2, zero internal crack pressure,
+ten load steps and the solver/refinement controls. These are explicit research
+defaults, not a calibration or engineering validation. The target remains
+**2.0 elements per length scale** (`h_max <= 0.125 m` at `l=0.25 m`). The length
+scale was raised from 0.1 m because the 0.5 m source cells have diameters up to
+0.866 m: `l=0.1 m` needs five halvings and about 19 million cells even for the
+local 4 m crack, while `l=0.25 m` resolves in three levels (about 2.0 million
+cells for the October 2026 peak). In AT2 the length scale also sets the effective
+strength; the 1-D estimate `(3/16) sqrt(3 E Gc / l)` gives about 6.3 MPa at
+0.25 m versus 10 MPa at 0.1 m (E = 35 GPa), against a configured 2 MPa tensile
+strength. Treat it as a regularisation choice that needs a sensitivity study.
 The 2 mm value defines the initial damaged prism thickness; the existing
 phase-field model does not enforce a physical 2 mm displacement discontinuity
 or unilateral crack-face contact.
@@ -555,14 +590,15 @@ from the configuration snapshot and numerical JSON reports. Repository
 `config.json` is never overwritten.
 
 The automatic job requires `2.0` elements per length scale and allows five
-local refinement levels. If unmet, the job fails before the refined baseline
-or cracking; it does not lower the target or enlarge the physical length scale.
+local refinement levels within a 4,000,000-cell budget. If unmet, the job fails
+before the refined baseline or cracking; it does not lower the target or change
+the length scale at run time. The automatic default length scale is 0.25 m (see
+above); explicit `crack_simulations` keep their own declared values.
 Historical preliminary runs used `0.9`, achieving `h_max` about `0.109 m`
 for `l=0.1 m`; these are under-resolved. A historical target of
-`2.0` generated roughly 12.5 million crack-band tetrahedra and a 1.8 GB mesh,
-then exhausted serial WSL memory. That stricter target requires a parallel
-workflow. Meeting the minimum is necessary but does not replace a convergence
-study or establish that the current full-size case fits local memory.
+`2.0` with `l=0.1 m` generated roughly 12.5 million crack-band tetrahedra and a
+1.8 GB mesh, then exhausted serial WSL memory. Meeting the minimum is necessary
+but does not replace a mesh and length-scale convergence study.
 
 The solver uses `alpha=0` for intact and `alpha=1` for fully damaged material.
 Mechanics uses `g(alpha)=(1-alpha)^2+kappa`. A

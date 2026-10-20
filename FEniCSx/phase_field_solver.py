@@ -285,7 +285,7 @@ def solve_staggered(
     boundary_conditions: Callable | None = None,
     output: Path | None = None,
     damage_cell_tags=None,
-    damage_region_id: int = 2,
+    damage_region_ids: tuple[int, ...] = (2,),
     parameters: PhaseFieldParameters | None = None,
     mechanics_formulation: str = "hybrid",
     damage_acceleration: bool = False,
@@ -347,8 +347,9 @@ def solve_staggered(
     )
     fixed_damage_dofs = None
     if damage_cell_tags is not None:
-        non_wall_cells = damage_cell_tags.indices[damage_cell_tags.values != damage_region_id]
-        if not domain.comm.allreduce(len(damage_cell_tags.find(damage_region_id)), op=MPI.SUM):
+        damageable = np.isin(damage_cell_tags.values, damage_region_ids)
+        non_wall_cells = damage_cell_tags.indices[~damageable]
+        if not domain.comm.allreduce(int(np.count_nonzero(damageable)), op=MPI.SUM):
             raise ValueError("Damage region has no tagged cells.")
         domain.topology.create_connectivity(domain.topology.dim, domain.topology.dim)
         fixed_damage_dofs = fem.locate_dofs_topological(

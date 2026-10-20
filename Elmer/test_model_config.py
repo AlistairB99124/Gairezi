@@ -215,6 +215,7 @@ class ModelConfigTests(unittest.TestCase):
         crack["solver"]["field_output_interval"] = 0
         crack["solver"]["staggered_tolerance"] = 1.0
         crack["solver"]["maximum_refinement_levels"] = -1
+        crack["solver"]["maximum_refined_cells"] = 0
         with self.assertRaises(ConfigurationValidationError) as context:
             validate_config(self.payload)
         paths = {issue.path for issue in context.exception.issues}
@@ -225,6 +226,7 @@ class ModelConfigTests(unittest.TestCase):
         self.assertIn(f"{prefix}.solver.field_output_interval", paths)
         self.assertIn(f"{prefix}.solver.staggered_tolerance", paths)
         self.assertIn(f"{prefix}.solver.maximum_refinement_levels", paths)
+        self.assertIn(f"{prefix}.solver.maximum_refined_cells", paths)
 
     def test_crack_solver_rejects_unknown_fields(self):
         self.add_legacy_crack_fixture()

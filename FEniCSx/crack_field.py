@@ -93,7 +93,9 @@ class PhaseFieldSolverOptions:
     field_output_interval: int = 1
     minimum_elements_per_length_scale: float = 2.0
     maximum_refinement_levels: int = 5
-
+    # Global tetrahedron budget for crack-band refinement; exceeding it fails cleanly
+    # instead of letting the operating system kill the process for lack of memory.
+    maximum_refined_cells: int = 4_000_000
 
 def load_crack_specifications(config: Path | dict | None = None) -> list[CrackSpecification]:
     """Read and validate crack_simulations from the authoritative dam configuration."""
@@ -240,7 +242,7 @@ def resolution_report(domain, specification: CrackSpecification, eligible_cells=
         eligible[:] = False
         eligible[eligible_cells] = True
         if not eligible.any():
-            raise ValueError("No wall cells are available for crack resolution checks.")
+            raise ValueError("No damageable cells are available for crack resolution checks.")
         band &= eligible
     if not band.any():
         band = eligible & (distance <= distance[eligible].min())
@@ -256,15 +258,19 @@ def resolution_report(domain, specification: CrackSpecification, eligible_cells=
     }
 
 
-def crack_placement_report(imported, specification: CrackSpecification, required_region: int = 2) -> dict:
-    """Locate a crack in the imported dam and verify that it intersects the concrete wall.
+def crack_placement_report(
+    imported, specification: CrackSpecification, required_regions=(2,), centre_regions=None,
+) -> dict:
+    """Locate a crack in the imported dam and verify which bodies its diffuse band reaches.
 
-    Region 2 is the wall in the existing shared mesh contract. A crack may approach
-    an interface, but its centre must be inside the required region and its diffuse
-    band must intersect at least one cell there.
+    Region 1 is the plinth and region 2 the wall. The crack centre must lie in one of
+    ``centre_regions`` (default: ``required_regions``) and its diffuse band must intersect
+    at least one cell of every region in ``required_regions``.
     """
     from dolfinx import geometry
 
+    required_regions = tuple(int(region) for region in required_regions)
+    centre_regions = required_regions if centre_regions is None else tuple(int(r) for r in centre_regions)
     domain = imported.domain
     dimension = domain.topology.dim
     centre = np.asarray(specification.centre_m, dtype=domain.geometry.x.dtype).reshape(1, 3)
@@ -273,12 +279,11 @@ def crack_placement_report(imported, specification: CrackSpecification, required
     colliding = geometry.compute_colliding_cells(domain, candidates, centre)
     centre_cells = colliding.links(0)
     centre_cells = centre_cells[centre_cells < domain.topology.index_map(dimension).size_local]
-    required_cells = set(map(int, imported.cell_tags.find(required_region)))
     region_by_cell = {
         int(cell): int(value)
         for cell, value in zip(imported.cell_tags.indices, imported.cell_tags.values)
     }
-    centre_regions = sorted(
+    local_centre_regions = sorted(
         {region_by_cell[int(cell)] for cell in centre_cells if int(cell) in region_by_cell}
     )
 
@@ -288,7 +293,7 @@ def crack_placement_report(imported, specification: CrackSpecification, required
     distance = signed_distance(midpoints, specification)
     band = distance <= 2.0 * specification.length_scale_m + diameters / 2.0
     band_cells = cells[band]
-    required_band_cells = np.asarray([cell for cell in band_cells if int(cell) in required_cells], dtype=np.int32)
+    band_regions = np.asarray([region_by_cell.get(int(cell), -1) for cell in band_cells], dtype=np.int64)
     bounds = [domain.geometry.x.min(axis=0).tolist(), domain.geometry.x.max(axis=0).tolist()]
     from mpi4py import MPI
 
@@ -296,34 +301,38 @@ def crack_placement_report(imported, specification: CrackSpecification, required
         [float(domain.comm.allreduce(value, op=MPI.MIN)) for value in bounds[0]],
         [float(domain.comm.allreduce(value, op=MPI.MAX)) for value in bounds[1]],
     ]
-    centre_regions = sorted({
-        value for region_ids in domain.comm.allgather(centre_regions) for value in region_ids
+    found_centre_regions = sorted({
+        value for region_ids in domain.comm.allgather(local_centre_regions) for value in region_ids
     })
+    band_counts = {
+        str(region): int(domain.comm.allreduce(int(np.count_nonzero(band_regions == region)), op=MPI.SUM))
+        for region in sorted(set(required_regions) | set(centre_regions))
+    }
     report = {
         "centre_m": list(specification.centre_m),
         "mesh_bounds_m": bounds,
         "centre_cell_count": int(domain.comm.allreduce(len(centre_cells), op=MPI.SUM)),
-        "centre_region_ids": centre_regions,
+        "centre_region_ids": found_centre_regions,
         "diffuse_band_cell_count": int(domain.comm.allreduce(len(band_cells), op=MPI.SUM)),
-        "required_region_id": required_region,
-        "required_region_band_cell_count": int(domain.comm.allreduce(len(required_band_cells), op=MPI.SUM)),
-        "centre_in_required_region": domain.comm.allreduce(
-            any(int(cell) in required_cells for cell in centre_cells), op=MPI.LOR,
-        ),
+        "required_region_ids": list(required_regions),
+        "allowed_centre_region_ids": list(centre_regions),
+        "band_cell_count_by_region": band_counts,
+        "required_region_band_cell_count": sum(band_counts[str(region)] for region in required_regions),
+        "centre_in_required_region": any(region in centre_regions for region in found_centre_regions),
         "minimum_cell_midpoint_signed_distance_m": float(domain.comm.allreduce(distance.min(), op=MPI.MIN)),
     }
-    report["valid"] = (
-        report["centre_in_required_region"] and report["required_region_band_cell_count"] > 0
+    report["valid"] = report["centre_in_required_region"] and all(
+        band_counts[str(region)] > 0 for region in required_regions
     )
     return report
 
 
-def validate_crack_placement(imported, specifications, required_region: int = 2) -> list[dict]:
+def validate_crack_placement(imported, specifications, required_regions=(2,), centre_regions=None) -> list[dict]:
     """Return placement reports or fail before constructing a meaningless damage field."""
     if isinstance(specifications, CrackSpecification):
         specifications = [specifications]
     reports = [
-        crack_placement_report(imported, specification, required_region)
+        crack_placement_report(imported, specification, required_regions, centre_regions)
         for specification in specifications
     ]
     invalid = [index for index, report in enumerate(reports) if not report["valid"]]
@@ -332,14 +341,26 @@ def validate_crack_placement(imported, specifications, required_region: int = 2)
             f"crack {index}: centre={reports[index]['centre_m']}, "
             f"mesh_bounds={reports[index]['mesh_bounds_m']}, "
             f"centre_regions={reports[index]['centre_region_ids']}, "
-            f"wall_band_cells={reports[index]['required_region_band_cell_count']}"
+            f"band_cells_by_region={reports[index]['band_cell_count_by_region']}"
             for index in invalid
         )
+        names = {1: "plinth", 2: "wall"}
+        bodies = " and ".join(f"concrete {names.get(region, region)}" for region in required_regions)
         raise ValueError(
-            "Configured crack does not intersect the concrete wall (region 2); "
+            f"Configured crack does not intersect the {bodies} (required regions {list(required_regions)}) "
+            "from an allowed centre region; "
             "check the dam global coordinate system. " + details
         )
     return reports
+
+def _require_cell_budget(cells: int, options: PhaseFieldSolverOptions, level: int, levels: list, verb: str):
+    if cells > options.maximum_refined_cells:
+        raise RuntimeError(
+            f"Crack-band refinement level {level} {verb} {cells} cells, above the "
+            f"maximum_refined_cells budget of {options.maximum_refined_cells}. Stopped before running "
+            "out of memory; reduce the crack extent or revisit the length scale. "
+            f"Last resolution: {[c['elements_per_length_scale'] for c in levels[-1]['cracks']]}"
+        )
 
 
 @dataclass
@@ -350,22 +371,25 @@ class RefinedPhaseFieldMesh:
     report: dict
 
 
-def refine_for_phase_field(imported, specifications, options: PhaseFieldSolverOptions) -> RefinedPhaseFieldMesh:
-    """Locally refine cells in the diffuse crack bands while preserving mesh tags."""
+def refine_for_phase_field(
+    imported, specifications, options: PhaseFieldSolverOptions, damage_region_ids=(2,),
+) -> RefinedPhaseFieldMesh:
+    """Locally refine damageable cells in the diffuse crack bands while preserving mesh tags."""
     if isinstance(specifications, CrackSpecification):
         specifications = [specifications]
-    validate_crack_placement(imported, specifications)
+    damage_region_ids = tuple(int(region) for region in damage_region_ids)
+    validate_crack_placement(imported, specifications, centre_regions=damage_region_ids)
     domain, cell_tags, facet_tags = imported.domain, imported.cell_tags, imported.facet_tags
     levels = []
     for level in range(options.maximum_refinement_levels + 1):
-        wall_cells = cell_tags.find(2)
-        reports = [resolution_report(domain, specification, wall_cells) for specification in specifications]
+        damage_cells = np.concatenate([cell_tags.find(region) for region in damage_region_ids])
+        reports = [resolution_report(domain, specification, damage_cells) for specification in specifications]
         levels.append({
             "level": level, "cracks": reports,
-            "wall_cells": int(len(wall_cells)), "plinth_cells": int(len(cell_tags.find(1))),
+            "wall_cells": int(len(cell_tags.find(2))), "plinth_cells": int(len(cell_tags.find(1))),
         })
-        print(f"Refinement level {level}: wall={len(wall_cells)}, plinth={len(cell_tags.find(1))}, "
-              f"wall resolution={[r['elements_per_length_scale'] for r in reports]}", flush=True)
+        print(f"Refinement level {level}: wall={len(cell_tags.find(2))}, plinth={len(cell_tags.find(1))}, "
+              f"damage-region resolution={[r['elements_per_length_scale'] for r in reports]}", flush=True)
         if all(
             report["elements_per_length_scale"] >= options.minimum_elements_per_length_scale
             for report in reports
@@ -387,8 +411,8 @@ def refine_for_phase_field(imported, specifications, options: PhaseFieldSolverOp
                         for report in reports
                     ),
                     "levels": levels,
-                    "refinement_region_id": 2,
-                    "non_wall_refinement": "conformity only",
+                    "refinement_region_ids": list(damage_region_ids),
+                    "non_damage_region_refinement": "conformity only",
                 },
             )
         if level == options.maximum_refinement_levels:
@@ -399,27 +423,38 @@ def refine_for_phase_field(imported, specifications, options: PhaseFieldSolverOp
         diameters = cell_diameters(domain._cpp_object, dimension, cells)
         midpoints = mesh.compute_midpoints(domain, dimension, cells)
         marked = np.zeros(len(cells), dtype=bool)
-        wall = np.zeros(len(cells), dtype=bool)
-        wall[wall_cells] = True
+        damageable = np.zeros(len(cells), dtype=bool)
+        damageable[damage_cells] = True
+        plinth = np.zeros(len(cells), dtype=bool)
+        plinth[cell_tags.find(1)] = True
         for specification, report in zip(specifications, reports):
             if report["elements_per_length_scale"] < options.minimum_elements_per_length_scale:
                 distance = signed_distance(midpoints, specification)
                 marked |= (
-                    wall
+                    damageable
                     & (distance <= 3.0 * specification.length_scale_m + diameters)
                     & (diameters > specification.length_scale_m / options.minimum_elements_per_length_scale)
                 )
         marked_cells = cells[marked]
-        levels[-1]["marked_wall_cells"] = int(len(marked_cells))
-        levels[-1]["marked_plinth_cells"] = 0
+        levels[-1]["marked_wall_cells"] = int(np.count_nonzero(marked & ~plinth))
+        levels[-1]["marked_plinth_cells"] = int(np.count_nonzero(marked & plinth))
         if not len(marked_cells):
             raise RuntimeError("No cells were selected for required crack-band refinement")
+        from mpi4py import MPI
+
+        total_cells = domain.topology.index_map(dimension).size_global
+        # Each marked tetrahedron splits into 8, so this lower bound ignores conformity closure.
+        predicted = total_cells + 7 * domain.comm.allreduce(len(marked_cells), op=MPI.SUM)
+        _require_cell_budget(predicted, options, level + 1, levels, "predicted at least")
         domain.topology.create_connectivity(dimension, 1)
         edges = mesh.compute_incident_entities(domain.topology, marked_cells, dimension, 1)
         refined, parent_cell, parent_facet = mesh.refine(
             domain,
             edges,
             option=mesh.RefinementOption.parent_cell_and_facet,
+        )
+        _require_cell_budget(
+            refined.topology.index_map(dimension).size_global, options, level + 1, levels, "reached",
         )
         refined.topology.create_connectivity(dimension, dimension - 1)
         refined.topology.create_connectivity(dimension - 1, dimension)

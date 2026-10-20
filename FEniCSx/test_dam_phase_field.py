@@ -165,7 +165,7 @@ class DamPhaseFieldTests(unittest.TestCase):
                 self.assertGreater(len(plinth_dofs), 0)
                 np.testing.assert_array_equal(result.damage.x.array[plinth_dofs], 0)
                 self.assertGreater(result.damage.x.array.max(), 0)
-                self.assertEqual(result.report["damage_region_id"], 2)
+                self.assertEqual(result.report["damage_region_ids"], [2])
 
     def test_annular_sector_runs_real_phase_field_solver_and_writes_results(self):
         imported, structure, crack, options = self.model()

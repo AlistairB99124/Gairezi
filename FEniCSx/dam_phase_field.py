@@ -53,13 +53,17 @@ def solve(
     if not specifications and parameters is None:
         raise ValueError("A crack specification or baseline phase-field parameters are required")
     first = parameters if parameters is not None else specifications[0]
-    placement = validate_crack_placement(imported, specifications) if specifications else []
     domain = imported.domain
     from three_body_model import (
-        is_three_body, materials, require_support_tags, rock_support, support_bcs, support_reactions,
-        support_form as rock_support_form,
+        DAMAGE_REGION_IDS, is_three_body, materials, require_support_tags, rock_support, support_bcs,
+        support_reactions, support_form as rock_support_form,
     )
     three_body = is_three_body(structure)
+    damage_regions = DAMAGE_REGION_IDS if three_body else (2,)
+    placement = (
+        validate_crack_placement(imported, specifications, centre_regions=damage_regions)
+        if specifications else []
+    )
     coefficients = materials(imported, structure) if three_body else None
     baseline_report = None
     def record_stage(stage):
@@ -160,7 +164,7 @@ def solve(
         support_form=support_form,
         output=output,
         damage_cell_tags=imported.cell_tags,
-        damage_region_id=2,
+        damage_region_ids=damage_regions,
         parameters=parameters,
         mechanics_formulation=mechanics_formulation,
         damage_acceleration=damage_acceleration,
@@ -279,8 +283,10 @@ def solve(
     result.report.update(
         {
             "crack_placement": placement,
-            "damage_region_id": 2,
-            "non_wall_damage": "fixed at zero, including shared interface DOFs",
+            "damage_region_ids": list(damage_regions),
+            "non_wall_damage": (
+                "bedrock fixed at zero" if three_body else "fixed at zero, including shared interface DOFs"
+            ),
             "applied_force_n": applied.tolist(),
             "ground_spring_reactions_n": reactions,
             "force_imbalance_n": imbalance.tolist(),
@@ -306,7 +312,12 @@ def solve(
                 "No unilateral crack-face contact or friction is enforced.",
                 "Diffuse pressure is an energy-consistent regularised traction, not an explicit face load.",
                 "Convergence and successful execution do not constitute engineering validation.",
-                "Damage is restricted to wall region 2; non-wall and shared interface damage DOFs are fixed at zero.",
+                (
+                    "Damage is allowed in plinth (1) and wall (2); bedrock damage DOFs are fixed at zero. "
+                    "Wall and plinth damage do not couple across the spring joint, and the joint springs do not soften."
+                    if three_body else
+                    "Damage is restricted to wall region 2; non-wall and shared interface damage DOFs are fixed at zero."
+                ),
             ],
         }
     )
