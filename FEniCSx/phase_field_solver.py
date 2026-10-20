@@ -290,6 +290,8 @@ def solve_staggered(
     mechanics_formulation: str = "hybrid",
     damage_acceleration: bool = False,
     final_load_substeps: int = 1,
+    elastic_coefficients=None,
+    interface_factory=None,
 ) -> PhaseFieldResult:
     """Solve mechanics and irreversible AT2 damage by alternate minimisation.
 
@@ -327,7 +329,14 @@ def solve_staggered(
         raise ValueError("field_output_interval must be positive")
 
     lam, mu, bulk = elastic_parameters(young, poisson)
+    damage_mask = 1.
+    if elastic_coefficients is not None:
+        if mechanics_formulation == "experimental_spectral":
+            raise ValueError("Three-body spectral mechanics is not verified; use hybrid or experimental_amor")
+        lam, mu, bulk = (elastic_coefficients[key] for key in ("lam", "mu", "bulk"))
+        damage_mask = elastic_coefficients["damage_mask"]
     displacement_space = fem.functionspace(domain, ("Lagrange", 1, (3,)))
+    interfaces = interface_factory(displacement_space) if interface_factory else None
     near_nullspace = rigid_body_near_nullspace(displacement_space)
     damage_space = fem.functionspace(domain, ("Lagrange", 1))
     history_space = fem.functionspace(domain, ("DG", 0))
@@ -360,7 +369,8 @@ def solve_staggered(
 
     trial, test = ufl.TrialFunction(displacement_space), ufl.TestFunction(displacement_space)
     dx = ufl.Measure("dx", domain=domain)
-    stiffness = degradation(damage, first.residual_stiffness) * ufl.inner(
+    factor = damage_mask * degradation(damage, first.residual_stiffness) + (1 - damage_mask)
+    stiffness = factor * ufl.inner(
         undamaged_stress(trial, lam, mu), strain(test)
     ) * dx
     if support_form is not None:
@@ -425,10 +435,14 @@ def solve_staggered(
             bcs = boundary_conditions(displacement_space, load_factor) if boundary_conditions else []
             setup_started = time.perf_counter()
             if mechanics_problem is None and mechanics_formulation == "hybrid":
-                mechanics_problem = LinearProblem(
+                from interface_springs import SpringLinearProblem
+                problem_type = SpringLinearProblem if interfaces is not None else LinearProblem
+                spring_arguments = {"interface_springs": interfaces} if interfaces is not None else {}
+                mechanics_problem = problem_type(
                     stiffness,
                     external_work(test, load_coefficient, damage),
                     bcs=bcs,
+                    **spring_arguments,
                     u=displacement,
                     petsc_options_prefix=f"phase_mechanics_{step}_",
                     petsc_options={
@@ -437,7 +451,7 @@ def solve_staggered(
                         "ksp_norm_type": "unpreconditioned",
                         "ksp_pc_side": "right",
                         "pc_type": "gamg",
-                        "ksp_rtol": options.mechanics_relative_tolerance,
+                        "ksp_rtol": 0.1 * options.mechanics_relative_tolerance,
                         "ksp_max_it": options.mechanics_maximum_iterations,
                         "ksp_error_if_not_converged": True,
                         "ksp_initial_guess_nonzero": True,
@@ -478,6 +492,7 @@ def solve_staggered(
                             displacement, damage, bulk, mu, first.residual_stiffness,
                             lambda test, alpha: external_work(test, load_coefficient, alpha),
                             bcs=bcs, support_form=support_form,
+                            interface_springs=interfaces, damage_mask=damage_mask,
                             relative_tolerance=options.mechanics_relative_tolerance,
                             linear_maximum_iterations=options.mechanics_maximum_iterations,
                             spectral=mechanics_formulation == "experimental_spectral",
@@ -572,7 +587,7 @@ def solve_staggered(
                     "this is not a dam-safety verdict."
                 )
 
-            tensile_density = tensile_energy(displacement, bulk, mu)
+            tensile_density = damage_mask * tensile_energy(displacement, bulk, mu)
             if mechanics_formulation == "experimental_spectral":
                 tensile_density = nonlinear_mechanics_problem.spectral_split.tensile_energy
             history_candidate.interpolate(
@@ -678,13 +693,14 @@ def solve_staggered(
         old_damage.x.array[:] = np.maximum(old_damage.x.array, damage.x.array)
         old_damage.x.scatter_forward()
         eps = strain(displacement)
-        elastic_density = degradation(damage, first.residual_stiffness) * (
+        elastic_density = factor * (
             0.5 * lam * ufl.tr(eps) ** 2 + mu * ufl.inner(eps, eps)
         )
         if mechanics_formulation == "experimental_amor":
             from compression_preserving import elastic_energy
 
-            elastic_density = elastic_energy(displacement, damage, bulk, mu, first.residual_stiffness)
+            elastic_density = elastic_energy(displacement, damage, bulk, mu, first.residual_stiffness,
+                                             damage_mask=damage_mask)
         elif mechanics_formulation == "experimental_spectral":
             elastic_density = nonlinear_mechanics_problem.spectral_split.energy
         fracture_density = first.critical_energy_release_rate_j_m2 * (
@@ -693,7 +709,8 @@ def solve_staggered(
         )
         elastic_energy = _global_scalar(domain, elastic_density * dx)
         fracture_energy = _global_scalar(domain, fracture_density * dx)
-        total_energy = elastic_energy + fracture_energy
+        spring_energy = interfaces.energy(displacement) if interfaces else 0.
+        total_energy = elastic_energy + fracture_energy + spring_energy
         if previous_energy is not None and not np.isfinite(total_energy):
             raise RuntimeError("Phase-field energy became non-finite")
         previous_energy = total_energy
@@ -708,6 +725,7 @@ def solve_staggered(
             "minimum_damage": float(domain.comm.allreduce(damage.x.array.min(), op=MPI.MIN)),
             "maximum_damage": float(domain.comm.allreduce(damage.x.array.max(), op=MPI.MAX)),
             "elastic_energy_j": elastic_energy,
+            "interface_spring_energy_j": spring_energy,
             "fracture_energy_j": fracture_energy,
             "total_internal_energy_j": total_energy,
         }

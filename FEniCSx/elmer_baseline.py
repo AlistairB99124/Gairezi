@@ -60,6 +60,8 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
         raise ValueError("Elmer baseline has invalid shapes or nonfinite coordinates/fields.")
     peak = None
     for element_id, (_, nodes) in enumerate(structure.cells, start=1):
+        if getattr(structure, "three_body_config", None) is not None and structure.region_ids[element_id - 1] != 2:
+            continue
         ids = list(nodes)
         xx, yy, zz, xy, yz, xz = stress[ids].mean(axis=0)
         principal = float(np.linalg.eigvalsh(
@@ -89,7 +91,7 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
         "has_tension": peak["value_pa"] > 0,
         "peak_method": "maximum principal eigenvalue of element-mean nodal stress tensor",
         "field_archive": "elmer_baseline_fields.npz",
-        "node_regions_encoding": "membership bits: 1=plinth, 2=wall, 3=shared bonded node",
+        "node_regions_encoding": "membership bits: 1=plinth, 2=wall, 4=bedrock; combined bits for shared nodes",
         "usage": "baseline fields are not fracture initial conditions; peak-driven geometry is recorded separately",
         "engineering_validated": False,
     }

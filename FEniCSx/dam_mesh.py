@@ -145,6 +145,22 @@ class ImportedDam:
     interpolation_parents: list[tuple[int, ...]]
 
 
+def compact_unused_nodes(structure):
+    """Remove volume-unused nodes without merging coincident interface identities."""
+    from dataclasses import replace
+    used = np.unique(np.asarray([cell for _, cell in structure.cells]).ravel())
+    if len(used) == len(structure.nodes):
+        return structure
+    mapping = np.full(len(structure.nodes), -1, dtype=np.int64)
+    mapping[used] = np.arange(len(used))
+    boundaries = [(tag, tuple(int(mapping[n]) for n in face)) for tag, face in structure.boundaries]
+    if any(min(face) < 0 for _, face in boundaries):
+        raise ValueError("A boundary references a node outside the volume mesh")
+    return replace(structure, nodes=[tuple(structure.nodes[n]) for n in used],
+                   cells=[(kind, tuple(int(mapping[n]) for n in cell)) for kind, cell in structure.cells],
+                   boundaries=boundaries)
+
+
 def import_structure(structure, maximum_volume_change: float) -> ImportedDam:
     points = np.asarray(structure.nodes, dtype=float)
     tets, regions, parents, boundary, values, volumes, coordinates, interpolation = subdivide(
@@ -177,8 +193,15 @@ def import_structure(structure, maximum_volume_change: float) -> ImportedDam:
     if len(lookup) != len(boundary):
         raise ValueError("Source boundary contains duplicate tagged triangles")
     imported_values = []
-    for face in facet_vertices:
+    cell_ids = domain.topology.original_cell_index
+    facet_cells = domain.topology.connectivity(2, 3)
+    for facet, face in zip(facets, facet_vertices):
         if tuple(face) not in lookup:
+            owner = facet_cells.links(int(facet))
+            if (getattr(structure, "three_body_config", None) is not None and len(owner) == 1
+                    and regions[cell_ids[owner[0]]] == 3):
+                imported_values.append(7)
+                continue
             raise ValueError(f"Untagged exterior triangle after subdivision: {face}")
         imported_values.append(lookup.pop(tuple(face)))
     if lookup:

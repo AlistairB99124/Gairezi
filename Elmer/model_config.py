@@ -63,6 +63,10 @@ CRACK_TYPES = {"phase_field"}
 CRACK_SHAPES = {"rectangular"}
 PHASE_FIELD_MODELS = {"AT2"}
 ENERGY_SPLITS = {"volumetric_deviatoric"}
+# Outer rock-box supports. "fixed_bottom" (default when material.bedrock.support
+# is absent) fixes every bottom DOF and leaves the sides free; "rollers" applies
+# stiff normal-only penalty springs to the bottom and the four vertical sides.
+ROCK_OUTER_SUPPORT_MODELS = {"fixed_bottom", "rollers"}
 SUPPORT_MODELS = {
     "plinth": ("distributed_elastic_concrete", "concrete"),
     "bedrock": ("distributed_elastic_granite", "bedrock"),
@@ -170,10 +174,20 @@ class _ConfigValidator:
     def validate_material(self, material: Mapping[str, object] | None) -> None:
         for name in ("concrete", "bedrock"):
             path = f"material.{name}"
-            values = self.object(material.get(name) if material is not None else None, path, MATERIAL_KEYS)
+            values = self.object(
+                material.get(name) if material is not None else None, path, MATERIAL_KEYS,
+                optional={"support"} if name == "bedrock" else None,
+            )
             if values is None:
                 continue
-            for key in ("density", "youngs_modulus", "tensile_strength_pa"):
+            if name == "bedrock" and "support" in values:
+                self.validate_rock_outer_support(values["support"], f"{path}.support")
+            # Zero rock density is allowed so rock self-weight can be omitted.
+            if name == "bedrock":
+                self.field_number(values, "density", path, nonnegative=True)
+            else:
+                self.field_number(values, "density", path, positive=True)
+            for key in ("youngs_modulus", "tensile_strength_pa"):
                 self.field_number(values, key, path, positive=True)
             poisson = self.field_number(values, "poisson_ratio", path)
             if poisson is not None and not -1 < poisson < 0.5:
@@ -184,6 +198,27 @@ class _ConfigValidator:
                     "is retained in configuration; the bedrock volume is generated only for "
                     "the unsolved geometry preview and is not part of the solver mesh, so "
                     "these properties do not affect the analysis.",
+                )
+
+    def validate_rock_outer_support(self, value: object, path: str) -> None:
+        """Outer rock-box supports; spring axes are the rock box's local frame.
+
+        x: the two bank faces, y: the upstream/downstream faces, z: the bottom.
+        """
+        values = self.object(value, path, SUPPORT_KEYS)
+        if values is None:
+            return
+        model = values.get("model")
+        if "model" in values and model not in ROCK_OUTER_SUPPORT_MODELS:
+            self.issue(f"{path}.model", f"must be one of {sorted(ROCK_OUTER_SUPPORT_MODELS)}")
+        if "material" in values and values.get("material") != "bedrock":
+            self.issue(f"{path}.material", "must be 'bedrock' for outer rock supports")
+        springs = self.object(values.get("spring_n_per_m3"), f"{path}.spring_n_per_m3", VECTOR_KEYS)
+        if springs is not None:
+            for axis in ("x", "y", "z"):
+                self.field_number(
+                    springs, axis, f"{path}.spring_n_per_m3",
+                    positive=model == "rollers", nonnegative=model != "rollers",
                 )
 
     def validate_contours(
@@ -234,6 +269,8 @@ class _ConfigValidator:
         expected_model, expected_material = SUPPORT_MODELS[region]
         for key, expected in (("model", expected_model), ("material", expected_material)):
             value = values.get(key)
+            if key == "model" and region == "bedrock" and value == "bonded":
+                continue
             if key in values and value != expected:
                 self.issue(f"{path}.{key}", f"must be {expected!r} for {region} support")
         springs = self.object(values.get("spring_n_per_m3"), f"{path}.spring_n_per_m3", {"x", "y", "z"})
@@ -544,6 +581,18 @@ def collect_warnings(payload: object, *, three_body: bool = False) -> list[Valid
         warning for warning in validator.warnings
         if not (three_body and warning.path == "material.bedrock")
     ]
+
+
+def rock_outer_support(config: Mapping[str, object]) -> dict[str, object]:
+    """Outer rock-box support; absent configuration keeps the historical fixed bottom."""
+    support = config["material"]["bedrock"].get("support")  # type: ignore[index, union-attr]
+    if support is None:
+        return {"model": "fixed_bottom", "spring_n_per_m3": None}
+    springs = support["spring_n_per_m3"]
+    return {
+        "model": support["model"],
+        "spring_n_per_m3": {axis: float(springs[axis]) for axis in ("x", "y", "z")},
+    }
 
 
 def load_config(source: Path | dict[str, object] = CONFIG_PATH) -> dict[str, object]:

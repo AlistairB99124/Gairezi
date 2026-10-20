@@ -67,6 +67,9 @@ def cutback_wall_plinth(mesh: CombinedStructure, reference_radius_m: float) -> C
 
     if not steps:
         raise ValueError("No wall/plinth staircase corners found for 45-degree cutback")
+    courses = {(key[0], key[1], key[3]): key for key in steps}
+    if len(courses) != len(steps):
+        raise ValueError("Overlapping cutback courses")
     boundary_tags = {tuple(sorted(face)): tag for tag, face in mesh.boundaries}
     removed_boundary_faces = set()
     new_boundaries = []
@@ -82,14 +85,15 @@ def cutback_wall_plinth(mesh: CombinedStructure, reference_radius_m: float) -> C
                   if region == 2 for n in cell]
     wall_mid_radius = (min(wall_radii) + max(wall_radii)) / 2
     for index, ((kind, cell), region) in enumerate(zip(mesh.cells, mesh.region_ids, strict=True)):
-        key = (
+        course = (
             min(stations[n] for n in cell), max(stations[n] for n in cell),
-            min(heights[n] for n in cell), max(heights[n] for n in cell),
+            max(heights[n] for n in cell),
         )
-        if region != 1 or key not in steps:
+        if region != 1 or course not in courses:
             cells.append((kind, cell))
             regions.append(region)
             continue
+        key = courses[course]
         if kind != 5 or len({radii[n] for n in cell}) != 2:
             raise ValueError("Unsupported plinth closure intersecting a 45-degree cutback")
         step, selected = steps[key]
@@ -103,7 +107,9 @@ def cutback_wall_plinth(mesh: CombinedStructure, reference_radius_m: float) -> C
             a = lookup[(away, radius, high)]
             b = lookup[(step, radius, high)]
             c = lookup[(step, radius, low)]
-            d = lookup[(away, radius, low)]
+            # The retained lower wedge follows the seat, not a horizontal course.
+            bottom = min(heights[n] for n in cell if stations[n] == away and radii[n] == radius)
+            d = lookup[(away, radius, bottom)]
             upper.extend((a, b, c))
             lower.extend((a, c, d))
         wedges = [tuple(upper), tuple(lower)]

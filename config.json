@@ -141,9 +141,9 @@
         "model": "distributed_elastic_granite",
         "material": "bedrock",
         "spring_n_per_m3": {
-          "x": 1000000000.0,
-          "y": 1000000000.0,
-          "z": 5000000000.0
+          "x": 1250000000.0,
+          "y": 1250000000.0,
+          "z": 3000000000.0
         }
       }
     }
@@ -159,7 +159,16 @@
       "density": 2700,
       "youngs_modulus": 50000000000.0,
       "poisson_ratio": 0.25,
-      "tensile_strength_pa": 25000000.0
+      "tensile_strength_pa": 25000000.0,
+      "support": {
+        "model": "rollers",
+        "material": "bedrock",
+        "spring_n_per_m3": {
+          "x": 1000000000000.0,
+          "y": 1000000000000.0,
+          "z": 1000000000000.0
+        }
+      }
     }
   },
   "loads": {

@@ -17,18 +17,18 @@ from elasticity_solver import rigid_body_near_nullspace
 from phase_field_solver import degradation, strain, tensile_energy
 
 
-def elastic_energy(displacement, damage, bulk: float, mu: float, kappa: float):
+def elastic_energy(displacement, damage, bulk: float, mu: float, kappa: float, *, damage_mask=1.):
     trace = ufl.tr(strain(displacement))
     return (
-        degradation(damage, kappa) * tensile_energy(displacement, bulk, mu)
+        (damage_mask * degradation(damage, kappa) + 1 - damage_mask) * tensile_energy(displacement, bulk, mu)
         + 0.5 * bulk * ufl.min_value(trace, 0.0)**2
     )
 
 
-def stress(displacement, damage, bulk: float, mu: float, kappa: float):
+def stress(displacement, damage, bulk: float, mu: float, kappa: float, *, damage_mask=1.):
     eps = strain(displacement)
     trace = ufl.tr(eps)
-    factor = degradation(damage, kappa)
+    factor = damage_mask * degradation(damage, kappa) + 1 - damage_mask
     return (
         2 * mu * factor * ufl.dev(eps)
         + bulk * (factor * ufl.max_value(trace, 0.0) + ufl.min_value(trace, 0.0))
@@ -46,11 +46,15 @@ class MechanicsProblem:
         maximum_iterations: int = 30, linear_maximum_iterations: int = 2000,
         direct_solver: bool = False,
         spectral: bool = False,
+        interface_springs=None,
+        damage_mask=1.,
     ):
         for name, value in (
             ("bulk modulus", bulk), ("shear modulus", mu), ("residual stiffness", kappa),
             ("relative tolerance", relative_tolerance), ("absolute tolerance", absolute_tolerance),
         ):
+            if isinstance(value, ufl.core.expr.Expr):
+                continue
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"Experimental {name} must be finite and positive")
         for value in (maximum_iterations, linear_maximum_iterations):
@@ -65,12 +69,13 @@ class MechanicsProblem:
         self.rebuild_requested = True
         self.norms = []
         self.spectral_split = None
+        self.interface_springs = interface_springs
         space = displacement.function_space
         test, trial = ufl.TestFunction(space), ufl.TrialFunction(space)
         load = external_work(test, damage)
         self.load_form = fem.form(load)
-        residual = ufl.inner(stress(displacement, damage, bulk, mu, kappa), strain(test)) * ufl.dx - load
-        factor = degradation(damage, kappa)
+        residual = ufl.inner(stress(displacement, damage, bulk, mu, kappa, damage_mask=damage_mask), strain(test)) * ufl.dx - load
+        factor = damage_mask * degradation(damage, kappa) + 1 - damage_mask
         # Choose the tensile-side generalized derivative at zero trace.
         tangent_stress = (
             2 * mu * factor * ufl.dev(strain(trial))
@@ -110,7 +115,11 @@ class MechanicsProblem:
         )
         self.problem.A.setNearNullSpace(rigid_body_near_nullspace(space))
         self.problem.solver.setMonitor(self._monitor)
-        if self.spectral_split is not None:
+        if interface_springs is not None:
+            self.problem.A.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
+            if interface_springs.matrix is None:
+                interface_springs.build_matrix(self.problem.A)
+        if self.spectral_split is not None or interface_springs is not None:
             self.problem.solver.setFunction(self._assemble_spectral_residual, self.problem.b)
             self.problem.solver.setJacobian(
                 self._assemble_spectral_jacobian, self.problem.A, self.problem.P_mat,
@@ -119,13 +128,21 @@ class MechanicsProblem:
     def _update_spectral(self, x):
         x.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
         fem.petsc.assign(x, self.displacement)
-        self.spectral_split.update()
+        if self.spectral_split is not None:
+            self.spectral_split.update()
 
     def _assemble_spectral_residual(self, snes, x, b):
         self._update_spectral(x)
         fem.petsc.assemble_residual(
             snes, x, b, self.displacement, self.problem.F, self.problem.J, self.bcs,
         )
+        if self.interface_springs is not None:
+            work = self.interface_springs.matrix.createVecLeft()
+            try:
+                self.interface_springs.matrix.mult(x, work)
+                b.axpy(1., work)
+            finally:
+                work.destroy()
 
     def _assemble_spectral_jacobian(self, snes, x, matrix, preconditioner):
         self._update_spectral(x)
@@ -133,6 +150,10 @@ class MechanicsProblem:
             snes, x, matrix, preconditioner, self.displacement,
             self.problem.J, self.problem.preconditioner, self.bcs,
         )
+        if self.interface_springs is not None:
+            self.interface_springs.add_to(matrix)
+            if preconditioner is not None and preconditioner.handle != matrix.handle:
+                self.interface_springs.add_to(preconditioner)
 
     def _monitor(self, snes, iteration, norm):
         self.norms.append(float(norm))

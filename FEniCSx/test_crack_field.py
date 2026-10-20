@@ -62,6 +62,11 @@ def configured_test_case():
 
 
 class CrackConfigurationTests(unittest.TestCase):
+    def test_automatic_defaults_require_two_elements_per_length_scale(self):
+        defaults = json.loads(Path(__file__).with_name("fracture_defaults.json").read_text())
+        self.assertEqual(defaults["solver"]["minimum_elements_per_length_scale"], 2.0)
+        self.assertEqual(defaults["length_scale_m"], 0.1)
+
     def test_reads_the_configured_crack_from_the_root_config(self):
         config = configured_test_case()
         cracks = load_crack_specifications(config)
@@ -382,6 +387,17 @@ class CrackPlacementAndRefinementTests(unittest.TestCase):
         self.assertGreater(len(refined.facet_tags.find(1)), 0)
         self.assertEqual(refined.report["status"], "preliminary_under_resolved")
         self.assertFalse(refined.report["meets_recommended_resolution"])
+
+    def test_required_resolution_fails_when_refinement_limit_is_reached(self):
+        imported = self.imported_box()
+        crack = specification(centre_m=(0.5, 0.5, 0.5), length_scale_m=0.1)
+        with self.assertRaisesRegex(RuntimeError, "under-resolved after 0 refinement levels"):
+            refine_for_phase_field(
+                imported, crack,
+                PhaseFieldSolverOptions(
+                    minimum_elements_per_length_scale=2.0, maximum_refinement_levels=0,
+                ),
+            )
 
 
 class CrackSurfaceDensityTests(unittest.TestCase):

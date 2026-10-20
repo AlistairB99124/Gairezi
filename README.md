@@ -108,8 +108,14 @@ compression-only, frictional or opening/sliding contact law.
 
 Initial boundary/load assumptions retained from the three-body diagnostic:
 
-- All displacement components fixed at the configured rock bottom (-87 m).
-- Outer rock sides and exposed rock top traction-free.
+- Outer rock support from `material.bedrock.support`. With `model: rollers`
+  (the approved default), the rock bottom (-87 m) and the four vertical rock
+  sides carry normal-only penalty springs `k n n` (`spring_n_per_m3` x = bank
+  faces, y = upstream/downstream faces, z = bottom). Tangential motion is free,
+  so the rock can expand laterally under its own weight instead of being
+  artificially clamped. If the block is absent, the historical fixed bottom
+  (all components zero) with free sides is used.
+- Exposed rock top traction-free.
 - Existing upstream/downstream concrete water loads, preserving the concrete
   tailwater datum rather than lowering it to the new rock bottom.
 - Gravity and water loads applied simultaneously; no geostatic initialization.
@@ -162,6 +168,19 @@ Use the labelled ParaView fields for the new analysis, not the legacy
 concrete-only report generator.
 
 ### Wall/plinth corner cutbacks
+
+The plinth **underside** now follows straight sloping segments between the
+unchanged `geometry.bedrock.contours` elevations, across its full 6 m width.
+It is no longer rounded down to 0.5 m horizontal courses and is not spline
+smoothed. Survey breakpoints and the flat valley-bottom segment remain.
+Standalone preview and canonical combined/three-body meshes use the same
+linear seat profile. The rock mesher locks its seat to those exact foundation
+triangles; a bonded seat shares displacement nodes, while the default spring
+seat keeps coincident but separate plinth and rock nodes. The upper
+wall/plinth cutbacks below remain unchanged. At thin bank closures, the retained
+lower wedges follow the actual sloping seat rather than assuming horizontal
+lower corners. Interior mesh courses may remain horizontal; they are not
+steps in the exposed underside.
 
 `geometry.plinth.wall_interface` selects the longitudinal joint topology:
 
@@ -309,12 +328,13 @@ preview command.
 Use a new empty directory. This runs four MPI ranks of Elmer with concrete
 and rock self-weight and the existing concrete water loads. The wall/plinth
 and plinth/rock interfaces are bonded for this diagnostic only; the rock bottom
-at the configured bottom (currently z = -87 m) is fixed, rock sides are free,
+(currently z = -87 m) and rock sides use the `material.bedrock.support` model
+(normal-only roller springs by default; fixed bottom and free sides if absent),
 and uplift is zero. Existing
 grounded springs are not active. The concrete tailwater datum is preserved.
 The rock uses the same configured domain and graded mesh as the preview, rather
 than four coarse vertical layers. Enlarging the domain does not validate the
-fixed-bottom/free-side assumptions. This is not a mesh-converged engineering result.
+outer rock support assumptions. This is not a mesh-converged engineering result.
 It does not implement the selected opening/sliding law.
 
 The solved PVTU is `results/three_body_diagnostic_t0001.pvtu`.

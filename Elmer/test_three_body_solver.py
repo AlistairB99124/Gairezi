@@ -28,8 +28,10 @@ class AppJobWorkerTests(unittest.TestCase):
             diagnostic_report = {
                 "nodes": 100, "cells_by_body": {"1": 10, "2": 20, "3": 30},
                 "wall_plinth_cutback": {"shoulder_fill": "empty_outside_original_wall_footprint"},
+                "plinth_bedrock_connection": "bonded",
                 "interface_stiffness_n_per_m3": {"wall_plinth": {"x": 1.25e9}},
-                "assumptions": ["fixed rock bottom"],
+                "assumptions": ["rock rollers"],
+                "rock_outer_support": {"model": "rollers", "faces": {}},
             }
             def prepare_job(config_root, model, **kwargs):
                 self.assertEqual(config_root, root)
@@ -66,6 +68,12 @@ class AppJobWorkerTests(unittest.TestCase):
                 self.assertEqual(analysis["tension_utilization"], 1.2)
                 self.assertEqual(report["cells"], 60)
                 self.assertEqual(report["model_kind"], "three_body")
+                self.assertEqual(report["plinth_bedrock_connection"], "bonded")
+                self.assertIn("bonded plinth/bedrock", report["active_support"])
+                self.assertIn("normal roller springs", report["active_support"])
+                self.assertEqual(report["rock_outer_support"]["model"], "rollers")
+                self.assertIn("geometry.bedrock.support.spring_n_per_m3: inactive for bonded seat",
+                              report["inactive_inputs"])
                 self.assertEqual(report["stress_bodies"]["bedrock"]["peak_tension_mpa"], 99)
                 self.assertEqual(json.loads(report_path.read_text()), report)
                 with self.assertRaisesRegex(ValueError, "fresh"):

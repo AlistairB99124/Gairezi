@@ -186,6 +186,32 @@ class FractureRunnerTests(unittest.TestCase):
             self.assertIn("invalid submitted mesh", manifest["error"])
             self.assertFalse((directory / "baseline_report.json").exists())
 
+    def test_canonical_job_rejects_lower_explicit_resolution_before_import(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            config = configured_test_case()
+            config["crack_simulations"][0]["solver"]["minimum_elements_per_length_scale"] = .9
+            snapshot = output / "submitted.json"
+            snapshot.write_text(json.dumps(config))
+            structure = SimpleNamespace(three_body_config=config, three_body_source={})
+            with (
+                patch("run.submitted_structure", return_value=structure),
+                patch("run.assert_fracture_ready", return_value={"directory": "verified-baseline"}),
+                patch("elmer_baseline.import_baseline", return_value={}),
+                patch("dam_mesh.import_structure") as importer,
+                patch("dam_phase_field.solve") as solver,
+                self.assertRaisesRegex(ValueError, "requires at least 2"),
+            ):
+                run_fracture(snapshot, output, {"test": True}, output / "reference.pvtu")
+            importer.assert_not_called()
+            solver.assert_not_called()
+            directory = next((output / "dam_phase_field").iterdir())
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertIn("configured target is 0.9", manifest["error"])
+            self.assertEqual((directory / "config.json").read_bytes(), snapshot.read_bytes())
+            self.assertFalse((directory / "phase_field_report.json").exists())
+
     def test_invalid_elmer_handover_fails_run_and_records_error(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

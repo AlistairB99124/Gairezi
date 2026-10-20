@@ -50,13 +50,15 @@ def read_reference(structure, reference: Path):
     points = np.asarray(structure.nodes)
     node_regions = np.zeros(len(points), dtype=np.int32)
     for (kind, cell), region in zip(structure.cells, structure.region_ids):
-        if region not in (1, 2):
+        if region not in (1, 2, 3):
             raise ValueError(f"Unexpected structural region {region}")
-        node_regions[list(cell)] |= region
+        node_regions[list(cell)] |= 1 << (region - 1)
     source_centres = np.asarray([points[list(cell)].mean(axis=0) for _, cell in structure.cells])
     tree = cKDTree(source_centres)
     nodal_trees = {}
-    for region in (1, 2, 3):
+    for region in np.unique(node_regions):
+        if region == 0:
+            continue
         ids = np.flatnonzero((node_regions & region) == region)
         if not len(ids):
             continue
@@ -94,7 +96,7 @@ def read_reference(structure, reference: Path):
             selected[volume_cells] = regions == region
             selected_connectivity = np.repeat(selected, sizes)
             ids = np.unique(connectivity[selected_connectivity])
-            point_regions[ids] |= int(region)
+            point_regions[ids] |= 1 << (int(region) - 1)
         stress_names = ("stress_xx", "stress_yy", "stress_zz", "stress_xy", "stress_yz", "stress_xz")
         if any(grid.GetPointData().GetArray(name) is None for name in stress_names):
             raise ValueError("Elmer reference is missing stress components")

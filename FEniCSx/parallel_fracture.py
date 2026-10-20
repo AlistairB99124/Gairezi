@@ -57,6 +57,9 @@ def main():
         specifications = [CrackSpecification(**value) for value in request["specifications"]]
         options = PhaseFieldSolverOptions(**request["options"])
         structure = submitted_structure(directory / "config.json")
+        from three_body_model import is_three_body
+        if is_three_body(structure):
+            assert_fracture_ready(structure)
         with io.XDMFFile(comm, directory / "mesh.xdmf", "r") as reader:
             domain = reader.read_mesh(name="mesh")
             domain.topology.create_connectivity(3, 2)

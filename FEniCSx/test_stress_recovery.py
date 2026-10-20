@@ -13,6 +13,48 @@ from test_dam_mesh import DamMeshTests
 
 
 class StressRecoveryTests(unittest.TestCase):
+    def test_canonical_peaks_use_nodal_tensors_preserve_element_means_and_compare_source_nodes(self):
+        from test_three_body import column
+        imported = import_structure(column(), 1e-12)
+        domain = imported.domain
+        tensor_space = fem.functionspace(domain, ("DG", 0, (3, 3)))
+        stress = fem.Function(tensor_space)
+        count = domain.topology.index_map(3).size_local
+        values = np.zeros((count, 3, 3))
+        for cell in range(count):
+            values[cell] = np.diag((cell + 1., -2. * cell, 1.))
+            stress.x.array.reshape(-1, 3, 3)[tensor_space.dofmap.cell_dofs(cell)[0]] = values[cell]
+        space = fem.functionspace(domain, ("Lagrange", 1, (3, 3)))
+        dofs = space.dofmap.list
+        xyz = domain.geometry.x[mesh.entities_to_geometry(domain, 3, np.arange(count, dtype=np.int32))]
+        volumes = np.abs(np.linalg.det(xyz[:, 1:] - xyz[:, :1])) / 6
+        nodes = space.dofmap.index_map.size_local
+        mass, rhs = np.zeros((nodes, nodes)), np.zeros((nodes, 9))
+        for cell, ids in enumerate(dofs):
+            mass[np.ix_(ids, ids)] += volumes[cell] / 20 * (np.ones((4, 4)) + np.eye(4))
+            rhs[ids] += volumes[cell] / 4 * values[cell].reshape(1, 9)
+        expected = np.linalg.solve(mass, rhs).reshape(-1, 3, 3)
+        source = np.empty_like(expected)
+        source[domain.geometry.input_global_indices[domain.geometry.dofmaps[0]]] = expected[dofs]
+        concrete = np.concatenate((imported.cell_tags.find(1), imported.cell_tags.find(2)))
+        ids = np.unique(dofs[concrete])
+        principal = np.linalg.eigvalsh(expected[ids])
+        mean_principal = np.linalg.eigvalsh(expected[dofs[concrete]].mean(axis=1))
+        with tempfile.TemporaryDirectory() as temporary:
+            report = recover_stress(domain, stress, Path(temporary), cell_tags=imported.cell_tags,
+                                    reference_stress=source)
+            bad = recover_stress(domain, stress, Path(temporary), cell_tags=imported.cell_tags,
+                                 reference_stress=source * 2)
+        self.assertEqual(report["stress_recovery"]["peak_measure"], "recovered_nodal")
+        self.assertAlmostEqual(report["maximum_principal_tensile_stress_pa"], principal[:, -1].max())
+        self.assertAlmostEqual(report["maximum_principal_compressive_stress_pa"], principal[:, 0].min())
+        self.assertAlmostEqual(report["element_mean_stress"]["maximum_principal_tensile_stress_pa"],
+                               mean_principal[:, -1].max())
+        self.assertGreater(report["maximum_principal_tensile_stress_pa"],
+                           report["element_mean_stress"]["maximum_principal_tensile_stress_pa"])
+        self.assertLess(report["stress_parity"]["relative_nodal_stress_difference"], 1e-10)
+        self.assertAlmostEqual(bad["stress_parity"]["relative_nodal_stress_difference"], .5)
+
     def test_consistent_projection_and_tensor_average_match_dense_reference(self):
         imported = import_structure(DamMeshTests().cube(), 1e-12)
         domain = imported.domain

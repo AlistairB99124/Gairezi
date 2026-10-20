@@ -43,6 +43,16 @@ def _coordinate_key(point: tuple[float, float, float]) -> tuple[float, float, fl
     return tuple(round(value, 9) for value in point)
 
 
+def bedrock_elevation(rows: list[dict], chainage_m: float) -> float:
+    """Piecewise-linear surveyed seat elevation, without mesh-level snapping."""
+    for left, right in zip(rows, rows[1:]):
+        start, end = float(left["chainage"]), float(right["chainage"])
+        if start - 1e-8 <= chainage_m <= end + 1e-8:
+            fraction = min(1., max(0., (chainage_m - start) / (end - start)))
+            return float(left["height"]) + fraction * (float(right["height"]) - float(left["height"]))
+    raise ValueError(f"Plinth chainage {chainage_m:g} is outside the bedrock contour range")
+
+
 def load_contours(path: Path, crest_raise_m: float = 0.0) -> list[ContourPoint]:
     """Rebase surveyed elevations to the raised crest datum, in metres."""
     if not math.isfinite(crest_raise_m):
@@ -57,19 +67,10 @@ def load_contours(path: Path, crest_raise_m: float = 0.0) -> list[ContourPoint]:
     if bedrock[0][0] > plinth_chainages[0] or bedrock[-1][0] < plinth_chainages[-1]:
         raise ValueError("Bedrock contours must cover the full plinth chainage range")
 
-    def bedrock_elevation(chainage_m: float) -> float:
-        for (left_chainage, left_height), (right_chainage, right_height) in zip(
-            bedrock, bedrock[1:],
-        ):
-            if left_chainage <= chainage_m <= right_chainage:
-                fraction = (chainage_m - left_chainage) / (right_chainage - left_chainage)
-                return left_height + fraction * (right_height - left_height)
-        raise ValueError(f"Plinth chainage {chainage_m:g} is outside the bedrock contour range")
-
     contours = [
         ContourPoint(
             float(row["chainage"]),
-            bedrock_elevation(float(row["chainage"])) - crest_raise_m,
+            bedrock_elevation(bedrock_rows, float(row["chainage"])) - crest_raise_m,
             float(row["height"]) - crest_raise_m,
         )
         for row in rows
@@ -253,7 +254,7 @@ def build_plinth(root: Path) -> PlinthMesh:
 
     section_levels = []
     for chainage_m in chainages_m:
-        bedrock_z_m = _monotone_values(contours, "bedrock_z_m", chainage_m)
+        bedrock_z_m = bedrock_elevation(geometry["bedrock"]["contours"], chainage_m)
         plinth_z_m = _monotone_values(contours, "plinth_z_m", chainage_m)
         if bedrock_z_m > plinth_z_m:
             raise ValueError(f"Plinth intersects immutable bedrock at chainage {chainage_m:g}")
@@ -338,7 +339,7 @@ def build_plinth(root: Path) -> PlinthMesh:
             boundary_id = RIGHT_END_BOUNDARY_ID
         else:
             on_bedrock = all(
-                abs(z_m - _monotone_values(contours, "bedrock_z_m", station_m)) < tolerance
+                abs(z_m - bedrock_elevation(geometry["bedrock"]["contours"], station_m)) < tolerance
                 for station_m, (_, _, z_m) in zip(stations_m, coordinates)
             )
             on_plinth = all(
@@ -364,9 +365,8 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
     UPSTREAM_RADIUS_M = float(geometry["plinth"]["upstream_radius_m"])
     DOWNSTREAM_RADIUS_M = float(geometry["plinth"]["downstream_radius_m"])
 
-    def stepped_bedrock_z_m(chainage_m: float) -> float:
-        bedrock_z_m = _monotone_values(contours, "bedrock_z_m", round(chainage_m, 6))
-        return math.floor((bedrock_z_m + 1.0e-9) / element_size_m) * element_size_m
+    def bottom_elevation(chainage_m: float) -> float:
+        return bedrock_elevation(geometry["bedrock"]["contours"], chainage_m)
 
     top_faces: dict[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...]] = {}
     segment_nodes: dict[tuple[float, float], dict[float, list[tuple[float, float, float]]]] = {}
@@ -430,7 +430,7 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
     })
     highest_top_z_m = max(point[2] for face in top_faces.values() for point in face)
     lowest_bedrock_z_m = min(
-        stepped_bedrock_z_m(chainage_m)
+        bottom_elevation(chainage_m)
         for chainage_m in chainages_m
     )
     highest_layer_index = math.ceil(highest_top_z_m / element_size_m)
@@ -443,7 +443,7 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}
     bedrock_by_top_node = {
-        _coordinate_key(point): stepped_bedrock_z_m(
+        _coordinate_key(point): bottom_elevation(
             centerline_radius_m * math.atan2(point[0], point[1])
         )
         for face in top_faces.values()
@@ -456,7 +456,10 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
         boundary_clearance_m = 0.5 * element_size_m
         if target_z_m >= top_z_m - boundary_clearance_m:
             z_m = top_z_m
-        elif target_z_m <= bedrock_z_m + boundary_clearance_m:
+        # Preserve the top course needed by the wall cutback even near a sloping seat.
+        elif (target_z_m <= bedrock_z_m
+              or (target_z_m <= bedrock_z_m + boundary_clearance_m
+                  and target_z_m < top_z_m - element_size_m - 1e-9)):
             z_m = bedrock_z_m
         else:
             z_m = target_z_m
@@ -597,7 +600,7 @@ def build_conforming_plinth(root: Path, interface_meshes: list[object]) -> Plint
         elif max(abs(station_m - chainages_m[-1]) for station_m in stations_m) < tolerance:
             boundary_id = RIGHT_END_BOUNDARY_ID
         elif all(
-            abs(z_m - stepped_bedrock_z_m(station_m)) < tolerance
+            abs(z_m - bottom_elevation(station_m)) < tolerance
             for station_m, (_, _, z_m) in zip(stations_m, coordinates)
         ):
             boundary_id = FOUNDATION_BOUNDARY_ID
@@ -704,9 +707,8 @@ def audit_plinth(mesh: PlinthMesh, root: Path) -> dict[str, object]:
         touches_bedrock = any(
             abs(
                 mesh.nodes[node_id - 1][2]
-                - _monotone_values(
-                    contours,
-                    "bedrock_z_m",
+                - bedrock_elevation(
+                    geometry["bedrock"]["contours"],
                     math.atan2(mesh.nodes[node_id - 1][0], mesh.nodes[node_id - 1][1])
                     * centerline_radius_m,
                 )

@@ -2,10 +2,10 @@
 
 ## Current milestone
 
-This directory is the WSL-based adapter. **The current intact reference now
-uses a provisional fully bonded wall/plinth in both Elmer and FEniCSx.**
-Earlier split-interface results below are historical and must not be combined
-with the new reference.
+This directory is the WSL-based adapter. **The canonical model is now the
+spring-jointed wall/plinth/bedrock model**, including the approved plinth
+cutbacks and wall-footprint-only infill. The bonded and earlier split-interface
+results below are historical and must not be combined with this reference.
 The verified scope includes environment/configuration checking, a migration
 inventory, an exact elastic patch test, conforming dam import and a full-dam
 elastic comparison against the current Elmer run, and an analytically checked
@@ -15,7 +15,124 @@ local crack-band refinement and ParaView output. **3-D crack-face contact is
 not implemented.** Acceptance limits are provisional porting criteria, not
 independent engineering validation.
 
-### Bonded intact reference and fracture hold (17 October 2026)
+### Canonical three-body model (19 October 2026)
+
+The app runs the original Elmer solve, a FEniCSx elastic comparison, local
+crack-band refinement, a zero-damage solve on the refined mesh, then fracture.
+Failed verification stops that sequence and preserves the completed Elmer
+results. Successful execution is not engineering validation.
+
+- Import the saved `three_body.msh`, `config.json` and `diagnostic.json` from
+  the isolated Elmer job, rather than regenerating geometry in WSL. Record
+  their SHA-256 hashes and reverse the saved boundary-ID remapping.
+- Preserve separate coincident interface nodes and body IDs: 1 plinth,
+  2 wall, 3 bedrock. Remove only unused volume nodes.
+- Use the configured concrete/rock density, Young's modulus and Poisson ratio.
+  Gravity includes rock self-weight. Apply the outer rock support recorded in
+  the Elmer diagnostic (`rock_outer_support`): for `rollers`, the same
+  normal-only penalty springs `k n n` as Elmer on the bottom and four vertical
+  rock faces (tags 10, 13-16), with no Dirichlet condition; otherwise fix the
+  rock bottom in all directions. The exposed rock top stays free. The tailwater datum remains
+  the concrete base, not the deep rock bottom.
+- Use the configured global x/y/z springs for both interfaces, with no
+  ground-spring bypass. The approved default uses
+  `geometry.bedrock.support.model: distributed_elastic_granite`, so the
+  plinth/rock seat is a mortar spring joint with the configured
+  `geometry.bedrock.support.spring_n_per_m3` stiffness, like the wall/plinth
+  joint. The alternative `model: bonded` shares plinth/rock
+  seat nodes in the source mesh and therefore displacement DOFs in both solvers.
+  A bonded seat can move with deformable rock but cannot slip or separate. No zero
+  absolute displacement is imposed there, and no penalty stiffness approximates
+  the bond. Bedrock spring coefficients are inactive for a bonded seat;
+  wall/plinth springs and the outer rock support are unchanged. Elmer checks
+  solved seat continuity, and the importer checks connection metadata and shared
+  body-node identities.
+  Elmer's Galerkin mortar formulation uses a lumped
+  multiplier compliance: eliminating that multiplier gives
+  `K = B.T diag(k / w) B`, where `B` integrates the slave-weighted relative
+  displacement and `w` is the slave nodal area. This is not the same discrete
+  operator as directly integrating `k * jump(u) * jump(v)`.
+- Intersect opposite surface triangles after refinement. The mortar operator
+  remains symmetric, conservative and invariant under rigid translation,
+  including nonmatching interfaces and partitions on different MPI ranks.
+- Damage and its driving history are restricted to the wall. Plinth/rock
+  remain exactly elastic, and interface springs are not degraded. Hybrid and
+  explicitly selected experimental Amor mechanics are supported; three-body
+  experimental spectral mechanics is rejected.
+
+Fracture requires a completed `Baseline_NoPhase` with matching submitted
+configuration and mesh/config/diagnostic hashes, relative displacement L2
+error at most `1e-4`, recovered concrete nodal tensor relative error at most
+`1e-4`, nodal peak metadata, and relative force imbalance at most `1e-6`. Crack-band
+resolution must meet at least **2.0 elements per length scale**. Canonical jobs
+reject explicit lower targets as well as under-resolved automatic runs. The refined
+zero-damage solve and final fracture equilibrium must also pass. Missing,
+failed, nonfinite or stale evidence is an error, not permission to continue.
+The older bonded-model fracture hold still applies to that legacy path.
+
+Full-size elastic verification: **164,457 used nodes / 821,178 tetrahedra**,
+latest GMRES Elmer/FEniCSx displacement L2 difference **6.578e-8**, recovered
+concrete nodal tensor difference **3.511e-7**, relative force imbalance
+**6.855e-11**, and true residual **9.636e-10** (135 iterations).
+The initial direct-jump discretisation differed by
+`8.081e-4`; it was corrected to match the mortar operator, not accepted by
+loosening the tolerance. Analytical gravity, directional load transfer,
+refined nonmatching interfaces, wall-only damage and serial/two-rank hybrid
+and Amor benchmarks are covered by `test_three_body.py`. Full-size fracture
+convergence, fracture calibration and dam safety remain unverified.
+
+Canonical elastic solves now use restarted GMRES (restart 100), right GAMG and
+an unpreconditioned residual check; legacy elastic solves retain CG/left GAMG.
+The failed 9,429,660-cell job had stopped in refined uncracked elasticity with
+CG's indefinite-preconditioner error, before damage evolution. A bounded
+verification with GMRES passed mechanics but exhausted a 12 GiB process limit
+while assembling reactions. The mechanics matrix/AMG hierarchy is now released
+before postprocessing and element averaging is chunked. A follow-up attempt
+produced partial fields but exited without a completed report; full-size refined
+postprocessing and cracking remain unverified. No partial run is accepted as success.
+`linear_solver_report.json` now persists successful mechanics diagnostics before
+postprocessing; stage messages distinguish reactions, raw-field export and nodal
+stress recovery. This diagnostic alone is not a completed baseline report.
+
+For a direct run, in **WSL Ubuntu**, with `MODEL` pointing to the existing
+isolated Elmer model directory and `OUTPUT` to a new output root:
+
+```bash
+python3 FEniCSx/run.py run-baseline --dam-config "$MODEL/config.json" \
+  --elmer-model "$MODEL" --elmer-result "$MODEL/results/three_body_results_t0001.pvtu" \
+  --output "$OUTPUT"
+python3 FEniCSx/run.py run-fracture --dam-config "$MODEL/config.json" \
+  --elmer-model "$MODEL" --elmer-result "$MODEL/results/three_body_results_t0001.pvtu" \
+  --verified-baseline "$OUTPUT/dam_elastic_baseline/<completed-run>" --output "$OUTPUT"
+```
+
+Raw/degraded stress outputs include a cell `body_id` for ParaView Threshold filtering.
+Headline recovered and raw stress extrema cover wall/plinth only. Per-body
+`body_stress.bedrock` describes the **full** rock domain, not the separate
+Elmer 5 m reporting clip; do not compare it to the clipped Elmer rock peak.
+The full rock domain is retained in mechanics. No infinite-earth boundary,
+geostatic initialisation, uplift, unilateral contact or friction is added.
+
+### Bonded plinth/rock seat verification (19 October 2026)
+
+A fresh four-rank Elmer solve and serial FEniCSx elastic comparison on the
+approved bonded-seat configuration both completed. The wall still contains
+501,024 tetrahedra; the complete domain has 821,178. Shared seat nodes reduce
+the source node count to 161,036 without changing the wall geometry.
+At 3,641 seat locations the maximum measured relative displacement is
+`1.212e-19 m`, while the plinth itself moves: this is a bond, not a grounded seat.
+
+Elmer/FEniCSx relative displacement L2 difference is `4.249e-8`, concrete nodal
+stress difference `3.278e-7`, and relative force imbalance `8.037e-11`.
+Wall peak nodal tension is `2.118841 MPa` at `(76.228153, 24.274858, -28.0) m`,
+at the wall base; plinth peak tension is `2.698981 MPa` at
+`(75.599479, 24.596115, -27.5) m`. The earlier stress table describes the
+two-spring configuration, not this changed model. The mesher still warns about
+minimum rock scaled Jacobian `0.00678428`; engineering use requires mesh-quality
+review. No full-size fracture/refinement was run for this check, and the
+automatic crack-length/placement issue is not resolved by this bond change.
+
+### Historical bonded intact reference and fracture hold (17 October 2026)
 
 The conforming source mesh now shares wall/plinth nodes. The interface is
 internal, not two free exterior surfaces. The audit requires exactly one
@@ -32,7 +149,7 @@ continuous displacement, including tensile/shear transfer: **no joint opening,
 sliding, friction or uplift at an opening interface is represented**. Construction
 details and independent engineering review are still needed.
 
-New app jobs run Elmer and `Baseline_NoPhase`, then persist
+At that milestone, app jobs ran Elmer and `Baseline_NoPhase`, then persisted
 `cracking_status = blocked` with a review reason. The desktop displays the
 baseline-only result and hold, not a fictitious successful crack run.
 `run-fracture`, `--baseline-phase` and the MPI entry point reject newly generated
@@ -91,7 +208,7 @@ each side and centreline radius 78 m. Regenerate the Elmer reference and reimpor
 previous dam meshes and parity results are historical, not validation of
 these updated dimensions.
 
-### Automatic-crack sensitivity investigation
+### Historical automatic-crack sensitivity investigation
 
 Before the bonded-reference hold, cracking jobs solved an additional **zero-damage elastic baseline after
 refinement and before seeding/evolving damage**, using the exact same mesh,
@@ -214,11 +331,22 @@ python3 -B -m unittest discover -s FEniCSx -p 'test_*.py' -v
 
 ### Stress comparison convention
 
-Principal-stress peaks in new elastic baseline and fracture reports use
+Three-body principal-stress peaks in new elastic baseline and fracture reports use
 [stress_recovery.py](stress_recovery.py): consistent L2 projection of the
-Cauchy stress tensor into a continuous P1 tensor space, followed by averaging
-the four nodal tensors of each tetrahedron, then taking eigenvalues and global
-extrema. This matches the Elmer nodal-stress/element-average reporting sequence.
+Cauchy stress tensor into a continuous P1 tensor space, followed by eigenvalues
+at the recovered **nodes**, matching the canonical Elmer headline summary.
+The previous FEniCSx headline instead averaged the four nodal tensors per
+tetrahedron before taking eigenvalues. Those unlike measures explained the
+apparent baseline discrepancy (2.395 MPa Elmer versus 1.741 MPa FEniCSx tension).
+The corrected full-size concrete peaks, in MPa, are:
+
+| Body | Elmer tension | FEniCSx tension | Elmer compression | FEniCSx compression |
+|---|---:|---:|---:|---:|
+| Wall | 1.791210 | 1.791210 | -3.563739 | -3.563738 |
+| Plinth | 2.395260 | 2.395259 | -3.533062 | -3.533062 |
+
+The original element-mean extrema remain under `element_mean_stress`;
+legacy two-body reports retain that headline convention.
 The Elmer stress solver uses a mass-matrix nodal projection; see upstream
 [StressSolve.F90](https://github.com/ElmerCSC/elmerfem/blob/devel/fem/src/modules/StressSolve.F90).
 The projection integrates the actual degraded stress expression for phase-field
@@ -227,20 +355,25 @@ runs, rather than first sampling it into a DG0 field.
 The same operator applies to NoPhase, initially intact Phase, and seeded-crack
 runs. No material, loading, support, mesh, or damage parameters are calibrated to
 force stress agreement. Separate coincident interface nodes remain separate.
-The current adapter and recovery require one MPI process.
+Source-order Elmer tensor parity requires one MPI process; refined fracture
+and stress recovery also have serial/two-rank benchmark coverage.
 
 `recovered_stress.pvd` contains recovered nodal stress in Pa.
 Existing `stress.pvd`/`degraded_stress.pvd` retain the raw DG0 stress.
 Reports retain its principal extrema under `raw_element_stress`, and record the
-recovery method, solver tolerance, and undeformed peak-centroid locations under
-`stress_recovery`. Recovered peaks can smooth local crack-tip concentrations:
+recovery method, solver tolerance, peak measure, body IDs and reference-coordinate
+locations under `stress_recovery`. For compatibility the location keys retain
+`*_peak_centroid_xyz_m`, but canonical locations are **nodes**, explicitly labelled
+by `peak_coordinate_location`. Recovered peaks can smooth local crack-tip concentrations:
 use the recovered values for like-for-like Elmer comparison, but inspect the raw
 fields and mesh sensitivity when interpreting local cracking.
 
-Historical reports/CSV exports are not rewritten. Run new jobs to obtain the
-recovered comparison metrics. A below-5% intact-baseline peak difference is a
-numerical parity criterion, not an engineering-validation certificate; real
-crack-induced stress differences must not be forced below that limit.
+Historical reports/CSV exports are not rewritten. The desktop warns when an old
+FEniCSx element-mean report is compared with canonical Elmer nodal peaks.
+Rerun the baseline to satisfy the new full-field stress parity gate; historical
+element-mean evidence cannot enable canonical fracture. Numerical parity is
+not engineering validation; real crack-induced stress differences must not
+be forced below the intact-baseline tolerance.
 
 ### Isolated uncracked baselines
 
@@ -349,14 +482,15 @@ Only wall cells drive crack-resolution checks and refinement marking; only
 under-resolved wall cells near the crack are marked. Neighbouring cells may
 still be subdivided for conformity. Refinement reports and logs record wall and
 plinth cell counts separately, with marked plinth cells always zero. Automatic
-runs allow up to **five** refinement levels, stopping early when the unchanged
-resolution target is met.
+runs allow up to **five** refinement levels, stopping early when the required
+resolution target is met and failing if that limit is exhausted.
 
 [fracture_defaults.json](fracture_defaults.json) preserves the previous workflow's
 AT2 settings: length scale 0.1 m, Gc 2700 J/m2, zero internal crack pressure,
 ten load steps and existing solver/refinement controls. These are explicit
-research defaults, not a new calibration or engineering validation. In
-particular, the retained 0.9 elements-per-length-scale target is preliminary.
+research defaults, not a new calibration or engineering validation. The target
+is now **2.0 elements per length scale** (`h_max <= 0.05 m` at `l=0.1 m`),
+not the previous preliminary 0.9. The physical length scale is unchanged.
 The 2 mm value defines the initial damaged prism thickness; the existing
 phase-field model does not enforce a physical 2 mm displacement discontinuity
 or unilateral crack-face contact.
@@ -420,13 +554,15 @@ writes `results.md`, a civil-engineering-oriented summary generated directly
 from the configuration snapshot and numerical JSON reports. Repository
 `config.json` is never overwritten.
 
-The default single-process WSL job uses three local refinement levels and a
-preliminary target of `0.9` length scales per maximum tetrahedron diameter. The
-resulting `h_max` is about `0.109 m` for `l=0.1 m`, so it is explicitly
-under-resolved and unsuitable for mesh-independent conclusions. A target of
+The automatic job requires `2.0` elements per length scale and allows five
+local refinement levels. If unmet, the job fails before the refined baseline
+or cracking; it does not lower the target or enlarge the physical length scale.
+Historical preliminary runs used `0.9`, achieving `h_max` about `0.109 m`
+for `l=0.1 m`; these are under-resolved. A historical target of
 `2.0` generated roughly 12.5 million crack-band tetrahedra and a 1.8 GB mesh,
 then exhausted serial WSL memory. That stricter target requires a parallel
-workflow and remains mandatory for a later convergence study.
+workflow. Meeting the minimum is necessary but does not replace a convergence
+study or establish that the current full-size case fits local memory.
 
 The solver uses `alpha=0` for intact and `alpha=1` for fully damaged material.
 Mechanics uses `g(alpha)=(1-alpha)^2+kappa`. A
@@ -895,7 +1031,7 @@ equivalence does not imply discretization equivalence.
 and `boundaries`. DOLFINx performs this compiled HDF5 I/O in Ubuntu; Windows
 `h5py` is not used.
 
-The dam solve uses small-strain isotropic elasticity, CG/GAMG with rigid-body
+The legacy dam solve uses small-strain isotropic elasticity, CG/GAMG with rigid-body
 near-nullspace modes, gravity, upstream pressure, tailwater and crest surcharge.
 Foundation springs act on tag 1. **The historical split-interface Elmer SIF grounded wall-side tag 8
 with directional springs; it does not couple wall displacement to plinth

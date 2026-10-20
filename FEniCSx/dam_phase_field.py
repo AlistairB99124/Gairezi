@@ -55,6 +55,12 @@ def solve(
     first = parameters if parameters is not None else specifications[0]
     placement = validate_crack_placement(imported, specifications) if specifications else []
     domain = imported.domain
+    from three_body_model import (
+        is_three_body, materials, require_support_tags, rock_support, support_bcs, support_reactions,
+        support_form as rock_support_form,
+    )
+    three_body = is_three_body(structure)
+    coefficients = materials(imported, structure) if three_body else None
     baseline_report = None
     def record_stage(stage):
         if domain.comm.rank == 0:
@@ -85,6 +91,9 @@ def solve(
             engineering_validated=False,
             comparison_basis="identical mesh, material, external loads and spring supports; no crack pressure",
         )
+        if three_body and (not np.isfinite(baseline_report["relative_force_balance_error"])
+                           or baseline_report["relative_force_balance_error"] > 1e-6):
+            raise RuntimeError("Refined three-body zero-damage equilibrium gate failed")
         if domain.comm.rank == 0:
             (baseline_output / "baseline_report.json").write_text(
                 json.dumps(baseline_report, indent=2, allow_nan=False) + "\n",
@@ -95,11 +104,13 @@ def solve(
     ds = ufl.Measure("ds", domain=domain, subdomain_data=imported.facet_tags)
     loads = structure.loads
     material = structure.material
-    gravity = ufl.as_vector((0.0, 0.0, material.density_kg_m3 * loads.gravity_z_m_s2))
+    density = coefficients["density"] if three_body else material.density_kg_m3
+    gravity = ufl.as_vector((0.0, 0.0, density * loads.gravity_z_m_s2))
     z = ufl.SpatialCoordinate(domain)[2]
     normal = ufl.FacetNormal(domain)
     pressure_gradient = loads.water_density_kg_m3 * abs(loads.gravity_z_m_s2)
-    minimum_elevation = float(domain.comm.allreduce(domain.geometry.x[:, 2].min(), op=MPI.MIN))
+    minimum_elevation = (structure.concrete_minimum_z if three_body else
+                         float(domain.comm.allreduce(domain.geometry.x[:, 2].min(), op=MPI.MIN)))
     tailwater_elevation = minimum_elevation + loads.tailwater_head_m
     pressures = {
         2: pressure_gradient * ufl.max_value(loads.overflow_head_m - z, 0),
@@ -108,14 +119,22 @@ def solve(
     }
     from dam_elasticity import ground_supports
 
-    springs, _ = ground_supports(imported, structure)
+    springs, _ = ({}, "three_body_springs") if three_body else ground_supports(imported, structure)
 
     def support_form(trial, test):
         result = 0
         for tag, coefficients in springs.items():
             for component, stiffness in enumerate(coefficients):
                 result += stiffness * trial[component] * test[component] * ds(tag)
+        rock_rollers = rock_support_form(trial, test, ds, structure) if three_body else None
+        if rock_rollers is not None:
+            result += rock_rollers
         return result
+
+    if three_body:
+        require_support_tags(imported, structure)
+    # Rollers are springs in support_form; only the legacy fixed bottom needs Dirichlet BCs.
+    fixed_bottom = three_body and rock_support(structure)["model"] == "fixed_bottom"
 
     pressure_value = first.internal_pressure_pa
     if any(specification.internal_pressure_pa != pressure_value for specification in specifications):
@@ -130,6 +149,7 @@ def solve(
             work += load_factor * ufl.inner(-pressure_value * ufl.grad(damage), test) * dx
         return work
 
+    from interface_springs import InterfaceSprings
     result = solve_staggered(
         domain,
         material.youngs_modulus_pa,
@@ -145,11 +165,20 @@ def solve(
         mechanics_formulation=mechanics_formulation,
         damage_acceleration=damage_acceleration,
         final_load_substeps=final_load_substeps,
+        elastic_coefficients=coefficients,
+        interface_factory=(lambda space: InterfaceSprings(imported, structure, space)) if three_body else None,
+        boundary_conditions=(
+            (lambda space, load: support_bcs(imported, space, structure)) if fixed_bottom else None
+        ),
     )
 
     lam, mu, bulk = elastic_parameters(material.youngs_modulus_pa, material.poissons_ratio)
+    mask = 1.
+    if three_body:
+        lam, mu, bulk = (coefficients[key] for key in ("lam", "mu", "bulk"))
+        mask = coefficients["damage_mask"]
     stress_expression = (
-        degradation(result.damage, first.residual_stiffness)
+        (mask * degradation(result.damage, first.residual_stiffness) + 1 - mask)
         * undamaged_stress(result.displacement, lam, mu)
     )
     if mechanics_formulation == "experimental_amor":
@@ -157,6 +186,7 @@ def solve(
 
         stress_expression = compression_preserving_stress(
             result.displacement, result.damage, bulk, mu, first.residual_stiffness,
+            damage_mask=mask,
         )
     elif mechanics_formulation == "experimental_spectral":
         from spectral_split import SpectralSplit
@@ -188,7 +218,7 @@ def solve(
         )
     )
     with io.VTKFile(domain.comm, output / "degraded_stress.pvd", "w") as writer:
-        writer.write_function(stress)
+        writer.write_function([stress, coefficients["body_id"]] if three_body else stress)
     with io.VTKFile(domain.comm, output / "strain.pvd", "w") as writer:
         writer.write_function(strain_field)
     with io.VTKFile(domain.comm, output / "crack_surface_density.pvd", "w") as writer:
@@ -216,6 +246,12 @@ def solve(
         ]
         for tag, coefficients in springs.items()
     }
+    if three_body:
+        test = ufl.TestFunction(result.displacement.function_space)
+        reactions = support_reactions(
+            imported, result.displacement.function_space, structure, result.displacement,
+            ufl.inner(stress_expression, strain(test)) * dx - external_work(test, 1., result.damage), ds,
+        )
     imbalance = applied + np.asarray(list(reactions.values())).sum(axis=0)
     applied_norm = float(np.linalg.norm(applied))
     relative_balance = float(np.linalg.norm(imbalance) / applied_norm) if applied_norm else 0.0
@@ -228,12 +264,17 @@ def solve(
     owned_cells = domain.topology.index_map(domain.topology.dim).size_local
     owned_stress_dofs = tensor_space.dofmap.list[:owned_cells, 0]
     stress_values = stress.x.array.reshape(-1, 3, 3)[owned_stress_dofs]
+    if three_body:
+        concrete = np.concatenate((imported.cell_tags.find(1), imported.cell_tags.find(2)))
+        stress_values = stress_values[concrete[concrete < owned_cells]]
+        if not np.isfinite(relative_balance) or relative_balance > 1e-6:
+            raise RuntimeError(f"Three-body fracture equilibrium gate failed: {relative_balance}")
     eigenvalues = np.linalg.eigvalsh(stress_values)
     maximum_tensile_stress = float(
-        domain.comm.allreduce(eigenvalues[:, -1].max(), op=MPI.MAX)
+        domain.comm.allreduce(eigenvalues[:, -1].max() if len(eigenvalues) else -np.inf, op=MPI.MAX)
     )
     maximum_compressive_stress = float(
-        domain.comm.allreduce(eigenvalues[:, 0].min(), op=MPI.MIN)
+        domain.comm.allreduce(eigenvalues[:, 0].min() if len(eigenvalues) else np.inf, op=MPI.MIN)
     )
     result.report.update(
         {
@@ -245,7 +286,7 @@ def solve(
             "force_imbalance_n": imbalance.tolist(),
             "relative_force_balance_error": relative_balance,
             "maximum_degraded_stress_pa": float(
-                domain.comm.allreduce(np.abs(stress_values).max(), op=MPI.MAX)
+                domain.comm.allreduce(np.abs(stress_values).max() if len(stress_values) else 0., op=MPI.MAX)
             ),
             "maximum_principal_tensile_stress_pa": maximum_tensile_stress,
             "maximum_principal_compressive_stress_pa": maximum_compressive_stress,
@@ -280,10 +321,25 @@ def solve(
         stress_expression,
         output,
         sample_points={
-            "refined_baseline_tensile_peak": baseline_report["stress_recovery"]["tensile_peak_centroid_xyz_m"],
-            "refined_baseline_compressive_peak": baseline_report["stress_recovery"]["compressive_peak_centroid_xyz_m"],
+            f"refined_baseline_{kind}_peak": {
+                "coordinate_xyz_m": baseline_report["stress_recovery"][f"{kind}_peak_centroid_xyz_m"],
+                "region_id": baseline_report["stress_recovery"].get(f"{kind}_peak_region_id"),
+            }
+            for kind in ("tensile", "compressive")
         } if baseline_report is not None else None,
+        cell_tags=imported.cell_tags if three_body else None,
     ))
+    if three_body:
+        result.report.update(
+            model_kind="three_body", source_mesh=structure.three_body_source,
+            wall_plinth_connection="three_body_springs",
+            plinth_bedrock_connection=(
+                "bonded" if structure.three_body_config["geometry"]["bedrock"]["support"].get("model") == "bonded"
+                else "spring"
+            ),
+            stress_scope="wall and plinth; full-domain rock reported separately",
+            fracture_verification="implementation verification only; full-dam validation required",
+        )
     result.report["mesh_nodes"] = int(result.damage.function_space.dofmap.index_map.size_global)
     result.report["mesh_cells"] = int(domain.topology.index_map(3).size_global)
     if baseline_report is not None:

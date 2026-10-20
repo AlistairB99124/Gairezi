@@ -82,23 +82,42 @@ def write_json(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
-def submitted_structure(config: Path):
+def submitted_structure(config: Path, model_directory: Path | None = None):
     """Rebuild the exact Elmer solver topology without modifying checkout inputs."""
     sys.path.insert(0, str(ROOT))
     from structural_model import audit_combined_structure, build_combined_structure
     from Elmer.structure_assembly import apply_load_case
     from Elmer.regions.tetrahedral import tetrahedralize_structure
+    source_record = config.parent / "three_body_source.json"
+    saved_source = json.loads(source_record.read_text()) if source_record.is_file() else None
+    if model_directory is None and saved_source is not None:
+        model_directory = Path(saved_source["model_directory"])
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         (root / "config.json").write_bytes(config.read_bytes())
         structure = build_combined_structure(root)
     apply_load_case(structure, config)
+    if model_directory is not None:
+        from three_body_model import load_structure
+        result = load_structure(config, model_directory, structure)
+        if saved_source is not None and saved_source.get("sha256") != result.three_body_source["sha256"]:
+            raise ValueError("Saved three-body source hashes no longer match the model")
+        result.three_body_baseline_directory = (
+            saved_source.get("verified_baseline_directory") if saved_source is not None else None
+        )
+        return result
     audit_combined_structure(structure)
-    return tetrahedralize_structure(structure)
+    from dam_mesh import compact_unused_nodes
+    return compact_unused_nodes(tetrahedralize_structure(structure))
 
 
-def assert_fracture_ready(structure):
+def assert_fracture_ready(structure, baseline_directory=None):
+    from three_body_model import is_three_body, require_verified_baseline
+    if is_three_body(structure):
+        return require_verified_baseline(
+            structure, baseline_directory or getattr(structure, "three_body_baseline_directory", None),
+        )
     if not any(tag == 8 for tag, _ in structure.boundaries):
         raise RuntimeError(
             "Cracking is on hold pending review of the corrected bonded intact wall/plinth reference. "
@@ -106,7 +125,8 @@ def assert_fracture_ready(structure):
         )
 
 
-def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: bool = False) -> None:
+def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: bool = False,
+                 model_directory: Path | None = None, elmer_result: Path | None = None) -> None:
     """Solve the submitted uncracked dam, with or without evolving AT2 damage."""
     from automatic_crack import DEFAULTS
     from crack_field import PhaseFieldParameters, PhaseFieldSolverOptions
@@ -126,7 +146,9 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
     }
     write_json(directory / "manifest.json", manifest)
     try:
-        structure = submitted_structure(snapshot)
+        structure = submitted_structure(snapshot, model_directory)
+        if model_directory is not None:
+            write_json(directory / "three_body_source.json", structure.three_body_source)
         if phase:
             assert_fracture_ready(structure)
         imported = import_structure(structure, maximum_volume_change=0.001)
@@ -161,16 +183,51 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
         else:
             from dam_elasticity import solve
 
-            _, _, report = solve(imported, structure, {
+            reference_options = {}
+            if model_directory is not None:
+                if elmer_result is None:
+                    raise ValueError("Three-body baseline verification requires --elmer-result")
+                from elastic_parity import read_reference
+                import numpy as np
+                expected, reference_components, _ = read_reference(structure, elmer_result)
+                reference_stress = np.empty((len(reference_components), 3, 3))
+                for component, (i, j) in enumerate(((0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (0, 2))):
+                    reference_stress[:, i, j] = reference_stress[:, j, i] = reference_components[:, component]
+                reference_options["reference_stress"] = reference_stress
+            displacement, sigma, report = solve(imported, structure, {
                 "relative_tolerance": options.mechanics_relative_tolerance,
                 "maximum_iterations": options.mechanics_maximum_iterations,
-            }, directory)
+            }, directory, **reference_options)
             report.update({
                 "model": "linear isotropic elasticity; phase field disabled",
                 "configured_tensile_strength_pa": structure.material.tensile_strength_pa,
                 "crack_surface_measure_m2": 0.0,
             })
             report_name = "baseline_report.json"
+            if model_directory is not None:
+                differences = displacement[imported.tetrahedra] - expected[imported.tetrahedra]
+                reference_values = expected[imported.tetrahedra]
+                def norm_squared(values):
+                    return float(np.sum(imported.volumes / 20 * (
+                        (values.sum(axis=1)**2).sum(axis=1) + (values**2).sum(axis=(1, 2)))))
+                reference_norm = norm_squared(reference_values)
+                if reference_norm <= 0:
+                    raise ValueError("Elmer displacement reference has zero norm")
+                error = float(np.sqrt(norm_squared(differences) / reference_norm))
+                stress_error = report["stress_parity"]["relative_nodal_stress_difference"]
+                verification = {
+                    "relative_l2_displacement_difference": error, "maximum_relative_l2_difference": 1e-4,
+                    "relative_force_balance_error": report["relative_force_balance_error"],
+                    "maximum_relative_force_balance_error": 1e-6,
+                    **report["stress_parity"],
+                    "passed": (error <= 1e-4 and stress_error <= 1e-4
+                               and report["relative_force_balance_error"] <= 1e-6),
+                    "engineering_validated": False,
+                }
+                report["three_body_verification"] = verification
+                if not verification["passed"]:
+                    write_json(directory / "baseline_report.json", report)
+                    raise RuntimeError(f"Three-body elastic verification failed: {verification}")
         report.update({
             "scenario_name": scenario, "engineering_validated": False,
             "configuration_sha256": manifest["configuration_sha256"],
@@ -216,6 +273,7 @@ def run_fracture(
     dam_config: Path, output_root: Path, versions: dict, elmer_result: Path | None = None,
     *, processes: int = 1, mechanics_formulation: str = "hybrid", damage_acceleration: bool = False,
     final_load_substeps: int = 1,
+    model_directory: Path | None = None, verified_baseline: Path | None = None,
 ) -> None:
     """Run one isolated phase-field job from the authoritative dam configuration."""
     if mechanics_formulation not in ("hybrid", "experimental_amor", "experimental_spectral"):
@@ -259,8 +317,20 @@ def run_fracture(
     }
     write_json(directory / "manifest.json", manifest)
     try:
-        structure = submitted_structure(snapshot)
-        assert_fracture_ready(structure)
+        structure = submitted_structure(snapshot, model_directory)
+        verification = assert_fracture_ready(structure, verified_baseline)
+        from three_body_model import is_three_body
+        if is_three_body(structure):
+            if mechanics_formulation == "experimental_spectral":
+                raise ValueError("Three-body spectral mechanics is not verified")
+            if elmer_result is None:
+                raise ValueError("Three-body fracture requires the full-domain --elmer-result")
+            source = dict(structure.three_body_source,
+                          verified_baseline_directory=verification["directory"])
+            write_json(directory / "three_body_source.json", source)
+            manifest["verified_elastic_baseline"] = verification
+            manifest["model_kind"] = "three_body"
+            write_json(directory / "manifest.json", manifest)
         if elmer_result is not None:
             from elmer_baseline import import_baseline
 
@@ -287,6 +357,10 @@ def run_fracture(
                 print(f"Automatic crack warning: {warning}", flush=True)
         else:
             options = load_phase_field_solver_options(snapshot)
+        if is_three_body(structure):
+            from three_body_model import require_fracture_resolution
+
+            require_fracture_resolution(options)
         imported = import_structure(structure, maximum_volume_change=0.001)
         write_json(directory / "import_report.json", imported.report)
         placement = [
@@ -364,6 +438,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=HERE / "cracking.json")
     parser.add_argument("--dam-config", type=Path, default=LOAD_CASE)
     parser.add_argument("--elmer-result", type=Path, help="Elmer baseline PVTU for run-fracture")
+    parser.add_argument("--elmer-model", type=Path, help="Exact canonical Elmer model directory (mesh, config, diagnostic)")
+    parser.add_argument("--verified-baseline", type=Path, help="Completed matching three-body elastic baseline directory")
     parser.add_argument("--baseline-phase", action="store_true",
                         help="Run an initially intact phase-field baseline without generating a crack")
     parser.add_argument("--fracture-processes", type=int, choices=range(9), default=1,
@@ -377,8 +453,12 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=HERE / "results")
     parser.add_argument("--scenario", help="Run one enabled scenario by id")
     args = parser.parse_args()
-    if args.elmer_result is not None and args.action != "run-fracture":
-        parser.error("--elmer-result is supported only with run-fracture")
+    if args.elmer_model is not None and args.action not in ("run-baseline", "run-fracture"):
+        parser.error("--elmer-model applies only to run-baseline or run-fracture")
+    if args.verified_baseline is not None and (args.action != "run-fracture" or args.baseline_phase):
+        parser.error("--verified-baseline applies only to a cracking run-fracture")
+    if args.elmer_result is not None and args.action not in ("run-fracture", "run-baseline"):
+        parser.error("--elmer-result is supported only with run-fracture or run-baseline")
     if args.baseline_phase and (args.action != "run-fracture" or args.elmer_result is not None):
         parser.error("--baseline-phase requires run-fracture without --elmer-result")
     if args.fracture_processes != 1 and (args.action != "run-fracture" or args.baseline_phase):
@@ -395,9 +475,20 @@ def main() -> int:
         parser.error("--fracture-final-substeps applies only to a cracking run-fracture")
     versions = environment()
     if args.action == "run-baseline" or args.baseline_phase:
-        run_baseline(args.dam_config.resolve(), args.output.resolve(), versions, phase=args.baseline_phase)
+        source_options = {}
+        if args.elmer_model is not None:
+            source_options["model_directory"] = args.elmer_model.resolve()
+        if args.elmer_result is not None:
+            source_options["elmer_result"] = args.elmer_result.resolve()
+        run_baseline(args.dam_config.resolve(), args.output.resolve(), versions, phase=args.baseline_phase,
+                     **source_options)
         return 0
     if args.action == "run-fracture":
+        source_options = {}
+        if args.elmer_model is not None:
+            source_options["model_directory"] = args.elmer_model.resolve()
+        if args.verified_baseline is not None:
+            source_options["verified_baseline"] = args.verified_baseline.resolve()
         run_fracture(
             args.dam_config.resolve(), args.output.resolve(), versions,
             args.elmer_result.resolve() if args.elmer_result is not None else None,
@@ -405,6 +496,7 @@ def main() -> int:
             mechanics_formulation=args.fracture_mechanics,
             damage_acceleration=args.accelerate_damage,
             final_load_substeps=args.fracture_final_substeps,
+            **source_options,
         )
         return 0
     scenarios = load_scenarios(args.config)

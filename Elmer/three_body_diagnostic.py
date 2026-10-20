@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from .bedrock_preview import configured_rock_mesh, survey_coordinates
-from .model_config import load_config, validate_config
+from .model_config import load_config, rock_outer_support, validate_config
 from .regions.combined_structure import build_combined_structure, write_combined_gmsh
 from .regions.tetrahedral import _CELL_FACES, tetrahedralize_structure
 from .structure_assembly import (
@@ -25,8 +25,124 @@ from .structure_assembly import (
 JOINT_MODELS = ("bonded", "spring")
 # Boundary tags for the two sides of each spring joint (8/9 follow FACE_GROUP_IDS).
 WALL_SIDE, PLINTH_TOP, PLINTH_SEAT, ROCK_SEAT = 8, 9, 11, 12
+ROCK_BOTTOM = 10
+# Outer rock-box sides: local axis (x = across valley/banks, y = stream depth) and
+# outward sign along that rock-local unit vector.
+ROCK_SIDES = {13: ("x", -1.), 14: ("x", 1.), 15: ("y", -1.), 16: ("y", 1.)}
 SPRING_PAIRS = {"wall_plinth": (WALL_SIDE, PLINTH_TOP), "plinth_bedrock": (PLINTH_SEAT, ROCK_SEAT)}
 SPRING_SUPPORTS = {"wall_plinth": "plinth", "plinth_bedrock": "bedrock"}
+_ROCK_CELL_FACES = {**_CELL_FACES, 7: ((0, 1, 2, 3), (0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4))}
+
+
+def rock_side_faces(rock) -> dict[int, list[tuple[int, ...]]]:
+    """Exterior rock faces on the four vertical box planes, in rock-local node ids.
+
+    Every unpaired rock-cell face must be a top, bottom or side face, so a side
+    support cannot silently miss part of the rock perimeter.
+    """
+    report = rock.report
+    origin = np.asarray(report["section_origin_xy_m"], dtype=float)
+    axes = {"x": np.asarray(report["across_unit_vector_xy"], dtype=float),
+            "y": np.asarray(report["depth_unit_vector_xy"], dtype=float)}
+    limits = {"x": report["rock_across_limits_m"], "y": report["rock_depth_limits_m"]}
+    points = np.asarray(rock.points, dtype=float)
+    local = {axis: (points[:, :2] - origin) @ vector for axis, vector in axes.items()}
+    span = max(abs(value) for pair in limits.values() for value in pair)
+    tolerance = 1e-7 * max(span, 1.)
+    exterior: list[np.ndarray] = []
+    for width in (3, 4):
+        faces = [
+            np.asarray(block, dtype=np.int64)[:, pattern]
+            for kind, block in rock.blocks.items() for pattern in _ROCK_CELL_FACES[kind]
+            if len(pattern) == width and len(block)
+        ]
+        if not faces:
+            continue
+        faces = np.vstack(faces)
+        _, first, counts = np.unique(np.sort(faces, axis=1), axis=0, return_index=True, return_counts=True)
+        if np.any(counts > 2):
+            raise ValueError("Rock volume has non-manifold faces")
+        exterior.extend(faces[first[counts == 1]])
+    known = {tuple(sorted(int(n) for n in face)) for face in (*rock.top_faces, *rock.bottom_faces)}
+    sides: dict[int, list[tuple[int, ...]]] = {tag: [] for tag in ROCK_SIDES}
+    unclassified = 0
+    for face in exterior:
+        if tuple(sorted(int(n) for n in face)) in known:
+            continue
+        for tag, (axis, sign) in ROCK_SIDES.items():
+            plane = limits[axis][0 if sign < 0 else 1]
+            if np.all(np.abs(local[axis][face] - plane) <= tolerance):
+                sides[tag].append(tuple(int(n) for n in face))
+                break
+        else:
+            unclassified += 1
+    if unclassified or not all(sides.values()):
+        raise ValueError(
+            f"Rock exterior is not a closed box: {unclassified} unclassified faces; "
+            f"side face counts {{tag: len(faces)}} = { {tag: len(f) for tag, f in sides.items()} }"
+        )
+    return sides
+
+
+def rock_outer_support_report(config: dict, rock, sides: dict[int, list[tuple[int, ...]]]) -> dict[str, object]:
+    """Face-wise outer rock supports shared by the Elmer SIF and FEniCSx."""
+    support = rock_outer_support(config)
+    if support["model"] == "fixed_bottom":
+        return {"model": "fixed_bottom", "fixed_boundary_tag": ROCK_BOTTOM,
+                "description": "all bottom DOFs fixed; free outer rock sides"}
+    springs = support["spring_n_per_m3"]
+    geometry = rock.report
+    points = np.asarray(rock.points, dtype=float)
+    across = np.asarray(geometry["across_unit_vector_xy"], dtype=float)
+    depth = np.asarray(geometry["depth_unit_vector_xy"], dtype=float)
+    faces = {str(ROCK_BOTTOM): {
+        "name": "bottom", "local_axis": "z", "outward_normal": [0., 0., -1.],
+        "normal_stiffness_n_per_m3": springs["z"],
+        "area_m2": face_area(points, [tuple(face) for face in rock.bottom_faces]),
+    }}
+    for tag, (axis, sign) in ROCK_SIDES.items():
+        vector = sign * (across if axis == "x" else depth)
+        faces[str(tag)] = {
+            "name": {13: "bank_x_min", 14: "bank_x_max", 15: "stream_y_min", 16: "stream_y_max"}[tag],
+            "local_axis": axis, "outward_normal": [float(vector[0]), float(vector[1]), 0.],
+            "normal_stiffness_n_per_m3": springs[axis],
+            "area_m2": face_area(points, sides[tag]),
+        }
+    return {
+        "model": "rollers",
+        "description": (
+            "normal-only penalty springs k*(n.u) on the rock bottom and four vertical sides; "
+            "tangential motion free (roller approximation)"
+        ),
+        "spring_axes": "rock-box local frame: x banks, y upstream/downstream, z bottom",
+        "source": "material.bedrock.support.spring_n_per_m3",
+        "faces": faces,
+    }
+
+
+def face_area(points: np.ndarray, faces: list[tuple[int, ...]]) -> float:
+    total = 0.
+    for face in faces:
+        p = points[list(face)]
+        for i in range(1, len(face) - 1):
+            total += np.linalg.norm(np.cross(p[i] - p[0], p[i + 1] - p[0])) / 2
+    return float(total)
+
+
+def roller_condition(number: int, tag: int, face: dict[str, object], boundary_map: dict[int, int]) -> str:
+    """Elmer BC: traction = -k (n.u) n via Spring ij = k n_i n_j (Cartesian, no N-T)."""
+    normal = np.asarray(face["outward_normal"], dtype=float)
+    tensor = face["normal_stiffness_n_per_m3"] * np.outer(normal, normal)
+    entries = "".join(
+        f"    Spring {i + 1}{j + 1} = Real {tensor[i, j] + 0.:.12g}\n"
+        for i in range(3) for j in range(3) if tensor[i, j] != 0.
+    )
+    return (
+        f"Boundary Condition {number}\n"
+        f"    Name = \"RockRoller_{face['name']}\"\n"
+        f"    Target Boundaries(1) = {boundary_map[tag]}\n"
+        f"{entries}End\n\n"
+    )
 
 
 def split_wall_from_plinth(concrete) -> tuple[list, list, list, int]:
@@ -110,12 +226,18 @@ def prepare(
         stream_margin_m, bank_margin_m, bottom_z_m,
     )
     rock_points, rock_blocks, geometry = rock.points, rock.blocks, rock.report
+    bonded_seat = joints == "spring" and config["geometry"]["bedrock"]["support"]["model"] == "bonded"
     stiffness = interface_stiffness(config) if joints == "spring" else {}
+    if bonded_seat:
+        del stiffness["plinth_bedrock"]
     seat_faces = [face for tag, face in concrete.boundaries if tag == 1]
     if joints == "spring":
         nodes, concrete_cells, concrete_boundaries, wall_joint_faces = split_wall_from_plinth(concrete)
-        # Rock gets its own seat nodes; the springs, not shared nodes, join it.
-        index = {}
+        # A perfect bond shares only plinth-seat nodes, never the split wall trace.
+        seat_nodes = {node for face in seat_faces for node in face}
+        index = {
+            tuple(round(v, 8) for v in nodes[node]): node for node in seat_nodes
+        } if bonded_seat else {}
     else:
         nodes, concrete_cells, concrete_boundaries = (
             list(concrete.nodes), concrete.cells, concrete.boundaries,
@@ -160,8 +282,10 @@ def prepare(
         raise ValueError("Non-manifold three-body mesh")
     seat = [key for key, value in memberships.items() if value == {1, 6}]
     if joints == "spring":
-        if seat or any(value == {1, 2} for value in memberships.values()):
+        if any(value == {1, 2} for value in memberships.values()) or (seat and not bonded_seat):
             raise ValueError("Spring joints must not share nodes between bodies")
+        if bonded_seat and len(seat) != geometry["seat_triangles"]:
+            raise ValueError("Bonded rock/plinth seat is not fully connected")
         def located(face: tuple[int, ...]) -> tuple:
             return tuple(sorted(tuple(round(v, 7) for v in nodes[n]) for n in face))
         plinth_seat = {located(tri) for face in seat_faces for tri in split_face(face)}
@@ -174,11 +298,15 @@ def prepare(
     else:
         seat_count = len(seat)
     boundaries = [(tag, face) for tag, face in concrete_boundaries if tag != 1]
-    if joints == "spring":
+    if joints == "spring" and not bonded_seat:
         boundaries.extend((PLINTH_SEAT, face) for face in seat_faces)
         boundaries.extend((ROCK_SEAT, face) for face in rock_seat)
     bottom_faces = [tuple(mapping[int(n)] for n in tri) for tri in rock.bottom_faces]
-    boundaries.extend((10, face) for face in bottom_faces)
+    boundaries.extend((ROCK_BOTTOM, face) for face in bottom_faces)
+    sides = rock_side_faces(rock) if rock_outer_support(config)["model"] == "rollers" else {}
+    outer_support = rock_outer_support_report(config, rock, sides)
+    for tag, faces in sides.items():
+        boundaries.extend((tag, tuple(mapping[n] for n in face)) for face in faces)
     boundary_map = {tag: i+1 for i, tag in enumerate(sorted({tag for tag, _ in boundaries}))}
     mesh = replace(
         concrete, nodes=nodes, cells=cells,
@@ -192,7 +320,19 @@ def prepare(
     text = path.read_text()
     start = text.index("Boundary Condition 1\n")
     end = text.index("Boundary Condition 2\n", start)
-    text = text[:start] + '''Boundary Condition 1
+    if outer_support["model"] == "rollers":
+        # Tags are remapped below with the concrete BCs, so write source tags here.
+        identity = {tag: tag for tag in boundary_map}
+        faces = outer_support["faces"]
+        bottom = roller_condition(1, ROCK_BOTTOM, faces[str(ROCK_BOTTOM)], identity)
+        last = max(int(n) for n in re.findall(r"^Boundary Condition (\d+)$", text, re.M))
+        side_text = "\n" + "".join(
+            roller_condition(last + offset, tag, faces[str(tag)], identity)
+            for offset, tag in enumerate(ROCK_SIDES, start=1)
+        )
+        text = text[:start] + bottom + text[end:] + side_text
+    else:
+        text = text[:start] + '''Boundary Condition 1
     Name = "DiagnosticFixedRockBottom"
     Target Boundaries(1) = 10
     Displacement 1 = Real 0
@@ -218,7 +358,7 @@ Material 2
 End
 
 Body Force 2
-    Stress Bodyforce 3 = Real {rock["density"] * config["loads"]["gravity"]:.12g}
+    Stress Bodyforce 3 = Real {rock["density"] * config["loads"]["gravity"] + 0.:.12g}
 End
 '''
     text = re.sub(
@@ -243,7 +383,9 @@ End
         text += spring_conditions(text, boundary_map, stiffness)
     joint_note = (
         f"directional springs (global x/y/z) {stiffness} "
-        "N/m^3 from geometry.plinth/bedrock.support at wall/plinth and plinth/rock"
+        + ("N/m^3 at wall/plinth; perfectly bonded plinth/rock (shared nodes)"
+           if bonded_seat else
+           "N/m^3 from geometry.plinth/bedrock.support at wall/plinth and plinth/rock")
         if joints == "spring" else "bonded interfaces"
     )
     result_name = "three_body_results" if integrated else "three_body_diagnostic"
@@ -252,18 +394,39 @@ End
         "! Foundation support only; geometry.plinth.support is inactive.\n",
         "",
     )
+    rollers = outer_support["model"] == "rollers"
+    if rollers:
+        k = rock_outer_support(config)["spring_n_per_m3"]
+        support_header = (
+            "rock rollers (normal penalty springs bottom/sides)",
+            f"! Rock box rollers: normal-only springs x={k['x']:g}, y={k['y']:g}, z={k['z']:g} N/m^3 "
+            "(local banks/stream/bottom). Configured graded rock mesh. Not a frictional/design result.\n",
+        )
+        support_assumptions = [
+            f"rock bottom z={geometry['bottom_z_m']:g} m and four vertical sides on normal-only "
+            "roller springs (tangential motion free)",
+            "rock self-weight and dam loads applied together (no geostatic initial stage)",
+        ]
+    else:
+        support_header = (
+            "fixed rock bottom",
+            "! Free outer rock sides. Configured graded rock mesh. Not a frictional/design result.\n",
+        )
+        support_assumptions = [f"fixed rock bottom z={geometry['bottom_z_m']:g} m", "free rock sides"]
     path.write_text(
         f"! {'THREE-BODY ANALYSIS' if integrated else 'DIAGNOSTIC ONLY'}: "
-        f"{joint_note}; fixed rock bottom; zero uplift.\n"
-        "! Free outer rock sides. Configured graded rock mesh. Not a frictional/design result.\n"
+        f"{joint_note}; {support_header[0]}; zero uplift.\n"
+        + support_header[1]
         + text.replace("combined_results_mpi", result_name),
     )
     report = {
         "assumptions": [
             "linear directional springs in global x/y/z (carry tension) at wall/plinth and plinth/rock"
-            if joints == "spring" else "bonded wall/plinth and plinth/rock",
+            if joints == "spring" and not bonded_seat else
+            "wall/plinth directional springs; perfectly bonded plinth/rock (zero relative displacement)"
+            if bonded_seat else "bonded wall/plinth and plinth/rock",
             "zero uplift",
-            f"fixed rock bottom z={geometry['bottom_z_m']:g} m", "free rock sides",
+            *support_assumptions,
             "simultaneous gravity and existing concrete water loads",
             "80 m chainage reference",
             (
@@ -278,17 +441,24 @@ End
             if integrated else "Solver integration diagnostic, NOT engineering validation"
         ),
         "joints": joints,
+        "plinth_bedrock_connection": "bonded" if bonded_seat or joints == "bonded" else "spring",
         "interface_stiffness_n_per_m3": stiffness,
         "interface_stiffness_sources": {
             name: f"geometry.{region}.support.spring_n_per_m3"
-            for name, region in SPRING_SUPPORTS.items()
+            for name, region in SPRING_SUPPORTS.items() if name in stiffness
         } if joints == "spring" else {},
         "nodes": len(nodes),
         "cells_by_body": dict(Counter(regions)),
         "solver_body_ids": {"plinth": 1, "wall": 2, "bedrock": 3},
         "boundary_id_map": boundary_map,
+        "rock_outer_support": outer_support,
         "wall_plinth_joint_faces": wall_joint_faces,
         "plinth_rock_seat_triangles": seat_count,
+        "plinth_underside": {
+            "profile": "piecewise_linear_bedrock_contours",
+            "elevation_quantization": False,
+            "radial_extent": "full_plinth_width",
+        },
         "geometry": geometry,
         "concrete_element_types": sorted({kind for kind, _ in concrete_cells}),
         "wall_plinth_cutback": concrete.wall_plinth_cutback,
@@ -314,6 +484,8 @@ def spring_conditions(
     first = max(int(n) for n in re.findall(r"^Boundary Condition (\d+)$", text, re.M)) + 1
     sections = []
     for offset, (name, (slave, master)) in enumerate(SPRING_PAIRS.items()):
+        if name not in stiffness:
+            continue
         slave_bc, master_bc = first + 2 * offset, first + 2 * offset + 1
         coefficients = "".join(
             f"    Mortar BC Coefficient Displacement {i} = Real {stiffness[name][axis]:.12g}\n"
@@ -337,7 +509,8 @@ def spring_conditions(
 def spring_partition_options(boundary_map: dict[int, int]) -> tuple[str, ...]:
     # Elmer's mortar projector silently gives wrong answers when the two sides
     # of a joint sit on different ranks; keep every joint face on one rank.
-    tags = [str(boundary_map[tag]) for pair in SPRING_PAIRS.values() for tag in pair]
+    tags = [str(boundary_map[tag]) for pair in SPRING_PAIRS.values()
+            if all(tag in boundary_map for tag in pair) for tag in pair]
     return ("-partdual", "-connect", *tags, "-halobc")
 
 
@@ -349,6 +522,8 @@ def check_spring_partitions(mesh: Path, partitions: int, boundary_map: dict[int,
             for line in stream:
                 owners.setdefault(int(line.split()[1]), set()).add(part)
     for name, pair in SPRING_PAIRS.items():
+        if not any(tag in boundary_map for tag in pair):
+            continue
         ranks = [owners.get(boundary_map[tag], set()) for tag in pair]
         if len(ranks[0]) != 1 or ranks[0] != ranks[1]:
             raise RuntimeError(f"{name} spring sides were split across ranks {ranks}")
@@ -409,6 +584,11 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
         raise RuntimeError("Solved stress contains non-finite values")
     if spring:
         check_spring_gaps(gaps, report["interface_stiffness_n_per_m3"])
+    if report.get("plinth_bedrock_connection") == "bonded":
+        seat = gaps["joints"]["plinth_bedrock"]
+        if (seat["locations"] <= 0 or not np.isfinite(seat["max_abs_gap_m"])
+                or seat["max_abs_gap_m"] > 1e-10):
+            raise RuntimeError("Bonded plinth/bedrock displacement continuity check failed")
     report["result"] = str(result)
     report["solver_exit_code"] = code
     report["partitions"] = partitions
@@ -449,7 +629,7 @@ def check_spring_gaps(gaps: dict, stiffness: dict[str, dict[str, float]]) -> Non
     Check each global-axis traction using its configured stiffness. The 100 MPa
     component ceiling is a plausibility check, not an engineering acceptance limit.
     """
-    for name in SPRING_PAIRS:
+    for name in stiffness:
         joint = gaps["joints"][name]
         if joint["locations"] == 0:
             raise RuntimeError(f"No {name} joint locations found in the result")

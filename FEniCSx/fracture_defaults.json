@@ -11,7 +11,7 @@
     "damage_gradient_tolerance": 1e-8,
     "damage_maximum_iterations": 500,
     "field_output_interval": 10,
-    "minimum_elements_per_length_scale": 0.9,
+    "minimum_elements_per_length_scale": 2.0,
     "maximum_refinement_levels": 5
   }
 }

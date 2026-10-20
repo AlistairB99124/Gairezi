@@ -25,8 +25,10 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         # Exercise legacy-config compatibility without regenerating a large
         # Gmsh volume in each SIF test. Graded-mesh tests cover the new mesher.
         config = load_config(Path(__file__).resolve().parents[1] / "config.json")
+        config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         del config["geometry"]["bedrock"]["mesh"]
         loader = patch("Elmer.three_body_diagnostic.load_config", return_value=config)
+        self.config = config
         loader.start()
         self.addCleanup(loader.stop)
 
@@ -44,13 +46,17 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
             self.assertEqual(report["geometry"]["bottom_z_m"], -87.)
             self.assertEqual(report["geometry"]["stream_margin_m"], 58.)
             self.assertEqual(report["geometry"]["bank_margin_m"], 58.)
-            self.assertIn("fixed rock bottom z=-87 m", report["assumptions"])
+            self.assertNotIn("fixed rock bottom z=-87 m", report["assumptions"])
+            self.assertTrue(any("roller springs" in item for item in report["assumptions"]))
             self.assertNotIn("Mortar", text)
             self.assertIn("Body 3\n", text)
             self.assertIn('Name = "Granite"', text)
             self.assertIn("Youngs Modulus = Real 50000000000", text)
-            self.assertIn("Stress Bodyforce 3 = Real -26487", text)
-            self.assertIn("Displacement 3 = Real 0", text)
+            rock_weight = self.config["material"]["bedrock"]["density"] * self.config["loads"]["gravity"] + 0.
+            self.assertIn(f"Stress Bodyforce 3 = Real {rock_weight:.12g}\n", text)
+            self.assertNotIn("Real -0\n", text)
+            self.assertNotIn("Displacement 3 = Real 0", text)
+            self.assertNotIn("DiagnosticFixedRockBottom", text)
             self.assertNotIn("Spring 1 =", text)
             self.assertIn("zero uplift", text)
             self.assertIn("Target Boundaries(1) = 7", text)
@@ -60,6 +66,60 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "new empty"):
                 prepare(root, output)
 
+    def test_rollers_put_normal_springs_on_bottom_and_all_four_sides(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            report = prepare(root, output)
+            text = (output / "diagnostic.sif").read_text()
+            mesh = (output / "three_body.msh").read_text()
+        support = report["rock_outer_support"]
+        self.assertEqual(support["model"], "rollers")
+        self.assertEqual(set(support["faces"]), {"10", "13", "14", "15", "16"})
+        boundary_map = {int(k): v for k, v in report["boundary_id_map"].items()}
+        sections = dict(re.findall(r"Boundary Condition (\d+)\n(.*?)End\n", text, re.S))
+        geometry = report["geometry"]
+        across = geometry["rock_across_limits_m"][1] - geometry["rock_across_limits_m"][0]
+        depth = geometry["rock_depth_limits_m"][1] - geometry["rock_depth_limits_m"][0]
+        self.assertAlmostEqual(support["faces"]["10"]["area_m2"], across * depth, delta=1e-6 * across * depth)
+        for tag, face in support["faces"].items():
+            body = next(b for b in sections.values() if f'"RockRoller_{face["name"]}"' in b)
+            self.assertIn(f"Target Boundaries(1) = {boundary_map[int(tag)]}\n", body)
+            self.assertNotIn("Displacement", body)
+            self.assertGreater(face["area_m2"], 0.)
+            k = face["normal_stiffness_n_per_m3"]
+            n = face["outward_normal"]
+            self.assertAlmostEqual(sum(v * v for v in n), 1., places=12)
+            values = {(int(i), int(j)): float(v) for i, j, v in
+                      re.findall(r"Spring (\d)(\d) = Real (\S+)\n", body)}
+            for i in range(3):
+                for j in range(3):
+                    expected = k * n[i] * n[j]
+                    self.assertAlmostEqual(values.get((i + 1, j + 1), 0.), expected,
+                                           delta=1e-9 * k, msg=(tag, i, j))
+            # Rock boundary faces must be present in the mesh for every support tag.
+            self.assertRegex(mesh, rf"\n\d+ [23] 2 {boundary_map[int(tag)]} {boundary_map[int(tag)]} ")
+        k = self.config["material"]["bedrock"]["support"]["spring_n_per_m3"]
+        self.assertEqual(support["faces"]["10"]["normal_stiffness_n_per_m3"], k["z"])
+        self.assertEqual(support["faces"]["13"]["normal_stiffness_n_per_m3"], k["x"])
+        self.assertEqual(support["faces"]["15"]["normal_stiffness_n_per_m3"], k["y"])
+        self.assertEqual(text.count("RockRoller_"), 5)
+
+    def test_missing_support_block_keeps_fixed_bottom(self):
+        del self.config["material"]["bedrock"]["support"]
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            report = prepare(root, output)
+            text = (output / "diagnostic.sif").read_text()
+        self.assertEqual(report["rock_outer_support"]["model"], "fixed_bottom")
+        self.assertIn("fixed rock bottom z=-87 m", report["assumptions"])
+        self.assertIn("free rock sides", report["assumptions"])
+        self.assertIn("DiagnosticFixedRockBottom", text)
+        self.assertIn("Displacement 3 = Real 0", text)
+        self.assertNotIn("RockRoller_", text)
+        self.assertNotIn("Spring 11", text)
+
     def test_spring_joints_split_nodes_and_pair_both_joints(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -67,9 +127,10 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
             output = Path(directory) / "spring"
             report = prepare(root, output, joints="spring")
         self.assertEqual(report["joints"], "spring")
+        geometry = json.loads((root / "config.json").read_text(encoding="utf-8"))["geometry"]
         self.assertEqual(report["interface_stiffness_n_per_m3"],
-                         {"wall_plinth": {"x": 1.25e9, "y": 1.25e9, "z": 3e9},
-                          "plinth_bedrock": {"x": 1e9, "y": 1e9, "z": 5e9}})
+                         {"wall_plinth": geometry["plinth"]["support"]["spring_n_per_m3"],
+                          "plinth_bedrock": geometry["bedrock"]["support"]["spring_n_per_m3"]})
         self.assertEqual(report["interface_stiffness_sources"],
                          {"wall_plinth": "geometry.plinth.support.spring_n_per_m3",
                           "plinth_bedrock": "geometry.bedrock.support.spring_n_per_m3"})
@@ -118,6 +179,35 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         self.assertNotIn("ILUT Tolerance", text)
         self.assertEqual(report["linear_solver"]["preconditioner"], "ILU1")
 
+    def test_bonded_seat_shares_nodes_but_keeps_wall_spring(self):
+        import meshio
+        root = Path(__file__).resolve().parents[1]
+        config = load_config(root / "config.json")
+        config["geometry"]["bedrock"]["support"]["model"] = "bonded"
+        del config["geometry"]["bedrock"]["mesh"]
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "Elmer.three_body_diagnostic.load_config", return_value=config,
+        ):
+            output = Path(directory)
+            report = prepare(root, output, joints="spring", integrated=True)
+            source = meshio.read(output / "three_body.msh")
+            text = (output / "dam_model.sif").read_text()
+        nodes = {region: set() for region in (1, 2, 3)}
+        for block, tags in zip(source.cells, source.cell_data["gmsh:physical"], strict=True):
+            if block.type == "tetra":
+                for cell, tag in zip(block.data, tags, strict=True):
+                    nodes[int(tag)].update(int(n) for n in cell)
+        self.assertTrue(nodes[1] & nodes[3])
+        self.assertFalse(nodes[2] & (nodes[1] | nodes[3]))
+        self.assertEqual(report["plinth_bedrock_connection"], "bonded")
+        self.assertEqual(set(report["interface_stiffness_n_per_m3"]), {"wall_plinth"})
+        self.assertEqual(text.count("Mortar BC Coefficient Displacement"), 3)
+        self.assertNotIn("plinth_bedrock_spring", text)
+        self.assertEqual(text.count("Displacement 1 = Real 0"), 0)
+        self.assertEqual(text.count("RockRoller_"), 5)
+        self.assertNotIn(11, report["boundary_id_map"])
+        self.assertNotIn(12, report["boundary_id_map"])
+
     def test_partition_check_rejects_split_joint_sides(self):
         boundary_map = {8: 9, 9: 10, 11: 11, 12: 12}
         with tempfile.TemporaryDirectory() as directory:
@@ -152,6 +242,7 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         config = load_config(root / "config.json")
         del config["geometry"]["bedrock"]["mesh"]
+        config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         config["geometry"]["plinth"]["support"]["spring_n_per_m3"] = {
             "z": 3e8, "x": 1e8, "y": 2e8,
         }

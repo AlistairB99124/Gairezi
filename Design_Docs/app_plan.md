@@ -125,12 +125,38 @@ Headline stress extrema/utilization cover concrete only; the table also shows
 near-field bedrock separately. The desktop rejects older API versions lacking
 `canonical_model: three_body` before submission.
 
-Legacy FEniCSx consumers are **not** migrated: new three-body jobs record
-`cracking_status: blocked` with an incompatibility reason and do not start a
-FEniCSx elastic/fracture process. Historical results remain readable. There is
-no automatic time limit on user app jobs; cancellation stops only the selected
-job's worker tree. API dependency staging includes Gmsh. See the
-README for three-body restraints, load omissions and post-processing limitations.
+FEniCSx now imports the exact saved three-body source mesh, preserves the
+wall/plinth relative-displacement mortar springs, and uses distinct concrete/rock
+material fields. The approved bedrock support model is
+`distributed_elastic_granite`: the plinth/rock seat is a directional elastic
+spring joint using `geometry.bedrock.support.spring_n_per_m3`, discretised as
+mortar springs in both solvers like the wall/plinth joint. The alternative
+`bonded` model shares plinth/rock seat displacement nodes in both solvers, with
+zero relative movement but nonzero common deformation allowed; its spring
+coefficients are inactive. Do not ground the plinth seat. New jobs run an
+elastic comparison first. Fracture requires matching
+source/configuration hashes, passed displacement and recovered concrete nodal
+tensor parity (each relative error <= 1e-4), explicit nodal peak metadata,
+force equilibrium (<= 1e-6), crack-band resolution and a converged refined
+zero-damage baseline. Canonical headline peaks use recovered nodes, not
+element-mean tensors; the desktop warns about historical unlike measures.
+Canonical elastic solves use GMRES/right GAMG instead of CG. Automatic fracture
+requires 2.0 elements per length scale with the unchanged 0.1 m length scale
+and five refinement levels; lower explicit canonical targets are rejected.
+If the limit is exhausted, stop rather than accept an under-resolved solve.
+Only wall damage evolves; plinth/rock and interface springs remain elastic.
+Failures preserve the completed Elmer result and expose the failed FEniCSx
+stage. Hybrid and explicit experimental Amor are supported; the historical
+bonded-reference hold remains for legacy jobs. Full-size elastic parity and
+small serial/MPI fracture benchmarks are verified, not full-dam fracture
+convergence or engineering safety. Historical results remain readable.
+The plinth underside follows piecewise-linear interpolation of the unchanged
+bedrock survey contours across the full plinth width, without 0.5 m elevation
+snapping. The locked rock seat conforms exactly; upper wall/plinth cutbacks
+remain unchanged, including at sloping lower wedge closures.
+There is no automatic time limit on user app jobs; cancellation stops only the
+selected job's worker tree. API dependency staging includes Gmsh. See the
+FEniCSx README for verification evidence and remaining limitations.
 
 Three-body stress review uses a separate reporting export: all wall/plinth and
 rock within 5 m of their nearest surface in reference coordinates. Keep the

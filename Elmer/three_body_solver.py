@@ -69,11 +69,26 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "reporting_distance_m": summary["rock_reporting_distance_m"],
         "reporting_limitations": summary["limitations"],
         "wall_plinth_connection": "configured_directional_springs",
-        "connection_assumption": "Separate coincident nodes; linear springs carry tension, not frictional contact",
-        "active_support": "Configured wall/plinth and plinth/bedrock directional springs; fixed rock bottom",
+        "plinth_bedrock_connection": diagnostic.get("plinth_bedrock_connection", "spring"),
+        "connection_assumption": (
+            "Wall/plinth linear springs carry tension; plinth/bedrock perfectly bonded by shared nodes"
+            if diagnostic.get("plinth_bedrock_connection") == "bonded" else
+            "Separate coincident nodes; linear springs carry tension, not frictional contact"
+        ),
+        "active_support": (
+            "Wall/plinth directional springs; bonded plinth/bedrock; "
+            if diagnostic.get("plinth_bedrock_connection") == "bonded" else
+            "Configured wall/plinth and plinth/bedrock directional springs; "
+        ) + (
+            "rock bottom and sides on normal roller springs"
+            if diagnostic.get("rock_outer_support", {}).get("model") == "rollers" else "fixed rock bottom"
+        ),
+        "rock_outer_support": diagnostic.get("rock_outer_support", {"model": "fixed_bottom"}),
         "inactive_inputs": ["geometry.wall.height_above_plinth_m: nominal metadata",
-                            "outputs: selections do not change solver fields"],
-        "fracture_hold_reason": "Legacy FEniCSx is incompatible with the canonical three-body spring interfaces.",
+                            "outputs: selections do not change solver fields"] + (
+                                ["geometry.bedrock.support.spring_n_per_m3: inactive for bonded seat"]
+                                if diagnostic.get("plinth_bedrock_connection") == "bonded" else []
+                            ),
         "regions": diagnostic["cells_by_body"],
         "interface_stiffness_n_per_m3": diagnostic["interface_stiffness_n_per_m3"],
         "assumptions": diagnostic["assumptions"],

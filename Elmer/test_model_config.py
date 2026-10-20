@@ -84,6 +84,44 @@ class ModelConfigTests(unittest.TestCase):
         self.payload["loads"]["gravity"] = float("nan")
         self.assert_invalid_at(self.payload, "loads.gravity")
 
+    def test_bedrock_density_accepts_zero_but_concrete_density_must_be_positive(self):
+        bedrock = self.payload["material"]["bedrock"]
+        for density in (0, 0.0, 2700):
+            bedrock["density"] = density
+            self.assertIs(validate_config(self.payload), self.payload)
+        for density in (-1.0, float("nan"), float("inf"), True):
+            bedrock["density"] = density
+            self.assert_invalid_at(self.payload, "material.bedrock.density")
+        bedrock["density"] = 0
+        self.payload["material"]["concrete"]["density"] = 0
+        self.assert_invalid_at(self.payload, "material.concrete.density")
+
+    def test_bedrock_outer_support_is_optional_and_validated(self):
+        from Elmer.model_config import rock_outer_support
+
+        self.assertEqual(rock_outer_support(self.payload)["model"], "rollers")
+        self.assertEqual(rock_outer_support(self.payload)["spring_n_per_m3"],
+                         {"x": 1e12, "y": 1e12, "z": 1e12})
+        legacy = copy.deepcopy(self.payload)
+        del legacy["material"]["bedrock"]["support"]
+        self.assertIs(validate_config(legacy), legacy)
+        self.assertEqual(rock_outer_support(legacy), {"model": "fixed_bottom", "spring_n_per_m3": None})
+        for key, value, path in (
+            ("model", "pinned", "material.bedrock.support.model"),
+            ("material", "concrete", "material.bedrock.support.material"),
+        ):
+            payload = copy.deepcopy(self.payload)
+            payload["material"]["bedrock"]["support"][key] = value
+            self.assert_invalid_at(payload, path)
+        for bad in (0, -1.0, float("nan"), True):
+            payload = copy.deepcopy(self.payload)
+            payload["material"]["bedrock"]["support"]["spring_n_per_m3"]["y"] = bad
+            self.assert_invalid_at(payload, "material.bedrock.support.spring_n_per_m3.y")
+        payload = copy.deepcopy(self.payload)
+        payload["material"]["bedrock"]["support"]["model"] = "fixed_bottom"
+        payload["material"]["bedrock"]["support"]["spring_n_per_m3"]["y"] = 0
+        self.assertIs(validate_config(payload), payload)
+
     def test_checks_radius_width_midpoint_and_plinth_coverage(self):
         self.payload["geometry"]["wall"]["radial_width_m"] = 3.0
         self.payload["geometry"]["plinth"]["upstream_radius_m"] = 79.0
@@ -131,6 +169,14 @@ class ModelConfigTests(unittest.TestCase):
         paths = {issue.path for issue in context.exception.issues}
         self.assertIn("geometry.plinth.support.spring_n_per_m3.y", paths)
         self.assertIn("geometry.bedrock.support.model", paths)
+
+    def test_bedrock_allows_explicit_bond_without_changing_wall_spring(self):
+        self.payload["geometry"]["bedrock"]["support"]["model"] = "bonded"
+        validate_config(self.payload)
+        self.assertEqual(self.payload["geometry"]["plinth"]["support"]["model"],
+                         "distributed_elastic_concrete")
+        self.payload["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
+        validate_config(self.payload)
 
     def test_obsolete_interface_overrides_are_rejected(self):
         self.assertNotIn("interfaces", self.payload)
