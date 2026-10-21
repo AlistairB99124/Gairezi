@@ -26,10 +26,9 @@ class AppJobWorkerTests(unittest.TestCase):
                 "wall_geometry": {"uniform_thickness_m": 4}, "maximum_applied_pressure_pa": 3e5,
             }
             diagnostic_report = {
-                "nodes": 100, "cells_by_body": {"1": 10, "2": 20, "3": 30},
-                "wall_plinth_cutback": {"shoulder_fill": "empty_outside_original_wall_footprint"},
-                "plinth_bedrock_connection": "bonded",
-                "interface_stiffness_n_per_m3": {"wall_plinth": {"x": 1.25e9}},
+                "nodes": 100, "cells_by_body": {"1": 30, "2": 30},
+                "wall_bedrock_connection": "bonded",
+                "interface_stiffness_n_per_m3": {},
                 "assumptions": ["rock rollers"],
                 "rock_outer_support": {"model": "rollers", "faces": {}},
             }
@@ -46,7 +45,7 @@ class AppJobWorkerTests(unittest.TestCase):
                         name: {"peak_tension_mpa": tension, "peak_compression_mpa": compression,
                                "reporting_cells": count}
                         for name, tension, compression, count in (
-                            ("wall", 1.8, 3.6, 20), ("plinth", 2.4, 3.5, 10), ("bedrock", 99, 99, 5))
+                            ("wall", 2.4, 3.6, 30), ("bedrock", 99, 99, 5))
                     },
                     "rock_reporting_distance_m": 5., "limitations": ["filter only"],
                 }
@@ -68,8 +67,10 @@ class AppJobWorkerTests(unittest.TestCase):
                 self.assertEqual(analysis["tension_utilization"], 1.2)
                 self.assertEqual(report["cells"], 60)
                 self.assertEqual(report["model_kind"], "three_body")
-                self.assertEqual(report["plinth_bedrock_connection"], "bonded")
-                self.assertIn("bonded plinth/bedrock", report["active_support"])
+                self.assertEqual(report["wall_bedrock_connection"], "bonded")
+                self.assertEqual(report["wall_connection"], "single_monolithic_body")
+                self.assertIn("Bonded wall/bedrock seat", report["active_support"])
+                self.assertNotIn("plinth", json.dumps(report).lower())
                 self.assertIn("normal roller springs", report["active_support"])
                 self.assertEqual(report["rock_outer_support"]["model"], "rollers")
                 self.assertIn("geometry.bedrock.support.spring_n_per_m3: inactive for bonded seat",
@@ -193,9 +194,9 @@ class ThreeBodySolverTests(unittest.TestCase):
 
     def test_missing_support_definition_is_not_silently_bonded(self):
         config = json.loads((ROOT / "config.json").read_text())
-        del config["geometry"]["plinth"]["support"]["spring_n_per_m3"]["y"]
+        del config["geometry"]["bedrock"]["support"]["spring_n_per_m3"]["y"]
         with patch.object(solver, "load_config", return_value=config):
-            with self.assertRaisesRegex(ValueError, "geometry.plinth.support.spring_n_per_m3.y"):
+            with self.assertRaisesRegex(ValueError, "geometry.bedrock.support.spring_n_per_m3.y"):
                 solver.run(ROOT, ROOT)
 
     def test_invalid_run_controls_fail_before_preparing(self):

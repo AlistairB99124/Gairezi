@@ -1,5 +1,4 @@
-! Provisional bonded wall/plinth: shared nodes, no joint opening/sliding.
-! Foundation support only; geometry.plinth.support is inactive.
+! Single wall body seated on the bedrock; foundation springs from geometry.bedrock.support.
 Header
     CHECK KEYWORDS Warn
     Mesh DB "mesh" "/"
@@ -20,13 +19,6 @@ Constants
 End
 
 Body 1
-    Name = "PlinthBody"
-    Equation = 1
-    Material = 1
-    Body Force = 1
-End
-
-Body 2
     Name = "WallBody"
     Equation = 1
     Material = 1

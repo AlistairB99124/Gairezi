@@ -59,7 +59,7 @@ def solve(
         support_reactions, support_form as rock_support_form,
     )
     three_body = is_three_body(structure)
-    damage_regions = DAMAGE_REGION_IDS if three_body else (2,)
+    damage_regions = DAMAGE_REGION_IDS if three_body else (1,)
     placement = (
         validate_crack_placement(imported, specifications, centre_regions=damage_regions)
         if specifications else []
@@ -117,13 +117,13 @@ def solve(
                          float(domain.comm.allreduce(domain.geometry.x[:, 2].min(), op=MPI.MIN)))
     tailwater_elevation = minimum_elevation + loads.tailwater_head_m
     pressures = {
-        2: pressure_gradient * ufl.max_value(loads.overflow_head_m - z, 0),
+        2: pressure_gradient * ufl.max_value(loads.upstream_surface_z_m - z, 0),
         3: pressure_gradient * ufl.max_value(tailwater_elevation - z, 0),
-        4: pressure_gradient * loads.overflow_head_m,
+        4: pressure_gradient * max(loads.upstream_surface_z_m, 0.0),
     }
     from dam_elasticity import ground_supports
 
-    springs, _ = ({}, "three_body_springs") if three_body else ground_supports(imported, structure)
+    springs, _ = ({}, "single_monolithic_body") if three_body else ground_supports(imported, structure)
 
     def support_form(trial, test):
         result = 0
@@ -269,7 +269,7 @@ def solve(
     owned_stress_dofs = tensor_space.dofmap.list[:owned_cells, 0]
     stress_values = stress.x.array.reshape(-1, 3, 3)[owned_stress_dofs]
     if three_body:
-        concrete = np.concatenate((imported.cell_tags.find(1), imported.cell_tags.find(2)))
+        concrete = imported.cell_tags.find(1)
         stress_values = stress_values[concrete[concrete < owned_cells]]
         if not np.isfinite(relative_balance) or relative_balance > 1e-6:
             raise RuntimeError(f"Three-body fracture equilibrium gate failed: {relative_balance}")
@@ -313,8 +313,8 @@ def solve(
                 "Diffuse pressure is an energy-consistent regularised traction, not an explicit face load.",
                 "Convergence and successful execution do not constitute engineering validation.",
                 (
-                    "Damage is allowed in plinth (1) and wall (2); bedrock damage DOFs are fixed at zero. "
-                    "Wall and plinth damage do not couple across the spring joint, and the joint springs do not soften."
+                    "Damage is restricted to wall region 1; bedrock damage DOFs are fixed at zero. "
+                    "Wall and bedrock damage do not couple across the seat, and the seat springs do not soften."
                     if three_body else
                     "Damage is restricted to wall region 2; non-wall and shared interface damage DOFs are fixed at zero."
                 ),
@@ -343,12 +343,12 @@ def solve(
     if three_body:
         result.report.update(
             model_kind="three_body", source_mesh=structure.three_body_source,
-            wall_plinth_connection="three_body_springs",
-            plinth_bedrock_connection=(
+            wall_connection="single_monolithic_body",
+            wall_bedrock_connection=(
                 "bonded" if structure.three_body_config["geometry"]["bedrock"]["support"].get("model") == "bonded"
                 else "spring"
             ),
-            stress_scope="wall and plinth; full-domain rock reported separately",
+            stress_scope="wall; full-domain rock reported separately",
             fracture_verification="implementation verification only; full-dam validation required",
         )
     result.report["mesh_nodes"] = int(result.damage.function_space.dofmap.index_map.size_global)

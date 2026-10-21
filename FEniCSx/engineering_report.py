@@ -106,7 +106,7 @@ def build_engineering_results(
         "- Three-dimensional tetrahedral dam and support mesh.",
         f"- {len(steps)} load increments ending at load factor {final['load_factor']:.1f}.",
         "- Staggered mechanics/damage solution with irreversible damage.",
-        "- Distributed elastic spring supports for the foundation and plinth.",
+        "- Distributed elastic spring supports for the bedrock boundary.",
         "- Gravity and configured external water loads.",
         f"- Internal crack pressure model: `{result['internal_pressure_model']}`.",
         "- No unilateral crack-face contact or friction.",

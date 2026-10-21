@@ -117,8 +117,8 @@ def load_scenarios(path: Path) -> list[dict]:
                 if not isinstance(probe["name"], str) or not probe["name"] or probe["name"] in names:
                     raise ValueError("Probe names must be nonempty and unique")
                 names.add(probe["name"])
-                if isinstance(probe["region_id"], bool) or probe["region_id"] not in (1, 2):
-                    raise ValueError("Probe region_id must be 1 (plinth) or 2 (wall)")
+                if isinstance(probe["region_id"], bool) or probe["region_id"] != 1:
+                    raise ValueError("Probe region_id must be 1 (wall)")
                 point = probe["point_m"]
                 if not isinstance(point, list) or len(point) != 3 or any(
                     isinstance(v, bool) or not isinstance(v, (float, int)) or not math.isfinite(v) for v in point

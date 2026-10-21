@@ -169,8 +169,9 @@ class FractureRunnerTests(unittest.TestCase):
         import test_dam_phase_field
 
         structure = test_dam_mesh.DamMeshTests().cube()
+        structure.region_ids = [1]
         _, material_model, _, _ = test_dam_phase_field.DamPhaseFieldTests().model()
-        for name in ("material", "loads", "foundation_support", "plinth_support"):
+        for name in ("material", "loads", "foundation_support"):
             setattr(structure, name, getattr(material_model, name))
         structure.boundaries = [
             (1 if index == 0 else 7, face)

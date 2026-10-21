@@ -11,16 +11,10 @@ from three_body_model import is_three_body
 
 
 def ground_supports(imported, structure):
-    """Retain explicit legacy split meshes; new bonded meshes have foundation only."""
-    supports = {1: structure.foundation_support}
-    legacy = imported.domain.comm.allreduce(len(imported.facet_tags.find(8)), op=MPI.SUM) > 0
-    if legacy:
-        supports[8] = structure.plinth_support
-    return {
-        tag: (support.spring_x_n_per_m3, support.spring_y_n_per_m3, support.spring_z_n_per_m3)
-        for tag, support in supports.items()
-    }, (
-        "legacy_split_grounded" if legacy else "bonded_intact_provisional"
+    """Return legacy foundation springs; the canonical mesh uses explicit support regions."""
+    support = structure.foundation_support
+    return {1: (support.spring_x_n_per_m3, support.spring_y_n_per_m3, support.spring_z_n_per_m3)}, (
+        "single_monolithic_body"
     )
 
 
@@ -54,7 +48,7 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
     ds = ufl.Measure("ds", domain=domain, subdomain_data=imported.facet_tags)
     dx = ufl.Measure("dx", domain=domain)
     a = ufl.inner(stress(trial), ufl.sym(ufl.grad(test))) * dx
-    springs, connection = ({}, "three_body_springs") if three_body else ground_supports(imported, structure)
+    springs, connection = ({}, "single_monolithic_body") if three_body else ground_supports(imported, structure)
     for tag, coefficients in springs.items():
         for component, stiffness in enumerate(coefficients):
             a += stiffness * trial[component] * test[component] * ds(tag)
@@ -75,9 +69,9 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         domain.geometry.x[:, 2].min(), op=MPI.MIN,
     ))) + loads.tailwater_head_m
     pressures = {
-        2: pressure_gradient * ufl.max_value(loads.overflow_head_m - z, 0),
+        2: pressure_gradient * ufl.max_value(loads.upstream_surface_z_m - z, 0),
         3: water_gradient * ufl.max_value(tailwater_elevation - z, 0),
-        4: water_gradient * loads.overflow_head_m,
+        4: water_gradient * max(loads.upstream_surface_z_m, 0.0),
     }
     L = ufl.inner(gravity, test) * dx
     for tag, pressure in pressures.items():
@@ -196,16 +190,7 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         )),
         "mesh_nodes": int(space.dofmap.index_map.size_global),
         "mesh_cells": int(domain.topology.index_map(3).size_global),
-        "wall_plinth_connection": connection,
-        "wall_plinth_model": (
-            "legacy wall-side grounded spring; not interbody coupling"
-            if connection == "legacy_split_grounded" else
-            "provisional fully bonded wall/plinth; foundation springs only; no opening/sliding"
-        ),
-        "inactive_inputs": (
-            ["geometry.plinth.support: no wall-ground spring in the bonded reference"]
-            if connection == "bonded_intact_provisional" else []
-        ),
+        "wall_connection": connection,
     }
     if three_body:
         from three_body_model import rock_support
@@ -213,16 +198,14 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         support = rock_support(structure)
         report.update(
             model_kind="three_body", interface_springs=interfaces.report,
-            wall_plinth_model="Relative displacement springs; "
-            + ("rock bottom and sides on normal roller springs" if support["model"] == "rollers"
-               else "fixed rock bottom") + "; no grounded bypass",
-            rock_outer_support=support,
-            plinth_bedrock_connection=(
+            wall_connection="single_monolithic_body",
+            wall_bedrock_connection=(
                 "bonded" if structure.three_body_config["geometry"]["bedrock"]["support"].get("model") == "bonded"
                 else "spring"
             ),
+            rock_outer_support=support,
             source_mesh=structure.three_body_source,
-            stress_scope="wall and plinth; rock reported separately",
+            stress_scope="wall; rock reported separately",
         )
     from stress_recovery import recover_stress
 
@@ -231,7 +214,7 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         sigma.x.array.reshape(-1, 3, 3)[tensor_space.dofmap.list[:owned_cells, 0]],
     )
     if three_body:
-        concrete = np.concatenate((imported.cell_tags.find(1), imported.cell_tags.find(2)))
+        concrete = imported.cell_tags.find(1)
         raw_principal = raw_principal[concrete[concrete < owned_cells]]
     report["raw_element_stress"] = {
         "maximum_principal_tensile_stress_pa": float(domain.comm.allreduce(

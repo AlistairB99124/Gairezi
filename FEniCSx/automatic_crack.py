@@ -10,31 +10,33 @@ import numpy as np
 DEFAULTS = Path(__file__).with_name("fracture_defaults.json")
 
 
-def plinth_intersections(contours: list[dict], z: float) -> tuple[float, float]:
-    """Interpolate the two chainages where the plinth reaches signed crest-relative Z."""
+def contour_intersections(contours: list[dict], z: float) -> tuple[float, float]:
+    """Return chainages where bedrock meets a wall elevation below the crest."""
     if not math.isfinite(z) or len(contours) < 2:
-        raise ValueError("A finite crack Z and at least two plinth contours are required.")
+        raise ValueError("A finite crack Z and at least two bedrock contours are required.")
     points = [(float(row["chainage"]), float(row["height"])) for row in contours]
     if not all(math.isfinite(s) and math.isfinite(h) for s, h in points):
-        raise ValueError("Plinth contours must be finite.")
+        raise ValueError("Bedrock contours must be finite.")
     if any(b[0] <= a[0] for a, b in zip(points, points[1:])):
-        raise ValueError("Plinth chainages must be strictly increasing.")
+        raise ValueError("Bedrock contour chainages must be strictly increasing.")
+    if z > 0 or z <= min(height for _, height in points):
+        raise ValueError("Crack Z must lie above the bedrock minimum and at or below the crest.")
     crossings = []
     for (s0, h0), (s1, h1) in zip(points, points[1:]):
         if h0 == h1:
             if z == h0:
-                raise ValueError("Crack Z coincides with a horizontal plinth segment.")
+                raise ValueError("Crack Z coincides with a horizontal bedrock segment.")
             continue
         if min(h0, h1) <= z <= max(h0, h1):
             s = s0 + (z - h0) * (s1 - s0) / (h1 - h0)
             if not any(math.isclose(s, other, abs_tol=1e-9) for other in crossings):
                 crossings.append(s)
     if len(crossings) != 2:
-        raise ValueError(f"Crack Z={z} requires exactly two plinth intersections; found {len(crossings)}.")
+        raise ValueError(f"Crack Z={z} requires exactly two bedrock contour intersections; found {len(crossings)}.")
     left, right = sorted(crossings)
-    interior = [h for s, h in points if left < s < right]
-    if not interior or any(h >= z for h in interior):
-        raise ValueError("Plinth intersections do not bound one continuous wall section.")
+    interior = [height for chainage, height in points if left < chainage < right]
+    if not interior or any(height >= z for height in interior):
+        raise ValueError("Bedrock intersections do not bound one continuous wall section.")
     return left, right
 
 
@@ -57,17 +59,15 @@ def locate_crack(config: dict, location, fields):
     if not (math.isfinite(y) and math.isfinite(z)):
         raise ValueError("Crack location Y and Z must be finite.")
     geometry = config["geometry"]
-    wall, plinth = geometry["wall"], geometry["plinth"]
+    wall = geometry["wall"]
     upstream = float(wall["upstream_radius_m"])
     thickness = float(wall["radial_width_m"])
     chainage_radius = float(wall["centerline_radius_m"])
-    plinth_upstream = float(plinth["upstream_radius_m"])
-    plinth_downstream = float(plinth["downstream_radius_m"])
+    downstream = float(wall["downstream_radius_m"])
     if not all(math.isfinite(v) and v > 0 for v in (
-        upstream, thickness, chainage_radius, plinth_upstream, plinth_downstream,
+        upstream, downstream, thickness, chainage_radius,
     )):
-        raise ValueError("Wall and plinth radii and wall thickness must be finite and positive.")
-    downstream = upstream - thickness
+        raise ValueError("Wall radii and thickness must be finite and positive.")
     if downstream <= 0:
         raise ValueError("Wall downstream radius must be positive.")
     if not -chainage_radius <= y <= chainage_radius:
@@ -84,9 +84,9 @@ def locate_crack(config: dict, location, fields):
         raise ValueError("automatic_crack.arc_length_m must be finite and positive.")
     depth = depth_fraction * thickness
     length_scale = float(defaults["length_scale_m"])
-    # Concrete exists above the rock seat.
+    # The wall exists above the surveyed bedrock and up to the crest.
     try:
-        concrete_left, concrete_right = plinth_intersections(geometry["bedrock"]["contours"], z)
+        concrete_left, concrete_right = contour_intersections(geometry["bedrock"]["contours"], z)
     except ValueError as error:
         raise ValueError(f"No concrete section exists at the selected Z={z} m ({error})") from error
     if not concrete_left <= chainage <= concrete_right:
@@ -109,28 +109,25 @@ def locate_crack(config: dict, location, fields):
         raise ValueError("Baseline fields must be nodal coordinates, six stress components and regions.")
     node_chainage = chainage_radius * plan_angle(points)
     node_radius = np.hypot(points[:, 0], points[:, 1])
-    concrete = (node_regions & 3) > 0
+    concrete = (node_regions & 1) > 0
     along = (node_chainage >= start) & (node_chainage <= end)
     nearby = np.flatnonzero(concrete & along & (np.abs(points[:, 2] - z) <= 0.5))
     if not len(nearby):
-        raise ValueError(f"No wall or plinth baseline nodes lie near the selected location (Y={y} m, Z={z} m).")
+        raise ValueError(f"No wall baseline nodes lie near the selected location (Y={y} m, Z={z} m).")
     principal = principal_stresses(stress[nearby])[:, -1]
     face_node = int(nearby[int(np.argmax(principal))])
     seed_face = "upstream" if node_radius[face_node] >= chainage_radius else "downstream"
-    plinth_nearby = bool(np.any(node_regions[nearby] & 1))
-    # Plinth shoulders extend beyond the wall faces; reach the plinth face when it is present.
     if seed_face == "upstream":
-        inner, outer = upstream - depth, max(upstream, plinth_upstream) if plinth_nearby else upstream
+        inner, outer = upstream - depth, upstream
     else:
-        inner, outer = min(downstream, plinth_downstream) if plinth_nearby else downstream, downstream + depth
+        inner, outer = downstream, downstream + depth
     crossed = concrete & along & (np.abs(points[:, 2] - z) <= length_scale / 2) & (
         (node_radius >= inner) & (node_radius <= outer)
     )
-    required_regions = [region for region in (1, 2) if np.any(node_regions[crossed] & region)]
+    required_regions = [1] if np.any(node_regions[crossed] & 1) else []
     if not required_regions:
         raise ValueError(
-            f"The {seed_face} crack band at the selected location (Y={y} m, Z={z} m) contains no wall "
-            "or plinth nodes."
+            f"The {seed_face} crack band at the selected location (Y={y} m, Z={z} m) contains no wall nodes."
         )
     theta0, theta1 = start / chainage_radius, end / chainage_radius
     if not 0 < theta1 - theta0 < math.pi:
@@ -145,7 +142,7 @@ def locate_crack(config: dict, location, fields):
         annular_sector=(inner, outer, theta0, theta1),
         **defaults,
     )
-    names = {1: "plinth", 2: "wall"}
+    names = {1: "wall"}
     report = {
         "method": (
             "local horizontal annular-sector crack at the user-selected Z-Y location, seeded from "
@@ -176,9 +173,8 @@ def locate_crack(config: dict, location, fields):
         },
         "warnings": warnings,
         "limitations": [
-            "The wall and plinth are separate meshes joined by springs: damage is computed in each "
-            "body, but the phase-field gradient does not couple across the joint and the joint "
-            "springs do not soften.",
+            "Damage is restricted to the wall; bedrock remains intact and does not share the wall damage field. "
+            "Seat springs do not soften as damage evolves.",
             "The Z-Y view cannot distinguish faces; the seeded face follows the baseline stress near "
             "the selected point.",
         ],

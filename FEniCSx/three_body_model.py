@@ -9,8 +9,8 @@ import meshio
 from mpi4py import MPI
 import numpy as np
 
-# Concrete bodies (1=plinth, 2=wall) may crack; bedrock (3) stays intact.
-DAMAGE_REGION_IDS = (1, 2)
+# Wall (1) may crack; bedrock (2) stays intact.
+DAMAGE_REGION_IDS = (1,)
 
 
 def is_three_body(structure):
@@ -34,11 +34,11 @@ def load_structure(config_path: Path, model: Path, structure):
     if json.loads((model / "config.json").read_text()) != config:
         raise ValueError("Three-body source mesh configuration differs from the submitted snapshot")
     diagnostic = json.loads((model / "diagnostic.json").read_text())
-    if diagnostic["joints"] != "spring" or diagnostic["solver_body_ids"] != {"plinth": 1, "wall": 2, "bedrock": 3}:
+    if diagnostic["joints"] != "spring" or diagnostic["solver_body_ids"] != {"wall": 1, "bedrock": 2}:
         raise ValueError("Expected canonical spring-jointed three-body source")
     bonded_seat = config["geometry"]["bedrock"]["support"]["model"] == "bonded"
-    if (diagnostic.get("plinth_bedrock_connection", "spring") == "bonded") != bonded_seat:
-        raise ValueError("Source plinth/bedrock connection differs from the submitted configuration")
+    if (diagnostic.get("wall_bedrock_connection", "spring") == "bonded") != bonded_seat:
+        raise ValueError("Source wall/bedrock connection differs from the submitted configuration")
     mesh_path = model / "three_body.msh"
     source = meshio.read(mesh_path)
     cells, regions, boundaries = [], [], []
@@ -52,18 +52,16 @@ def load_structure(config_path: Path, model: Path, structure):
                               for cell, tag in zip(block.data, tags, strict=True))
         else:
             raise ValueError(f"Unsupported three-body source cell type {block.type}")
-    if set(regions) != {1, 2, 3} or len(source.points) != diagnostic["nodes"]:
+    if set(regions) != {1, 2} or len(source.points) != diagnostic["nodes"]:
         raise ValueError("Canonical source body tags or node count do not match diagnostic")
     body_nodes = {
         region: {node for (_, cell), tag in zip(cells, regions, strict=True)
                  if tag == region for node in cell}
-        for region in (1, 2, 3)
+        for region in (1, 2)
     }
-    if body_nodes[2] & (body_nodes[1] | body_nodes[3]):
-        raise ValueError("Wall spring interface must retain independent wall nodes")
-    shared_seat = body_nodes[1] & body_nodes[3]
+    shared_seat = body_nodes[1] & body_nodes[2]
     if bool(shared_seat) != bonded_seat:
-        raise ValueError("Plinth/bedrock mesh connectivity does not implement the configured connection")
+        raise ValueError("Wall/bedrock mesh connectivity does not implement the configured connection")
     from dam_mesh import compact_unused_nodes
     result = compact_unused_nodes(replace(
         structure, nodes=[tuple(p) for p in source.points], cells=cells,
@@ -85,12 +83,12 @@ def load_structure(config_path: Path, model: Path, structure):
     result.three_body_source = {
         "model_directory": str(model.resolve()),
         "unused_source_nodes_removed": int(len(source.points) - len(result.nodes)),
-        "node_compaction": "Unused nodes only; coincident interface nodes remain distinct",
-        "plinth_bedrock_connection": "bonded" if bonded_seat else "spring",
+        "node_compaction": "Unused nodes only; seat connectivity follows the configured connection",
+        "wall_bedrock_connection": "bonded" if bonded_seat else "spring",
         "sha256": {name: hashlib.sha256((model / name).read_bytes()).hexdigest()
                    for name in ("three_body.msh", "config.json", "diagnostic.json")},
     }
-    concrete = np.asarray([cell for (_, cell), tag in zip(result.cells, regions, strict=True) if tag in (1, 2)])
+    concrete = np.asarray([cell for (_, cell), tag in zip(result.cells, regions, strict=True) if tag == 1])
     result.concrete_minimum_z = float(np.asarray(result.nodes)[np.unique(concrete), 2].min())
     return result
 
@@ -133,7 +131,7 @@ def materials(imported, structure):
     fields = {}
     for key in ("density", "youngs_modulus", "poisson_ratio"):
         field = fem.Function(space, name=key)
-        for tag, name in ((1, "concrete"), (2, "concrete"), (3, "bedrock")):
+        for tag, name in ((1, "concrete"), (2, "bedrock")):
             cells = imported.cell_tags.find(tag)
             field.x.array[space.dofmap.list[cells, 0]] = config["material"][name][key]
         field.x.scatter_forward()

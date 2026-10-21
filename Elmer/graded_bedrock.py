@@ -1,4 +1,4 @@
-"""Conforming 3-D rock tetrahedra with a locked plinth seat and distance grading."""
+"""Conforming 3-D rock tetrahedra with a locked wall seat and distance grading."""
 from __future__ import annotations
 
 from collections import Counter
@@ -152,7 +152,7 @@ def build_graded_rock(
         }
         if actual != expected or len(actual_seat) != seat_count:
             raise ValueError(
-                f"Gmsh changed the locked plinth/rock interface: expected {seat_count}, "
+                f"Gmsh changed the locked wall/rock interface: expected {seat_count}, "
                 f"got {len(actual_seat)}; missing {list(expected - actual)[:1]}"
             )
         expected_points = {
@@ -186,7 +186,7 @@ def build_graded_rock(
                 report.get("seat_max_coordinate_difference_m", 0.), float(coordinate_error),
             ),
             mesher_version=gmsh.__version__, vertical_layers=None,
-            surface_edge_size_policy="Unstructured conforming triangles; locked plinth seat",
+            surface_edge_size_policy="Unstructured conforming triangles; locked wall seat",
             surface_row_axis=None,
             maximum_exterior_surface_edge_m=float(max(
                 np.linalg.norm(points[surface_faces[:, i]] - points[surface_faces[:, (i + 1) % 3]],

@@ -46,11 +46,11 @@ def reference_structure(root: Path, load_case: Path, reference: Path):
 
 
 def read_reference(structure, reference: Path):
-    """Map by region membership (1=plinth, 2=wall, 3=shared), not coordinates alone."""
+    """Map by region membership (1=wall, 2=bedrock), not coordinates alone."""
     points = np.asarray(structure.nodes)
     node_regions = np.zeros(len(points), dtype=np.int32)
     for (kind, cell), region in zip(structure.cells, structure.region_ids):
-        if region not in (1, 2, 3):
+        if region not in (1, 2):
             raise ValueError(f"Unexpected structural region {region}")
         node_regions[list(cell)] |= 1 << (region - 1)
     source_centres = np.asarray([points[list(cell)].mean(axis=0) for _, cell in structure.cells])
@@ -105,7 +105,7 @@ def read_reference(structure, reference: Path):
             if region == 0:
                 continue
             if int(region) not in nodal_trees:
-                raise ValueError("Elmer piece merged wall/plinth nodes that are separate in the source mesh")
+                raise ValueError("Elmer piece merged wall/bedrock nodes that must remain separate for a spring seat")
             selected = np.flatnonzero(point_regions == region)
             ids, nodal_tree = nodal_trees[int(region)]
             distance, nearest = nodal_tree.query(xyz[selected])

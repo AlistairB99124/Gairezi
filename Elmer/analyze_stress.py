@@ -734,7 +734,7 @@ def analyze(
     if exclude_below_z is not None:
         summary["exclusion"] = {
             "excluded_centroid_z_m_lte": exclude_below_z,
-            "description": "Excludes the wall, wedge, and plinth transition region at and below the stated elevation.",
+            "description": "Excludes the wall base transition region at and below the stated elevation.",
         }
     tensile_strength = load_tensile_strength(load_cases_path)
     summary["tensile_strength_pa"] = tensile_strength

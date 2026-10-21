@@ -1,4 +1,4 @@
-"""Isolated three-body Elmer check (bonded or stiff-spring joints); not frictional."""
+"""Wall-on-bedrock Elmer check (bonded or stiff-spring seat); not frictional."""
 from __future__ import annotations
 
 import argparse
@@ -23,14 +23,15 @@ from .structure_assembly import (
 
 
 JOINT_MODELS = ("bonded", "spring")
-# Boundary tags for the two sides of each spring joint (8/9 follow FACE_GROUP_IDS).
-WALL_SIDE, PLINTH_TOP, PLINTH_SEAT, ROCK_SEAT = 8, 9, 11, 12
+# Boundary tags for the two sides of the wall/bedrock spring seat.
+WALL_SEAT, ROCK_SEAT = 11, 12
 ROCK_BOTTOM = 10
 # Outer rock-box sides: local axis (x = across valley/banks, y = stream depth) and
 # outward sign along that rock-local unit vector.
 ROCK_SIDES = {13: ("x", -1.), 14: ("x", 1.), 15: ("y", -1.), 16: ("y", 1.)}
-SPRING_PAIRS = {"wall_plinth": (WALL_SIDE, PLINTH_TOP), "plinth_bedrock": (PLINTH_SEAT, ROCK_SEAT)}
-SPRING_SUPPORTS = {"wall_plinth": "plinth", "plinth_bedrock": "bedrock"}
+WALL_BODY, BEDROCK_BODY = 1, 2
+SPRING_PAIRS = {"wall_bedrock": (WALL_SEAT, ROCK_SEAT)}
+SPRING_SUPPORTS = {"wall_bedrock": "bedrock"}
 _ROCK_CELL_FACES = {**_CELL_FACES, 7: ((0, 1, 2, 3), (0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4))}
 
 
@@ -145,47 +146,6 @@ def roller_condition(number: int, tag: int, face: dict[str, object], boundary_ma
     )
 
 
-def split_wall_from_plinth(concrete) -> tuple[list, list, list, int]:
-    """Give wall cells their own copies of the wall/plinth joint nodes.
-
-    Returns nodes, cells and boundaries with the wall side tagged WALL_SIDE and
-    the plinth side tagged PLINTH_TOP, plus the number of joint faces.
-    """
-    faces: dict[tuple[int, ...], list[tuple[int, tuple[int, ...]]]] = {}
-    for (kind, cell), region in zip(concrete.cells, concrete.region_ids, strict=True):
-        for pattern in _CELL_FACES[kind]:
-            face = tuple(cell[i] for i in pattern)
-            faces.setdefault(tuple(sorted(face)), []).append((region, face))
-    joint = {key: dict(entries) for key, entries in faces.items()
-             if sorted(region for region, _ in entries) == [1, 2]}
-    joint_nodes = {node for key in joint for node in key}
-    wall_nodes = {n for (_, c), r in zip(concrete.cells, concrete.region_ids) if r == 2 for n in c}
-    plinth_nodes = {n for (_, c), r in zip(concrete.cells, concrete.region_ids) if r == 1 for n in c}
-    if not joint or (wall_nodes & plinth_nodes) != joint_nodes:
-        raise ValueError("Wall and plinth must meet only on conforming shared faces")
-    nodes = list(concrete.nodes)
-    copy = {}
-    for node in sorted(joint_nodes):
-        copy[node] = len(nodes)
-        nodes.append(nodes[node])
-    def wall_side(face: tuple[int, ...]) -> tuple[int, ...]:
-        return tuple(copy.get(n, n) for n in face)
-    cells = [
-        (kind, wall_side(cell) if region == 2 else cell)
-        for (kind, cell), region in zip(concrete.cells, concrete.region_ids, strict=True)
-    ]
-    boundaries = []
-    for tag, face in concrete.boundaries:
-        owners = faces.get(tuple(sorted(face)))
-        if owners is None or len(owners) != 1:
-            raise ValueError(f"Boundary face {face} is not an exterior cell face")
-        boundaries.append((tag, wall_side(face) if owners[0][0] == 2 else face))
-    for sides in joint.values():
-        boundaries.append((WALL_SIDE, wall_side(sides[2])))
-        boundaries.append((PLINTH_TOP, sides[1]))
-    return nodes, cells, boundaries, len(joint)
-
-
 def interface_stiffness(config: dict) -> dict[str, dict[str, float]]:
     """Directional traction/jump coefficients in global Cartesian axes (N/m^3)."""
     validate_config(config)
@@ -229,21 +189,14 @@ def prepare(
     bonded_seat = joints == "spring" and config["geometry"]["bedrock"]["support"]["model"] == "bonded"
     stiffness = interface_stiffness(config) if joints == "spring" else {}
     if bonded_seat:
-        del stiffness["plinth_bedrock"]
+        del stiffness["wall_bedrock"]
     seat_faces = [face for tag, face in concrete.boundaries if tag == 1]
-    if joints == "spring":
-        nodes, concrete_cells, concrete_boundaries, wall_joint_faces = split_wall_from_plinth(concrete)
-        # A perfect bond shares only plinth-seat nodes, never the split wall trace.
-        seat_nodes = {node for face in seat_faces for node in face}
-        index = {
-            tuple(round(v, 8) for v in nodes[node]): node for node in seat_nodes
-        } if bonded_seat else {}
-    else:
-        nodes, concrete_cells, concrete_boundaries = (
-            list(concrete.nodes), concrete.cells, concrete.boundaries,
-        )
-        wall_joint_faces = 0
-        index = {tuple(round(v, 8) for v in p): i for i, p in enumerate(nodes)}
+    nodes, concrete_cells, concrete_boundaries = (
+        list(concrete.nodes), concrete.cells, concrete.boundaries,
+    )
+    spring_seat = joints == "spring" and not bonded_seat
+    # A spring seat gives the rock its own copies of the seat nodes.
+    index = {} if spring_seat else {tuple(round(v, 8) for v in p): i for i, p in enumerate(nodes)}
     mapping = []
     for coordinates in rock_points:
         point = tuple(coordinates)
@@ -258,7 +211,7 @@ def prepare(
         for kind, block in rock_blocks.items() for cell in block
     ]
     cells = concrete_cells + rock_cells
-    regions = concrete.region_ids + [6] * len(rock_cells)
+    regions = concrete.region_ids + [BEDROCK_BODY] * len(rock_cells)
     patterns = {**_CELL_FACES, 4: ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)),
                 7: ((0, 1, 2, 3), (0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4))}
     # Triangulate exterior/interface quads consistently for a topology audit.
@@ -277,29 +230,27 @@ def prepare(
     for face in top_faces:
         key = tuple(sorted(face))
         face_counts[key] += 1
-        memberships.setdefault(key, set()).add(6)
+        memberships.setdefault(key, set()).add(BEDROCK_BODY)
     if max(face_counts.values()) > 2:
-        raise ValueError("Non-manifold three-body mesh")
-    seat = [key for key, value in memberships.items() if value == {1, 6}]
-    if joints == "spring":
-        if any(value == {1, 2} for value in memberships.values()) or (seat and not bonded_seat):
-            raise ValueError("Spring joints must not share nodes between bodies")
-        if bonded_seat and len(seat) != geometry["seat_triangles"]:
-            raise ValueError("Bonded rock/plinth seat is not fully connected")
+        raise ValueError("Non-manifold wall/bedrock mesh")
+    seat = [key for key, value in memberships.items() if value == {WALL_BODY, BEDROCK_BODY}]
+    if spring_seat:
+        if seat:
+            raise ValueError("Spring seat must not share nodes between wall and bedrock")
         def located(face: tuple[int, ...]) -> tuple:
             return tuple(sorted(tuple(round(v, 7) for v in nodes[n]) for n in face))
-        plinth_seat = {located(tri) for face in seat_faces for tri in split_face(face)}
-        rock_seat = [face for face in top_faces if located(face) in plinth_seat]
-        if len(rock_seat) != geometry["seat_triangles"] or len(rock_seat) != len(plinth_seat):
-            raise ValueError("Rock and plinth seat faces do not coincide")
+        wall_seat = {located(tri) for face in seat_faces for tri in split_face(face)}
+        rock_seat = [face for face in top_faces if located(face) in wall_seat]
+        if len(rock_seat) != geometry["seat_triangles"] or len(rock_seat) != len(wall_seat):
+            raise ValueError("Rock and wall seat faces do not coincide")
         seat_count = len(rock_seat)
     elif len(seat) != geometry["seat_triangles"]:
-        raise ValueError("Rock/plinth seat is not fully connected")
+        raise ValueError("Rock/wall seat is not fully connected")
     else:
         seat_count = len(seat)
     boundaries = [(tag, face) for tag, face in concrete_boundaries if tag != 1]
-    if joints == "spring" and not bonded_seat:
-        boundaries.extend((PLINTH_SEAT, face) for face in seat_faces)
+    if spring_seat:
+        boundaries.extend((WALL_SEAT, face) for face in seat_faces)
         boundaries.extend((ROCK_SEAT, face) for face in rock_seat)
     bottom_faces = [tuple(mapping[int(n)] for n in tri) for tri in rock.bottom_faces]
     boundaries.extend((ROCK_BOTTOM, face) for face in bottom_faces)
@@ -310,7 +261,7 @@ def prepare(
     boundary_map = {tag: i+1 for i, tag in enumerate(sorted({tag for tag, _ in boundaries}))}
     mesh = replace(
         concrete, nodes=nodes, cells=cells,
-        region_ids=[3 if region == 6 else region for region in regions],
+        region_ids=regions,
         boundaries=[(boundary_map[tag], face) for tag, face in boundaries],
     )
     write_combined_gmsh(mesh, output / "three_body.msh")
@@ -343,7 +294,7 @@ End
 ''' + text[end:]
     rock = config["material"]["bedrock"]
     text += f'''
-Body 3
+Body 2
     Name = "BedrockBody"
     Equation = 1
     Material = 2
@@ -375,7 +326,7 @@ End
             "Linear System ILUT Tolerance = 1.0e-4",
             "Linear System Residual Output = 20",
         )
-    if joints == "spring":
+    if stiffness:
         text = text.replace(
             "    Variable DOFs = 3\n",
             "    Variable DOFs = 3\n    Apply Mortar BCs = Logical True\n", 1,
@@ -383,15 +334,14 @@ End
         text += spring_conditions(text, boundary_map, stiffness)
     joint_note = (
         f"directional springs (global x/y/z) {stiffness} "
-        + ("N/m^3 at wall/plinth; perfectly bonded plinth/rock (shared nodes)"
-           if bonded_seat else
-           "N/m^3 from geometry.plinth/bedrock.support at wall/plinth and plinth/rock")
-        if joints == "spring" else "bonded interfaces"
+        "N/m^3 from geometry.bedrock.support at the wall/rock seat"
+        if spring_seat else
+        "perfectly bonded wall/rock seat (shared nodes; geometry.bedrock.support.model is bonded)"
+        if bonded_seat else "bonded wall/rock seat"
     )
     result_name = "three_body_results" if integrated else "three_body_diagnostic"
     text = text.replace(
-        "! Provisional bonded wall/plinth: shared nodes, no joint opening/sliding.\n"
-        "! Foundation support only; geometry.plinth.support is inactive.\n",
+        "! Single wall body seated on the bedrock; foundation springs from geometry.bedrock.support.\n",
         "",
     )
     rollers = outer_support["model"] == "rollers"
@@ -414,17 +364,17 @@ End
         )
         support_assumptions = [f"fixed rock bottom z={geometry['bottom_z_m']:g} m", "free rock sides"]
     path.write_text(
-        f"! {'THREE-BODY ANALYSIS' if integrated else 'DIAGNOSTIC ONLY'}: "
+        f"! {'WALL-BEDROCK ANALYSIS' if integrated else 'DIAGNOSTIC ONLY'}: "
         f"{joint_note}; {support_header[0]}; zero uplift.\n"
         + support_header[1]
         + text.replace("combined_results_mpi", result_name),
     )
     report = {
         "assumptions": [
-            "linear directional springs in global x/y/z (carry tension) at wall/plinth and plinth/rock"
-            if joints == "spring" and not bonded_seat else
-            "wall/plinth directional springs; perfectly bonded plinth/rock (zero relative displacement)"
-            if bonded_seat else "bonded wall/plinth and plinth/rock",
+            "linear directional springs in global x/y/z (carry tension) at the wall/rock seat"
+            if spring_seat else
+            "perfectly bonded wall/rock seat (zero relative displacement)",
+            "the wall is seated directly on the bedrock contours",
             "zero uplift",
             *support_assumptions,
             "simultaneous gravity and existing concrete water loads",
@@ -437,11 +387,11 @@ End
             ),
         ],
         "purpose": (
-            "Initial three-body linear analysis, NOT engineering validation"
+            "Initial wall-on-bedrock linear analysis, NOT engineering validation"
             if integrated else "Solver integration diagnostic, NOT engineering validation"
         ),
         "joints": joints,
-        "plinth_bedrock_connection": "bonded" if bonded_seat or joints == "bonded" else "spring",
+        "wall_bedrock_connection": "spring" if spring_seat else "bonded",
         "interface_stiffness_n_per_m3": stiffness,
         "interface_stiffness_sources": {
             name: f"geometry.{region}.support.spring_n_per_m3"
@@ -449,19 +399,17 @@ End
         } if joints == "spring" else {},
         "nodes": len(nodes),
         "cells_by_body": dict(Counter(regions)),
-        "solver_body_ids": {"plinth": 1, "wall": 2, "bedrock": 3},
+        "solver_body_ids": {"wall": WALL_BODY, "bedrock": BEDROCK_BODY},
         "boundary_id_map": boundary_map,
         "rock_outer_support": outer_support,
-        "wall_plinth_joint_faces": wall_joint_faces,
-        "plinth_rock_seat_triangles": seat_count,
-        "plinth_underside": {
+        "wall_rock_seat_triangles": seat_count,
+        "wall_underside": {
             "profile": "piecewise_linear_bedrock_contours",
             "elevation_quantization": False,
-            "radial_extent": "full_plinth_width",
+            "radial_extent": "full_wall_thickness",
         },
         "geometry": geometry,
         "concrete_element_types": sorted({kind for kind, _ in concrete_cells}),
-        "wall_plinth_cutback": concrete.wall_plinth_cutback,
         "linear_solver": (
             {"method": "BiCGStabl", "preconditioner": "ILU1",
              "ilu_factor": 0.01, "convergence_tolerance": 1e-10}
@@ -584,11 +532,11 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
         raise RuntimeError("Solved stress contains non-finite values")
     if spring:
         check_spring_gaps(gaps, report["interface_stiffness_n_per_m3"])
-    if report.get("plinth_bedrock_connection") == "bonded":
-        seat = gaps["joints"]["plinth_bedrock"]
+    if report.get("wall_bedrock_connection") == "bonded":
+        seat = gaps["joints"]["wall_bedrock"]
         if (seat["locations"] <= 0 or not np.isfinite(seat["max_abs_gap_m"])
                 or seat["max_abs_gap_m"] > 1e-10):
-            raise RuntimeError("Bonded plinth/bedrock displacement continuity check failed")
+            raise RuntimeError("Bonded wall/bedrock displacement continuity check failed")
     report["result"] = str(result)
     report["solver_exit_code"] = code
     report["partitions"] = partitions

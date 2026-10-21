@@ -127,11 +127,11 @@ class DamPhaseFieldTests(unittest.TestCase):
         domain = imported.domain
         cells = imported.cell_tags.indices
         midpoints = mesh.compute_midpoints(domain, domain.topology.dim, cells)
-        values = np.where(midpoints[:, 2] < 0.34, 1, 2).astype(np.int32)
+        values = np.where(midpoints[:, 2] < 0.34, 2, 1).astype(np.int32)
         imported.cell_tags = mesh.meshtags(domain, domain.topology.dim, cells, values)
         crack = replace(crack, centre_m=(0.5, 0.5, 0.6))
-        wall = imported.cell_tags.find(2)
-        plinth = imported.cell_tags.find(1)
+        wall = imported.cell_tags.find(1)
+        bedrock = imported.cell_tags.find(2)
         report = resolution_report(domain, crack, wall)
         self.assertLessEqual(report["cells_in_damaged_band"], len(wall))
         options = replace(options, minimum_elements_per_length_scale=0.7, maximum_refinement_levels=2)
@@ -139,18 +139,18 @@ class DamPhaseFieldTests(unittest.TestCase):
             refined = refine_for_phase_field(imported, [crack], options)
         marked = marking.call_args_list[0].args[1]
         self.assertTrue(set(marked).issubset(set(wall)))
-        self.assertFalse(set(marked) & set(plinth))
-        self.assertGreater(refined.report["levels"][0]["plinth_cells"], 0)
-        self.assertEqual(refined.report["levels"][0]["marked_plinth_cells"], 0)
+        self.assertFalse(set(marked) & set(bedrock))
+        self.assertGreater(refined.report["levels"][0]["bedrock_cells"], 0)
+        self.assertGreater(refined.report["levels"][0]["marked_wall_cells"], 0)
         self.assertGreater(refined.report["levels"][-1]["wall_cells"], len(wall))
 
-    def test_plinth_damage_stays_exactly_zero_during_real_solve(self):
+    def test_bedrock_damage_stays_exactly_zero_during_real_solve(self):
         imported, structure, crack, options = self.model()
         domain = imported.domain
         dimension = domain.topology.dim
         cells = imported.cell_tags.indices
         midpoints = mesh.compute_midpoints(domain, dimension, cells)
-        values = np.where(midpoints[:, 2] < 0.34, 1, 2).astype(np.int32)
+        values = np.where(midpoints[:, 2] < 0.34, 2, 1).astype(np.int32)
         imported.cell_tags = mesh.meshtags(domain, dimension, cells, values)
         crack = replace(crack, centre_m=(0.5, 0.5, 0.6), length_scale_m=0.4)
         for formulation, acceleration in (("hybrid", False), ("experimental_amor", True)):
@@ -159,13 +159,13 @@ class DamPhaseFieldTests(unittest.TestCase):
                     imported, structure, [crack], options, Path(directory),
                     mechanics_formulation=formulation, damage_acceleration=acceleration,
                 )
-                plinth_dofs = fem.locate_dofs_topological(
-                    result.damage.function_space, dimension, imported.cell_tags.find(1),
+                bedrock_dofs = fem.locate_dofs_topological(
+                    result.damage.function_space, dimension, imported.cell_tags.find(2),
                 )
-                self.assertGreater(len(plinth_dofs), 0)
-                np.testing.assert_array_equal(result.damage.x.array[plinth_dofs], 0)
+                self.assertGreater(len(bedrock_dofs), 0)
+                np.testing.assert_array_equal(result.damage.x.array[bedrock_dofs], 0)
                 self.assertGreater(result.damage.x.array.max(), 0)
-                self.assertEqual(result.report["damage_region_ids"], [2])
+                self.assertEqual(result.report["damage_region_ids"], [1])
 
     def test_annular_sector_runs_real_phase_field_solver_and_writes_results(self):
         imported, structure, crack, options = self.model()
@@ -184,7 +184,7 @@ class DamPhaseFieldTests(unittest.TestCase):
         domain = mesh.create_unit_cube(MPI.COMM_WORLD, 3, 3, 3)
         dimension = domain.topology.dim
         cells = np.arange(domain.topology.index_map(dimension).size_local, dtype=np.int32)
-        cell_tags = mesh.meshtags(domain, dimension, cells, np.full(len(cells), 2, dtype=np.int32))
+        cell_tags = mesh.meshtags(domain, dimension, cells, np.full(len(cells), 1, dtype=np.int32))
         domain.topology.create_connectivity(dimension - 1, dimension)
         facets = mesh.exterior_facet_indices(domain.topology)
         facet_tags = mesh.meshtags(
@@ -205,6 +205,7 @@ class DamPhaseFieldTests(unittest.TestCase):
             water_density_kg_m3=1.0,
             tailwater_head_m=0.0,
             overflow_head_m=0.0,
+            upstream_surface_z_m=0.0,
         )
         support = SimpleNamespace(
             spring_x_n_per_m3=1000.0,
@@ -215,8 +216,7 @@ class DamPhaseFieldTests(unittest.TestCase):
             material=material,
             loads=loads,
             foundation_support=support,
-            plinth_support=support,
-        )
+         )
         crack = CrackSpecification(
             type="phase_field",
             shape="rectangular",

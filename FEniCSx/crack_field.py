@@ -259,11 +259,11 @@ def resolution_report(domain, specification: CrackSpecification, eligible_cells=
 
 
 def crack_placement_report(
-    imported, specification: CrackSpecification, required_regions=(2,), centre_regions=None,
+    imported, specification: CrackSpecification, required_regions=(1,), centre_regions=None,
 ) -> dict:
     """Locate a crack in the imported dam and verify which bodies its diffuse band reaches.
 
-    Region 1 is the plinth and region 2 the wall. The crack centre must lie in one of
+    Region 1 is the wall and region 2 is bedrock. The crack centre must lie in one of
     ``centre_regions`` (default: ``required_regions``) and its diffuse band must intersect
     at least one cell of every region in ``required_regions``.
     """
@@ -327,7 +327,7 @@ def crack_placement_report(
     return report
 
 
-def validate_crack_placement(imported, specifications, required_regions=(2,), centre_regions=None) -> list[dict]:
+def validate_crack_placement(imported, specifications, required_regions=(1,), centre_regions=None) -> list[dict]:
     """Return placement reports or fail before constructing a meaningless damage field."""
     if isinstance(specifications, CrackSpecification):
         specifications = [specifications]
@@ -344,7 +344,7 @@ def validate_crack_placement(imported, specifications, required_regions=(2,), ce
             f"band_cells_by_region={reports[index]['band_cell_count_by_region']}"
             for index in invalid
         )
-        names = {1: "plinth", 2: "wall"}
+        names = {1: "wall", 2: "bedrock"}
         bodies = " and ".join(f"concrete {names.get(region, region)}" for region in required_regions)
         raise ValueError(
             f"Configured crack does not intersect the {bodies} (required regions {list(required_regions)}) "
@@ -372,7 +372,7 @@ class RefinedPhaseFieldMesh:
 
 
 def refine_for_phase_field(
-    imported, specifications, options: PhaseFieldSolverOptions, damage_region_ids=(2,),
+    imported, specifications, options: PhaseFieldSolverOptions, damage_region_ids=(1,),
 ) -> RefinedPhaseFieldMesh:
     """Locally refine damageable cells in the diffuse crack bands while preserving mesh tags."""
     if isinstance(specifications, CrackSpecification):
@@ -386,9 +386,9 @@ def refine_for_phase_field(
         reports = [resolution_report(domain, specification, damage_cells) for specification in specifications]
         levels.append({
             "level": level, "cracks": reports,
-            "wall_cells": int(len(cell_tags.find(2))), "plinth_cells": int(len(cell_tags.find(1))),
+            "wall_cells": int(len(cell_tags.find(1))), "bedrock_cells": int(len(cell_tags.find(2))),
         })
-        print(f"Refinement level {level}: wall={len(cell_tags.find(2))}, plinth={len(cell_tags.find(1))}, "
+        print(f"Refinement level {level}: wall={len(cell_tags.find(1))}, bedrock={len(cell_tags.find(2))}, "
               f"damage-region resolution={[r['elements_per_length_scale'] for r in reports]}", flush=True)
         if all(
             report["elements_per_length_scale"] >= options.minimum_elements_per_length_scale
@@ -425,8 +425,8 @@ def refine_for_phase_field(
         marked = np.zeros(len(cells), dtype=bool)
         damageable = np.zeros(len(cells), dtype=bool)
         damageable[damage_cells] = True
-        plinth = np.zeros(len(cells), dtype=bool)
-        plinth[cell_tags.find(1)] = True
+        bedrock = np.zeros(len(cells), dtype=bool)
+        bedrock[cell_tags.find(2)] = True
         for specification, report in zip(specifications, reports):
             if report["elements_per_length_scale"] < options.minimum_elements_per_length_scale:
                 distance = signed_distance(midpoints, specification)
@@ -436,8 +436,7 @@ def refine_for_phase_field(
                     & (diameters > specification.length_scale_m / options.minimum_elements_per_length_scale)
                 )
         marked_cells = cells[marked]
-        levels[-1]["marked_wall_cells"] = int(np.count_nonzero(marked & ~plinth))
-        levels[-1]["marked_plinth_cells"] = int(np.count_nonzero(marked & plinth))
+        levels[-1]["marked_wall_cells"] = int(np.count_nonzero(marked & ~bedrock))
         if not len(marked_cells):
             raise RuntimeError("No cells were selected for required crack-band refinement")
         from mpi4py import MPI

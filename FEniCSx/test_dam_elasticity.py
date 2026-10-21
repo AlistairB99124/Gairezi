@@ -18,10 +18,10 @@ class DamElasticityTests(unittest.TestCase):
         structure.material = SimpleNamespace(youngs_modulus_pa=1e7, poissons_ratio=0.0, density_kg_m3=1000.0)
         structure.loads = SimpleNamespace(
             gravity_z_m_s2=-10.0, peak_water_pressure_pa=0.0, maximum_water_height_m=1.0,
-            water_density_kg_m3=1000.0, tailwater_head_m=0.0, overflow_head_m=0.0
+            water_density_kg_m3=1000.0, tailwater_head_m=0.0, overflow_head_m=0.0, upstream_surface_z_m=0.0
         )
         support = SimpleNamespace(spring_x_n_per_m3=1e6, spring_y_n_per_m3=1e6, spring_z_n_per_m3=1e6)
-        structure.foundation_support = structure.plinth_support = support
+        structure.foundation_support = support
         imported = import_structure(structure, 1e-12)
         with tempfile.TemporaryDirectory() as directory:
             displacement, _, report = solve(

@@ -18,7 +18,7 @@ from .regions.combined_structure import build_combined_structure
 from .regions.tetrahedral import split_face
 
 
-BODY_IDS = {"plinth": 1, "wall": 2, "bedrock": 6}
+BODY_IDS = {"wall": 1, "bedrock": 2}
 # Agreed rock domain extension (m): upstream/downstream of the concrete and
 # beyond each bank end of the surveyed cross-section.
 STREAM_MARGIN_M = 20.
@@ -190,13 +190,13 @@ def seated_bedrock_geometry(
     grade_mesh: bool = False,
     resample_surface: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
-    """Use the actual plinth underside as the rock seat, extending the canyon outside it.
+    """Use the actual wall underside as the rock seat, extending the canyon outside it.
 
     stream_margin_m extends the rock upstream and downstream of the concrete
     footprint; the canyon cross-section is unchanged along that direction.
     bank_margin_m extends it beyond each bank end of the survey/concrete span at
     the outermost surveyed bank elevation, because no survey exists beyond it.
-    Sample parallel exterior rows without changing the existing plinth seat or
+    Sample parallel exterior rows without changing the existing wall seat or
     the piecewise-linear topography. Returned columns retain bottom/top ordering.
     """
     if (
@@ -215,20 +215,20 @@ def seated_bedrock_geometry(
                              (concrete[:, :2] - origin) @ depth))
     face_triangles = [tri for face in foundation_faces for tri in split_face(face)]
     if not face_triangles:
-        raise ValueError("No plinth foundation faces found")
+        raise ValueError("No wall foundation faces found")
     edge_counts = Counter(
         tuple(sorted((tri[i], tri[(i + 1) % 3])))
         for tri in face_triangles for i in range(3)
     )
     if max(edge_counts.values()) > 2:
-        raise ValueError("Non-manifold plinth underside")
+        raise ValueError("Non-manifold wall underside")
     perimeter_edges = [edge for edge, count in edge_counts.items() if count == 1]
     neighbours: dict[int, list[int]] = {}
     for a, b in perimeter_edges:
         neighbours.setdefault(a, []).append(b)
         neighbours.setdefault(b, []).append(a)
     if any(len(values) != 2 for values in neighbours.values()):
-        raise ValueError("Plinth footprint must have a single closed perimeter")
+        raise ValueError("Wall footprint must have a single closed perimeter")
     start = min(neighbours)
     loop = [start]
     previous = -1
@@ -238,11 +238,11 @@ def seated_bedrock_geometry(
         if following == start:
             break
         if following in loop:
-            raise ValueError("Invalid plinth perimeter cycle")
+            raise ValueError("Invalid wall perimeter cycle")
         loop.append(following)
         previous, current = current, following
     if len(loop) != len(neighbours):
-        raise ValueError("Multiple plinth perimeter loops are not supported")
+        raise ValueError("Multiple wall perimeter loops are not supported")
     outline = PlotPath(local[loop])
     x_min = min(0., float(local[:, 0].min()))
     x_max = max(float(report["projected_span_m"]), float(local[:, 0].max()))
@@ -330,7 +330,7 @@ def seated_bedrock_geometry(
     triangles[negative] = triangles[negative][:, [0, 2, 1]]
     top_array = surface[:, 2]
     if np.any(top_array <= bottom_z_m):
-        raise ValueError("Plinth underside reaches or crosses the rock bottom")
+        raise ValueError("Wall underside reaches or crosses the rock bottom")
     plan = origin + points_2d[:, :1] * across + points_2d[:, 1:] * depth
     count = len(plan)
     nodes = np.vstack((
@@ -369,12 +369,12 @@ def seated_bedrock_geometry(
             for i in range(3)
         )) if len(exterior) else 0.,
         "surface_edge_size_policy": (
-            "Nominally spaced parallel local-X rows outside the plinth; retain exact "
+            "Nominally spaced parallel local-X rows outside the wall seat; retain exact "
             "seat nodes and use unstructured triangles only for the interface transition."
         ),
         "surface_row_axis": "local cross-valley X; across_unit_vector_xy in global coordinates",
         "surface_definition": (
-            "Exact existing plinth underside at the seat; approved projected canyon "
+            "Exact existing wall underside at the seat; approved projected canyon "
             "profile at the outer rectangle; triangulated transition between them. "
             "Flat bank extensions at the end survey heights beyond the survey chord "
             "endpoints; canyon section held constant upstream and downstream."
@@ -534,7 +534,7 @@ def layered_bedrock_geometry(
         layers = len(levels)
     triangles = wedges[:, :3]
     # Share horizontal levels, clipping each column at its own terrain height.
-    # Collapsed wedges close with pyramids/tetrahedra, as in the plinth builder.
+    # Collapsed wedges close with pyramids/tetrahedra, as in the wall builder.
     chunks = [top, bottom]
     node_count = 2 * count
     lower = np.arange(count, 2 * count, dtype=np.int64)
@@ -706,7 +706,7 @@ def export_preview(
     ET.indent(manifest)
     ET.ElementTree(manifest).write(path, encoding="utf-8", xml_declaration=True)
     report.update({
-        "purpose": "Three-body geometry preview only; NOT an Elmer solution",
+        "purpose": "Wall and bedrock geometry preview only; NOT an Elmer solution",
         "body_ids": BODY_IDS,
         "cell_counts": counts,
         "concrete_chainage_reference_radius_m": 80.,
@@ -717,8 +717,7 @@ def export_preview(
             "closures; configured near-field spacing with far-field grading when "
             "mesh_grading is set; unsolved"
         ),
-        "matching_plinth_rock_surface": True,
-        "wall_plinth_cutback": structure.wall_plinth_cutback,
+        "matching_wall_rock_surface": True,
         "solver_interface_law_assigned": False,
         "materials_source": str((root / "config.json").resolve()),
     })

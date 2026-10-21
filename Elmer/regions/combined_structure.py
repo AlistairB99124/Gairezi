@@ -8,34 +8,21 @@ import math
 from pathlib import Path
 import struct
 
-from .plinth import build_conforming_plinth, build_plinth, load_model_contours
-from .uniform_wall import (
-    DOWNSTREAM_BATTER_BASE_Z_M,
-    DOWNSTREAM_WALL_RADIUS_M,
-    UPSTREAM_RADIUS_M,
-    build_uniform_wall,
-)
+from .bedrock_contours import load_contours
+from .uniform_wall import build_bedrock_seated_wall
 from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS, build_named_groups
 from ..model_config import load_config
 
 
 def build_wall(root: Path, extra_radial_fractions: tuple[float, ...] = ()):
-    contours = load_model_contours(root)
-    return build_uniform_wall(
-        root,
-        contours[0].chainage_m,
-        contours[-1].chainage_m,
-        [point.chainage_m for point in contours],
-        extra_radial_fractions,
-    )
+    return build_bedrock_seated_wall(root, extra_radial_fractions)
 
 
 REGION_BUILDERS = (
-    (REGION_GROUP_IDS["PLINTH"], "plinth", build_plinth),
     (REGION_GROUP_IDS["WALL"], "wall", build_wall),
 )
 
-STRUCTURAL_REGION_BUILDERS = REGION_BUILDERS[1:]
+STRUCTURAL_REGION_BUILDERS = REGION_BUILDERS
 
 
 @dataclass(frozen=True)
@@ -54,13 +41,25 @@ class EnvironmentalLoads:
     water_density_kg_m3: float
     tailwater_head_m: float
     overflow_head_m: float
+    # Reservoir surface in model coordinates (crest at z=0). None keeps the legacy crest-plus-overflow datum.
+    upstream_water_surface_z_m: float | None = None
 
     @property
     def water_pressure_gradient_pa_per_m(self) -> float:
         return self.water_density_kg_m3 * abs(self.gravity_z_m_s2)
 
+    @property
+    def upstream_surface_z_m(self) -> float:
+        if self.upstream_water_surface_z_m is None:
+            return self.overflow_head_m
+        return self.upstream_water_surface_z_m
+
+    @property
+    def crest_surcharge_pa(self) -> float:
+        return self.water_pressure_gradient_pa_per_m * max(self.upstream_surface_z_m, 0.0)
+
     def upstream_pressure_pa(self, elevation_m: float) -> float:
-        return self.water_pressure_gradient_pa_per_m * max(self.overflow_head_m - elevation_m, 0.0)
+        return self.water_pressure_gradient_pa_per_m * max(self.upstream_surface_z_m - elevation_m, 0.0)
 
 
 @dataclass(frozen=True)
@@ -79,9 +78,7 @@ class CombinedStructure:
     material: MaterialProperties
     loads: EnvironmentalLoads
     foundation_support: FoundationSupport
-    plinth_support: FoundationSupport
     region_cell_counts: dict[str, int]
-    wall_plinth_cutback: dict[str, object] | None = None
 
 
 def load_material(path: Path) -> MaterialProperties:
@@ -96,6 +93,8 @@ def load_material(path: Path) -> MaterialProperties:
 
 def load_environment(path: Path) -> EnvironmentalLoads:
     values = load_config(path)["loads"]
+    # water_height is measured from the deepest wall seat (lowest bedrock contour, crest at z = 0).
+    bed_elevation_m = min(point.bedrock_z_m for point in load_contours(path))
     loads = EnvironmentalLoads(
         gravity_z_m_s2=float(values["gravity"]),
         maximum_water_height_m=float(values["water_height"]),
@@ -105,8 +104,9 @@ def load_environment(path: Path) -> EnvironmentalLoads:
         water_density_kg_m3=float(values["water_density"]),
         tailwater_head_m=float(values["tailwater_head"]),
         overflow_head_m=float(values["overflow_head"]),
+        upstream_water_surface_z_m=bed_elevation_m + float(values["water_height"]) + float(values["overflow_head"]),
     )
-    expected_peak = loads.upstream_pressure_pa(-loads.maximum_water_height_m)
+    expected_peak = loads.upstream_pressure_pa(bed_elevation_m)
     if not math.isclose(loads.peak_water_pressure_pa, expected_peak, rel_tol=1e-10, abs_tol=1e-6):
         raise ValueError(
             f"Peak Water Pressure {loads.peak_water_pressure_pa} Pa must equal "
@@ -129,7 +129,6 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
     load_path = root / "config.json"
     loads = load_environment(load_path)
     foundation_support = load_foundation_support(load_path)
-    plinth_support = load_foundation_support(load_path, "plinth")
     nodes: list[tuple[float, float, float]] = []
     coordinate_nodes: dict[tuple[float, float, float], int] = {}
     cells: list[tuple[int, tuple[int, ...]]] = []
@@ -137,12 +136,7 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
     boundary_faces: dict[tuple[int, ...], list[tuple[int, int, tuple[int, ...]]]] = {}
     region_cell_counts: dict[str, int] = {}
 
-    wall = build_wall(root, extra_radial_fractions)
-    plinth = build_conforming_plinth(root, [wall])
-    regions = [
-        (REGION_GROUP_IDS["PLINTH"], "plinth", plinth),
-        (REGION_GROUP_IDS["WALL"], "wall", wall),
-    ]
+    regions = [(REGION_GROUP_IDS["WALL"], "wall", build_wall(root, extra_radial_fractions))]
 
     for region_id, region_name, mesh in regions:
         local_to_global: dict[int, int] = {}
@@ -183,14 +177,8 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
         material=material,
         loads=loads,
         foundation_support=foundation_support,
-        plinth_support=plinth_support,
         region_cell_counts=region_cell_counts,
     )
-    if load_config(root / "config.json")["geometry"]["plinth"].get("wall_interface") == "cutback_45deg":
-        from .interface_cutback import cutback_wall_plinth
-        combined = cutback_wall_plinth(
-            combined, float(load_config(root / "config.json")["geometry"]["wall"]["centerline_radius_m"]),
-        )
     return combined
 
 
@@ -333,7 +321,7 @@ def write_combined_vtu(mesh: CombinedStructure, path: Path) -> None:
 def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     element_counts = Counter(element_type for element_type, _ in mesh.cells)
     if any(
-        element_type not in ((5, 6) if mesh.wall_plinth_cutback else (5,))
+        element_type not in (5, 6)
         for (element_type, _), region_id in zip(mesh.cells, mesh.region_ids)
         if region_id == REGION_GROUP_IDS["WALL"]
     ):
@@ -368,18 +356,7 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
 
     face_owners: dict[tuple[int, ...], int] = {}
     region_interfaces: Counter[tuple[int, int]] = Counter()
-    plinth_boundary_nodes: set[int] = set()
-    for boundary_id, face in mesh.boundaries:
-        if boundary_id == FACE_GROUP_IDS["FOUNDATION"]:
-            plinth_boundary_nodes.update(face)
     for cell_index, (element_type, cell) in enumerate(mesh.cells):
-        if (
-            mesh.region_ids[cell_index] == REGION_GROUP_IDS["PLINTH"]
-            and element_type != 5
-            and not (mesh.wall_plinth_cutback and element_type == 6)
-            and not set(cell) & plinth_boundary_nodes
-        ):
-            raise ValueError("Plinth has a non-hexahedral cell outside the bedrock closure")
         for pattern in face_patterns[element_type]:
             face = tuple(sorted(cell[index] for index in pattern))
             if face in face_owners:
@@ -409,17 +386,8 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         if boundary_id == FACE_GROUP_IDS["UPSTREAM"]
         for node_id in face
     }
-    wall_interface_face_count = sum(
-        1 for boundary_id, _ in mesh.boundaries
-        if boundary_id == FACE_GROUP_IDS["WALL_PLINTH_WALL"]
-    )
-    plinth_interface_face_count = sum(
-        1 for boundary_id, _ in mesh.boundaries
-        if boundary_id == FACE_GROUP_IDS["WALL_PLINTH_PLINTH"]
-    )
-    bonded_interface_count = region_interfaces[(REGION_GROUP_IDS["PLINTH"], REGION_GROUP_IDS["WALL"])]
-    if wall_interface_face_count or plinth_interface_face_count or not bonded_interface_count:
-        raise ValueError("Bonded wall/plinth interface must be internal shared faces, without ground-spring bypass")
+    if not foundation_node_count:
+        raise ValueError("Wall has no foundation seat faces on the bedrock")
     wall_node_ids = {
         node_id
         for (_, cell), region_id in zip(mesh.cells, mesh.region_ids)
@@ -428,9 +396,6 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     }
     wall_radii = [math.hypot(*mesh.nodes[node_id][:2]) for node_id in wall_node_ids]
     wall_min_radius, wall_max_radius = min(wall_radii), max(wall_radii)
-    locally_widened = bool(
-        mesh.wall_plinth_cutback and mesh.wall_plinth_cutback.get("shoulder_wall_wedges", 0)
-    )
     return {
         "nodes": len(mesh.nodes),
         "cells": len(mesh.cells),
@@ -439,12 +404,10 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "triangular_prisms": element_counts[6],
         "pyramids": element_counts[7],
         "face_connected_components": component_count,
-        "wall_plinth_interface_faces": bonded_interface_count,
-        "wall_plinth_cutback": mesh.wall_plinth_cutback,
-        "wall_plinth_connection": "bonded_intact_provisional",
-        "connection_assumption": "Shared displacement nodes; no opening/sliding; construction details require review",
+        "wall_connection": "single_monolithic_body",
+        "connection_assumption": "Wall is one concrete body seated directly on the bedrock; no internal joints",
         "active_support": "geometry.bedrock.support on foundation tag 1 only",
-        "inactive_inputs": ["geometry.plinth.support: retained for legacy cases; no wall-ground bypass"],
+        "inactive_inputs": ["geometry.wall.height_m: nominal metadata; the seat follows geometry.bedrock.contours"],
         "fracture_hold_reason": "Cracking is on hold pending review of the corrected bonded intact reference.",
         "region_interface_faces": {
             f"{first_region}-{second_region}": count
@@ -455,9 +418,7 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "wall_geometry": {
             "downstream_radius_m": wall_min_radius,
             "upstream_radius_m": wall_max_radius,
-            "uniform_thickness_m": None if locally_widened else wall_max_radius - wall_min_radius,
-            "maximum_radial_extent_m": wall_max_radius - wall_min_radius,
-            "locally_widened_at_cutbacks": locally_widened,
+            "uniform_thickness_m": wall_max_radius - wall_min_radius,
             "wall_base_elevation_m": min(mesh.nodes[node_id][2] for node_id in wall_node_ids),
         },
         "foundation_nodes": foundation_node_count,

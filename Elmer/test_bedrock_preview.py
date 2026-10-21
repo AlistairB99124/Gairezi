@@ -69,15 +69,14 @@ class BedrockPreviewTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bedrock_geometry(rows, self.concrete)
 
-    def test_manifest_has_three_readable_attributed_bodies(self):
+    def test_manifest_has_readable_attributed_wall_and_bedrock(self):
         self.config["geometry"]["global_element_size_m"] = .25
         del self.config["geometry"]["bedrock"]["mesh"]
         structure = SimpleNamespace(
             nodes=[(0., 0., -29.), (1., 0., -29.), (0., 1., -29.), (0., 0., 0.)],
-            cells=[(4, (0, 1, 2, 3)), (4, (0, 1, 2, 3))],
-            region_ids=[1, 2],
+            cells=[(4, (0, 1, 2, 3))],
+            region_ids=[1],
             boundaries=[],
-            wall_plinth_cutback=None,
         )
         rock = np.array([
             [0., 0., -31.], [1., 0., -31.], [0., 1., -31.],
@@ -100,7 +99,7 @@ class BedrockPreviewTests(unittest.TestCase):
             self.assertEqual(geometry.call_args.args[3:5], (58., 58.))
             self.assertTrue(geometry.call_args.kwargs["grade_mesh"])
             pieces = ET.parse(path).findall(".//Piece")
-            self.assertEqual(len(pieces), 3)
+            self.assertEqual(len(pieces), 2)
             ids = set()
             for piece in pieces:
                 mesh = meshio.read(path.parent / piece.attrib["Source"])
@@ -110,7 +109,7 @@ class BedrockPreviewTests(unittest.TestCase):
                 ]
                 for values in mesh.cell_data["YoungsModulus"]:
                     np.testing.assert_array_equal(values, material["youngs_modulus"])
-            self.assertEqual(ids, {1, 2, 6})
+            self.assertEqual(ids, {1, 2})
             rock_mesh = meshio.read(path.parent / "bedrock.vtu")
             self.assertEqual(sum(len(block.data) for block in rock_mesh.cells), 8)
 
@@ -299,7 +298,7 @@ class BedrockPreviewTests(unittest.TestCase):
                     np.array([[0, 1, 2, 3, 4, 5]]), spacing,
                 )
 
-    def test_rock_seat_matches_plinth_and_retains_full_canyon_span(self):
+    def test_rock_seat_matches_wall_and_retains_full_canyon_span(self):
         contours = [{"chainage": 6, "height": 0.}, {"chainage": 174, "height": 0.}]
         _, _, frame = bedrock_geometry(contours, self.concrete)
         origin = np.array(frame["section_origin_xy_m"])

@@ -17,7 +17,7 @@ import numpy as np
 
 Y_BIN_M = 1.0
 Z_BIN_M = 0.5
-BODY_BITS = {"plinth": 1, "wall": 2}
+BODY_BITS = {"wall": 1}
 
 
 def principal_stresses(stress: np.ndarray) -> np.ndarray:
@@ -67,9 +67,9 @@ def selection_map(points: np.ndarray, stress: np.ndarray, node_regions: np.ndarr
             or not np.isfinite(points).all() or not np.isfinite(stress).all()):
         raise ValueError("Selection map requires finite nodal coordinates, six stress components and regions.")
     radius = chainage_radius(config)
-    concrete = np.flatnonzero((node_regions & 3) > 0)
+    concrete = np.flatnonzero((node_regions & 1) > 0)
     if not len(concrete):
-        raise ValueError("Baseline has no wall or plinth nodes for the crack-selection map.")
+        raise ValueError("Baseline has no wall nodes for the crack-selection map.")
     principal = principal_stresses(stress[concrete])
     theta = plan_angle(points[concrete])
     if theta.min() < 0 or theta.max() > math.pi:
@@ -118,7 +118,7 @@ def selection_map(points: np.ndarray, stress: np.ndarray, node_regions: np.ndarr
             "y = R cos(theta) at the wall centreline radius R; selected y maps to chainage = R acos(y/R)"
         ),
         "chainage_radius_m": radius,
-        "field": "Elmer nodal maximum principal stress over wall and plinth nodes (tension positive)",
+        "field": "Elmer nodal maximum principal stress over wall nodes (tension positive)",
         "bin_statistic": "maximum over the radial thickness and nodes in each bin",
         "y_bin_m": Y_BIN_M, "z_bin_m": Z_BIN_M,
         "y_min_m": y_min, "z_min_m": z_min,
@@ -126,8 +126,7 @@ def selection_map(points: np.ndarray, stress: np.ndarray, node_regions: np.ndarr
         "max_principal_stress_mpa": values,
         "peaks": peaks,
         "outlines": [
-            _outline("plinth_top", geometry["plinth"]["contours"], radius),
-            _outline("rock_seat", geometry["bedrock"]["contours"], radius),
+            _outline("wall_base", geometry["bedrock"]["contours"], radius),
         ],
         "engineering_validated": False,
     }

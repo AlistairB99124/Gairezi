@@ -87,7 +87,7 @@ class InterfaceSprings:
         xyz = space.tabulate_dof_coordinates()
         local = {}
         facet_count = domain.topology.index_map(2).size_local
-        for tag in (8, 9, 11, 12):
+        for tag in (11, 12):
             records = []
             for facet in imported.facet_tags.find(tag):
                 if facet >= facet_count:
@@ -106,14 +106,25 @@ class InterfaceSprings:
         self._operator = sparse.csr_matrix((3 * node_count, 3 * node_count))
         self.report = {}
         for name, tags, support in (
-            ("wall_plinth", (8, 9), "plinth"),
-            ("plinth_bedrock", (11, 12), "bedrock"),
+            ("wall_bedrock", (11, 12), "bedrock"),
         ):
-            if (support == "bedrock"
-                    and structure.three_body_config["geometry"][support]["support"].get("model") == "bonded"):
+            if structure.three_body_config["geometry"][support]["support"].get("model") == "bonded":
                 if faces[tags[0]] or faces[tags[1]]:
-                    raise ValueError("Bonded plinth/bedrock seat must be internal shared-node faces, not springs")
-                self.report[name] = {"connection": "bonded", "discretisation": "shared displacement DOFs"}
+                    raise ValueError("Bonded wall/bedrock seat must not be tagged as spring faces")
+                cells = domain.geometry.dofmaps[0]
+                regions = np.zeros(len(cells), dtype=np.int32)
+                regions[imported.cell_tags.indices] = imported.cell_tags.values
+                faces_by_region = []
+                for region in (1, 2):
+                    faces_by_region.append({
+                        tuple(sorted(int(node) for node in face))
+                        for cell in np.flatnonzero(regions == region)
+                        for face in (cells[cell][[0, 1, 2]], cells[cell][[0, 1, 3]],
+                                     cells[cell][[0, 2, 3]], cells[cell][[1, 2, 3]])
+                    })
+                if not faces_by_region[0] & faces_by_region[1]:
+                    raise ValueError("Bonded wall/bedrock seat must use shared-node faces")
+                self.report[name] = {"connection": "bonded", "discretisation": "shared-node faces"}
                 continue
             first, second = faces[tags[0]], faces[tags[1]]
             if not first or not second:

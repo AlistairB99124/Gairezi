@@ -20,7 +20,7 @@ from vtkmodules.vtkIOXML import (
 
 
 DISTANCE_ARRAY = "DistanceToConcrete_m"
-BODY_NAMES = {1: "plinth", 2: "wall", 3: "bedrock"}
+BODY_NAMES = {1: "wall", 2: "bedrock"}
 
 
 def select_body(mesh, lower: int, upper: int):
@@ -52,9 +52,9 @@ def reporting_region(mesh, distance_m: float = 5.):
         raise ValueError("Reporting distance must be finite and positive")
     labels = mesh.GetCellData().GetArray("GeometryIds")
     if labels is None or set(np.unique(vtk_to_numpy(labels))) != set(BODY_NAMES):
-        raise ValueError("Expected attributed wall, plinth and bedrock (GeometryIds 1/2/3)")
-    concrete = select_body(mesh, 1, 2)
-    rock = select_body(mesh, 3, 3)
+        raise ValueError("Expected attributed wall and bedrock (GeometryIds 1/2)")
+    concrete = select_body(mesh, 1, 1)
+    rock = select_body(mesh, 2, 2)
     reference = vtkUnstructuredGrid()
     reference.DeepCopy(concrete)
     points = vtkPoints()
@@ -170,7 +170,7 @@ def export_region(result: Path, output: Path, distance_m: float = 5.) -> dict:
     report = {
         "source_full_domain_result": str(result.resolve()),
         "result": str(path.resolve()), "rock_reporting_distance_m": distance_m,
-        "selection": "All wall/plinth; rock within nearest concrete-surface distance in undeformed coordinates",
+        "selection": "All wall; rock within nearest concrete-surface distance in undeformed coordinates",
         "boundary_approximation": "Exact surface distance at rock vertices; linearly interpolated within cells, clipped at threshold",
         "stress_method": "Principal eigenvalues of recovered nodal stress tensor; interpolated tensors at clip intersections",
         "full_domain_cells": source.GetNumberOfCells(),

@@ -66,10 +66,7 @@ def main():
             domain.topology.create_connectivity(2, 3)
             cell_tags = reader.read_meshtags(domain, name="regions")
             facet_tags = reader.read_meshtags(domain, name="boundaries")
-        has_plinth = comm.allreduce(len(cell_tags.find(1)), op=MPI.SUM) > 0
-        has_wall = comm.allreduce(len(cell_tags.find(2)), op=MPI.SUM) > 0
-        has_legacy_wall_support = comm.allreduce(len(facet_tags.find(8)), op=MPI.SUM) > 0
-        if has_plinth and has_wall and not has_legacy_wall_support:
+        if is_three_body(structure):
             assert_fracture_ready(structure)
         if comm.allreduce(domain.topology.index_map(3).size_local == 0, op=MPI.LOR):
             raise ValueError("Each MPI worker requires owned mesh cells; reduce --fracture-processes")

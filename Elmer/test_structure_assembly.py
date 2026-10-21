@@ -36,72 +36,84 @@ class BondedTopologyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "expected mesh header"):
                 assembly.convert_with_elmergrid(root / "source.msh", root / "mesh", 4)
 
-    def test_generated_wall_plinth_are_one_body_before_and_after_tetrahedralization(self):
+    def test_generated_wall_is_one_body_seated_on_bedrock_before_and_after_tetrahedralization(self):
         from collections import Counter
+        from Elmer.regions.bedrock_contours import bedrock_elevation, load_model_contours
         from Elmer.regions.combined_structure import audit_combined_structure, build_combined_structure
-        from Elmer.regions.tetrahedral import _CELL_FACES, split_face, tetrahedralize_structure
+        from Elmer.regions.tetrahedral import tetrahedralize_structure
+        import math
 
         source = build_combined_structure(assembly.ROOT)
         audit = audit_combined_structure(source)
         self.assertEqual(audit["face_connected_components"], 1)
-        self.assertGreater(audit["wall_plinth_interface_faces"], 0)
-        self.assertEqual(audit["wall_plinth_connection"], "bonded_intact_provisional")
+        self.assertEqual(audit["wall_connection"], "single_monolithic_body")
+        self.assertGreater(audit["foundation_nodes"], 0)
+        self.assertEqual(set(source.region_ids), {1})
         self.assertEqual(len({tuple(round(x, 9) for x in xyz) for xyz in source.nodes}), len(source.nodes))
-        self.assertFalse(any(tag in (8, 9) for tag, _ in source.boundaries))
-        source_faces = {}
-        for (kind, cell), region in zip(source.cells, source.region_ids, strict=True):
-            for pattern in _CELL_FACES[kind]:
-                oriented = tuple(cell[i] for i in pattern)
-                source_faces.setdefault(tuple(sorted(oriented)), []).append((region, oriented))
-        expected_triangles = sum(
-            len(split_face(entries[0][1])) for entries in source_faces.values()
-            if {region for region, _ in entries} == {1, 2}
-        )
+        self.assertFalse(any(tag > 7 for tag, _ in source.boundaries))
+        # Every foundation face sits on the piecewise-linear bedrock surface.
+        rows = [{"chainage": p.chainage_m, "height": p.bedrock_z_m} for p in load_model_contours(assembly.ROOT)]
+        seat_nodes = {node for tag, face in source.boundaries if tag == 1 for node in face}
+        self.assertTrue(seat_nodes)
+        for node in seat_nodes:
+            x, y, z = source.nodes[node]
+            chainage = 78.0 * math.atan2(x, y)
+            self.assertLess(abs(z - bedrock_elevation(rows, chainage)), 1e-6)
+        self.assertAlmostEqual(min(z for _, _, z in source.nodes), -29.0)
         mesh = tetrahedralize_structure(source)
         faces = Counter()
-        regions = {}
-        for (_, tet), region in zip(mesh.cells, mesh.region_ids):
+        for _, tet in mesh.cells:
             for pattern in ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)):
-                face = tuple(sorted(tet[i] for i in pattern))
-                faces[face] += 1
-                regions.setdefault(face, set()).add(region)
+                faces[tuple(sorted(tet[i] for i in pattern))] += 1
         self.assertEqual(max(faces.values()), 2)
-        interface = {face for face, membership in regions.items() if membership == {1, 2}}
-        self.assertEqual(len(interface), expected_triangles)
+        self.assertEqual(set(mesh.region_ids), {1})
         exterior = {tuple(sorted(face)) for _, face in mesh.boundaries}
-        self.assertFalse(interface & exterior)
         self.assertEqual(exterior, {face for face, count in faces.items() if count == 1})
 
 
-class RaisedReservoirTests(unittest.TestCase):
-    def test_active_load_case_and_generated_pressure_law(self):
-        root = assembly.ROOT
-        environment = root / "config.json"
-        support = load_foundation_support(environment)
-        mesh = SimpleNamespace(
-            loads=load_environment(environment),
-            material=load_material(environment),
-            foundation_support=support, plinth_support=support,
-            nodes=[(80.0, 0.0, -31.0), (80.0, 0.0, 0.0)],
-            boundaries=[],
+class ReservoirLevelTests(unittest.TestCase):
+    """Upstream water surface = deepest seat (z = -height_m) + water_height + overflow_head."""
+
+    def generated_sif(self, water_height, overflow_head, tailwater_head=0.0):
+        payload = json.loads(assembly.CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        self.assertEqual(min(row["height"] for row in payload["geometry"]["bedrock"]["contours"]), -29.0)
+        payload["loads"].update(
+            water_height=water_height, overflow_head=overflow_head, tailwater_head=tailwater_head,
+            overflow_water_level=water_height + overflow_head,
         )
-        payload = json.loads(assembly.LOAD_CASES_PATH.read_text())
-        self.assertEqual(payload["loads"]["water_height"], 31)
-        self.assertEqual(payload["loads"]["overflow_water_level"], 34)
-        assembly.apply_load_case(mesh, assembly.LOAD_CASES_PATH)
-        self.assertEqual(mesh.loads.peak_water_pressure_pa, 333540)
-        self.assertEqual(mesh.loads.overflow_head_m, 3)
-        self.assertEqual(mesh.loads.water_pressure_gradient_pa_per_m, 9810)
         with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.json"
+            config.write_text(json.dumps(payload))
+            mesh = SimpleNamespace(nodes=[(80.0, 0.0, -29.0), (80.0, 0.0, 0.0)], boundaries=[])
+            assembly.apply_load_case(mesh, config)
             path = Path(directory) / "model.sif"
             assembly.write_combined_solver_input(mesh, path)
             text = path.read_text()
-        expression = re.search(r'Real MATC "([^"]+)"', text).group(1)
-        for z, pressure in ((-31, -333540), (-30, -323730), (0, -29430), (3, 0)):
-            self.assertAlmostEqual(eval(expression, {"__builtins__": {}}, {"tx": z}), pressure)
-        self.assertIn("Normal Force = Real -29430", text)
-        self.assertNotIn("WallPlinthSpring", text)
-        self.assertNotIn("Target Boundaries(1) = 8", text)
+        upstream = re.search(r'Real MATC "([^"]+)"', text).group(1)
+        crest = float(re.search(r"Normal Force = Real (\S+)", text).group(1))
+        return mesh.loads, (lambda z: eval(upstream, {"__builtins__": {}}, {"tx": z})), crest
+
+    def test_overflowing_reservoir_matches_legacy_crest_datum(self):
+        loads, upstream, crest = self.generated_sif(29.0, 3.0)
+        self.assertEqual(loads.upstream_surface_z_m, 3.0)
+        self.assertEqual(loads.peak_water_pressure_pa, 9810 * 32)
+        for z, pressure in ((-29, -313920), (0, -29430), (3, 0), (4, 0)):
+            self.assertAlmostEqual(upstream(z), pressure)
+        self.assertAlmostEqual(crest, -29430)
+
+    def test_partial_reservoir_has_no_crest_surcharge(self):
+        loads, upstream, crest = self.generated_sif(20.0, 0.0)
+        self.assertEqual(loads.upstream_surface_z_m, -9.0)
+        for z, pressure in ((-29, -196200), (-9, 0), (0, 0)):
+            self.assertAlmostEqual(upstream(z), pressure)
+        self.assertEqual(crest, 0.0)
+
+    def test_empty_reservoir_applies_no_water_pressure(self):
+        loads, upstream, crest = self.generated_sif(0.0, 0.0)
+        self.assertEqual(loads.upstream_surface_z_m, -29.0)
+        for z in (-29, -10, 0):
+            self.assertEqual(upstream(z), 0)
+        self.assertEqual(crest, 0.0)
 
 
 class MpiLauncherTests(unittest.TestCase):

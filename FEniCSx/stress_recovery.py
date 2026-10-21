@@ -46,7 +46,7 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
         tags = np.zeros(count, dtype=np.int32)
         valid = cell_tags.indices < count
         tags[cell_tags.indices[valid]] = cell_tags.values[valid]
-        for tag, name in ((1, "plinth"), (2, "wall"), (3, "bedrock")):
+        for tag, name in ((1, "wall"), (2, "bedrock")):
             selected = principal[tags == tag]
             records = domain.comm.allgather((
                 float(selected[:, -1].max()) if len(selected) else -np.inf,
@@ -56,8 +56,8 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
                 "maximum_principal_tensile_stress_pa": max(p[0] for p in records),
                 "maximum_principal_compressive_stress_pa": min(p[1] for p in records),
             }
-        principal[tags == 3, -1] = -np.inf
-        principal[tags == 3, 0] = np.inf
+        principal[tags == 2, -1] = -np.inf
+        principal[tags == 2, 0] = np.inf
     xyz = domain.geometry.x[mesh.entities_to_geometry(domain, 3, cells)].mean(axis=1)
     tensile = int(np.argmax(principal[:, -1]))
     compressive = int(np.argmin(principal[:, 0]))
@@ -89,7 +89,7 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
             reference = np.empty_like(nodal_tensors)
             reference[space.dofmap.list] = reference_stress[source_ids]
             concrete_ids = np.unique(space.dofmap.list[np.concatenate((
-                cell_tags.find(1), cell_tags.find(2),
+                cell_tags.find(1),
             ))])
             denominator = np.linalg.norm(reference[concrete_ids])
             if not np.isfinite(reference).all() or denominator <= 0:
@@ -99,11 +99,11 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
             )
             stress_parity = {
                 "relative_nodal_stress_difference": relative_difference,
-                "scope": "wall/plinth; matched source nodes; full recovered stress tensors",
+                "scope": "wall; matched source nodes; full recovered stress tensors",
                 "maximum_relative_nodal_stress_difference": 1e-4,
             }
         nodal_peaks, body_peaks = [], {}
-        for tag, name in ((1, "plinth"), (2, "wall"), (3, "bedrock")):
+        for tag, name in ((1, "wall"), (2, "bedrock")):
             ids = np.unique(space.dofmap.list[cell_tags.find(tag)])
             ids = ids[ids < owned_nodes]
             local = None
@@ -120,7 +120,7 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
                 "maximum_principal_tensile_stress_pa": max(0., maximum[0]),
                 "maximum_principal_compressive_stress_pa": min(0., minimum[2]),
             }
-            if tag in (1, 2):
+            if tag == 1:
                 nodal_peaks.extend(records)
         tensile_peak = max(nodal_peaks, key=lambda p: p[0])
         compressive_peak = min(nodal_peaks, key=lambda p: p[2])
@@ -139,7 +139,7 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
             local = [
                 nodal.eval(coordinates, np.asarray([cell], dtype=np.int32)).reshape(3, 3).tolist()
                 for cell in collisions.links(0) if cell < count
-                and (cell_tags is None or tags[cell] in (1, 2))
+                and (cell_tags is None or tags[cell] == 1)
                 and (region is None or (cell_tags is not None and tags[cell] == region))
             ]
             candidates = [tensor for rank_values in domain.comm.allgather(local) for tensor in rank_values]

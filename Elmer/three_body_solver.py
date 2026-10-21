@@ -1,4 +1,4 @@
-"""Solve the configured wall/plinth/rock model in a fresh, isolated run directory."""
+"""Solve the configured wall-on-bedrock model in a fresh, isolated run directory."""
 from __future__ import annotations
 
 import argparse
@@ -49,7 +49,7 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
     reporting_result = export_reporting_region(result, timeout=timeout)
     summary_path = reporting_result.parent / "stress_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    concrete = [summary["bodies"][name] for name in ("wall", "plinth")]
+    concrete = [summary["bodies"]["wall"]]
     tension = max(entry["peak_tension_mpa"] for entry in concrete) * 1e6
     compression = -max(entry["peak_compression_mpa"] for entry in concrete) * 1e6
     strength = config["material"]["concrete"]["tensile_strength_pa"]
@@ -58,7 +58,6 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "material": geometry["material"],
         "loads": geometry["loads"],
         "wall_geometry": geometry["wall_geometry"],
-        "wall_plinth_cutback": diagnostic["wall_plinth_cutback"],
         "maximum_applied_pressure_pa": geometry["maximum_applied_pressure_pa"],
         "model_kind": "three_body",
         "stress_result": str(reporting_result.resolve()),
@@ -68,26 +67,26 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "stress_bodies": summary["bodies"],
         "reporting_distance_m": summary["rock_reporting_distance_m"],
         "reporting_limitations": summary["limitations"],
-        "wall_plinth_connection": "configured_directional_springs",
-        "plinth_bedrock_connection": diagnostic.get("plinth_bedrock_connection", "spring"),
+        "wall_connection": "single_monolithic_body",
+        "wall_bedrock_connection": diagnostic.get("wall_bedrock_connection", "spring"),
         "connection_assumption": (
-            "Wall/plinth linear springs carry tension; plinth/bedrock perfectly bonded by shared nodes"
-            if diagnostic.get("plinth_bedrock_connection") == "bonded" else
-            "Separate coincident nodes; linear springs carry tension, not frictional contact"
+            "Wall perfectly bonded to the bedrock by shared seat nodes"
+            if diagnostic.get("wall_bedrock_connection") == "bonded" else
+            "Separate coincident seat nodes; linear springs carry tension, not frictional contact"
         ),
         "active_support": (
-            "Wall/plinth directional springs; bonded plinth/bedrock; "
-            if diagnostic.get("plinth_bedrock_connection") == "bonded" else
-            "Configured wall/plinth and plinth/bedrock directional springs; "
+            "Bonded wall/bedrock seat; "
+            if diagnostic.get("wall_bedrock_connection") == "bonded" else
+            "Configured wall/bedrock directional seat springs; "
         ) + (
             "rock bottom and sides on normal roller springs"
             if diagnostic.get("rock_outer_support", {}).get("model") == "rollers" else "fixed rock bottom"
         ),
         "rock_outer_support": diagnostic.get("rock_outer_support", {"model": "fixed_bottom"}),
-        "inactive_inputs": ["geometry.wall.height_above_plinth_m: nominal metadata",
+        "inactive_inputs": ["geometry.wall.height_m: nominal metadata; the seat follows geometry.bedrock.contours",
                             "outputs: selections do not change solver fields"] + (
                                 ["geometry.bedrock.support.spring_n_per_m3: inactive for bonded seat"]
-                                if diagnostic.get("plinth_bedrock_connection") == "bonded" else []
+                                if diagnostic.get("wall_bedrock_connection") == "bonded" else []
                             ),
         "regions": diagnostic["cells_by_body"],
         "interface_stiffness_n_per_m3": diagnostic["interface_stiffness_n_per_m3"],
@@ -95,7 +94,7 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "nodes": diagnostic["nodes"],
         "cells": sum(diagnostic["cells_by_body"].values()),
         "stress_analysis": {
-            "scope": "wall and plinth only; bedrock reported separately within 5 m",
+            "scope": "wall only; bedrock reported separately within 5 m",
             "max_tensile_principal_stress_pa": {"value_pa": tension},
             "max_compressive_principal_stress_pa": {"value_pa": compression},
             "tensile_strength_pa": strength,

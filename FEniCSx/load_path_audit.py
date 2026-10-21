@@ -16,7 +16,7 @@ def region_connection(points, cells, regions):
     if cells.ndim != 2 or cells.shape[1] != 4 or len(regions) != len(cells):
         raise ValueError("Expected tetrahedral connectivity and one region ID per cell")
     if set(np.unique(regions)) != {1, 2}:
-        raise ValueError("Audit requires exactly plinth (1) and wall (2) regions")
+        raise ValueError("Audit requires exactly wall (1) and bedrock (2) regions")
     nodes = {region: np.unique(cells[regions == region]) for region in (1, 2)}
     shared = np.intersect1d(nodes[1], nodes[2])
     coordinates = {
@@ -24,15 +24,15 @@ def region_connection(points, cells, regions):
         for region, ids in nodes.items()
     }
     return {
-        "wall_cells": int(np.count_nonzero(regions == 2)),
-        "plinth_cells": int(np.count_nonzero(regions == 1)),
+        "wall_cells": int(np.count_nonzero(regions == 1)),
+        "bedrock_cells": int(np.count_nonzero(regions == 2)),
         "shared_vertex_ids": int(len(shared)),
         "coincident_coordinate_count_rounded_1e_9_m": len(coordinates[1] & coordinates[2]),
         "direct_continuous_p1_displacement_transfer": bool(len(shared)),
         "qualification": (
             "Shared nodes indicate some kinematic coupling, not proof of a fully bonded interface."
             if len(shared) else
-            "No shared P1 displacement DOFs. Separate springs to ground do not couple the two bodies."
+            "No shared P1 displacement DOFs; wall-to-bedrock transfer depends on the configured seat springs."
         ),
     }
 
@@ -98,7 +98,7 @@ def audit(run: Path) -> dict:
     }
     ds = ufl.Measure("ds", domain=domain, subdomain_data=facets)
     f_to_c = domain.topology.connectivity(2, 3)
-    for tag in (1, 8, 9):
+    for tag in (10, 11, 12):
         ids = facets.find(tag)
         adjacent = [f_to_c.links(int(facet)) for facet in ids]
         report["interface_facets"][str(tag)] = {
@@ -108,9 +108,8 @@ def audit(run: Path) -> dict:
             "area_m2": float(fem.assemble_scalar(fem.form(1.0 * ds(tag)))),
         }
     report["mechanical_supports"] = {
-        "tag_1": "plinth foundation: directional spring to ground",
-        "tag_8": "wall base: directional spring to ground, not to plinth displacement",
-        "tag_9": "plinth-side coincident surface: no coupling/contact term in dam adapter",
+        "tag_10": "fixed rock bottom or configured normal roller support",
+        "tags_11_12": "opposing wall/bedrock seat spring faces; absent for bonded shared-node seats",
         "source": "dam_phase_field.support_form and dam_elasticity.solve",
     }
     baseline = json.loads((run / "refined_baseline" / "baseline_report.json").read_text())
@@ -152,15 +151,18 @@ def audit(run: Path) -> dict:
         }
     domain.topology.create_connectivity(3, 3)
     domain.topology.create_connectivity(3, 3)
-    wall_dofs = fem.locate_dofs_topological(alpha_space, 3, tags.find(2))
-    plinth_dofs = fem.locate_dofs_topological(alpha_space, 3, tags.find(1))
-    report["checkpoint"]["plinth_max_damage"] = float(alpha.x.array[plinth_dofs].max())
-    report["checkpoint"]["shared_damage_dofs"] = int(len(np.intersect1d(wall_dofs, plinth_dofs)))
-    for tag, name in ((8, "wall_base"), (9, "plinth_top")):
+    wall_dofs = fem.locate_dofs_topological(alpha_space, 3, tags.find(1))
+    bedrock_dofs = fem.locate_dofs_topological(alpha_space, 3, tags.find(2))
+    report["checkpoint"]["bedrock_max_damage"] = float(alpha.x.array[bedrock_dofs].max())
+    report["checkpoint"]["shared_wall_bedrock_damage_dofs"] = int(
+        len(np.intersect1d(wall_dofs, bedrock_dofs))
+    )
+    for tag, name in ((11, "wall_seat"), (12, "bedrock_seat")):
         dofs = fem.locate_dofs_topological(alpha_space, 2, facets.find(tag))
-        report["checkpoint"][f"{name}_damage_range"] = [
-            float(alpha.x.array[dofs].min()), float(alpha.x.array[dofs].max()),
-        ]
+        if len(dofs):
+            report["checkpoint"][f"{name}_damage_range"] = [
+                float(alpha.x.array[dofs].min()), float(alpha.x.array[dofs].max()),
+            ]
     norms = fem.Function(fem.functionspace(domain, ("DG", 0)))
     norms.interpolate(fem.Expression(
         ufl.sqrt(ufl.inner(strain(u), strain(u))), norms.function_space.element.interpolation_points,
@@ -174,17 +176,11 @@ def audit(run: Path) -> dict:
         float(((1 - peak_damage)**2 + residual).max()),
     ]
     point = np.asarray(report["checkpoint"]["strain_peak"]["centroid_xyz_m"])
-    for tag in (8, 9):
-        centroids = mesh.compute_midpoints(domain, 2, facets.find(tag))
-        distance = np.linalg.norm(centroids - point, axis=1)
-        nearest = int(np.argmin(distance))
-        report["interface_facets"][str(tag)]["nearest_centroid_to_checkpoint_strain_peak_m"] = centroids[nearest].tolist()
-        report["interface_facets"][str(tag)]["centroid_distance_not_exact_surface_distance_m"] = float(distance[nearest])
     report["limitations"] = [
         "Topology and saved-state inspection only; no new equilibrium solve.",
         "Checkpoint can be an unconverged iterate and is not a dam-safety result.",
-        "Ground-spring support does not implement wall/plinth contact or load redistribution.",
-        "No inference that removing damage constraints or bonding nodes is physically justified.",
+        "Seat support behavior is reported from the saved mesh tags and baseline reactions.",
+        "Topology alone does not establish engineering validity or justify a different seat model.",
     ]
     return report
 

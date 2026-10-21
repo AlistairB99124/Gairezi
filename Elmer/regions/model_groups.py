@@ -1,19 +1,11 @@
 """Semantic group contract shared by the mesh model and solver adapters."""
 
 REGION_GROUP_IDS = {
-    "PLINTH": 1,
-    "WALL": 2,
-    "MORTAR": 3,
-    "STEP_FILL": 4,
-    "HAUNCH": 5,
+    "WALL": 1,
 }
 
 REGION_NAMES = {
-    "PLINTH": "plinth",
     "WALL": "wall",
-    "MORTAR": "mortar",
-    "STEP_FILL": "step_fill",
-    "HAUNCH": "haunch",
 }
 
 FACE_GROUP_IDS = {
@@ -24,8 +16,6 @@ FACE_GROUP_IDS = {
     "LEFT_ABUTMENT": 5,
     "RIGHT_ABUTMENT": 6,
     "OTHER_EXTERIOR": 7,
-    "WALL_PLINTH_WALL": 8,
-    "WALL_PLINTH_PLINTH": 9,
 }
 
 GROUP_ENTITIES = {
@@ -34,7 +24,6 @@ GROUP_ENTITIES = {
 }
 
 REQUIRED_GROUPS = (
-    "PLINTH",
     "WALL",
     "FOUNDATION",
     "UPSTREAM",

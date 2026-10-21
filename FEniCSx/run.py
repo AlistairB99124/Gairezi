@@ -65,14 +65,13 @@ def inventory() -> dict:
         "material": asdict(structure.material),
         "loads": asdict(structure.loads),
         "foundation_support": asdict(structure.foundation_support),
-        "plinth_support": asdict(structure.plinth_support),
         "audit": audit,
         "porting_requirements": [
             "Preserve mixed-cell topology or verify a controlled conversion.",
-            "Preserve bonded internal wall/plinth faces and shared displacement nodes.",
-            "Foundation springs only; plinth support coefficients are inactive in the bonded reference.",
+            "Preserve the wall/bedrock seat as shared nodes or configured distributed springs.",
+            "Apply bedrock seat support from the submitted configuration.",
             "Verify displacement probes, reactions and global equilibrium against Elmer.",
-            "Verify crack contact and initial-gap geometry on a small benchmark before dam scenarios.",
+            "Verify the wall damage mask and bedrock-intact behavior on a small benchmark.",
         ],
     }
 
@@ -119,11 +118,7 @@ def assert_fracture_ready(structure, baseline_directory=None):
         return require_verified_baseline(
             structure, baseline_directory or getattr(structure, "three_body_baseline_directory", None),
         )
-    if not any(tag == 8 for tag, _ in structure.boundaries):
-        raise RuntimeError(
-            "Cracking is on hold pending review of the corrected bonded intact wall/plinth reference. "
-            "Run the elastic baseline first; joint opening/sliding and fracture require separate verification."
-        )
+    return None
 
 
 def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: bool = False,
@@ -162,7 +157,7 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
             from dolfinx.cpp.mesh import h
 
             parameters = PhaseFieldParameters(**defaults)
-            cells = imported.cell_tags.find(2)
+            cells = imported.cell_tags.find(1)
             maximum_diameter = float(h(imported.domain._cpp_object, 3, cells).max())
             resolution = parameters.length_scale_m / maximum_diameter
             if resolution < options.minimum_elements_per_length_scale:
@@ -242,10 +237,6 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
             "configuration_sha256": manifest["configuration_sha256"],
             "initial_cracks": [], "internal_crack_pressure_pa": 0.0,
         })
-        if report.get("wall_plinth_connection") == "bonded_intact_provisional":
-            report["fracture_hold_reason"] = (
-                "Cracking is on hold pending review of the corrected bonded intact wall/plinth reference."
-            )
         write_json(directory / report_name, report)
         (directory / "results.md").write_text(
             f"# {scenario}\n\n"
@@ -255,10 +246,10 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
                if phase else "Phase-field damage is disabled.\n\n")
             + "This is a numerical baseline, not engineering validation or a dam-safety assessment.\n\n"
             + (
-                "Wall/plinth connection: provisional fully bonded shared nodes. "
-                "Foundation springs only; geometry.plinth.support is inactive. "
-                "No joint opening/sliding. Cracking is on hold pending model review.\n\n"
-                if report.get("wall_plinth_connection") == "bonded_intact_provisional" else ""
+                "Wall-to-bedrock seat follows the configured bonded or distributed-spring model. "
+                ""
+                "\n\n"
+                if report.get("wall_bedrock_connection") in ("bonded", "spring") else ""
             )
             + "Principal-stress peaks use consistent L2 nodal recovery followed by "
             "element tensor averaging before eigenvalues, matching the Elmer comparison. "
@@ -393,12 +384,12 @@ def run_fracture(
         imported = import_structure(structure, maximum_volume_change=0.001)
         write_json(directory / "import_report.json", imported.report)
         from three_body_model import DAMAGE_REGION_IDS
-        damage_regions = DAMAGE_REGION_IDS if is_three_body(structure) else (2,)
+        damage_regions = DAMAGE_REGION_IDS if is_three_body(structure) else (1,)
         # The selected crack must reach every damageable concrete body its band crosses.
         required_regions = (
             tuple(region for region in generation["required_region_ids"] if region in damage_regions)
             or damage_regions
-        ) if generated else (2,)
+        ) if generated else (1,)
         placement = [
             crack_placement_report(imported, specification, required_regions, damage_regions)
             for specification in specifications

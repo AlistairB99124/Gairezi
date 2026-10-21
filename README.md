@@ -2,23 +2,25 @@
 
 This repository is the clean v2 working copy for the Gairedzi dam study.
 
-The purpose of this repo is to separate the newer plinth-based geometry work from the earlier baseline model and keep the design assumptions explicit.
+The purpose of this repo is to separate the newer surveyed-foundation geometry work from the earlier baseline model and keep the design assumptions explicit.
 
-## Integrated wall/plinth/bedrock solver
+On this branch the wall sits **directly on the bedrock**: there is no plinth. The model has two bodies, wall (1) and bedrock (2). Module and file names containing `three_body` are kept for compatibility.
+
+## Integrated wall/bedrock solver
 
 This is now the canonical **WPF app/API** model as well as the CLI model.
 New app submissions use the existing isolated job directories, preserve all
-configured cutback/domain/mesh/spring data, and run `Elmer.three_body_solver`
+configured domain/mesh/spring data, and run `Elmer.three_body_solver`
 through its `--config-root`, `--output-dir`, `--report-path` job adapter.
 The desktop opens the 5 m reporting VTU by default, retains a full-domain
-ParaView action, and shows separate wall/plinth/near-field rock principal
+ParaView action, and shows separate wall/near-field rock principal
 stresses. Bedrock is read-only in the editor. Historical jobs retain their
 old result paths; legacy FEniCSx baseline/fracture is explicitly blocked for
 new three-body jobs, not silently run with incompatible joints. Restart the
 updated API and rebuild/relaunch the desktop. See the parent app README.
 
 **Elmer: Run solver** (the default build task) and **Elmer: Run combined solver**
-now run all three bodies, including the approved graded 2H bedrock domain.
+now run the wall and bedrock, including the approved graded 2H bedrock domain.
 Equivalent PowerShell command:
 
 ```powershell
@@ -34,16 +36,16 @@ in the output root points only to the last successfully verified run; check the
 current run's status, not that pointer, to establish whether a new run succeeded.
 
 Open the printed `model\results\three_body_results_t0001.pvtu` in ParaView.
-Keep its adjacent VTU pieces. Colour by cell `GeometryIds`: **1 = plinth,
-2 = wall, 3 = bedrock**, or select displacement and stress fields. These are
+Keep its adjacent VTU pieces. Colour by cell `GeometryIds`: **1 = wall,
+2 = bedrock**, or select displacement and stress fields. These are
 solved fields, unlike the geometry-only preview below.
 
 ### Stress reporting region: concrete and nearby bedrock
 
 Three-body runs also generate `model\reporting\structure_and_near_rock.vtu`
 and `model\reporting\stress_summary.json`. **Use this VTU for stress review**:
-it contains all wall and plinth cells and only bedrock within **5 m of the
-nearest wall or plinth surface**, in undeformed coordinates. All solved fields
+it contains all wall cells and only bedrock within **5 m of the
+nearest wall surface**, in undeformed coordinates. All solved fields
 are retained. Rescale ParaView's colour map to this filtered dataset; do not
 reuse the full-domain colour range.
 
@@ -79,23 +81,24 @@ The analysis uses the same 80 m survey reference, seat and graded rock mesh as
 the approved preview. Concrete cells are subdivided into conforming linear
 tetrahedra without adding or moving nodes, following the legacy solver's concrete
 element formulation; rock uses conforming distance-graded linear tetrahedra.
-The supplied configuration enables the plinth cutbacks described below; the
-shared concrete builder is used by both this solver and the geometry preview.
+The shared wall builder is used by both this solver and the geometry preview.
 It uses each body's configured density, Young's modulus
-and Poisson ratio and applies self-weight to all three bodies. Interface springs
-use the existing directional support values with separate coincident nodes:
+and Poisson ratio and applies self-weight to both bodies. With a spring seat, the wall/rock
+interface uses the directional support values with separate coincident nodes:
 
 | Joint | Configuration source | Current x / y / z stiffness (N/m³) |
 |---|---|---|
-| Wall / plinth | `geometry.plinth.support.spring_n_per_m3` | 1.25e9 / 1.25e9 / 3e9 |
-| Plinth / bedrock | `geometry.bedrock.support.spring_n_per_m3` | 1e9 / 1e9 / 5e9 |
+| Wall / bedrock | `geometry.bedrock.support.spring_n_per_m3` | 1.25e9 / 1.25e9 / 3e9 |
+
+With `geometry.bedrock.support.model: bonded` the wall and rock share seat
+nodes instead and these coefficients are inactive.
 
 Directions are **global Cartesian x/y/z**, not local normal/tangential axes.
 For each component, traction = configured stiffness times the relative
 displacement between the two bodies. Zero stiffness releases that component;
 an inadequately restrained model can fail to solve. No stiffness is inferred
 from Young's modulus. These coefficients are applied only between bodies:
-the old grounded foundation/plinth springs are **not also applied**.
+the old grounded foundation springs are **not also applied**.
 The temporary top-level `interfaces` section has been removed and is rejected
 by validation rather than silently overriding the support values. Remove that
 obsolete section from older input configurations before starting new runs.
@@ -161,90 +164,46 @@ full-resolution jobs concurrently. Check RAM, committed memory and the latest
 residuals rather than assuming that an active CPU means useful progress.
 
 The prior two-body CLI `Elmer\structure_assembly.py combined-solve` and its
-defaults remain unchanged, available as **Elmer: Run legacy wall/plinth
+defaults remain unchanged, available as **Elmer: Run legacy wall-only
 foundation-spring solver**. Legacy client reports and the existing FEniCSx
 tasks still consume that two-body result; they are not three-body post-processing.
 Use the labelled ParaView fields for the new analysis, not the legacy
 concrete-only report generator.
 
-### Wall/plinth corner cutbacks
+### Wall underside on the bedrock
 
-The plinth **underside** now follows straight sloping segments between the
-unchanged `geometry.bedrock.contours` elevations, across its full 6 m width.
-It is no longer rounded down to 0.5 m horizontal courses and is not spline
-smoothed. Survey breakpoints and the flat valley-bottom segment remain.
-Standalone preview and canonical combined/three-body meshes use the same
-linear seat profile. The rock mesher locks its seat to those exact foundation
-triangles; a bonded seat shares displacement nodes, while the default spring
-seat keeps coincident but separate plinth and rock nodes. The upper
-wall/plinth cutbacks below remain unchanged. At thin bank closures, the retained
-lower wedges follow the actual sloping seat rather than assuming horizontal
-lower corners. Interior mesh courses may remain horizontal; they are not
-steps in the exposed underside.
-
-`geometry.plinth.wall_interface` selects the longitudinal joint topology:
-
-- `"cutback_45deg"` (enabled in the supplied configuration) removes the upper
-  triangular corner of each staircase plinth step and assigns that same volume
-  to the wall only beneath the original wall footprint. Outside that footprint,
-  the shoulder corner wedges are removed and left empty.
-- `"stepped"`, or omitting the optional setting, retains the previous geometry.
-
-Each current 0.5 m rise is replaced by a 0.5 m run in **design chainage/elevation
-coordinates**. This is nominally 45 degrees; on the curved wall, physical slopes
-vary slightly across the radial width and with the 80 m survey mapping.
-Cutback generation fails explicitly if the adjacent mesh run and step rise
-do not match. It does not silently alter contour elevations or move nodes.
-
-The shared builder replaces selected hexahedra by matching triangular prisms.
-The cutback spans the **full plinth width, including both radial shoulders**.
-Wall fills only the cutbacks within its original 4 m footprint; the two 1 m
-shoulder cutbacks remain empty. The wall does not widen. Plinth volume is
-reduced by both the transferred wall wedges and the removed shoulder wedges;
-total concrete volume decreases by the latter. The exact bedrock seat is
-preserved. Newly exposed shoulder slopes and wall sides receive the existing
-upstream/downstream water-pressure law for their respective side; this does not
-introduce an uplift model. The three-body solver then tetrahedralizes
-the concrete and applies the configured wall/plinth springs on the new matching
-inclined faces, using separate coincident nodes.
-Spring values and their global x/y/z interpretation do not change.
-
-`wall_plinth_cutback` in the preview and preparation reports records the number
-of steps, transferred volume and reference radius. That volume is measured in
-the builder coordinates **before** survey remapping. Start a fresh run to use
-the revised joint; existing snapshots and results are unchanged. Cutbacks can
-reduce corner stress concentrations but do not prove their elimination or
-replace a mesh-convergence study and engineering review.
-
-For inspection, colour **cell** `RegionId` in the geometry preview or cell
-`GeometryIds` in solver results. Threshold value **1** to isolate plinth and hide
-the original source. The wall fills the cutbacks, so a single solid colour for
-the entire concrete envelope can still conceal the internal joint beneath the
-wall, but the shoulder slopes are exposed. The report identifies the current
-revision with `shoulder_fill: empty_outside_original_wall_footprint` and records
-`removed_shoulder_volume_m3`. Earlier runs either retained stepped shoulders or
-filled them with wall; regenerate rather than reusing those results.
+There is no plinth. The wall **underside** follows straight sloping segments
+between the unchanged `geometry.bedrock.contours` elevations, across the full
+wall thickness. It is not rounded to horizontal courses and is not spline
+smoothed. Survey breakpoints and the flat valley-bottom segment remain. The wall
+spans the chainages where the rock lies below the crest (z = 0; about 6 to 174 m
+for the supplied contours) and tapers to zero height at both ends.
+Standalone preview and solver meshes use the same linear seat profile. The rock
+mesher locks its seat to those exact wall-underside triangles; a bonded seat
+shares displacement nodes, while a spring seat keeps coincident but separate
+wall and rock nodes (boundary tags 11 = wall side, 12 = rock side).
+`geometry.wall.height_m` is nominal metadata; the contours set the real height.
 
 ## Three-body bedrock geometry review (Elmer scope)
 
-**The legacy combined solver result contains only wall and plinth.** Its
+**The legacy combined solver result contains only the wall.** Its
 bedrock support is a spring boundary condition, not a visible rock volume.
 Changing the bedrock contours does not add a rock body to that solve or its
 stress CSV. Do not use the geometry preview as a bedrock stress result.
 
-Run **Elmer: Preview wall, plinth and bedrock (geometry only)** from VS Code,
+Run **Elmer: Preview wall and bedrock (geometry only)** from VS Code,
 or generate the standalone ParaView geometry preview in PowerShell:
 
 ```powershell
 .\.venv\Scripts\python.exe -m Elmer.bedrock_preview --output "$env:LOCALAPPDATA\Lamb\bedrock-preview"
 ```
 
-Open `three_body_geometry.pvtu` and colour by cell `RegionId`: 1 = plinth,
-2 = wall, 6 = bedrock. All three adjacent VTU files are required. Concrete
+Open `three_body_geometry.pvtu` and colour by cell `RegionId`: 1 = wall,
+2 = bedrock. Both adjacent VTU files are required. Concrete
 uses `material.concrete`; rock uses `material.bedrock` from `config.json`.
 The rock starts from the approved 80 m-survey chord section, extruded through
 the concrete's upstream/downstream bounds. Its top
-matches the existing plinth underside exactly at the seat, with a triangulated
+matches the wall underside exactly at the seat, with a triangulated
 transition to the projected canyon profile at the outer perimeter. By default
 the rock uses `geometry.bedrock.domain` from `config.json`:
 
@@ -262,7 +221,7 @@ is assumed flat at the end survey heights; no additional site geology is implied
 The canyon section is held constant upstream/downstream outside the seat transition.
 The current bedrock profile reaches z = +5 m
 at chainages 0 and 180, above the z = +3 m surcharge water surface, while the
-plinth still ends at chainages 6 and 174. The diagnostic below accepts the same
+wall ends where the rock reaches the crest (chainages 6 and 174). The diagnostic below accepts the same
 options. `--stream-margin-m`, `--bank-margin-m` and `--bottom-z-m` override the
 configured dimensions for either command without rewriting the configuration.
 Configurations without the optional `domain` section retain the legacy 20 m
@@ -276,10 +235,10 @@ tetrahedral rock mesh**, controlled by `geometry.bedrock.mesh`:
 |---|---:|---|
 | `near_size_m` | 0.5 | Nominal near-interface element length |
 | `far_size_m` | 15 | Nominal remote-rock element length |
-| `near_distance_m` | 2 | Fine buffer from the plinth underside |
+| `near_distance_m` | 2 | Fine buffer from the wall underside |
 | `far_distance_m` | 50 | Distance at which the far-field target is reached |
 
-A Gmsh `Distance` field samples the actual triangulated plinth-seat **surfaces**
+A Gmsh `Distance` field samples the actual triangulated wall-seat **surfaces**
 (`SurfacesList`, not `VolumesList`); a `Threshold` field grades linearly between
 these distances in all three dimensions. Existing seat nodes and all seat
 triangles are locked, including their diagonals. The rock exterior retains the
@@ -326,8 +285,8 @@ preview command.
 ```
 
 Use a new empty directory. This runs four MPI ranks of Elmer with concrete
-and rock self-weight and the existing concrete water loads. The wall/plinth
-and plinth/rock interfaces are bonded for this diagnostic only; the rock bottom
+and rock self-weight and the existing concrete water loads. The wall/rock
+seat is bonded for this diagnostic only; the rock bottom
 (currently z = -87 m) and rock sides use the `material.bedrock.support` model
 (normal-only roller springs by default; fixed bottom and free sides if absent),
 and uplift is zero. Existing
@@ -343,7 +302,7 @@ installation directory for body attribution. That step uses VTK to preserve
 Elmer field arrays, removes auxiliary surface cells, and matches volume cells
 to the source mesh after subtracting displacement from Elmer's deformed output
 coordinates. Displacement and stress values are not recomputed.
-Its cell `GeometryIds` identifies 1 = plinth, 2 = wall, 3 = bedrock.
+Its cell `GeometryIds` identifies 1 = wall, 2 = bedrock.
 Unlike the preview's region 6, solver body IDs are contiguous to prevent
 ElmerGrid renumbering. `diagnostic.json`, the configuration snapshot, SIF,
 mesh and `solver.log` record the run. The development solve has a 480-second
@@ -463,8 +422,7 @@ the deleted `Elmer/load_cases.json` is read by these workflows.
 | `geometry.global_element_size_m` | Shared mesh spacing in metres |
 | `geometry.local_element_size_m` | Corner refinement for standalone geometry generators |
 | `geometry.wall` | Wall face radii, radial width and centreline |
-| `geometry.plinth` | Plinth radii, signed contour elevations and wall/plinth spring support |
-| `geometry.bedrock` | Signed bedrock contour elevations and foundation spring support |
+| `geometry.bedrock` | Signed bedrock contour elevations (the wall seat) and wall/rock seat support |
 | `material.concrete` | Density, Young's modulus, Poisson ratio and tensile-strength reporting threshold |
 | `material.bedrock` | Rock material data; no rock volume is currently meshed |
 | `loads` | Gravity, water density, reference water depth, overflow and tailwater heads |
@@ -472,8 +430,9 @@ the deleted `Elmer/load_cases.json` is read by these workflows.
 | `crack_simulations` | Optional; declared phase-field cracks consumed by [FEniCSx/crack_field.py](FEniCSx/crack_field.py) |
 
 Contour `height` is a signed elevation relative to crest z = 0, not a positive
-wall height. Plinth and bedrock stations must match and be strictly increasing.
-The mesh follows these contours; `height_above_plinth_m` is nominal metadata,
+wall height. Bedrock stations must be strictly increasing and must dip below
+the crest so the wall has a seat. A `geometry.plinth` section is rejected as an
+unknown field. The mesh follows these contours; `geometry.wall.height_m` is nominal metadata,
 not a second instruction to shift their elevations. Changing dam height means
 updating the contour elevations. There is no implicit crest raise or chainage
 rescaling. Radial width must equal upstream minus downstream radius, and each
@@ -523,8 +482,8 @@ tetrahedra plus a 1.8 GB mesh in testing; that exceeded the available serial WSL
 memory. Use parallel/distributed meshing and solve resources for that target,
 then perform a mesh/length-scale convergence study. The app workflow instead
 pauses after the elastic baseline and asks the user to click the crack location
-on a Z-Y plot of baseline wall/plinth stress (no automatic placement), then
-seeds a local 4 m crack there so that the concrete bodies it crosses (but not
+on a Z-Y plot of baseline wall stress (no automatic placement), then
+seeds a local 4 m crack there so that the wall (but not
 bedrock) can damage, with a 0.25 m length scale and a 4,000,000-cell refinement
 budget; see [FEniCSx/README.md](FEniCSx/README.md).
 
@@ -555,37 +514,36 @@ section are always global Cartesian coordinates, not chainage/radius values.
 |---|---|
 | `geometry.global_element_size_m` | Active; controls the shared mesh spacing |
 | `geometry.local_element_size_m` | Validated, but does not refine the combined mesh |
-| Wall/plinth radii and contour elevations | Active; define the mesh geometry |
-| `geometry.wall.height_above_plinth_m` | Nominal metadata; contour elevations define actual geometry |
+| Wall radii and bedrock contour elevations | Active; define the mesh geometry |
+| `geometry.wall.height_m` | Nominal metadata; contour elevations define actual geometry |
 | Directional support springs | Active; explicit X/Y/Z stiffnesses are used as configured |
 | Bedrock material properties | Retained and validated; no bedrock volume is currently meshed |
-| `loads.overflow_head`, gravity and water density | Active in hydrostatic loading |
-| `loads.water_height` and `loads.overflow_water_level` | Reference-depth metadata; the latter must equal their documented sum |
+| `loads.water_height`, `loads.overflow_head`, gravity and water density | Active in hydrostatic loading |
+| `loads.overflow_water_level` | Reservoir depth above the deepest seat; must equal `water_height + overflow_head` |
 | `outputs.*` flags | Validated metadata only; the current solver still writes its standard fields and reports |
 | `outputs.cracking_risk` | Not a crack/damage analysis; the elastic model does not implement crack propagation |
 | `crack_simulations[*]` | Active in the FEniCSx `run-fracture` action; placement, refinement, load stepping and solver controls are validated |
 
-The supplied model has a **4 m wall** at radii **76-80 m**, on a **6 m plinth**
-at radii **75-81 m**. Both centrelines are 78 m, with 1 m overhang on each side.
-The deepest wall/plinth interface is z = -28 m and bedrock is z = -29 m.
+The supplied model has a **4 m wall** at radii **76-80 m** (centreline 78 m)
+seated directly on the bedrock. The deepest wall/rock seat is z = -29 m.
 Support stiffness uses the explicit directional `spring_n_per_m3` values;
 rock/concrete elastic moduli do not silently recalculate these springs.
 
 ### Reservoir overflow head and pressure
 
-As intended, the water surface is at `loads.overflow_head` above crest z = 0:
-`p(z) = water_density * abs(gravity) * max(overflow_head - z, 0)`.
-`water_height` is a reference depth, not a reservoir-level control.
-`overflow_water_level` must equal `water_height + overflow_head` and is also
-a reference depth. The reported reference peak is calculated from that sum,
-not independently configured.
+The reservoir depth is measured from the deepest wall seat (the lowest
+bedrock contour, z = -29 m; crest z = 0). The upstream water surface is at
+`z_s = z_seat + water_height + overflow_head` and
+`p(z) = water_density * abs(gravity) * max(z_s - z, 0)`.
+The crest surcharge is `water_density * abs(gravity) * max(z_s, 0)`, so it is
+zero when the reservoir is below the crest. `overflow_water_level` must equal
+`water_height + overflow_head`.
 
-With the supplied 31 m reference depth and 3 m overflow head, the reference
-peak is **333540 Pa**, but the actual pressure at the model's deepest bedrock
-z = -29 m is **313920 Pa**, and at the wall/plinth interface z = -28 m it is
-**304110 Pa**. Crest pressure is **29430 Pa**. This distinction is intentional.
-Changing `overflow_head`, gravity or water density changes the applied pressure;
-changing only the reference depth does not.
+With the supplied 29 m water height and 3 m overflow head, z_s = +3 m: the
+pressure at the deepest seat is **313920 Pa** and at the crest **29430 Pa**.
+Setting `water_height` and `overflow_head` to 0 empties the reservoir
+(gravity-only upstream face); tailwater is controlled separately by
+`tailwater_head`.
 
 Run **Elmer: Run combined solver**, or in PowerShell:
 
@@ -602,6 +560,9 @@ The separate calibration and crack/scenario JSONs remain scenario-specific
 inputs, not additional sources for the shared baseline dam properties.
 
 ## Background: v1 baseline
+
+> Historical notes. The v2 plinth-and-wedge interpretation described below was
+> later superseded; on this branch the wall sits directly on the bedrock.
 
 The original v1 model was a straightforward curved dam wall built directly from the general base contour data in Data/Dam_Base_Contours.json.
 

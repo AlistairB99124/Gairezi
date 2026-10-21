@@ -25,7 +25,6 @@ from Elmer.structural_model import (
 
 from Elmer.regions.combined_structure import write_combined_gmsh, write_combined_vtu
 from Elmer.regions.tetrahedral import tetrahedralize_structure
-from Elmer.regions.plinth import audit_plinth, build_plinth, write_gmsh, write_vtu
 from Elmer.model_config import CONFIG_PATH
 from Elmer.regions.combined_structure import load_material, load_environment, load_foundation_support
 
@@ -88,19 +87,6 @@ def convert_with_elmergrid(
     return True
 
 
-def build_plinth_region(root: Path = ROOT, output_dir: Path = OUTPUT_DIR) -> dict[str, object]:
-    mesh = build_plinth(root)
-    mesh_path = output_dir / "plinth.msh"
-    preview_path = output_dir / "plinth.vtu"
-    write_gmsh(mesh, mesh_path)
-    write_vtu(mesh, preview_path)
-    report = audit_plinth(mesh, root)
-    report["gmsh_path"] = str(mesh_path)
-    report["paraview_path"] = str(preview_path)
-    report["elmer_conversion"] = convert_with_elmergrid(mesh_path, output_dir / "plinth_mesh")
-    return report
-
-
 def build_combined_region(root: Path = ROOT, output_dir: Path = OUTPUT_DIR) -> dict[str, object]:
     mesh = build_combined_structure(root)
     mesh_path = output_dir / "combined_structure.msh"
@@ -119,7 +105,6 @@ def apply_load_case(mesh, path: Path) -> None:
     mesh.material = load_material(path)
     mesh.loads = load_environment(path)
     mesh.foundation_support = load_foundation_support(path)
-    mesh.plinth_support = load_foundation_support(path, "plinth")
 
 
 def write_combined_solver_input(mesh, path: Path) -> None:
@@ -129,18 +114,17 @@ def write_combined_solver_input(mesh, path: Path) -> None:
     foundation_spring_x = foundation_support.spring_x_n_per_m3
     foundation_spring_y = foundation_support.spring_y_n_per_m3
     foundation_spring_z = foundation_support.spring_z_n_per_m3
-    if any(tag in (8, 9) for tag, _ in mesh.boundaries):
-        raise ValueError("Bonded solver input cannot contain separate wall/plinth spring faces; regenerate mesh")
+    if any(tag > 7 for tag, _ in mesh.boundaries):
+        raise ValueError("Solver input contains unknown boundary tags; regenerate mesh")
     water_density = mesh.loads.water_density_kg_m3
     tailwater_head = mesh.loads.tailwater_head_m
-    overflow_head = mesh.loads.overflow_head_m
+    upstream_surface = getattr(mesh.loads, "upstream_surface_z_m", mesh.loads.overflow_head_m)
     foundation_elevation = min(z_m for _, _, z_m in mesh.nodes)
     tailwater_elevation = foundation_elevation + tailwater_head
     water_pressure_gradient = water_density * abs(mesh.loads.gravity_z_m_s2)
-    overflow_surcharge = water_pressure_gradient * overflow_head
+    overflow_surcharge = water_pressure_gradient * max(upstream_surface, 0.0)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f'''! Provisional bonded wall/plinth: shared nodes, no joint opening/sliding.
-! Foundation support only; geometry.plinth.support is inactive.
+    path.write_text(f'''! Single wall body seated on the bedrock; foundation springs from geometry.bedrock.support.
 Header
     CHECK KEYWORDS Warn
     Mesh DB "mesh" "/"
@@ -161,13 +145,6 @@ Constants
 End
 
 Body 1
-    Name = "PlinthBody"
-    Equation = 1
-    Material = 1
-    Body Force = 1
-End
-
-Body 2
     Name = "WallBody"
     Equation = 1
     Material = 1
@@ -226,7 +203,7 @@ Boundary Condition 2
     Name = "UpstreamHydrostaticPressure"
     Target Boundaries(1) = 2
     Normal Force = Variable Coordinate 3
-        Real MATC "-{pressure_gradient:.12g} * ({overflow_head:.12g} - tx) * (tx < {overflow_head:.12g})"
+        Real MATC "-{pressure_gradient:.12g} * ({upstream_surface:.12g} - tx) * (tx < {upstream_surface:.12g})"
 End
 
 Boundary Condition 3
@@ -311,8 +288,8 @@ def main() -> None:
     parser.add_argument(
         "region",
         nargs="?",
-        default="plinth",
-        choices=("plinth", "combined", "combined-solve"),
+        default="combined",
+        choices=("combined", "combined-solve"),
     )
     parser.add_argument(
         "--config-root",
@@ -340,9 +317,7 @@ def main() -> None:
     root = args.config_root if args.config_root is not None else ROOT
     output_dir = args.output_dir if args.output_dir is not None else OUTPUT_DIR
     solver_dir = output_dir / "combined_solver" if args.output_dir is not None else COMBINED_SOLVER_DIR
-    if args.region == "plinth":
-        report = build_plinth_region(root, output_dir)
-    elif args.region == "combined":
+    if args.region == "combined":
         report = build_combined_region(root, output_dir)
     else:
         report = solve_combined_structure(root, solver_dir)

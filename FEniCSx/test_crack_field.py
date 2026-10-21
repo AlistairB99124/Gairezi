@@ -337,7 +337,7 @@ class CrackPlacementAndRefinementTests(unittest.TestCase):
         domain = mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2)
         dimension = domain.topology.dim
         cells = np.arange(domain.topology.index_map(dimension).size_local, dtype=np.int32)
-        cell_tags = mesh.meshtags(domain, dimension, cells, np.full(len(cells), 2, dtype=np.int32))
+        cell_tags = mesh.meshtags(domain, dimension, cells, np.full(len(cells), 1, dtype=np.int32))
         domain.topology.create_connectivity(dimension - 1, dimension)
         facets = mesh.exterior_facet_indices(domain.topology)
         facet_tags = mesh.meshtags(
@@ -368,25 +368,21 @@ class CrackPlacementAndRefinementTests(unittest.TestCase):
         self.assertIn("mesh_bounds", str(context.exception))
         self.assertIn("concrete wall", str(context.exception))
 
-    def test_junction_crack_must_reach_both_plinth_and_wall(self):
+    def test_wall_damage_band_may_reach_intact_bedrock(self):
         imported = self.imported_box()
         domain = imported.domain
         cells = imported.cell_tags.indices
         midpoints = mesh.compute_midpoints(domain, domain.topology.dim, cells)
-        # Lower half plinth (1), upper half wall (2), junction at z=0.5.
-        values = np.where(midpoints[:, 2] < 0.5, 1, 2).astype(np.int32)
+        values = np.where(midpoints[:, 2] < 0.5, 2, 1).astype(np.int32)
         imported.cell_tags = mesh.meshtags(domain, domain.topology.dim, cells, values)
-        spanning = specification(centre_m=(0.5, 0.5, 0.45), size_m=(0.4, 0.4, 0.02), length_scale_m=0.2)
-        report = crack_placement_report(imported, spanning, (1, 2), (1, 2))
+        spanning = specification(centre_m=(0.5, 0.5, 0.55), size_m=(0.4, 0.4, 0.02), length_scale_m=0.2)
+        report = crack_placement_report(imported, spanning)
         self.assertTrue(report["valid"])
         self.assertEqual(report["centre_region_ids"], [1])
         self.assertGreater(report["band_cell_count_by_region"]["1"], 0)
-        self.assertGreater(report["band_cell_count_by_region"]["2"], 0)
-        # Wall-only placement rules reject a centre in the plinth.
-        self.assertFalse(crack_placement_report(imported, spanning)["valid"])
-        plinth_only = specification(centre_m=(0.5, 0.5, 0.1), size_m=(0.4, 0.4, 0.02), length_scale_m=0.02)
-        with self.assertRaisesRegex(ValueError, "concrete plinth and concrete wall"):
-            validate_crack_placement(imported, plinth_only, (1, 2), (1, 2))
+        bedrock_centre = specification(centre_m=(0.5, 0.5, 0.1), size_m=(0.4, 0.4, 0.02), length_scale_m=0.02)
+        with self.assertRaisesRegex(ValueError, "concrete wall"):
+            validate_crack_placement(imported, bedrock_centre)
 
     def test_local_refinement_preserves_region_and_boundary_tags(self):
         imported = self.imported_box()
@@ -406,7 +402,8 @@ class CrackPlacementAndRefinementTests(unittest.TestCase):
         )
         after = refined.report["levels"][-1]["cracks"][0]["elements_per_length_scale"]
         self.assertGreater(after, before)
-        self.assertGreater(len(refined.cell_tags.find(2)), 0)
+        self.assertGreater(len(refined.cell_tags.find(1)), 0)
+        self.assertEqual(set(refined.cell_tags.values), {1})
         self.assertGreater(len(refined.facet_tags.find(1)), 0)
         self.assertEqual(refined.report["status"], "preliminary_under_resolved")
         self.assertFalse(refined.report["meets_recommended_resolution"])

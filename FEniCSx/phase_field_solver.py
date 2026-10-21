@@ -285,7 +285,7 @@ def solve_staggered(
     boundary_conditions: Callable | None = None,
     output: Path | None = None,
     damage_cell_tags=None,
-    damage_region_ids: tuple[int, ...] = (2,),
+    damage_region_ids: tuple[int, ...] = (1,),
     parameters: PhaseFieldParameters | None = None,
     mechanics_formulation: str = "hybrid",
     damage_acceleration: bool = False,

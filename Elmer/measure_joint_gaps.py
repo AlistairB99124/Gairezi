@@ -1,7 +1,7 @@
 """Run with pvpython after attribute_diagnostic_result.py: joint gaps per body pair.
 
 The gap at a joint location is the upper body's displacement minus the lower
-body's (wall - plinth, plinth - bedrock), in metres. Bonded joints give zero.
+body's (wall - bedrock), in metres. Bonded joints give zero.
 Prints one JSON line.
 """
 from pathlib import Path
@@ -13,8 +13,8 @@ import numpy as np
 from vtkmodules.util.numpy_support import vtk_to_numpy
 from vtkmodules.vtkIOXML import vtkXMLUnstructuredGridReader
 
-BODY_NAMES = {1: "plinth", 2: "wall", 3: "bedrock"}
-JOINTS = {"wall_plinth": (2, 1), "plinth_bedrock": (1, 3)}
+BODY_NAMES = {1: "wall", 2: "bedrock"}
+JOINTS = {"wall_bedrock": (1, 2)}
 
 
 def measure(result: Path) -> dict[str, object]:

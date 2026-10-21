@@ -42,10 +42,10 @@
       "maximum_probe_relative_difference": 0.10,
       "maximum_force_balance_error": 0.001,
       "probes": [
-        {"name": "upstream_crest", "region_id": 2, "point_m": [78.5, 14.3, 0.0], "maximum_distance_m": 1.0},
-        {"name": "upstream_midwall", "region_id": 2, "point_m": [78.5, 14.3, -14.0], "maximum_distance_m": 1.0},
-        {"name": "upstream_lower_wall", "region_id": 2, "point_m": [78.5, 14.3, -25.0], "maximum_distance_m": 1.0},
-        {"name": "plinth_base", "region_id": 1, "point_m": [76.5, 14.0, -29.0], "maximum_distance_m": 1.5}
+        {"name": "upstream_crest", "region_id": 1, "point_m": [78.5, 14.3, 0.0], "maximum_distance_m": 1.0},
+        {"name": "upstream_midwall", "region_id": 1, "point_m": [78.5, 14.3, -14.0], "maximum_distance_m": 1.0},
+        {"name": "upstream_lower_wall", "region_id": 1, "point_m": [78.5, 14.3, -25.0], "maximum_distance_m": 1.0},
+        {"name": "wall_base", "region_id": 1, "point_m": [76.5, 14.0, -29.0], "maximum_distance_m": 1.5}
       ]
     }
   },

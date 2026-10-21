@@ -39,14 +39,14 @@ def file_hash(path: Path) -> str:
 
 
 def concrete_nodal_peak(points: np.ndarray, stress: np.ndarray, node_regions: np.ndarray) -> dict:
-    """Peak nodal principal stress over wall and plinth, matching the displayed Elmer field.
+    """Peak nodal principal stress over wall, matching the displayed Elmer field.
 
-    Wall and plinth nodes are distinct across the spring joint, so each nodal tensor belongs
-    to one concrete body. Nodes also belonging to rock (bonded seat) count as plinth.
+    Wall and bedrock nodes are distinct across a spring seat. Shared nodes on a bonded
+    seat carry both wall and bedrock membership bits.
     """
-    concrete = np.flatnonzero((node_regions & 3) > 0)
+    concrete = np.flatnonzero((node_regions & 1) > 0)
     if not len(concrete):
-        raise ValueError("Elmer baseline has no wall or plinth nodes.")
+        raise ValueError("Elmer baseline has no wall nodes.")
     xx, yy, zz, xy, yz, xz = stress[concrete].T
     tensors = np.stack((
         np.stack((xx, xy, xz), axis=-1), np.stack((xy, yy, yz), axis=-1), np.stack((xz, yz, zz), axis=-1),
@@ -112,11 +112,11 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
         "max_principal_stress": peak,
         "has_tension": peak["value_pa"] > 0,
         "peak_method": (
-            "maximum principal eigenvalue of the Elmer nodal stress tensor over wall and plinth nodes"
+            "maximum principal eigenvalue of the Elmer nodal stress tensor over wall nodes"
             if three_body else "maximum principal eigenvalue of element-mean nodal stress tensor"
         ),
         "field_archive": "elmer_baseline_fields.npz",
-        "node_regions_encoding": "membership bits: 1=plinth, 2=wall, 4=bedrock; combined bits for shared nodes",
+        "node_regions_encoding": "membership bits: 1=wall, 2=bedrock; combined bits for shared nodes",
         "usage": "baseline fields are not fracture initial conditions; the user-selected crack location is recorded separately",
         "engineering_validated": False,
     }

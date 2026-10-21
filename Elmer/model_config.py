@@ -11,7 +11,7 @@ from pathlib import Path
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 
 CONFIG_KEYS = {
-    "geometry": {"global_element_size_m", "local_element_size_m", "wall", "plinth", "bedrock"},
+    "geometry": {"global_element_size_m", "local_element_size_m", "wall", "bedrock"},
     "material": {"concrete", "bedrock"},
     "loads": {
         "gravity",
@@ -68,7 +68,6 @@ ENERGY_SPLITS = {"volumetric_deviatoric"}
 # stiff normal-only penalty springs to the bottom and the four vertical sides.
 ROCK_OUTER_SUPPORT_MODELS = {"fixed_bottom", "rollers"}
 SUPPORT_MODELS = {
-    "plinth": ("distributed_elastic_concrete", "concrete"),
     "bedrock": ("distributed_elastic_granite", "bedrock"),
 }
 
@@ -388,17 +387,8 @@ class _ConfigValidator:
             wall = self.object(
                 geometry.get("wall"),
                 "geometry.wall",
-                RADIUS_KEYS | {"height_above_plinth_m"},
+                RADIUS_KEYS | {"height_m"},
             )
-            plinth = self.object(
-                geometry.get("plinth"),
-                "geometry.plinth",
-                RADIUS_KEYS | {"contours", "support"},
-                {"wall_interface"},
-            )
-            if plinth is not None and "wall_interface" in plinth:
-                if plinth["wall_interface"] not in ("stepped", "cutback_45deg"):
-                    self.issue("geometry.plinth.wall_interface", "must be 'stepped' or 'cutback_45deg'")
             bedrock = self.object(
                 geometry.get("bedrock"),
                 "geometry.bedrock",
@@ -440,32 +430,18 @@ class _ConfigValidator:
                     "is a draft profile, not an active solver input. The geometry preview "
                     "derives its section from geometry.bedrock.contours.",
                 )
-            wall_upstream, wall_downstream = self.validate_radii(wall, "geometry.wall")
-            plinth_upstream, plinth_downstream = self.validate_radii(plinth, "geometry.plinth")
+            self.validate_radii(wall, "geometry.wall")
             if wall is not None:
-                self.field_number(wall, "height_above_plinth_m", "geometry.wall")
-                if "height_above_plinth_m" in wall:
+                self.field_number(wall, "height_m", "geometry.wall")
+                if "height_m" in wall:
                     self.warn(
-                        "geometry.wall.height_above_plinth_m",
+                        "geometry.wall.height_m",
                         "is nominal metadata; it does not change the meshed geometry. "
-                        "Edit geometry.plinth.contours / geometry.bedrock.contours heights instead.",
+                        "The wall runs from the crest (z = 0) down to geometry.bedrock.contours; "
+                        "edit those heights instead.",
                     )
-            if (
-                wall_downstream is not None
-                and plinth_downstream is not None
-                and plinth_downstream > wall_downstream
-            ):
-                self.issue("geometry.plinth.downstream_radius_m", "the plinth must cover the wall radial width")
-            if (
-                wall_upstream is not None
-                and plinth_upstream is not None
-                and plinth_upstream < wall_upstream
-            ):
-                self.issue("geometry.plinth.upstream_radius_m", "the plinth must cover the wall radial width")
 
-            self.validate_support(geometry, "plinth")
             self.validate_support(geometry, "bedrock")
-            plinth_stations = self.validate_contours(geometry, "plinth")
             bedrock_stations = self.validate_contours(geometry, "bedrock")
             if domain_bottom is not None and bedrock_stations:
                 if domain_bottom >= min(height for _, height in bedrock_stations):
@@ -473,57 +449,9 @@ class _ConfigValidator:
                         "geometry.bedrock.domain.bottom_z_m",
                         "must be below every bedrock contour elevation",
                     )
-            if plinth_stations is not None and bedrock_stations is not None:
-                plinth_start, plinth_end = plinth_stations[0][0], plinth_stations[-1][0]
-                bedrock_start, bedrock_end = bedrock_stations[0][0], bedrock_stations[-1][0]
-                if bedrock_start > plinth_start or bedrock_end < plinth_end:
-                    self.issue(
-                        "geometry.bedrock.contours",
-                        "must cover the full chainage range of geometry.plinth.contours",
-                    )
-                elif all(
-                    left[0] < right[0]
-                    for stations in (plinth_stations, bedrock_stations)
-                    for left, right in zip(stations, stations[1:])
-                ):
-                    def interpolate(
-                        stations: list[tuple[float, float]], chainage: float,
-                    ) -> float:
-                        for (left_chainage, left_height), (right_chainage, right_height) in zip(
-                            stations, stations[1:],
-                        ):
-                            if left_chainage <= chainage <= right_chainage:
-                                fraction = (
-                                    (chainage - left_chainage)
-                                    / (right_chainage - left_chainage)
-                                )
-                                return left_height + fraction * (right_height - left_height)
-                        raise ValueError(f"Chainage {chainage:g} is outside the contour range")
-
-                    check_stations = sorted({
-                        chainage for chainage, _ in plinth_stations
-                    } | {
-                        chainage for chainage, _ in bedrock_stations
-                        if plinth_start <= chainage <= plinth_end
-                    })
-                    for chainage in check_stations:
-                        if interpolate(bedrock_stations, chainage) > interpolate(plinth_stations, chainage):
-                            bedrock_index = next(
-                                (
-                                    index for index, (station, _) in enumerate(bedrock_stations)
-                                    if station == chainage
-                                ),
-                                None,
-                            )
-                            path = (
-                                f"geometry.bedrock.contours[{bedrock_index}].height"
-                                if bedrock_index is not None
-                                else "geometry.bedrock.contours"
-                            )
-                            self.issue(
-                                path,
-                                "must not be above the plinth elevation within their shared chainage range",
-                            )
+            if bedrock_stations and min(height for _, height in bedrock_stations) >= 0:
+                # The wall spans the chainages where rock lies below the crest (z = 0).
+                self.issue("geometry.bedrock.contours", "must dip below the crest elevation (z = 0)")
 
         self.validate_material(self.object(root.get("material"), "material", CONFIG_KEYS["material"]))
 
@@ -577,7 +505,7 @@ def validate_config(payload: object) -> dict[str, object]:
 
 def collect_warnings(payload: object, *, three_body: bool = False) -> list[ValidationIssue]:
     """Return non-fatal warnings for nominal or currently inactive configuration
-    properties (e.g. height_above_plinth_m, bedrock material, cracking_risk output)
+    properties (e.g. wall height_m, bedrock material, cracking_risk output)
     without reinterpreting or rejecting the submitted values. Intended to be called
     only once the configuration has already passed validate_config.
     """

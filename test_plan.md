@@ -112,10 +112,10 @@ This test plan is designed for end-to-end acceptance testing on a clean, seconda
 
 * **Pre-conditions:** On **Configuration** screen.
 * **Test Steps:**
-  1. **Default Load:** Verify default dam parameters are populated (Wall radii, Plinth, Material properties, Water levels, Contours).
+  1. **Default Load:** Verify default dam parameters are populated (Wall radii, Material properties, Water levels, Bedrock contours).
   2. **Valid Edit:** Change `water_height` to `30.0` and `overflow_head` to `1.5`. Observe status bar and JSON Preview.
   3. **File Save As:** Click `File` -> `Save As...`, save to `Documents\test_dam_config.json`.
-  4. **Invalid Input (Negative Radius):** Enter a negative inner radius or inverted plinth station. Observe validation banner.
+  4. **Invalid Input (Negative Radius):** Enter a negative inner radius or a wall thickness of zero. Observe validation banner.
   5. **Invalid Input (String in Number Field):** Enter alphabetic characters into a numeric box.
   6. **File Open:** Click `File` -> `Open...`, open the saved `test_dam_config.json`.
 * **Expected Results:**

@@ -18,11 +18,11 @@ def fixture():
     mesh = vtkUnstructuredGrid()
     points = vtkPoints()
     labels = []
-    # Two concrete cubes; rock tetrahedra inside, straddling and outside 5 m.
-    for body, x, z in ((1, 0., 0.), (2, 0., 1.), (3, 5.8, 0.), (3, 6.2, 0.),
-                       (3, 5.9, 0.), (3, 0., -30.), (3, 4.9, 5.9)):
+    # Two wall cubes; rock tetrahedra inside, straddling and outside 5 m.
+    for body, x, z in ((1, 0., 0.), (1, 0., 1.), (2, 5.8, 0.), (2, 6.2, 0.),
+                       (2, 5.9, 0.), (2, 0., -30.), (2, 4.9, 5.9)):
         start = points.GetNumberOfPoints()
-        if body < 3:
+        if body < 2:
             offsets = ((0,0,0),(1,0,0),(1,1,0),(0,1,0),
                        (0,0,1),(1,0,1),(1,1,1),(0,1,1))
             kind = 12
@@ -58,7 +58,7 @@ class StressReportingRegionTests(unittest.TestCase):
     def test_nearest_surface_not_bounds_or_centroid_and_no_remote_bottom(self):
         mesh = fixture()
         result = reporting_region(mesh)
-        for body in (1, 2):
+        for body in (1,):
             before, after = select_body(mesh, body, body), select_body(result, body, body)
             self.assertEqual(before.GetNumberOfCells(), after.GetNumberOfCells())
             np.testing.assert_array_equal(reference_coordinates(before), reference_coordinates(after))
@@ -67,7 +67,7 @@ class StressReportingRegionTests(unittest.TestCase):
                     vtk_to_numpy(before.GetPointData().GetArray(field)),
                     vtk_to_numpy(after.GetPointData().GetArray(field)),
                 )
-        rock = select_body(result, 3, 3)
+        rock = select_body(result, 2, 2)
         points = reference_coordinates(rock)
         self.assertGreater(rock.GetNumberOfCells(), 0)
         self.assertGreaterEqual(points[:, 2].min(), 0.)
@@ -87,7 +87,7 @@ class StressReportingRegionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "distance"):
                 reporting_region(fixture(), distance)
         with self.assertRaisesRegex(ValueError, "Expected attributed"):
-            reporting_region(select_body(fixture(), 1, 2))
+            reporting_region(select_body(fixture(), 1, 1))
 
     def test_selection_uses_undeformed_coordinates(self):
         mesh = fixture()

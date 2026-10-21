@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import tempfile
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -9,6 +10,9 @@ from unittest.mock import patch
 import numpy as np
 import vtk
 from vtk.util.numpy_support import numpy_to_vtk
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from elmer_baseline import baseline_files, import_baseline, read_reference
 
@@ -22,7 +26,7 @@ class BaselineTests(unittest.TestCase):
             (0, 0, -26), (1, 0, -26), (1, 1, -26), (0, 1, -26),
             (0, 0, -25), (1, 0, -25), (1, 1, -25), (0, 1, -25),
         ], dtype=float)
-        # Duplicate interface coordinates must not merge wall and plinth nodes.
+        # Duplicate interface coordinates must remain separate for a spring-supported seat.
         self.points = np.vstack((self.points, self.points + [0, 0, 1]))
         self.structure = SimpleNamespace(
             nodes=self.points, cells=[(5, tuple(range(8))), (5, tuple(range(8, 16)))],

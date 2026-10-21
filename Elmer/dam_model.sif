@@ -66,7 +66,7 @@ Boundary Condition 1
   Target Boundaries(1) = 1
   ! Distributed elastic foundation, in N/m^3 (traction per displacement).
   ! Representative granite rock mass: E = 35 GPa, nu = 0.25, G = 14 GPa.
-  ! Elastic half-space estimate over 7 m plinth width:
+  ! Elastic half-space estimate over the 7 m base width:
   ! k_h = 8G / ((2 - nu) B) = 9.1e9 N/m^3; k_v = 4G / ((1 - nu) B) = 1.07e10 N/m^3.
   Spring 1 = Real 9.1e9
   Spring 2 = Real 9.1e9

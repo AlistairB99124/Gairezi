@@ -118,22 +118,23 @@ new jobs using `--config-root`, `--output-dir` and `--report-path`; historical
 jobs without a `model_kind` retain legacy paths. The worker preserves the job's
 snapshot and rejects nonempty output/report paths. API success requires the
 full PVTU partitions, 5 m reporting VTU and matching finite per-body summary.
-The WPF schema/model preserve cutbacks and rock domain/mesh settings through
+The WPF schema/model preserve rock domain/mesh settings through
 load/save/submission, while bedrock remains read-only in the editor. Default
 ParaView opening uses the reporting VTU, with a separate full-domain action.
 Headline stress extrema/utilization cover concrete only; the table also shows
 near-field bedrock separately. The desktop rejects older API versions lacking
 `canonical_model: three_body` before submission.
 
-FEniCSx now imports the exact saved three-body source mesh, preserves the
-wall/plinth relative-displacement mortar springs, and uses distinct concrete/rock
-material fields. The approved bedrock support model is
-`distributed_elastic_granite`: the plinth/rock seat is a directional elastic
-spring joint using `geometry.bedrock.support.spring_n_per_m3`, discretised as
-mortar springs in both solvers like the wall/plinth joint. The alternative
-`bonded` model shares plinth/rock seat displacement nodes in both solvers, with
-zero relative movement but nonzero common deformation allowed; its spring
-coefficients are inactive. Do not ground the plinth seat. New jobs run an
+FEniCSx now imports the exact saved canonical source mesh (legacy name
+"three-body"; it now holds two bodies: wall = 1, bedrock = 2) and uses distinct
+concrete/rock material fields. There is no plinth: the wall sits directly on
+the bedrock and its underside follows the bedrock contours. The approved
+bedrock support model is `distributed_elastic_granite`: the wall/rock seat is a
+directional elastic spring joint using `geometry.bedrock.support.spring_n_per_m3`,
+discretised as relative-displacement mortar springs in both solvers. The
+alternative `bonded` model shares wall/rock seat displacement nodes in both
+solvers, with zero relative movement but nonzero common deformation allowed;
+its spring coefficients are inactive. Do not ground the wall seat. New jobs run an
 elastic comparison first. Fracture requires matching
 source/configuration hashes, passed displacement and recovered concrete nodal
 tensor parity (each relative error <= 1e-4), explicit nodal peak metadata,
@@ -144,11 +145,11 @@ Canonical elastic solves use GMRES/right GAMG instead of CG. Fracture requires
 2.0 elements per length scale (0.25 m length scale, up to five refinement levels
 and 4,000,000 cells); lower explicit canonical targets are rejected.
 If the limit is exhausted, stop rather than accept an under-resolved solve.
-Wall and plinth damage evolve; bedrock and interface springs remain elastic.
+Wall damage evolves; bedrock and seat springs remain elastic.
 The crack location is never chosen automatically. After the verified elastic
 baseline the job pauses at stage `awaiting_crack_location` (cracking status
 `awaiting_location`); `GET /jobs/{id}/crack-selection` returns the binned
-Z-Y wall/plinth maximum principal stress map with peaks, the desktop plots it,
+Z-Y wall maximum principal stress map with peaks, the desktop plots it,
 and the user's click is submitted with `POST /jobs/{id}/crack-location`
 (`y_m`, `z_m`; rejected unless the point lies on a concrete bin). The API then
 runs `run-fracture --crack-location Y Z`. Cancelling while paused skips cracking
@@ -158,15 +159,16 @@ stage. Hybrid and explicit experimental Amor are supported; the historical
 bonded-reference hold remains for legacy jobs. Full-size elastic parity and
 small serial/MPI fracture benchmarks are verified, not full-dam fracture
 convergence or engineering safety. Historical results remain readable.
-The plinth underside follows piecewise-linear interpolation of the unchanged
-bedrock survey contours across the full plinth width, without 0.5 m elevation
-snapping. The locked rock seat conforms exactly; upper wall/plinth cutbacks
-remain unchanged, including at sloping lower wedge closures.
+The wall underside follows piecewise-linear interpolation of the unchanged
+bedrock survey contours across the full wall thickness, without elevation
+snapping. The wall spans the chainages where the rock lies below the crest
+(z = 0) and tapers to zero height at both ends. The locked rock seat conforms
+exactly.
 There is no automatic time limit on user app jobs; cancellation stops only the
 selected job's worker tree. API dependency staging includes Gmsh. See the
 FEniCSx README for verification evidence and remaining limitations.
 
-Three-body stress review uses a separate reporting export: all wall/plinth and
+Three-body stress review uses a separate reporting export: the whole wall and
 rock within 5 m of their nearest surface in reference coordinates. Keep the
 full-domain solution for audit; never replace or truncate the solver domain to
 implement this display filter. The filtered VTU and per-body stress summary are
@@ -180,19 +182,18 @@ independent sensitivity verification. See the README for existing-run export.
 
 | Input | UI/API treatment |
 |---|---|
-| Wall/plinth radii and radial width | Validate width and midpoint relationships; display units in metres |
+| Wall radii and radial width | Validate width and midpoint relationships; display units in metres |
 | Contour `height` | Label as signed elevation relative to crest z = 0 |
-| `geometry.plinth.wall_interface` | Optional `stepped` (also the omitted default) or `cutback_45deg`. Plinth corners are cut across the full width with 1:1 design-chainage/elevation drops. Wall fills only within its original footprint; shoulder cutbacks remain empty, reducing total concrete volume without widening wall. Rock seat is unchanged. Newly exposed faces use their side's existing upstream/downstream hydrostatic law, not an added uplift model. Preview and Elmer concrete builders share the setting. Rise/run mismatches fail explicitly. Transferred and removed volumes use builder coordinates before survey mapping; `shoulder_fill: empty_outside_original_wall_footprint` identifies this revision. Spring stiffnesses remain unchanged. Existing jobs require fresh runs. |
-| `height_above_plinth_m` | Clearly identify current nominal metadata; contours control the actual height |
+| `geometry.wall.height_m` | Clearly identify current nominal metadata; contours control the actual height |
 | Global element size | Controls the shared combined mesh |
 | Local element size | Identify which generator uses it; do not imply it refines the current combined mesh |
-| `water_height` | Reference depth only, not reservoir surface elevation |
-| `overflow_head` | Actual water surface above crest; changes hydrostatic loading |
+| `water_height` | Reservoir depth above the deepest wall seat; with `overflow_head` sets the water surface |
+| `overflow_head` | Depth above the crest when overflowing; adds the crest surcharge |
 | `overflow_water_level` | Derived reference depth: water height plus overflow head |
-| Explicit directional springs | Three-body wall/plinth joint uses `geometry.plinth.support.spring_n_per_m3`; plinth/bedrock uses `geometry.bedrock.support.spring_n_per_m3`, in global x/y/z, on relative displacement only (no grounded spring bypass). Legacy wall/plinth solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
-| Bedrock material | Active in the integrated three-body solver; the legacy wall/plinth solve represents the foundation with grounded springs instead |
-| `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall/plinth solve |
-| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: 0.5 m target within 2 m of the locked plinth seat, grading to 15 m by 50 m; shared by preview and three-body preparation. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
+| Explicit directional springs | The wall/bedrock seat uses `geometry.bedrock.support.spring_n_per_m3`, in global x/y/z, on relative displacement only (no grounded spring bypass). The legacy wall-only solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
+| Bedrock material | Active in the integrated three-body solver; the legacy wall-only solve represents the foundation with grounded springs instead |
+| `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall-only solve |
+| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: 0.5 m target within 2 m of the locked wall seat, grading to 15 m by 50 m; shared by preview and three-body preparation. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
 | Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |
 
 No silent physical reinterpretation as part of the API work. If actual-height
@@ -206,8 +207,8 @@ and add numerical regression tests first.
   validate worker inputs; avoid competing Pydantic and legacy validators.
 - Reject missing/unknown fields, incorrect types, booleans used as numbers,
   nonfinite values, invalid radii, invalid mesh sizes and invalid material values.
-- Validate matching unique plinth/bedrock stations, increasing chainages,
-  bedrock below plinth, and finite signed elevations.
+- Validate unique, increasing bedrock chainages with finite signed elevations
+  that dip below the crest (z = 0) so the wall has a seat.
 - Validate exact X/Y/Z spring entries, supported support models/material mappings,
   boolean output flags, and the reference water-depth relationship.
 - Return field paths and messages that WPF can associate with individual controls.
@@ -290,7 +291,7 @@ Visual Studio installation at implementation time.
 | Screen | First-release content |
 |---|---|
 | Home | Backend readiness, recent jobs and new/open configuration actions |
-| Configuration / Geometry | Mesh spacing, wall/plinth radii, contour DataGrids and support editors |
+| Configuration / Geometry | Mesh spacing, wall radii, bedrock contour DataGrid and support editors |
 | Configuration / Material | Concrete/bedrock fields with units and applicability notes |
 | Configuration / Loads | Gravity, water density, tailwater and overflow controls; reference-depth labels |
 | Configuration / Outputs | Implemented result selections, with unsupported features visibly disabled |
