@@ -25,6 +25,7 @@ from Elmer.structural_model import (
 
 from Elmer.regions.combined_structure import write_combined_gmsh, write_combined_vtu
 from Elmer.regions.tetrahedral import tetrahedralize_structure
+from Elmer.regions.model_groups import is_wall_joint_boundary_id
 from Elmer.model_config import CONFIG_PATH
 from Elmer.regions.combined_structure import load_material, load_environment, load_foundation_support
 
@@ -114,7 +115,8 @@ def write_combined_solver_input(mesh, path: Path) -> None:
     foundation_spring_x = foundation_support.spring_x_n_per_m3
     foundation_spring_y = foundation_support.spring_y_n_per_m3
     foundation_spring_z = foundation_support.spring_z_n_per_m3
-    if any(tag > 7 for tag, _ in mesh.boundaries):
+    # Wall-joint tags carry no condition here; the three-body diagnostic adds their mortar springs.
+    if any(tag > 7 and not is_wall_joint_boundary_id(tag) for tag, _ in mesh.boundaries):
         raise ValueError("Solver input contains unknown boundary tags; regenerate mesh")
     water_density = mesh.loads.water_density_kg_m3
     tailwater_head = mesh.loads.tailwater_head_m

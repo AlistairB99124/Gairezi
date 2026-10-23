@@ -285,7 +285,7 @@ def solve(
             "crack_placement": placement,
             "damage_region_ids": list(damage_regions),
             "non_wall_damage": (
-                "bedrock fixed at zero" if three_body else "fixed at zero, including shared interface DOFs"
+                "bedrock and optional foundation fixed at zero" if three_body else "fixed at zero, including shared interface DOFs"
             ),
             "applied_force_n": applied.tolist(),
             "ground_spring_reactions_n": reactions,
@@ -313,7 +313,7 @@ def solve(
                 "Diffuse pressure is an energy-consistent regularised traction, not an explicit face load.",
                 "Convergence and successful execution do not constitute engineering validation.",
                 (
-                    "Damage is restricted to wall region 1; bedrock damage DOFs are fixed at zero. "
+                    "Damage is restricted to wall region 1; bedrock and foundation damage DOFs are fixed at zero. "
                     "Wall and bedrock damage do not couple across the seat, and the seat springs do not soften."
                     if three_body else
                     "Damage is restricted to wall region 2; non-wall and shared interface damage DOFs are fixed at zero."
@@ -341,14 +341,15 @@ def solve(
         cell_tags=imported.cell_tags if three_body else None,
     ))
     if three_body:
+        from three_body_model import connection_report
+
         result.report.update(
             model_kind="three_body", source_mesh=structure.three_body_source,
-            wall_connection="single_monolithic_body",
-            wall_bedrock_connection=(
-                "bonded" if structure.three_body_config["geometry"]["bedrock"]["support"].get("model") == "bonded"
-                else "spring"
-            ),
-            stress_scope="wall; full-domain rock reported separately",
+            wall_connection=getattr(structure, "wall_connection", "single_monolithic_body"),
+            wall_joints=[{"name": joint["name"], "z_m": joint["z_m"]}
+                         for joint in getattr(structure, "wall_joints", [])],
+            **connection_report(structure),
+            stress_scope="wall; full-domain rock and optional foundation reported separately",
             fracture_verification="implementation verification only; full-dam validation required",
         )
     result.report["mesh_nodes"] = int(result.damage.function_space.dofmap.index_map.size_global)

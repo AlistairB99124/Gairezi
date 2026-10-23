@@ -10,12 +10,12 @@ import struct
 
 from .bedrock_contours import load_contours
 from .uniform_wall import build_bedrock_seated_wall
-from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS, build_named_groups
-from ..model_config import load_config
+from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS, build_named_groups, is_wall_joint_boundary_id
+from ..model_config import load_config, wall_joint_support
 
 
-def build_wall(root: Path, extra_radial_fractions: tuple[float, ...] = ()):
-    return build_bedrock_seated_wall(root, extra_radial_fractions)
+def build_wall(root: Path, extra_radial_fractions: tuple[float, ...] = (), split_joints: bool = False):
+    return build_bedrock_seated_wall(root, extra_radial_fractions, split_joints)
 
 
 REGION_BUILDERS = (
@@ -79,6 +79,8 @@ class CombinedStructure:
     loads: EnvironmentalLoads
     foundation_support: FoundationSupport
     region_cell_counts: dict[str, int]
+    # Step elevations split into spring joints between wall blocks; empty for a monolithic wall.
+    wall_joint_levels_m: tuple[float, ...] = ()
 
 
 def load_material(path: Path) -> MaterialProperties:
@@ -124,7 +126,16 @@ def load_foundation_support(path: Path, region: str = "bedrock") -> FoundationSu
     )
 
 
-def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ...] = ()) -> CombinedStructure:
+def build_combined_structure(
+    root: Path, extra_radial_fractions: tuple[float, ...] = (), *, split_wall_joints: bool | None = None,
+) -> CombinedStructure:
+    """Attributed wall mesh.
+
+    split_wall_joints=True separates the thickness bands into blocks (duplicated joint
+    nodes, joint tags) when geometry.wall.joint_support is "spring"; the default keeps
+    one monolithic wall for consumers that do not model the joint springs.
+    """
+    split_joints = bool(split_wall_joints) and wall_joint_support(load_config(root / "config.json")["geometry"]["wall"]) is not None
     material = load_material(root / "config.json")
     load_path = root / "config.json"
     loads = load_environment(load_path)
@@ -136,12 +147,15 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
     boundary_faces: dict[tuple[int, ...], list[tuple[int, int, tuple[int, ...]]]] = {}
     region_cell_counts: dict[str, int] = {}
 
-    regions = [(REGION_GROUP_IDS["WALL"], "wall", build_wall(root, extra_radial_fractions))]
+    wall_mesh = build_wall(root, extra_radial_fractions, split_joints)
+    regions = [(REGION_GROUP_IDS["WALL"], "wall", wall_mesh)]
 
     for region_id, region_name, mesh in regions:
         local_to_global: dict[int, int] = {}
+        blocks = mesh.node_blocks or [0] * len(mesh.nodes)
         for local_id, coordinate in enumerate(mesh.nodes, start=1):
-            key = tuple(round(value, 9) for value in coordinate)
+            # Joint nodes have one copy per block; never merge copies of different blocks.
+            key = (*(round(value, 9) for value in coordinate), blocks[local_id - 1])
             if key not in coordinate_nodes:
                 node_id = len(nodes)
                 nodes.append(coordinate)
@@ -178,6 +192,7 @@ def build_combined_structure(root: Path, extra_radial_fractions: tuple[float, ..
         loads=loads,
         foundation_support=foundation_support,
         region_cell_counts=region_cell_counts,
+        wall_joint_levels_m=tuple(wall_mesh.joint_levels_m),
     )
     return combined
 
@@ -338,8 +353,17 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         if len(node_ids) > 1
         for node_id in node_ids
     }
-    if duplicate_nodes:
+    joint_nodes = {
+        node_id
+        for boundary_id, face in mesh.boundaries
+        if is_wall_joint_boundary_id(boundary_id)
+        for node_id in face
+    }
+    if duplicate_nodes - joint_nodes:
         raise ValueError("Bonded structure contains duplicate coordinates; regenerate a conforming mesh")
+    joint_count = len(mesh.wall_joint_levels_m)
+    if joint_nodes and not joint_count:
+        raise ValueError("Wall joint faces present without configured joint levels")
     face_patterns = {
         4: ((0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)),
         5: ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)),
@@ -372,8 +396,10 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
             else:
                 face_owners[face] = cell_index
     component_count = len({find(cell_index) for cell_index in range(len(mesh.cells))})
-    if component_count != 1:
-        raise ValueError(f"Combined structure has {component_count} face-connected components")
+    if component_count != joint_count + 1:
+        raise ValueError(
+            f"Combined structure has {component_count} face-connected components; expected {joint_count + 1}"
+        )
     foundation_node_count = len({
         node_id
         for boundary_id, face in mesh.boundaries
@@ -404,8 +430,15 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "triangular_prisms": element_counts[6],
         "pyramids": element_counts[7],
         "face_connected_components": component_count,
-        "wall_connection": "single_monolithic_body",
-        "connection_assumption": "Wall is one concrete body seated directly on the bedrock; no internal joints",
+        "wall_connection": "spring_jointed_blocks" if joint_count else "single_monolithic_body",
+        "connection_assumption": (
+            f"Wall is {joint_count + 1} concrete blocks split at thickness steps z="
+            + ", ".join(f"{level:g}" for level in mesh.wall_joint_levels_m)
+            + " m, joined by linear springs from geometry.wall.joint_support; seated directly on the bedrock"
+            if joint_count else
+            "Wall is one concrete body seated directly on the bedrock; no internal joints"
+        ),
+        "wall_joint_levels_m": list(mesh.wall_joint_levels_m),
         "active_support": "geometry.bedrock.support on foundation tag 1 only",
         "inactive_inputs": ["geometry.wall.height_m: nominal metadata; the seat follows geometry.bedrock.contours"],
         "fracture_hold_reason": "Cracking is on hold pending review of the corrected bonded intact reference.",
@@ -418,7 +451,7 @@ def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
         "wall_geometry": {
             "downstream_radius_m": wall_min_radius,
             "upstream_radius_m": wall_max_radius,
-            "uniform_thickness_m": wall_max_radius - wall_min_radius,
+            "max_thickness_m": wall_max_radius - wall_min_radius,
             "wall_base_elevation_m": min(mesh.nodes[node_id][2] for node_id in wall_node_ids),
         },
         "foundation_nodes": foundation_node_count,

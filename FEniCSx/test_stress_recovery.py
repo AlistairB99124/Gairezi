@@ -13,6 +13,23 @@ from test_dam_mesh import DamMeshTests
 
 
 class StressRecoveryTests(unittest.TestCase):
+    def test_foundation_stress_is_separate_and_headline_stays_wall_only(self):
+        from test_three_body import foundation_column
+        imported = import_structure(foundation_column(), 1e-12)
+        space = fem.functionspace(imported.domain, ("DG", 0, (3, 3)))
+        stress = fem.Function(space)
+        for cell, region in zip(imported.cell_tags.indices, imported.cell_tags.values):
+            stress.x.array.reshape(-1, 3, 3)[space.dofmap.cell_dofs(int(cell))[0]] = np.diag(
+                (10. * region, -20. * region, 0.))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            report = recover_stress(imported.domain, stress, Path(directory), cell_tags=imported.cell_tags)
+        self.assertEqual(set(report["body_stress"]), {"wall", "bedrock", "foundation"})
+        self.assertAlmostEqual(report["maximum_principal_tensile_stress_pa"], 10.)
+        self.assertAlmostEqual(report["maximum_principal_compressive_stress_pa"], -20.)
+        self.assertAlmostEqual(report["body_stress"]["foundation"]["maximum_principal_tensile_stress_pa"], 30.)
+        self.assertAlmostEqual(report["body_stress"]["foundation"]["maximum_principal_compressive_stress_pa"], -60.)
+        self.assertAlmostEqual(report["element_mean_stress"]["maximum_principal_tensile_stress_pa"], 10.)
+
     def test_canonical_peaks_use_nodal_tensors_preserve_element_means_and_compare_source_nodes(self):
         from test_three_body import column
         imported = import_structure(column(), 1e-12)

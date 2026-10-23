@@ -48,7 +48,10 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
     ds = ufl.Measure("ds", domain=domain, subdomain_data=imported.facet_tags)
     dx = ufl.Measure("dx", domain=domain)
     a = ufl.inner(stress(trial), ufl.sym(ufl.grad(test))) * dx
-    springs, connection = ({}, "single_monolithic_body") if three_body else ground_supports(imported, structure)
+    springs, connection = (
+        ({}, getattr(structure, "wall_connection", "single_monolithic_body"))
+        if three_body else ground_supports(imported, structure)
+    )
     for tag, coefficients in springs.items():
         for component, stiffness in enumerate(coefficients):
             a += stiffness * trial[component] * test[component] * ds(tag)
@@ -193,19 +196,17 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         "wall_connection": connection,
     }
     if three_body:
-        from three_body_model import rock_support
+        from three_body_model import rock_support, connection_report
 
         support = rock_support(structure)
         report.update(
             model_kind="three_body", interface_springs=interfaces.report,
-            wall_connection="single_monolithic_body",
-            wall_bedrock_connection=(
-                "bonded" if structure.three_body_config["geometry"]["bedrock"]["support"].get("model") == "bonded"
-                else "spring"
-            ),
+            wall_connection=connection,
+            wall_joints=[{"name": joint["name"], "z_m": joint["z_m"]} for joint in getattr(structure, "wall_joints", [])],
+            **connection_report(structure),
             rock_outer_support=support,
             source_mesh=structure.three_body_source,
-            stress_scope="wall; rock reported separately",
+            stress_scope="wall; rock and optional foundation reported separately",
         )
     from stress_recovery import recover_stress
 

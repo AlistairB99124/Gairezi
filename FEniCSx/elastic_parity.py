@@ -46,23 +46,20 @@ def reference_structure(root: Path, load_case: Path, reference: Path):
 
 
 def read_reference(structure, reference: Path):
-    """Map by region membership (1=wall, 2=bedrock), not coordinates alone."""
+    """Map each Elmer point through its parent source cell, not coordinates alone.
+
+    Spring seats and spring-jointed wall blocks duplicate coincident nodes; only
+    the owning cell identifies which copy an Elmer point belongs to.
+    """
     points = np.asarray(structure.nodes)
     node_regions = np.zeros(len(points), dtype=np.int32)
     for (kind, cell), region in zip(structure.cells, structure.region_ids):
-        if region not in (1, 2):
+        if region not in (1, 2, 3):
             raise ValueError(f"Unexpected structural region {region}")
         node_regions[list(cell)] |= 1 << (region - 1)
     source_centres = np.asarray([points[list(cell)].mean(axis=0) for _, cell in structure.cells])
+    source_sizes = np.asarray([len(cell) for _, cell in structure.cells])
     tree = cKDTree(source_centres)
-    nodal_trees = {}
-    for region in np.unique(node_regions):
-        if region == 0:
-            continue
-        ids = np.flatnonzero((node_regions & region) == region)
-        if not len(ids):
-            continue
-        nodal_trees[int(region)] = (ids, cKDTree(points[ids]))
     values = np.zeros((len(points), 3))
     stresses = np.zeros((len(points), 6))
     counts = np.zeros(len(points), dtype=int)
@@ -89,29 +86,35 @@ def read_reference(structure, reference: Path):
         if distance.max() > 1e-7:
             raise ValueError("Elmer result cells do not match the current source mesh")
         cell_seen[parents] = True
-        regions = np.asarray(structure.region_ids)[parents]
-        point_regions = np.zeros(len(xyz), dtype=int)
-        for region in np.unique(regions):
-            selected = np.zeros(len(sizes), dtype=bool)
-            selected[volume_cells] = regions == region
-            selected_connectivity = np.repeat(selected, sizes)
-            ids = np.unique(connectivity[selected_connectivity])
-            point_regions[ids] |= 1 << (int(region) - 1)
+        volume_sizes = sizes[volume_cells]
+        if np.any(volume_sizes != source_sizes[parents]):
+            raise ValueError("Elmer result cell types do not match the current source mesh")
+        point_source = np.full(len(xyz), -1, dtype=np.int64)
+        volume_offsets = offsets[:-1][volume_cells]
+        for size in np.unique(volume_sizes):
+            chosen = volume_sizes == size
+            elmer_ids = connectivity[volume_offsets[chosen, None] + np.arange(size)]
+            source_ids = np.asarray([structure.cells[parent][1] for parent in parents[chosen]])
+            gaps = np.linalg.norm(xyz[elmer_ids][:, :, None] - points[source_ids][:, None, :], axis=3)
+            nearest = gaps.argmin(axis=2)
+            if np.take_along_axis(gaps, nearest[:, :, None], axis=2).max() > 1e-7:
+                raise ValueError("Elmer point does not match a node of its source cell")
+            mapped = np.take_along_axis(source_ids, nearest, axis=1).ravel()
+            flat = elmer_ids.ravel()
+            previous = point_source[flat]
+            if np.any((previous >= 0) & (previous != mapped)):
+                raise ValueError("Elmer piece merged nodes that must remain separate (spring seat or wall joint)")
+            point_source[flat] = mapped
+            # Repeated Elmer points within one batch must also map to a single source node.
+            if np.any(point_source[flat] != mapped):
+                raise ValueError("Elmer piece merged nodes that must remain separate (spring seat or wall joint)")
         stress_names = ("stress_xx", "stress_yy", "stress_zz", "stress_xy", "stress_yz", "stress_xz")
         if any(grid.GetPointData().GetArray(name) is None for name in stress_names):
             raise ValueError("Elmer reference is missing stress components")
         stress = np.column_stack([vtk_to_numpy(grid.GetPointData().GetArray(name)) for name in stress_names])
-        for region in np.unique(point_regions):
-            if region == 0:
-                continue
-            if int(region) not in nodal_trees:
-                raise ValueError("Elmer piece merged wall/bedrock nodes that must remain separate for a spring seat")
-            selected = np.flatnonzero(point_regions == region)
-            ids, nodal_tree = nodal_trees[int(region)]
-            distance, nearest = nodal_tree.query(xyz[selected])
-            if distance.max() > 1e-7:
-                raise ValueError("Elmer point does not match a source node in its region")
-            source_ids = ids[nearest]
+        selected = np.flatnonzero(point_source >= 0)
+        if len(selected):
+            source_ids = point_source[selected]
             existing = counts[source_ids] > 0
             if np.any(existing) and not np.allclose(
                 values[source_ids[existing]] / counts[source_ids[existing], None],

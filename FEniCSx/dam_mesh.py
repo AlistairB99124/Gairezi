@@ -199,7 +199,7 @@ def import_structure(structure, maximum_volume_change: float) -> ImportedDam:
         if tuple(face) not in lookup:
             owner = facet_cells.links(int(facet))
             if (getattr(structure, "three_body_config", None) is not None and len(owner) == 1
-                    and regions[cell_ids[owner[0]]] == 2):
+                    and regions[cell_ids[owner[0]]] in (2, 3)):
                 imported_values.append(7)
                 continue
             raise ValueError(f"Untagged exterior triangle after subdivision: {face}")

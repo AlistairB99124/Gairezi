@@ -1,5 +1,13 @@
 {
   "geometry": {
+    "foundation": {
+      "depth_m": 1.0,
+      "side_margin_m": 0.5,
+      "support": {
+        "model": "spring",
+        "spring_n_per_m3": { "x": 1.25e9, "y": 1.25e9, "z": 1.25e9 }
+      }
+    },
     "global_element_size_m": 0.5,
     "local_element_size_m": 0.1,
     "wall": {
@@ -7,7 +15,16 @@
       "height_m": 29.0,
       "upstream_radius_m": 80.0,
       "centerline_radius_m": 78.0,
-      "downstream_radius_m": 76.0
+      "downstream_radius_m": 76.0,
+      "thickness_steps": [
+        { "top_z_m": -20.0, "radial_width_m": 4.5 },
+        { "top_z_m": -25.0, "radial_width_m": 5.5 }
+      ],
+      "joint_support": {
+        "model": "spring",
+        "spring_n_per_m3": { "x": 1.25e9, "y": 1.25e9, "z": 3.0e9 }
+      },
+      "step_end_taper_ratio": 1.0
     },
     "bedrock": {
       "mesh": {
@@ -76,7 +93,7 @@
         }
       ],
       "support": {
-        "model": "distributed_elastic_granite",
+        "model": "bonded",
         "material": "bedrock",
         "spring_n_per_m3": {
           "x": 1250000000.0,

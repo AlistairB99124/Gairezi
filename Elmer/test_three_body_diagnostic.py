@@ -8,8 +8,35 @@ from unittest.mock import patch
 
 from Elmer.three_body_diagnostic import (
     SPRING_PAIRS, check_spring_gaps, check_spring_partitions, interface_stiffness, prepare,
+    spring_conditions,
 )
 from Elmer.model_config import load_config
+
+
+class SpringProjectorTests(unittest.TestCase):
+    def test_normal_galerkin_projector_for_planar_and_grouped_springs(self):
+        pairs = {"wall_joint_1": (21, 22), "wall_foundation/tread_0001": (17, 18)}
+        stiffness = {name: {"x": 1.e9, "y": 2.e9, "z": 3.e9} for name in pairs}
+        text = spring_conditions("Boundary Condition 1\nEnd\n",
+                                 {tag: tag for pair in pairs.values() for tag in pair},
+                                 stiffness, pairs)
+        self.assertEqual(text.count("Normal Projector = Logical True"), 2)
+        self.assertEqual(text.count("Galerkin Projector = Logical True"), 2)
+        self.assertEqual(text.count("Save Projector = Logical True"), 1)
+        for axis, value in enumerate((1.e9, 2.e9, 3.e9), start=1):
+            self.assertEqual(text.count(
+                f"Mortar BC Coefficient Displacement {axis} = Real {value:.12g}"), 2)
+        self.assertNotIn("Normal-Tangential Displacement", text)
+        self.assertNotIn("Level Projector", text)
+
+    def test_benchmark_uses_normal_galerkin_projector(self):
+        from Elmer.interface_spring_benchmark import write_sif
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "benchmark.sif"
+            write_sif(path, 7.e11, {"youngs_modulus": 35.e9, "poisson_ratio": .2, "density": 2400.})
+            text = path.read_text()
+        self.assertIn("Normal Projector = Logical True", text)
+        self.assertIn("Galerkin Projector = Logical True", text)
 
 
 class ThreeBodyDiagnosticTests(unittest.TestCase):
@@ -25,12 +52,16 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         # Exercise legacy-config compatibility without regenerating a large
         # Gmsh volume in each SIF test. Graded-mesh tests cover the new mesher.
         config = load_config(Path(__file__).resolve().parents[1] / "config.json")
+        config["geometry"].pop("foundation", None)
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         del config["geometry"]["bedrock"]["mesh"]
         loader = patch("Elmer.three_body_diagnostic.load_config", return_value=config)
         self.config = config
         loader.start()
         self.addCleanup(loader.stop)
+        wall_loader = patch("Elmer.regions.uniform_wall.load_config", return_value=config)
+        wall_loader.start()
+        self.addCleanup(wall_loader.stop)
 
     def test_prepared_model_has_connected_rock_and_explicit_assumptions(self):
         root = Path(__file__).resolve().parents[1]
@@ -131,13 +162,28 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
             report = prepare(root, output, joints="spring")
         self.assertEqual(report["joints"], "spring")
         geometry = json.loads((root / "config.json").read_text(encoding="utf-8"))["geometry"]
-        self.assertEqual(report["interface_stiffness_n_per_m3"],
-                         {"wall_bedrock": geometry["bedrock"]["support"]["spring_n_per_m3"]})
-        self.assertEqual(report["interface_stiffness_sources"],
-                         {"wall_bedrock": "geometry.bedrock.support.spring_n_per_m3"})
+        joint_springs = geometry["wall"]["joint_support"]["spring_n_per_m3"]
+        self.assertEqual(report["interface_stiffness_n_per_m3"], {
+            "wall_bedrock": geometry["bedrock"]["support"]["spring_n_per_m3"],
+            "wall_joint_1": joint_springs, "wall_joint_2": joint_springs,
+        })
+        self.assertEqual(report["interface_stiffness_sources"], {
+            "wall_bedrock": "geometry.bedrock.support.spring_n_per_m3",
+            "wall_joint_1": "geometry.wall.joint_support.spring_n_per_m3",
+            "wall_joint_2": "geometry.wall.joint_support.spring_n_per_m3",
+        })
         self.assertEqual(report["wall_bedrock_connection"], "spring")
         self.assertEqual(bonded["wall_bedrock_connection"], "bonded")
         self.assertEqual(report["wall_rock_seat_triangles"], bonded["wall_rock_seat_triangles"])
+        # Bonded joints keep one monolithic wall; spring joints split it at each step.
+        self.assertEqual(bonded["wall_connection"], "single_monolithic_body")
+        self.assertEqual(bonded["wall_joints"], [])
+        self.assertEqual(report["wall_connection"], "spring_jointed_blocks")
+        self.assertEqual([(j["name"], j["z_m"], j["tags"]) for j in report["wall_joints"]],
+                         [("wall_joint_1", -10.0, [21, 22]), ("wall_joint_2", -20.0, [23, 24])])
+        self.assertEqual(report["spring_pairs"],
+                         {"wall_bedrock": [11, 12], "wall_joint_1": [21, 22], "wall_joint_2": [23, 24]})
+        self.assertTrue(any("thickness blocks" in item for item in report["assumptions"]))
         # Each seat node now exists once on the wall and once on the rock.
         self.assertGreater(report["nodes"], bonded["nodes"])
         self.assertEqual(report["cells_by_body"], bonded["cells_by_body"])
@@ -149,11 +195,12 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
             report = prepare(root, output, joints="spring", integrated=True)
             text = (output / "dam_model.sif").read_text()
         self.assertEqual(text.count("Apply Mortar BCs = Logical True"), 1)
-        self.assertEqual(text.count("Mortar BC Coefficient Displacement"), 3)
+        self.assertEqual(text.count("Mortar BC Coefficient Displacement"), 9)
         self.assertNotIn("700000000000", text)
         boundary_map = {int(k): v for k, v in report["boundary_id_map"].items()}
         sections = dict(re.findall(r"Boundary Condition (\d+)\n(.*?)End\n", text, re.S))
-        for name, (slave, master) in SPRING_PAIRS.items():
+        self.assertEqual(set(report["spring_pairs"]), {"wall_bedrock", "wall_joint_1", "wall_joint_2"})
+        for name, (slave, master) in report["spring_pairs"].items():
             slave_bc = next(n for n, body in sections.items() if f'"{name}_spring"' in body)
             master_bc = re.search(r"Mortar BC = Integer (\d+)", sections[slave_bc]).group(1)
             self.assertIn(f"Target Boundaries(1) = {boundary_map[slave]}\n", sections[slave_bc])
@@ -185,6 +232,7 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         import meshio
         root = Path(__file__).resolve().parents[1]
         config = load_config(root / "config.json")
+        config["geometry"].pop("foundation", None)
         config["geometry"]["bedrock"]["support"]["model"] = "bonded"
         del config["geometry"]["bedrock"]["mesh"]
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -201,9 +249,9 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
                     nodes[int(tag)].update(int(n) for n in cell)
         self.assertTrue(nodes[1] & nodes[2])
         self.assertEqual(report["wall_bedrock_connection"], "bonded")
-        self.assertEqual(report["interface_stiffness_n_per_m3"], {})
-        self.assertEqual(text.count("Mortar BC Coefficient Displacement"), 0)
-        self.assertNotIn("Apply Mortar BCs", text)
+        # Only the wall block joints remain springs.
+        self.assertEqual(set(report["interface_stiffness_n_per_m3"]), {"wall_joint_1", "wall_joint_2"})
+        self.assertEqual(text.count("Mortar BC Coefficient Displacement"), 6)
         self.assertNotIn("wall_bedrock_spring", text)
         self.assertEqual(text.count("Displacement 1 = Real 0"), 0)
         self.assertEqual(text.count("RockRoller_"), 5)
@@ -225,19 +273,23 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
             check_spring_partitions(mesh, 2, boundary_map)
 
     def test_gap_check_rejects_missing_joints_and_runaway_openings(self):
-        stiffness = interface_stiffness(load_config(Path(__file__).resolve().parents[1] / "config.json"))
+        stiffness = interface_stiffness(self.config)
         sane = {"locations": 10, "max_abs_gap_by_axis_m": [2e-6, 2e-6, 2e-6]}
-        check_spring_gaps({"joints": {"wall_bedrock": sane}}, stiffness)
+        all_sane = {name: sane for name in stiffness}
+        check_spring_gaps({"joints": all_sane}, stiffness)
         with self.assertRaisesRegex(RuntimeError, "No wall_bedrock"):
-            check_spring_gaps({"joints": {"wall_bedrock": {"locations": 0}}}, stiffness)
+            check_spring_gaps({"joints": {**all_sane, "wall_bedrock": {"locations": 0}}}, stiffness)
+        with self.assertRaisesRegex(RuntimeError, "No wall_joint_2"):
+            check_spring_gaps({"joints": {**all_sane, "wall_joint_2": {"locations": 0}}}, stiffness)
         with self.assertRaisesRegex(RuntimeError, "100 MPa"):
-            check_spring_gaps({"joints": {"wall_bedrock": {"locations": 10,
+            check_spring_gaps({"joints": {**all_sane, "wall_bedrock": {"locations": 10,
                                                          "max_abs_gap_by_axis_m": [0., 0., 1e10]}}},
                               stiffness)
 
     def test_directional_springs_use_snapshot_values_in_axis_order(self):
         root = Path(__file__).resolve().parents[1]
         config = load_config(root / "config.json")
+        config["geometry"].pop("foundation", None)
         del config["geometry"]["bedrock"]["mesh"]
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         config["geometry"]["bedrock"]["support"]["spring_n_per_m3"] = {

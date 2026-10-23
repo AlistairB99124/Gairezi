@@ -11,6 +11,29 @@ from Elmer.model_config import ConfigurationValidationError, load_config, valida
 
 
 class GradedBedrockTests(unittest.TestCase):
+    def test_planar_bottom_has_no_artificial_fan_seams(self):
+        config = load_config(Path(__file__).resolve().parents[1] / "config.json")
+        top = np.array([[0., 0., 0.], [2., 0., 0.], [2., 2., 0.], [0., 2., 0.]])
+        bottom = top.copy()
+        bottom[:, 2] = -10.
+        triangles = np.array([[0, 1, 2], [0, 2, 3]])
+        with (
+            patch("Elmer.graded_bedrock.seated_bedrock_geometry", return_value=(
+                np.vstack((bottom, top)), np.column_stack((triangles, triangles + 4)),
+                {"seat_triangles": 2, "rock_volume_m3": 40.},
+            )),
+            patch("gmsh.model.geo.addCurveLoop", wraps=gmsh.model.geo.addCurveLoop) as loops,
+            patch("gmsh.model.geo.addPoint", wraps=gmsh.model.geo.addPoint) as points,
+            patch("gmsh.model.mesh.generate", side_effect=RuntimeError("stop before meshing")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop before meshing"):
+                build_graded_rock(config, top, [])
+        # Two top triangles, one bottom polygon, eight side triangles; no centre point.
+        self.assertEqual([len(call.args[0]) for call in loops.call_args_list],
+                         [3, 3, 4] + [3] * 8)
+        self.assertEqual(points.call_count, 8)
+        self.assertFalse(gmsh.isInitialized())
+
     def test_actual_mesher_preserves_seat_and_grades_in_three_dimensions(self):
         config = load_config(Path(__file__).resolve().parents[1] / "config.json")
         config["geometry"]["bedrock"]["mesh"] = dict(
@@ -74,6 +97,7 @@ class GradedBedrockTests(unittest.TestCase):
 
     def test_mesh_policy_is_optional_for_existing_configurations(self):
         config = load_config(Path(__file__).resolve().parents[1] / "config.json")
+        config["geometry"].pop("foundation", None)
         del config["geometry"]["bedrock"]["mesh"]
         validate_config(config)
 

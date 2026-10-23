@@ -14,7 +14,8 @@ import time
 import numpy as np
 
 from .bedrock_preview import configured_rock_mesh, survey_coordinates
-from .model_config import load_config, rock_outer_support, validate_config
+from .model_config import foundation_support, load_config, rock_outer_support, validate_config, wall_joint_support
+from .regions.model_groups import joint_boundary_ids
 from .regions.combined_structure import build_combined_structure, write_combined_gmsh
 from .regions.tetrahedral import _CELL_FACES, tetrahedralize_structure
 from .structure_assembly import (
@@ -32,6 +33,7 @@ ROCK_SIDES = {13: ("x", -1.), 14: ("x", 1.), 15: ("y", -1.), 16: ("y", 1.)}
 WALL_BODY, BEDROCK_BODY = 1, 2
 SPRING_PAIRS = {"wall_bedrock": (WALL_SEAT, ROCK_SEAT)}
 SPRING_SUPPORTS = {"wall_bedrock": "bedrock"}
+WALL_JOINT_SOURCE = "geometry.wall.joint_support.spring_n_per_m3"
 _ROCK_CELL_FACES = {**_CELL_FACES, 7: ((0, 1, 2, 3), (0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4))}
 
 
@@ -146,16 +148,67 @@ def roller_condition(number: int, tag: int, face: dict[str, object], boundary_ma
     )
 
 
+def wall_joints(config: dict) -> list[dict[str, object]]:
+    """Spring joints between wall thickness blocks, top to bottom (empty when bonded)."""
+    support = wall_joint_support(config["geometry"]["wall"])
+    if support is None:
+        return []
+    return [
+        {
+            "name": f"wall_joint_{index + 1}",
+            "z_m": level_m,
+            "tags": list(joint_boundary_ids(index)),
+            "spring_n_per_m3": dict(support["spring_n_per_m3"]),
+        }
+        for index, level_m in enumerate(support["levels_m"])
+    ]
+
+
 def interface_stiffness(config: dict) -> dict[str, dict[str, float]]:
     """Directional traction/jump coefficients in global Cartesian axes (N/m^3)."""
     validate_config(config)
-    return {
-        name: {
-            axis: float(config["geometry"][region]["support"]["spring_n_per_m3"][axis])
-            for axis in ("x", "y", "z")
-        }
-        for name, region in SPRING_SUPPORTS.items()
+    bedrock_bonded = config["geometry"]["bedrock"]["support"]["model"] == "bonded"
+    values = {
+        **({
+            name: {
+                axis: float(config["geometry"][region]["support"]["spring_n_per_m3"][axis])
+                for axis in ("x", "y", "z")
+            }
+            for name, region in SPRING_SUPPORTS.items()
+        } if not bedrock_bonded else {}),
+        **{joint["name"]: dict(joint["spring_n_per_m3"]) for joint in wall_joints(config)},
     }
+    if "foundation" in config["geometry"]:
+        if not bedrock_bonded:
+            values["foundation_bedrock"] = values.pop("wall_bedrock")
+        support = foundation_support(config)
+        if support["model"] == "spring":
+            values["wall_foundation"] = dict(support["spring_n_per_m3"])
+    return values
+
+
+def _merge_bonded_seat_copies(concrete, tags=(1,)):
+    """Merge block copies of joint nodes lying on a bonded seat.
+
+    Both blocks are bonded to the same support point there, so their copies must move
+    together; the joint springs still act everywhere above the seat line.
+    """
+    seat_nodes = {n for tag, face in concrete.boundaries if tag in tags for n in face}
+    canonical: dict[tuple, int] = {}
+    remap = list(range(len(concrete.nodes)))
+    for i in sorted(seat_nodes):
+        remap[i] = canonical.setdefault(tuple(round(v, 8) for v in concrete.nodes[i]), i)
+    if remap == list(range(len(concrete.nodes))):
+        return concrete
+    kept = sorted(set(remap))
+    compact = {old: new for new, old in enumerate(kept)}
+    renumber = [compact[remap[i]] for i in range(len(remap))]
+    return replace(
+        concrete,
+        nodes=[concrete.nodes[i] for i in kept],
+        cells=[(kind, tuple(renumber[n] for n in cell)) for kind, cell in concrete.cells],
+        boundaries=[(tag, tuple(renumber[n] for n in face)) for tag, face in concrete.boundaries],
+    )
 
 
 def prepare(
@@ -173,23 +226,72 @@ def prepare(
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(root / "config.json", output / "config.json")
     config = load_config(output / "config.json")
-    concrete = build_combined_structure(output)
+    # Thickness blocks are only split where springs join them; otherwise the wall stays monolithic.
+    concrete = build_combined_structure(output, split_wall_joints=joints == "spring")
+    joint_list = wall_joints(config) if concrete.wall_joint_levels_m else []
+    foundation_present = "foundation" in config["geometry"]
+    bonded_foundation = foundation_present and foundation_support(config)["model"] == "bonded"
+    bonded_bedrock = config["geometry"]["bedrock"]["support"]["model"] == "bonded"
+    seat_pairs = (
+        {"foundation_bedrock": (11, 12), "wall_foundation": (17, 18)}
+        if foundation_present else dict(SPRING_PAIRS)
+    )
+    if bonded_foundation:
+        seat_pairs.pop("wall_foundation")
+    if bonded_bedrock:
+        seat_pairs.pop("foundation_bedrock" if foundation_present else "wall_bedrock")
+    pairs = {**seat_pairs, **{joint["name"]: tuple(joint["tags"]) for joint in joint_list}}
+    joint_levels_text = ", ".join(f"{joint['z_m']:g}" for joint in joint_list)
     concrete.nodes = [tuple(p) for p in survey_coordinates(
         np.asarray(concrete.nodes),
         config["geometry"]["wall"]["centerline_radius_m"], 80.,
     )]
-    if integrated:
+    if integrated or foundation_present:
         concrete = tetrahedralize_structure(concrete)
-    rock = configured_rock_mesh(
-        config, np.asarray(concrete.nodes),
-        [face for tag, face in concrete.boundaries if tag == 1],
-        stream_margin_m, bank_margin_m, bottom_z_m,
-    )
+    if joint_list and (bonded_foundation or (bonded_bedrock and not foundation_present)):
+        concrete = _merge_bonded_seat_copies(concrete)
+    # Joint nodes have one copy per wall block; the rock seat sees one node per location.
+    canonical: dict[tuple, int] = {}
+    seat_index = [canonical.setdefault(tuple(round(v, 8) for v in p), i)
+                  for i, p in enumerate(concrete.nodes)]
+    solver_concrete = concrete
+    foundation = None
+    if foundation_present:
+        if joints != "spring":
+            raise ValueError("Foundation trench requires joints='spring' (configured interface workflow)")
+        from .foundation_trench import build_foundation
+        from .graded_bedrock import build_graded_rock
+        foundation = build_foundation(config, concrete)
+        rock = build_graded_rock(
+            config, foundation.points, [tuple(f) for f in foundation.terrain_faces],
+            stream_margin_m, bank_margin_m, bottom_z_m, foundation=foundation,
+        )
+        offset = len(concrete.nodes)
+        convert = lambda face: tuple(offset + int(n) for n in face)
+        concrete = replace(
+            concrete, nodes=concrete.nodes + [tuple(p) for p in foundation.points],
+            cells=concrete.cells + [(4, convert(cell)) for cell in foundation.tetrahedra],
+            region_ids=concrete.region_ids + [3] * len(foundation.tetrahedra),
+            boundaries=[(17 if tag == 1 else tag, face) for tag, face in concrete.boundaries]
+            + [(18, convert(face)) for face in foundation.wall_faces]
+            + [(1, convert(face)) for face in foundation.contact_faces],
+        )
+        if bonded_foundation:
+            concrete = _merge_bonded_seat_copies(concrete, tags=(17, 18))
+            concrete = replace(concrete, boundaries=[
+                (tag, face) for tag, face in concrete.boundaries if tag not in (17, 18)
+            ])
+        foundation.report["support"] = dict(foundation_support(config))
+    else:
+        rock = configured_rock_mesh(
+            config, np.asarray(concrete.nodes),
+            [tuple(seat_index[n] for n in face) for tag, face in concrete.boundaries if tag == 1],
+            stream_margin_m, bank_margin_m, bottom_z_m,
+        )
     rock_points, rock_blocks, geometry = rock.points, rock.blocks, rock.report
-    bonded_seat = joints == "spring" and config["geometry"]["bedrock"]["support"]["model"] == "bonded"
+    bonded_seat = joints == "spring" and bonded_bedrock
     stiffness = interface_stiffness(config) if joints == "spring" else {}
-    if bonded_seat:
-        del stiffness["wall_bedrock"]
+    stiffness = {name: value for name, value in stiffness.items() if name in pairs}
     seat_faces = [face for tag, face in concrete.boundaries if tag == 1]
     nodes, concrete_cells, concrete_boundaries = (
         list(concrete.nodes), concrete.cells, concrete.boundaries,
@@ -233,7 +335,7 @@ def prepare(
         memberships.setdefault(key, set()).add(BEDROCK_BODY)
     if max(face_counts.values()) > 2:
         raise ValueError("Non-manifold wall/bedrock mesh")
-    seat = [key for key, value in memberships.items() if value == {WALL_BODY, BEDROCK_BODY}]
+    seat = [key for key, value in memberships.items() if value == {3 if foundation_present else WALL_BODY, BEDROCK_BODY}]
     if spring_seat:
         if seat:
             raise ValueError("Spring seat must not share nodes between wall and bedrock")
@@ -258,6 +360,12 @@ def prepare(
     outer_support = rock_outer_support_report(config, rock, sides)
     for tag, faces in sides.items():
         boundaries.extend((tag, tuple(mapping[n] for n in face)) for face in faces)
+    from .mortar_interfaces import split_planar_interfaces, expand_spring_pairs
+    pair_contract = pairs
+    if foundation_present:
+        boundaries, pair_contract = split_planar_interfaces(nodes, boundaries, pairs)
+    solver_pairs = expand_spring_pairs(pair_contract)
+    solver_stiffness = {name: stiffness[name.split("/")[0]] for name in solver_pairs if name.split("/")[0] in stiffness}
     boundary_map = {tag: i+1 for i, tag in enumerate(sorted({tag for tag, _ in boundaries}))}
     mesh = replace(
         concrete, nodes=nodes, cells=cells,
@@ -267,7 +375,7 @@ def prepare(
     write_combined_gmsh(mesh, output / "three_body.msh")
     # Preserve concrete water datum; the added rock must not lower tailwater.
     path = output / ("dam_model.sif" if integrated else "diagnostic.sif")
-    write_combined_solver_input(concrete, path)
+    write_combined_solver_input(solver_concrete, path)
     text = path.read_text()
     start = text.index("Boundary Condition 1\n")
     end = text.index("Boundary Condition 2\n", start)
@@ -312,15 +420,19 @@ Body Force 2
     Stress Bodyforce 3 = Real {rock["density"] * config["loads"]["gravity"] + 0.:.12g}
 End
 '''
+    if foundation_present:
+        text += '\nBody 3\n    Name = "FoundationBody"\n    Equation = 1\n    Material = 1\n    Body Force = 1\nEnd\n'
     text = re.sub(
         r"Target Boundaries\(1\) = (\d+)",
         lambda match: f"Target Boundaries(1) = {boundary_map[int(match.group(1))]}", text,
     )
     if integrated:
         # Fixed-level fill avoids the runaway ILUT factors on the full rock mesh.
+        # The foundation's many grouped spring interfaces stall ILU1 (residual ~1e-6
+        # after 2000 iterations); level-2 fill reaches ~6e-9 within ~360 iterations.
         text = text.replace(
             "Linear System Preconditioning = ILUT",
-            "Linear System Preconditioning = ILU1\n"
+            f"Linear System Preconditioning = {'ILU2' if foundation_present else 'ILU1'}\n"
             "    Linear System ILU Factor = Real 0.01",
         ).replace(
             "Linear System ILUT Tolerance = 1.0e-4",
@@ -331,13 +443,33 @@ End
             "    Variable DOFs = 3\n",
             "    Variable DOFs = 3\n    Apply Mortar BCs = Logical True\n", 1,
         )
-        text += spring_conditions(text, boundary_map, stiffness)
-    joint_note = (
-        f"directional springs (global x/y/z) {stiffness} "
-        "N/m^3 from geometry.bedrock.support at the wall/rock seat"
-        if spring_seat else
-        "perfectly bonded wall/rock seat (shared nodes; geometry.bedrock.support.model is bonded)"
-        if bonded_seat else "bonded wall/rock seat"
+        text += spring_conditions(text, boundary_map, solver_stiffness, solver_pairs)
+    if foundation_present:
+        wall_foundation_note = (
+            "perfectly bonded wall/foundation (shared nodes; zero relative displacement)"
+            if bonded_foundation else
+            "wall/foundation directional springs (global x/y/z) from "
+            "geometry.foundation.support.spring_n_per_m3"
+        )
+        foundation_bedrock_note = (
+            "perfectly bonded foundation/bedrock (shared nodes; zero relative displacement)"
+            if bonded_bedrock else
+            "foundation/bedrock directional springs from geometry.bedrock.support.spring_n_per_m3"
+        )
+        joint_note = f"{wall_foundation_note}; {foundation_bedrock_note}"
+    elif spring_seat:
+        joint_note = (
+            f"directional springs (global x/y/z) {stiffness} N/m^3 "
+            "from geometry.bedrock.support at the wall/rock seat"
+        )
+    elif bonded_seat:
+        joint_note = "perfectly bonded wall/rock seat (shared nodes; zero relative displacement)"
+    else:
+        joint_note = "bonded wall/rock seat"
+    joint_note += (
+        f"; wall blocks joined at z={joint_levels_text} m by "
+        f"directional springs from {WALL_JOINT_SOURCE}"
+        if joint_list else ""
     )
     result_name = "three_body_results" if integrated else "three_body_diagnostic"
     text = text.replace(
@@ -364,17 +496,42 @@ End
         )
         support_assumptions = [f"fixed rock bottom z={geometry['bottom_z_m']:g} m", "free rock sides"]
     path.write_text(
-        f"! {'WALL-BEDROCK ANALYSIS' if integrated else 'DIAGNOSTIC ONLY'}: "
+        f"! {'WALL-FOUNDATION-BEDROCK ANALYSIS' if foundation_present and integrated else 'WALL-BEDROCK ANALYSIS' if integrated else 'DIAGNOSTIC ONLY'}: "
         f"{joint_note}; {support_header[0]}; zero uplift.\n"
         + support_header[1]
         + text.replace("combined_results_mpi", result_name),
     )
     report = {
+        "foundation": foundation.report if foundation_present else {"present": False},
+        "foundation_bedrock_connection": ("bonded" if bonded_bedrock else "spring") if foundation_present else None,
+        "wall_foundation_connection": "bonded" if bonded_foundation else "spring" if foundation_present else None,
         "assumptions": [
-            "linear directional springs in global x/y/z (carry tension) at the wall/rock seat"
-            if spring_seat else
-            "perfectly bonded wall/rock seat (zero relative displacement)",
-            "the wall is seated directly on the bedrock contours",
+            (
+                f"{wall_foundation_note}; {foundation_bedrock_note}"
+                if foundation_present else
+                "linear directional springs in global x/y/z (carry tension) at the wall/rock seat"
+                if spring_seat else
+                "perfectly bonded wall/rock seat (zero relative displacement)"
+            ),
+            *([] if not foundation_present else [
+                "both concrete interfaces share displacement nodes"
+                if bonded_foundation and bonded_bedrock else
+                "the wall/foundation interface shares displacement nodes; foundation/bedrock interface uses springs"
+                if bonded_foundation else
+                "the wall/foundation interface uses springs; foundation/bedrock interface shares displacement nodes"
+                if bonded_bedrock else
+                "both concrete interfaces use directional springs"
+            ]),
+            *([
+                f"wall split into thickness blocks at z={joint_levels_text}"
+                " m; linear directional springs in global x/y/z (carry tension, no opening "
+                "or sliding limit) join the blocks; damage cannot cross a joint"
+            ] if joint_list else []),
+            (f"wall seated exclusively on a structured staircase concrete foundation; horizontal treads and station-plane risers; cut floor and sides "
+             f"{'bonded' if bonded_bedrock else 'spring-connected'} to bedrock"
+             if foundation_present else "the wall is seated directly on the bedrock contours"),
+            *(["constant-width radial shoulders and crest-end extensions separate all wall/rock coordinates; no shared displacement nodes or wall/rock interface faces"]
+              if foundation_present else []),
             "zero uplift",
             *support_assumptions,
             "simultaneous gravity and existing concrete water loads",
@@ -391,27 +548,38 @@ End
             if integrated else "Solver integration diagnostic, NOT engineering validation"
         ),
         "joints": joints,
-        "wall_bedrock_connection": "spring" if spring_seat else "bonded",
+        "wall_bedrock_connection": "not_in_contact" if foundation_present else "spring" if spring_seat else "bonded",
         "interface_stiffness_n_per_m3": stiffness,
         "interface_stiffness_sources": {
-            name: f"geometry.{region}.support.spring_n_per_m3"
-            for name, region in SPRING_SUPPORTS.items() if name in stiffness
+            **{
+                name: f"geometry.{region}.support.spring_n_per_m3"
+                for name, region in SPRING_SUPPORTS.items() if name in stiffness
+            },
+            **{joint["name"]: WALL_JOINT_SOURCE for joint in joint_list},
+            **({"wall_foundation": "geometry.foundation.support.spring_n_per_m3"
+                } if foundation_present and not bonded_foundation else {}),
+            **({"foundation_bedrock": "geometry.bedrock.support.spring_n_per_m3"}
+               if foundation_present and not bonded_bedrock else {}),
         } if joints == "spring" else {},
+        "spring_pairs": {name: value if isinstance(value, dict) else list(value)
+                         for name, value in pair_contract.items() if name in stiffness},
+        "wall_connection": "spring_jointed_blocks" if joint_list else "single_monolithic_body",
+        "wall_joints": joint_list,
         "nodes": len(nodes),
         "cells_by_body": dict(Counter(regions)),
-        "solver_body_ids": {"wall": WALL_BODY, "bedrock": BEDROCK_BODY},
+        "solver_body_ids": {"wall": WALL_BODY, "bedrock": BEDROCK_BODY, **({"foundation": 3} if foundation_present else {})},
         "boundary_id_map": boundary_map,
         "rock_outer_support": outer_support,
         "wall_rock_seat_triangles": seat_count,
         "wall_underside": {
-            "profile": "piecewise_linear_bedrock_contours",
-            "elevation_quantization": False,
+            "profile": "stepped_45deg_chamfer" if foundation_present else "piecewise_linear_bedrock_contours",
+            "elevation_quantization": foundation_present,
             "radial_extent": "full_wall_thickness",
         },
         "geometry": geometry,
         "concrete_element_types": sorted({kind for kind, _ in concrete_cells}),
         "linear_solver": (
-            {"method": "BiCGStabl", "preconditioner": "ILU1",
+            {"method": "BiCGStabl", "preconditioner": "ILU2" if foundation_present else "ILU1",
              "ilu_factor": 0.01, "convergence_tolerance": 1e-10}
             if integrated else
             {"method": "BiCGStabl", "preconditioner": "ILUT",
@@ -427,13 +595,13 @@ End
 
 def spring_conditions(
     text: str, boundary_map: dict[int, int], stiffness: dict[str, dict[str, float]],
+    pairs: dict[str, tuple[int, int]] | None = None,
 ) -> str:
     """Mortar spring pairs: traction = k * (relative displacement), N/m^3."""
     first = max(int(n) for n in re.findall(r"^Boundary Condition (\d+)$", text, re.M)) + 1
     sections = []
-    for offset, (name, (slave, master)) in enumerate(SPRING_PAIRS.items()):
-        if name not in stiffness:
-            continue
+    active = [(name, pair) for name, pair in (pairs or SPRING_PAIRS).items() if name in stiffness]
+    for offset, (name, (slave, master)) in enumerate(active):
         slave_bc, master_bc = first + 2 * offset, first + 2 * offset + 1
         coefficients = "".join(
             f"    Mortar BC Coefficient Displacement {i} = Real {stiffness[name][axis]:.12g}\n"
@@ -445,7 +613,9 @@ def spring_conditions(
             f"    Target Boundaries(1) = {boundary_map[slave]}\n"
             f"    Mortar BC = Integer {master_bc}\n"
             "    Galerkin Projector = Logical True\n"
-            f"{coefficients}End\n"
+            "    Normal Projector = Logical True\n"
+            + ("    Save Projector = Logical True\n" if "/" in name else "")
+            + f"{coefficients}End\n"
             f"\nBoundary Condition {master_bc}\n"
             f"    Name = \"{name}_master\"\n"
             f"    Target Boundaries(1) = {boundary_map[master]}\n"
@@ -454,22 +624,31 @@ def spring_conditions(
     return "".join(sections)
 
 
-def spring_partition_options(boundary_map: dict[int, int]) -> tuple[str, ...]:
+def spring_partition_options(
+    boundary_map: dict[int, int], pairs: dict[str, tuple[int, int]] | None = None,
+) -> tuple[str, ...]:
     # Elmer's mortar projector silently gives wrong answers when the two sides
     # of a joint sit on different ranks; keep every joint face on one rank.
-    tags = [str(boundary_map[tag]) for pair in SPRING_PAIRS.values()
+    tags = [str(boundary_map[tag]) for pair in (pairs or SPRING_PAIRS).values()
             if all(tag in boundary_map for tag in pair) for tag in pair]
+    # A partition-only source mesh coalesces large planar inventories to one
+    # tag; original face labels are restored before solver launch.
+    if len(tags) > 128:
+        return ("-partdual", "-connect", str(min(map(int, tags))), "-halobc")
     return ("-partdual", "-connect", *tags, "-halobc")
 
 
-def check_spring_partitions(mesh: Path, partitions: int, boundary_map: dict[int, int]) -> None:
+def check_spring_partitions(
+    mesh: Path, partitions: int, boundary_map: dict[int, int],
+    pairs: dict[str, tuple[int, int]] | None = None,
+) -> None:
     """Fail unless both sides of every spring joint are on the same single rank."""
     owners: dict[int, set[int]] = {}
     for part in range(1, partitions + 1):
         with (mesh / f"partitioning.{partitions}" / f"part.{part}.boundary").open() as stream:
             for line in stream:
                 owners.setdefault(int(line.split()[1]), set()).add(part)
-    for name, pair in SPRING_PAIRS.items():
+    for name, pair in (pairs or SPRING_PAIRS).items():
         if not any(tag in boundary_map for tag in pair):
             continue
         ranks = [owners.get(boundary_map[tag], set()) for tag in pair]
@@ -491,15 +670,32 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
     pvpython_executable()
     spring = report.get("joints") == "spring"
     boundary_map = {int(k): v for k, v in report["boundary_id_map"].items()}
-    options = spring_partition_options(boundary_map) if spring else ()
+    from .mortar_interfaces import expand_spring_pairs
+    pairs = expand_spring_pairs(report.get("spring_pairs", SPRING_PAIRS))
+    options = spring_partition_options(boundary_map, pairs) if spring else ()
     print(f"Converting and partitioning three-body mesh ({partitions} rank(s))...", flush=True)
+    partition_source = output / "three_body.msh"
+    original_boundary_tags = None
+    if sum(len(pair) for pair in pairs.values()) > 128:
+        from .mortar_interfaces import coalesced_partition_input
+        partition_source = output / "partition_input.msh"
+        original_boundary_tags = coalesced_partition_input(
+            output / "three_body.msh", partition_source,
+            {boundary_map[tag] for pair in pairs.values() for tag in pair},
+        )
     if not convert_with_elmergrid(
-        output / "three_body.msh", output / "mesh",
+        partition_source, output / "mesh",
         partitions if partitions > 1 else None, options if partitions > 1 else (),
     ):
         raise RuntimeError("ElmerGrid unavailable")
+    if original_boundary_tags is not None:
+        from .mortar_interfaces import restore_partition_boundary_tags
+        report["partition_boundary_restoration"] = restore_partition_boundary_tags(
+            output / "mesh", original_boundary_tags,
+        )
+        report_path.write_text(json.dumps(report, indent=2))
     if spring and partitions > 1:
-        check_spring_partitions(output / "mesh", partitions, boundary_map)
+        check_spring_partitions(output / "mesh", partitions, boundary_map, pairs)
     (output / "results").mkdir()
     environment = os.environ.copy()
     environment.setdefault("ELMER_HOME", str(Path(executable).resolve().parent.parent))
@@ -525,18 +721,22 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
     if not result.is_file() and not (partitions == 1 and result.with_suffix(".vtu").is_file()):
         raise RuntimeError("Elmer did not produce its expected PVTU")
     attribute_result(output, result, timeout=None if timeout is None else 90)
-    gaps = measure_joint_gaps(result, timeout=None if timeout is None else 120)
+    gaps = measure_joint_gaps(
+        result, timeout=None if timeout is None else 120,
+        joint_levels_m=[joint["z_m"] for joint in report.get("wall_joints", [])],
+    )
     if not gaps["finite_displacement"]:
         raise RuntimeError("Solved displacement contains non-finite values")
     if not gaps["finite_stress"]:
         raise RuntimeError("Solved stress contains non-finite values")
     if spring:
         check_spring_gaps(gaps, report["interface_stiffness_n_per_m3"])
-    if report.get("wall_bedrock_connection") == "bonded":
-        seat = gaps["joints"]["wall_bedrock"]
-        if (seat["locations"] <= 0 or not np.isfinite(seat["max_abs_gap_m"])
-                or seat["max_abs_gap_m"] > 1e-10):
-            raise RuntimeError("Bonded wall/bedrock displacement continuity check failed")
+    for interface in ("wall_bedrock", "wall_foundation", "foundation_bedrock"):
+        if report.get(f"{interface}_connection") == "bonded":
+            seat = gaps["joints"][interface]
+            if (seat["locations"] <= 0 or not np.isfinite(seat["max_abs_gap_m"])
+                    or seat["max_abs_gap_m"] > 1e-10):
+                raise RuntimeError(f"Bonded {interface.replace('_', '/')} displacement continuity check failed")
     report["result"] = str(result)
     report["solver_exit_code"] = code
     report["partitions"] = partitions
@@ -602,9 +802,13 @@ def pvpython_executable() -> str:
     return executable
 
 
-def measure_joint_gaps(result: Path, timeout: int | None = 120) -> dict[str, object]:
+def measure_joint_gaps(
+    result: Path, timeout: int | None = 120, joint_levels_m: list[float] | None = None,
+) -> dict[str, object]:
+    """Seat gaps, plus wall_joint_k gaps at each wall block joint elevation (m)."""
     completed = subprocess.run(
-        [pvpython_executable(), str(Path(__file__).with_name("measure_joint_gaps.py")), str(result)],
+        [pvpython_executable(), str(Path(__file__).with_name("measure_joint_gaps.py")), str(result),
+         *([f"levels={','.join(f'{level:.12g}' for level in joint_levels_m)}"] if joint_levels_m else [])],
         check=True, timeout=timeout, capture_output=True, text=True,
     )
     return json.loads(completed.stdout.strip().splitlines()[-1])

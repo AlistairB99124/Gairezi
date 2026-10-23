@@ -64,6 +64,11 @@ def locate_crack(config: dict, location, fields):
     thickness = float(wall["radial_width_m"])
     chainage_radius = float(wall["centerline_radius_m"])
     downstream = float(wall["downstream_radius_m"])
+    # Optional thickness steps widen the wall downstream below each top_z_m.
+    for step in wall.get("thickness_steps") or ():
+        if z < float(step["top_z_m"]):
+            thickness = float(step["radial_width_m"])
+            downstream = upstream - thickness
     if not all(math.isfinite(v) and v > 0 for v in (
         upstream, downstream, thickness, chainage_radius,
     )):
@@ -111,17 +116,20 @@ def locate_crack(config: dict, location, fields):
     node_radius = np.hypot(points[:, 0], points[:, 1])
     concrete = (node_regions & 1) > 0
     along = (node_chainage >= start) & (node_chainage <= end)
-    nearby = np.flatnonzero(concrete & along & (np.abs(points[:, 2] - z) <= 0.5))
+    # Search one coarse wall element layer (about 0.5 m) either side of the click so a
+    # selection between node layers still finds wall concrete; the crack stays at z.
+    search_half_height = 0.5
+    nearby = np.flatnonzero(concrete & along & (np.abs(points[:, 2] - z) <= search_half_height))
     if not len(nearby):
         raise ValueError(f"No wall baseline nodes lie near the selected location (Y={y} m, Z={z} m).")
     principal = principal_stresses(stress[nearby])[:, -1]
     face_node = int(nearby[int(np.argmax(principal))])
-    seed_face = "upstream" if node_radius[face_node] >= chainage_radius else "downstream"
+    seed_face = "upstream" if node_radius[face_node] >= upstream - thickness / 2 else "downstream"
     if seed_face == "upstream":
         inner, outer = upstream - depth, upstream
     else:
         inner, outer = downstream, downstream + depth
-    crossed = concrete & along & (np.abs(points[:, 2] - z) <= length_scale / 2) & (
+    crossed = concrete & along & (np.abs(points[:, 2] - z) <= max(length_scale / 2, search_half_height)) & (
         (node_radius >= inner) & (node_radius <= outer)
     )
     required_regions = [1] if np.any(node_regions[crossed] & 1) else []

@@ -41,8 +41,21 @@ def location(chainage, z):
 
 class UserLocatedCrackTests(unittest.TestCase):
     def setUp(self):
+        # These cases check a constant 4 m wall; stepped walls are covered separately.
         self.config = copy.deepcopy(CONFIG)
+        self.config["geometry"]["wall"].pop("thickness_steps", None)
         self.fields = synthetic_fields()
+
+    def test_stepped_wall_uses_the_local_thickness_at_the_crack_elevation(self):
+        self.config["geometry"]["wall"]["thickness_steps"] = [
+            {"top_z_m": -10.0, "radial_width_m": 4.5}, {"top_z_m": -20.0, "radial_width_m": 5.0},
+        ]
+        crack, _, report = locate_crack(self.config, location(108.5, -27.5), self.fields)
+        self.assertEqual(report["seed_face"], "upstream")
+        self.assertEqual(crack.annular_sector[:2], (76.25, 80))
+        crack, _, report = locate_crack(self.config, location(108.5, -27.5), synthetic_fields(False))
+        self.assertEqual(report["seed_face"], "downstream")
+        self.assertEqual(crack.annular_sector[:2], (75, 78.75))
 
     def test_selected_point_seeds_wall_crack_at_user_chainage(self):
         crack, options, report = locate_crack(self.config, location(108.5, -27.5), self.fields)
@@ -87,6 +100,16 @@ class UserLocatedCrackTests(unittest.TestCase):
         ):
             with self.subTest(selected=selected), self.assertRaisesRegex(ValueError, message):
                 locate_crack(self.config, selected, self.fields)
+
+    def test_selection_between_coarse_node_layers_still_finds_the_wall(self):
+        # Elmer wall nodes are about 0.5 m apart vertically; a click midway between
+        # layers is farther than length_scale / 2 from every node.
+        points, stress, regions = self.fields
+        layer = np.isclose(points[:, 2] * 2, np.round(points[:, 2] * 2))
+        coarse = (points[layer], stress[layer], regions[layer])
+        crack, _, report = locate_crack(self.config, location(108.5, -26.75), coarse)
+        self.assertEqual(report["damaged_bodies"], ["wall"])
+        self.assertEqual(crack.centre_m[2], -26.75)
 
     def test_location_without_wall_baseline_nodes_fails(self):
         points, stress, regions = self.fields

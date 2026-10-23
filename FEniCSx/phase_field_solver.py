@@ -799,6 +799,8 @@ def solve_staggered(
         },
         "steps": step_reports,
     }
+    if interfaces is not None:
+        report["interface_springs"] = interfaces.report
     if output is not None and domain.comm.rank == 0:
         (output / "phase_field_report.json").write_text(json.dumps(report, indent=2) + "\n")
     return PhaseFieldResult(displacement, damage, history, report)

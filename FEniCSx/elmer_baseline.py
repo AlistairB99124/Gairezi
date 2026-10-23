@@ -116,7 +116,7 @@ def import_baseline(structure, reference: Path, config: Path, directory: Path) -
             if three_body else "maximum principal eigenvalue of element-mean nodal stress tensor"
         ),
         "field_archive": "elmer_baseline_fields.npz",
-        "node_regions_encoding": "membership bits: 1=wall, 2=bedrock; combined bits for shared nodes",
+        "node_regions_encoding": "membership bits: 1=wall, 2=bedrock, 4=foundation; combined bits for shared nodes",
         "usage": "baseline fields are not fracture initial conditions; the user-selected crack location is recorded separately",
         "engineering_validated": False,
     }

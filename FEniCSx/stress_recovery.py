@@ -42,11 +42,14 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
             raise ValueError("Recovered stress contains nonfinite values")
         principal[start:end] = np.linalg.eigvalsh(tensors)
     body_peaks = {}
+    bodies = [(1, "wall"), (2, "bedrock")]
+    if cell_tags is not None and domain.comm.allreduce(len(cell_tags.find(3))) > 0:
+        bodies.append((3, "foundation"))
     if cell_tags is not None:
         tags = np.zeros(count, dtype=np.int32)
         valid = cell_tags.indices < count
         tags[cell_tags.indices[valid]] = cell_tags.values[valid]
-        for tag, name in ((1, "wall"), (2, "bedrock")):
+        for tag, name in bodies:
             selected = principal[tags == tag]
             records = domain.comm.allgather((
                 float(selected[:, -1].max()) if len(selected) else -np.inf,
@@ -56,8 +59,8 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
                 "maximum_principal_tensile_stress_pa": max(p[0] for p in records),
                 "maximum_principal_compressive_stress_pa": min(p[1] for p in records),
             }
-        principal[tags == 2, -1] = -np.inf
-        principal[tags == 2, 0] = np.inf
+        principal[tags != 1, -1] = -np.inf
+        principal[tags != 1, 0] = np.inf
     xyz = domain.geometry.x[mesh.entities_to_geometry(domain, 3, cells)].mean(axis=1)
     tensile = int(np.argmax(principal[:, -1]))
     compressive = int(np.argmin(principal[:, 0]))
@@ -103,7 +106,7 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
                 "maximum_relative_nodal_stress_difference": 1e-4,
             }
         nodal_peaks, body_peaks = [], {}
-        for tag, name in ((1, "wall"), (2, "bedrock")):
+        for tag, name in bodies:
             ids = np.unique(space.dofmap.list[cell_tags.find(tag)])
             ids = ids[ids < owned_nodes]
             local = None

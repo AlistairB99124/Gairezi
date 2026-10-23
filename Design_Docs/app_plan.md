@@ -129,12 +129,27 @@ FEniCSx now imports the exact saved canonical source mesh (legacy name
 "three-body"; it now holds two bodies: wall = 1, bedrock = 2) and uses distinct
 concrete/rock material fields. There is no plinth: the wall sits directly on
 the bedrock and its underside follows the bedrock contours. The approved
-bedrock support model is `distributed_elastic_granite`: the wall/rock seat is a
-directional elastic spring joint using `geometry.bedrock.support.spring_n_per_m3`,
-discretised as relative-displacement mortar springs in both solvers. The
-alternative `bonded` model shares wall/rock seat displacement nodes in both
-solvers, with zero relative movement but nonzero common deformation allowed;
-its spring coefficients are inactive. Do not ground the wall seat. New jobs run an
+bedrock support model is `distributed_elastic_granite`: without an optional
+concrete foundation, the wall/rock seat is a directional elastic spring joint
+using `geometry.bedrock.support.spring_n_per_m3`, discretised as
+relative-displacement mortar springs in both solvers. The alternative `bonded`
+model shares wall/rock seat displacement nodes, with zero relative movement
+but nonzero common deformation allowed; its spring coefficients are inactive.
+In the foundation-trench workflow, when `geometry.foundation` is configured,
+`geometry.foundation.support` selects the wall/foundation connection and
+`geometry.bedrock.support.model` selects the foundation/bedrock connection
+independently; either may be bonded or use its configured springs. The Python
+and desktop validators require explicit `geometry.foundation.support` whenever
+a foundation is present; it never inherits `geometry.wall.joint_support`.
+The checked-in configuration uses explicit wall/foundation springs
+(X/Y = 1.25e9, Z = 3e9 N/m3) with a bonded foundation/bedrock interface.
+New foundations enabled in the desktop explicitly select bonded support.
+The Elmer and FEniCSx paths require a bonded interface to have conforming shared-node
+faces, and do not assemble spring terms for it. Do not ground a bonded
+interface. Elmer spring BCs explicitly use the normal Galerkin projector
+(`Normal Projector = True` with `Galerkin Projector = True`), not the
+deprecated weighted fallback; spring axes remain global X/Y/Z and connected
+near-planar groups remain separate. New jobs run an
 elastic comparison first. Fracture requires matching
 source/configuration hashes, passed displacement and recovered concrete nodal
 tensor parity (each relative error <= 1e-4), explicit nodal peak metadata,
@@ -190,7 +205,7 @@ independent sensitivity verification. See the README for existing-run export.
 | `water_height` | Reservoir depth above the deepest wall seat; with `overflow_head` sets the water surface |
 | `overflow_head` | Depth above the crest when overflowing; adds the crest surcharge |
 | `overflow_water_level` | Derived reference depth: water height plus overflow head |
-| Explicit directional springs | The wall/bedrock seat uses `geometry.bedrock.support.spring_n_per_m3`, in global x/y/z, on relative displacement only (no grounded spring bypass). The legacy wall-only solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
+| Explicit directional springs | Without `geometry.foundation`, the wall/bedrock seat uses `geometry.bedrock.support.spring_n_per_m3`; with it, that setting controls foundation/bedrock and `geometry.foundation.support` controls wall/foundation. Springs act on relative displacement only (no grounded spring bypass); bonded interfaces share nodes and leave spring coefficients inactive. The legacy wall-only solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
 | Bedrock material | Active in the integrated three-body solver; the legacy wall-only solve represents the foundation with grounded springs instead |
 | `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall-only solve |
 | `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: 0.5 m target within 2 m of the locked wall seat, grading to 15 m by 50 m; shared by preview and three-body preparation. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |

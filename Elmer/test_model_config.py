@@ -163,6 +163,7 @@ class ModelConfigTests(unittest.TestCase):
         self.assertIn("geometry.bedrock.support.model", paths)
 
     def test_bedrock_allows_explicit_bond(self):
+        self.payload["geometry"].pop("foundation", None)
         self.payload["geometry"]["bedrock"]["support"]["model"] = "bonded"
         validate_config(self.payload)
         self.payload["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"

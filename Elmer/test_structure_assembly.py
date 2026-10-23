@@ -43,7 +43,11 @@ class BondedTopologyTests(unittest.TestCase):
         from Elmer.regions.tetrahedral import tetrahedralize_structure
         import math
 
-        source = build_combined_structure(assembly.ROOT)
+        from Elmer.model_config import load_config
+        legacy = load_config(assembly.ROOT / "config.json")
+        legacy["geometry"].pop("foundation", None)
+        with patch("Elmer.regions.uniform_wall.load_config", return_value=legacy):
+            source = build_combined_structure(assembly.ROOT)
         audit = audit_combined_structure(source)
         self.assertEqual(audit["face_connected_components"], 1)
         self.assertEqual(audit["wall_connection"], "single_monolithic_body")
@@ -51,14 +55,18 @@ class BondedTopologyTests(unittest.TestCase):
         self.assertEqual(set(source.region_ids), {1})
         self.assertEqual(len({tuple(round(x, 9) for x in xyz) for xyz in source.nodes}), len(source.nodes))
         self.assertFalse(any(tag > 7 for tag, _ in source.boundaries))
-        # Every foundation face sits on the piecewise-linear bedrock surface.
+        # Every seat node lies on a horizontal course excavated less than one element
+        # (0.5 m) below the surveyed bedrock surface.
         rows = [{"chainage": p.chainage_m, "height": p.bedrock_z_m} for p in load_model_contours(assembly.ROOT)]
         seat_nodes = {node for tag, face in source.boundaries if tag == 1 for node in face}
         self.assertTrue(seat_nodes)
         for node in seat_nodes:
             x, y, z = source.nodes[node]
             chainage = 78.0 * math.atan2(x, y)
-            self.assertLess(abs(z - bedrock_elevation(rows, chainage)), 1e-6)
+            depth = bedrock_elevation(rows, chainage) - z
+            self.assertGreater(depth, -1e-6)
+            self.assertLess(depth, 0.5)
+            self.assertLess(abs(z / 0.5 - round(z / 0.5)), 1e-6)
         self.assertAlmostEqual(min(z for _, _, z in source.nodes), -29.0)
         mesh = tetrahedralize_structure(source)
         faces = Counter()

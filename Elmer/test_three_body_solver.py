@@ -23,11 +23,16 @@ class AppJobWorkerTests(unittest.TestCase):
             config = {"material": {"concrete": {"tensile_strength_pa": 2e6}}}
             geometry = {
                 "material": {"density_kg_m3": 2400}, "loads": {"gravity_z_m_s2": -9.81},
-                "wall_geometry": {"uniform_thickness_m": 4}, "maximum_applied_pressure_pa": 3e5,
+                "wall_geometry": {"max_thickness_m": 4}, "maximum_applied_pressure_pa": 3e5,
             }
             diagnostic_report = {
                 "nodes": 100, "cells_by_body": {"1": 30, "2": 30},
-                "wall_bedrock_connection": "bonded",
+                "foundation": {"present": True},
+                "wall_foundation_connection": "bonded",
+                "foundation_bedrock_connection": "bonded",
+                "wall_bedrock_connection": "not_in_contact",
+                "wall_connection": "spring_jointed_blocks",
+                "wall_joints": [{"name": "wall_joint_1", "z_m": -10.0, "tags": [21, 22]}],
                 "interface_stiffness_n_per_m3": {},
                 "assumptions": ["rock rollers"],
                 "rock_outer_support": {"model": "rollers", "faces": {}},
@@ -67,14 +72,21 @@ class AppJobWorkerTests(unittest.TestCase):
                 self.assertEqual(analysis["tension_utilization"], 1.2)
                 self.assertEqual(report["cells"], 60)
                 self.assertEqual(report["model_kind"], "three_body")
-                self.assertEqual(report["wall_bedrock_connection"], "bonded")
-                self.assertEqual(report["wall_connection"], "single_monolithic_body")
-                self.assertIn("Bonded wall/bedrock seat", report["active_support"])
+                self.assertEqual(report["wall_bedrock_connection"], "not_in_contact")
+                self.assertEqual(report["wall_foundation_connection"], "bonded")
+                self.assertEqual(report["foundation_bedrock_connection"], "bonded")
+                self.assertEqual(report["wall_connection"], "spring_jointed_blocks")
+                self.assertEqual(report["wall_joints"], diagnostic_report["wall_joints"])
+                self.assertIn("wall thickness blocks joined by linear springs", report["connection_assumption"])
+                self.assertIn("Bonded wall/foundation interface; bonded foundation/bedrock interface",
+                              report["active_support"])
                 self.assertNotIn("plinth", json.dumps(report).lower())
                 self.assertIn("normal roller springs", report["active_support"])
                 self.assertEqual(report["rock_outer_support"]["model"], "rollers")
-                self.assertIn("geometry.bedrock.support.spring_n_per_m3: inactive for bonded seat",
-                              report["inactive_inputs"])
+                self.assertIn(
+                    "geometry.bedrock.support.spring_n_per_m3: inactive for bonded foundation/bedrock interface",
+                    report["inactive_inputs"],
+                )
                 self.assertEqual(report["stress_bodies"]["bedrock"]["peak_tension_mpa"], 99)
                 self.assertEqual(json.loads(report_path.read_text()), report)
                 with self.assertRaisesRegex(ValueError, "fresh"):

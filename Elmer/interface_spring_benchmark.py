@@ -165,6 +165,7 @@ Boundary Condition 4
     Target Boundaries(1) = 4
     Mortar BC = Integer 5
     Galerkin Projector = Logical True
+    Normal Projector = Logical True
     Mortar BC Coefficient Displacement 1 = Real {stiffness:.12g}
     Mortar BC Coefficient Displacement 2 = Real {stiffness:.12g}
     Mortar BC Coefficient Displacement 3 = Real {stiffness:.12g}

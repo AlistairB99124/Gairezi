@@ -26,6 +26,7 @@ def build_graded_rock(
     config: dict, concrete: np.ndarray, foundation_faces: list[tuple[int, ...]],
     stream_margin_m: float | None = None, bank_margin_m: float | None = None,
     bottom_z_m: float | None = None,
+    *, foundation=None,
 ) -> RockMesh:
     rock = config["geometry"]["bedrock"]
     domain = rock.get("domain", {})
@@ -50,12 +51,51 @@ def build_graded_rock(
     # Retain the faceted terrain exactly; only the seat triangles are mesh-locked.
     facets = [tuple(int(n) + count for n in tri) for tri in triangles]
     top_count = len(facets)
-    # A coarse bottom fan is planar; its interior edges do not force fine columns.
-    boundary_nodes = sorted({n for edge in perimeter for n in edge})
-    centre = columns[boundary_nodes].mean(axis=0)
-    shell_points = np.vstack((columns, centre))
+    if foundation is not None:
+        # Remove the unexcavated trench top and replace it by the lining's cut
+        # floor/side staircase and exposed walls up to the surveyed terrain.
+        shell_points_list = columns.tolist()
+        lookup = {tuple(np.round(p, 8)): i for i, p in enumerate(columns)}
+        mapping = []
+        for p in foundation.points:
+            key = tuple(np.round(p, 8))
+            if key not in lookup:
+                lookup[key] = len(shell_points_list)
+                shell_points_list.append(p.tolist())
+            mapping.append(lookup[key])
+        cut = [tuple(mapping[int(n)] for n in tri) for tri in foundation.contact_faces]
+        exposed = [tuple(mapping[int(n)] for n in tri) for tri in foundation.exposed_rock_faces]
+        facets = cut + exposed + facets[seat_count:]
+        seat_count = len(cut)
+        top_count = len(facets)
+        report["seat_triangles"] = seat_count
+        report["rock_volume_m3"] -= (foundation.report["volume_m3"]
+                                    + foundation.report.get("open_excavation_volume_m3", 0.))
+        report["foundation"] = foundation.report
+        columns = np.asarray(shell_points_list)
+    # Mesh the planar bottom without artificial radial seams.
+    neighbours: dict[int, list[int]] = {}
+    for a, b in perimeter:
+        neighbours.setdefault(a, []).append(b)
+        neighbours.setdefault(b, []).append(a)
+    if not neighbours or any(len(nodes) != 2 for nodes in neighbours.values()):
+        raise ValueError("Rock perimeter must be a single closed loop")
+    bottom_loop = [min(neighbours)]
+    previous = -1
+    current = bottom_loop[0]
+    while True:
+        following = next(n for n in neighbours[current] if n != previous)
+        if following == bottom_loop[0]:
+            break
+        if following in bottom_loop:
+            raise ValueError("Invalid rock perimeter cycle")
+        bottom_loop.append(following)
+        previous, current = current, following
+    if len(bottom_loop) != len(neighbours):
+        raise ValueError("Multiple rock perimeter loops are not supported")
+    shell_points = columns
     bottom_start = len(facets)
-    facets.extend((a, b, 2 * count) for a, b in perimeter)
+    facets.append(tuple(bottom_loop))
     bottom_end = len(facets)
     for a, b in perimeter:
         facets.extend(((a, b, b + count), (a, b + count, a + count)))
@@ -103,7 +143,7 @@ def build_graded_rock(
         for key, value in {
             "Mesh.MeshSizeFromPoints": 0, "Mesh.MeshSizeFromCurvature": 0,
             "Mesh.MeshSizeExtendFromBoundary": 0, "Mesh.MeshSizeMin": settings["near_size_m"],
-            "Mesh.MeshSizeMax": settings["far_size_m"], "Mesh.Algorithm3D": 10,
+            "Mesh.MeshSizeMax": settings["far_size_m"], "Mesh.Algorithm3D": 1 if foundation is not None else 10,
             "Mesh.ElementOrder": 1,
             "Mesh.OptimizeNetgen": 1,
             "Mesh.RandomSeed": 1,
@@ -175,7 +215,10 @@ def build_graded_rock(
             gmsh.model.mesh.getElements(3, volume)[1][0], "minSICN",
         )
         if np.min(qualities) <= 1e-8:
-            raise ValueError("Graded rock contains numerically degenerate tetrahedra")
+            worst = int(np.argmin(qualities))
+            tags = gmsh.model.mesh.getElements(3, volume)[2][0].reshape(-1, 4)[worst]
+            xyz = [gmsh.model.mesh.getNode(int(tag))[0].tolist() for tag in tags]
+            raise ValueError(f"Graded rock contains numerically degenerate tetrahedra: minSICN={min(qualities)}; nodes={xyz}")
         report.update(
             mesh_method="conforming_distance_graded_tetrahedra",
             mesh_grading=dict(settings), bedrock_cells=len(tetrahedra),

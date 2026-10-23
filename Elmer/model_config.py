@@ -67,6 +67,10 @@ ENERGY_SPLITS = {"volumetric_deviatoric"}
 # is absent) fixes every bottom DOF and leaves the sides free; "rollers" applies
 # stiff normal-only penalty springs to the bottom and the four vertical sides.
 ROCK_OUTER_SUPPORT_MODELS = {"fixed_bottom", "rollers"}
+# Horizontal joints between the wall's thickness bands. "bonded" (default when
+# geometry.wall.joint_support is absent) keeps one monolithic wall; "spring" makes
+# each band a separate concrete block joined by linear x/y/z springs (N/m^3).
+WALL_JOINT_MODELS = {"bonded", "spring"}
 SUPPORT_MODELS = {
     "bedrock": ("distributed_elastic_granite", "bedrock"),
 }
@@ -169,6 +173,67 @@ class _ConfigValidator:
                     "must be midway between upstream_radius_m and downstream_radius_m",
                 )
         return upstream, downstream
+
+    def validate_thickness_steps(
+        self,
+        value: object,
+        upstream: float | None,
+        crest_downstream: float | None,
+    ) -> None:
+        """Optional downstream thickening below given elevations.
+
+        Each step sets the radial width (m) of the wall below ``top_z_m``; the
+        upstream face stays at upstream_radius_m, so the extra thickness is on
+        the downstream face. Steps must deepen and must not thin the wall.
+        """
+        path = "geometry.wall.thickness_steps"
+        if not isinstance(value, list):
+            self.issue(path, "must be an array")
+            return
+        previous_z = 0.0
+        previous_width = (
+            upstream - crest_downstream
+            if upstream is not None and crest_downstream is not None else None
+        )
+        for index, row in enumerate(value):
+            row_path = f"{path}[{index}]"
+            values = self.object(row, row_path, {"top_z_m", "radial_width_m"})
+            top_z = self.field_number(values, "top_z_m", row_path)
+            width = self.field_number(values, "radial_width_m", row_path, positive=True)
+            if top_z is not None:
+                if top_z >= previous_z:
+                    self.issue(
+                        f"{row_path}.top_z_m",
+                        "must be below the crest (z = 0) and below the previous step",
+                    )
+                previous_z = top_z
+            if width is not None:
+                if previous_width is not None and width < previous_width - 1e-9:
+                    self.issue(
+                        f"{row_path}.radial_width_m",
+                        "must not be less than the wall width above it",
+                    )
+                if upstream is not None and width >= upstream:
+                    self.issue(f"{row_path}.radial_width_m", "must be less than upstream_radius_m")
+                previous_width = width
+
+    def validate_wall_joint_support(self, value: object) -> None:
+        """Joints between thickness bands: bonded, or linear springs in global x/y/z (N/m^3)."""
+        path = "geometry.wall.joint_support"
+        values = self.object(value, path, {"model"}, {"spring_n_per_m3"})
+        if values is None:
+            return
+        model = values.get("model")
+        if model not in WALL_JOINT_MODELS:
+            self.issue(f"{path}.model", f"must be one of {sorted(WALL_JOINT_MODELS)}")
+        if model == "spring" and "spring_n_per_m3" not in values:
+            self.issue(f"{path}.spring_n_per_m3", "is required for spring joints")
+        if "spring_n_per_m3" in values:
+            springs = self.object(values["spring_n_per_m3"], f"{path}.spring_n_per_m3", VECTOR_KEYS)
+            if springs is not None:
+                for axis in ("x", "y", "z"):
+                    # A zero spring would leave a block free to drift.
+                    self.field_number(springs, axis, f"{path}.spring_n_per_m3", positive=True)
 
     def validate_material(self, material: Mapping[str, object] | None) -> None:
         for name in ("concrete", "bedrock"):
@@ -377,8 +442,35 @@ class _ConfigValidator:
         if root is None:
             return self.issues
 
-        geometry = self.object(root.get("geometry"), "geometry", CONFIG_KEYS["geometry"])
+        geometry = self.object(root.get("geometry"), "geometry", CONFIG_KEYS["geometry"], {"foundation"})
         if geometry is not None:
+            if "foundation" in geometry:
+                path = "geometry.foundation"
+                foundation = self.object(geometry["foundation"], path, {"depth_m", "side_margin_m", "support"})
+                if foundation is not None and "support" in foundation:
+                    support_path = f"{path}.support"
+                    interface = self.object(foundation["support"], support_path, {"model"}, {"spring_n_per_m3"})
+                    if interface is not None:
+                        model = interface.get("model")
+                        if model not in ("bonded", "spring"):
+                            self.issue(f"{support_path}.model", "must be 'bonded' or 'spring'; bonded means zero relative displacement")
+                        if model == "spring":
+                            springs = self.object(interface.get("spring_n_per_m3"), f"{support_path}.spring_n_per_m3", VECTOR_KEYS)
+                            if springs is not None:
+                                for axis in ("x", "y", "z"):
+                                    self.field_number(springs, axis, f"{support_path}.spring_n_per_m3", positive=True)
+                        elif "spring_n_per_m3" in interface:
+                            self.issue(f"{support_path}.spring_n_per_m3", "is only valid for spring support")
+                for key in ("depth_m", "side_margin_m"):
+                    value = self.field_number(foundation, key, path, positive=True)
+                    if value is not None and value > 5.:
+                        self.issue(f"{path}.{key}", "must not exceed 5 m")
+                bedrock_value = geometry.get("bedrock")
+                support = bedrock_value.get("support") if isinstance(bedrock_value, Mapping) else None
+                if not isinstance(support, Mapping):
+                    support = {}
+                if isinstance(bedrock_value, Mapping) and "mesh" not in bedrock_value:
+                    self.issue(path, "requires geometry.bedrock.mesh (graded rock mesh)")
             global_size = self.field_number(geometry, "global_element_size_m", "geometry", positive=True)
             local_size = self.field_number(geometry, "local_element_size_m", "geometry", positive=True)
             if global_size is not None and local_size is not None and local_size > global_size:
@@ -388,6 +480,7 @@ class _ConfigValidator:
                 geometry.get("wall"),
                 "geometry.wall",
                 RADIUS_KEYS | {"height_m"},
+                {"thickness_steps", "joint_support", "step_end_taper_ratio"},
             )
             bedrock = self.object(
                 geometry.get("bedrock"),
@@ -430,7 +523,20 @@ class _ConfigValidator:
                     "is a draft profile, not an active solver input. The geometry preview "
                     "derives its section from geometry.bedrock.contours.",
                 )
-            self.validate_radii(wall, "geometry.wall")
+            wall_upstream, wall_downstream = self.validate_radii(wall, "geometry.wall")
+            if wall is not None and "thickness_steps" in wall:
+                self.validate_thickness_steps(
+                    wall["thickness_steps"], wall_upstream, wall_downstream,
+                )
+            if wall is not None and "joint_support" in wall:
+                self.validate_wall_joint_support(wall["joint_support"])
+            if wall is not None and "step_end_taper_ratio" in wall:
+                self.field_number(wall, "step_end_taper_ratio", "geometry.wall", positive=True)
+                if not wall.get("thickness_steps") or "foundation" not in geometry:
+                    self.issue(
+                        "geometry.wall.step_end_taper_ratio",
+                        "requires geometry.wall.thickness_steps and geometry.foundation",
+                    )
             if wall is not None:
                 self.field_number(wall, "height_m", "geometry.wall")
                 if "height_m" in wall:
@@ -449,6 +555,13 @@ class _ConfigValidator:
                         "geometry.bedrock.domain.bottom_z_m",
                         "must be below every bedrock contour elevation",
                     )
+            foundation_value = geometry.get("foundation")
+            depth = foundation_value.get("depth_m") if isinstance(foundation_value, Mapping) else None
+            if (domain_bottom is not None and bedrock_stations
+                    and isinstance(depth, (int, float)) and not isinstance(depth, bool)
+                    and math.isfinite(depth)
+                    and domain_bottom >= min(height for _, height in bedrock_stations) - depth):
+                self.issue("geometry.foundation.depth_m", "trench floor must remain above the rock-domain bottom")
             if bedrock_stations and min(height for _, height in bedrock_stations) >= 0:
                 # The wall spans the chainages where rock lies below the crest (z = 0).
                 self.issue("geometry.bedrock.contours", "must dip below the crest elevation (z = 0)")
@@ -490,6 +603,78 @@ class _ConfigValidator:
         if "crack_simulations" in root:
             self.validate_cracks(root["crack_simulations"])
         return self.issues
+
+
+def wall_thickness_steps(wall: Mapping[str, object]) -> list[tuple[float, float]]:
+    """Return (top_z_m, radial_width_m) bands from the crest downwards.
+
+    The first band is the crest section (top z = 0, radial_width_m); later
+    bands come from the optional geometry.wall.thickness_steps.
+    """
+    bands = [(0.0, float(wall["upstream_radius_m"]) - float(wall["downstream_radius_m"]))]
+    for step in wall.get("thickness_steps") or ():
+        bands.append((float(step["top_z_m"]), float(step["radial_width_m"])))
+    return bands
+
+
+def wall_width_at(wall: Mapping[str, object], z: float) -> float:
+    """Radial wall width (m) at elevation z; a step applies strictly below its top_z_m."""
+    width = wall_thickness_steps(wall)[0][1]
+    for top_z, step_width in wall_thickness_steps(wall)[1:]:
+        if z < top_z:
+            width = step_width
+    return width
+
+
+def wall_downstream_radius_at(wall: Mapping[str, object], z: float) -> float:
+    """Downstream face radius (m) at elevation z; the upstream face is fixed."""
+    return float(wall["upstream_radius_m"]) - wall_width_at(wall, z)
+
+
+def tapered_wall_downstream_radius_at(wall: Mapping[str, object], z: float, seat_z: float) -> float:
+    """Downstream radius (m) at elevation z above a seat at seat_z.
+
+    With optional geometry.wall.step_end_taper_ratio, each step widens the band
+    above it by at most ratio * (step top_z_m - seat_z): where a step ends against
+    the abutment, its extra width grows with the seat depth below the step
+    instead of starting at full width on a one-course shelf. Without it, this
+    equals wall_downstream_radius_at.
+    """
+    ratio = wall.get("step_end_taper_ratio")
+    if ratio is None:
+        return wall_downstream_radius_at(wall, z)
+    bands = wall_thickness_steps(wall)
+    width = bands[0][1]
+    for top_z, step_width in bands[1:]:
+        if z < top_z:
+            width = max(width, min(step_width, width + float(ratio) * max(0.0, top_z - seat_z)))
+    return float(wall["upstream_radius_m"]) - width
+
+
+def foundation_support(config: dict) -> dict:
+    """Explicit wall/foundation connection, independent of internal wall joints."""
+    return config["geometry"]["foundation"]["support"]
+
+
+def wall_joint_support(wall: Mapping[str, object]) -> dict[str, object] | None:
+    """Spring joints between thickness bands, or None for one bonded (monolithic) wall.
+
+    Returns {"levels_m": step elevations (top to bottom), "spring_n_per_m3": {x, y, z}}.
+    """
+    support = wall.get("joint_support")
+    levels = [top_z for top_z, _ in wall_thickness_steps(wall)[1:]]
+    if not isinstance(support, Mapping) or support.get("model") != "spring" or not levels:
+        return None
+    springs = support["spring_n_per_m3"]
+    return {
+        "levels_m": levels,
+        "spring_n_per_m3": {axis: float(springs[axis]) for axis in ("x", "y", "z")},  # type: ignore[index]
+    }
+
+
+def wall_block_index(wall: Mapping[str, object], z: float) -> int:
+    """Thickness band (0 = crest block) containing elevation z; steps start strictly below top_z_m."""
+    return sum(1 for top_z, _ in wall_thickness_steps(wall)[1:] if z < top_z)
 
 
 def validate_config(payload: object) -> dict[str, object]:

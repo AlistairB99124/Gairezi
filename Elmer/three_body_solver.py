@@ -41,7 +41,7 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
     if report_path.exists() or (output.exists() and any(output.iterdir())):
         raise ValueError("API job requires fresh output and report paths")
     print("Stage: meshing", flush=True)
-    geometry = audit_combined_structure(build_combined_structure(root))
+    geometry = audit_combined_structure(build_combined_structure(root, split_wall_joints=True))
     prepare(root, output / "model", joints="spring", integrated=True)
     print("Stage: solving", flush=True)
     result = solve(output / "model", timeout=timeout, partitions=partitions)
@@ -54,6 +54,41 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
     compression = -max(entry["peak_compression_mpa"] for entry in concrete) * 1e6
     strength = config["material"]["concrete"]["tensile_strength_pa"]
     diagnostic = json.loads((output / "model" / "diagnostic.json").read_text())
+    if diagnostic.get("foundation", {}).get("present"):
+        wall_foundation = diagnostic.get("wall_foundation_connection")
+        foundation_bedrock = diagnostic.get("foundation_bedrock_connection")
+        connection_assumption = (
+            ("Bonded" if wall_foundation == "bonded" else "Spring-connected")
+            + " wall/foundation interface; "
+            + ("bonded" if foundation_bedrock == "bonded" else "spring-connected")
+            + " foundation/bedrock interface"
+        )
+        active_support = connection_assumption + "; "
+    elif diagnostic.get("wall_bedrock_connection") == "bonded":
+        connection_assumption = "Wall perfectly bonded to the bedrock by shared seat nodes"
+        active_support = "Bonded wall/bedrock seat; "
+    else:
+        connection_assumption = "Separate coincident seat nodes; linear springs carry tension, not frictional contact"
+        active_support = "Configured wall/bedrock directional seat springs; "
+    if diagnostic.get("wall_joints"):
+        connection_assumption += (
+            "; wall thickness blocks joined by linear springs "
+            "(geometry.wall.joint_support) that carry tension"
+        )
+    active_support += (
+        "rock bottom and sides on normal roller springs"
+        if diagnostic.get("rock_outer_support", {}).get("model") == "rollers" else "fixed rock bottom"
+    )
+    inactive_inputs = [
+        "geometry.wall.height_m: nominal metadata; the seat follows geometry.bedrock.contours",
+        "outputs: selections do not change solver fields",
+    ]
+    if diagnostic.get("foundation_bedrock_connection") == "bonded":
+        inactive_inputs.append(
+            "geometry.bedrock.support.spring_n_per_m3: inactive for bonded foundation/bedrock interface"
+        )
+    elif diagnostic.get("wall_bedrock_connection") == "bonded":
+        inactive_inputs.append("geometry.bedrock.support.spring_n_per_m3: inactive for bonded seat")
     report = {
         "material": geometry["material"],
         "loads": geometry["loads"],
@@ -67,34 +102,27 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "stress_bodies": summary["bodies"],
         "reporting_distance_m": summary["rock_reporting_distance_m"],
         "reporting_limitations": summary["limitations"],
-        "wall_connection": "single_monolithic_body",
+        "foundation": diagnostic.get("foundation", {"present": False}),
+        "wall_foundation_connection": diagnostic.get("wall_foundation_connection"),
+        "foundation_bedrock_connection": diagnostic.get("foundation_bedrock_connection"),
+        "spring_pairs": diagnostic.get("spring_pairs", {}),
+        "solver_body_ids": diagnostic.get("solver_body_ids", {"wall": 1, "bedrock": 2}),
+        "boundary_id_map": diagnostic.get("boundary_id_map", {}),
+        "joint_gaps": diagnostic.get("joint_gaps", {}),
+        "wall_connection": diagnostic.get("wall_connection", "single_monolithic_body"),
+        "wall_joints": diagnostic.get("wall_joints", []),
         "wall_bedrock_connection": diagnostic.get("wall_bedrock_connection", "spring"),
-        "connection_assumption": (
-            "Wall perfectly bonded to the bedrock by shared seat nodes"
-            if diagnostic.get("wall_bedrock_connection") == "bonded" else
-            "Separate coincident seat nodes; linear springs carry tension, not frictional contact"
-        ),
-        "active_support": (
-            "Bonded wall/bedrock seat; "
-            if diagnostic.get("wall_bedrock_connection") == "bonded" else
-            "Configured wall/bedrock directional seat springs; "
-        ) + (
-            "rock bottom and sides on normal roller springs"
-            if diagnostic.get("rock_outer_support", {}).get("model") == "rollers" else "fixed rock bottom"
-        ),
+        "connection_assumption": connection_assumption,
+        "active_support": active_support,
         "rock_outer_support": diagnostic.get("rock_outer_support", {"model": "fixed_bottom"}),
-        "inactive_inputs": ["geometry.wall.height_m: nominal metadata; the seat follows geometry.bedrock.contours",
-                            "outputs: selections do not change solver fields"] + (
-                                ["geometry.bedrock.support.spring_n_per_m3: inactive for bonded seat"]
-                                if diagnostic.get("wall_bedrock_connection") == "bonded" else []
-                            ),
+        "inactive_inputs": inactive_inputs,
         "regions": diagnostic["cells_by_body"],
         "interface_stiffness_n_per_m3": diagnostic["interface_stiffness_n_per_m3"],
         "assumptions": diagnostic["assumptions"],
         "nodes": diagnostic["nodes"],
         "cells": sum(diagnostic["cells_by_body"].values()),
         "stress_analysis": {
-            "scope": "wall only; bedrock reported separately within 5 m",
+            "scope": "wall only; foundation separately when present; bedrock separately within 5 m",
             "max_tensile_principal_stress_pa": {"value_pa": tension},
             "max_compressive_principal_stress_pa": {"value_pa": compression},
             "tensile_strength_pa": strength,
