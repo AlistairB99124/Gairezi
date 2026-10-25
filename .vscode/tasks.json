@@ -1,68 +1,8 @@
-{
+﻿{
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "FEniCSx: Run phase-field fracture",
-      "type": "process",
-      "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "/home/alist/.venvs/dolfinx-external-operator/bin/python", "-u", "-B", "FEniCSx/run.py", "run-fracture", "--dam-config", "config.json", "--elmer-result", "Elmer/structure_output/combined_solver/results/combined_results_mpi_t0001.pvtu", "--output", "FEniCSx/results"],
-      "problemMatcher": [],
-      "group": "build",
-      "detail": "Consumes the existing Elmer PVTU, generates a peak-driven crack when no legacy scenario is supplied, refines its band, and runs hybrid AT2 fracture. Run Elmer first with the same configuration."
-    },
-    {
-      "label": "FEniCSx: Verify frictionless contact benchmark",
-      "type": "process",
-      "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "run", "--scenario", "frictionless_contact_benchmark"],
-      "problemMatcher": [],
-      "group": "build",
-      "detail": "Verifies opening, closure, pressure, equilibrium and unloading of two elastic bars on two meshes; not a dam crack solve."
-    },
-    {
-      "label": "FEniCSx: Import and audit dam mesh",
-      "type": "process",
-      "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "import-dam"],
-      "problemMatcher": [],
-      "detail": "Subdivides the current dam conformingly, verifies boundary tags and writes XDMF mesh/tag output."
-    },
-    {
-      "label": "FEniCSx: Verify dam elastic parity",
-      "type": "process",
-      "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "run", "--scenario", "dam_elastic_parity"],
-      "problemMatcher": [],
-      "group": "build",
-      "detail": "Solves the full tetrahedral dam and checks displacement probes, spring reactions and equilibrium against Elmer."
-    },
-    {
-      "label": "FEniCSx: Check WSL environment and scenarios",
-      "type": "process",
-      "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "check"],
-      "problemMatcher": [],
-      "detail": "Checks the Ubuntu DOLFINx environment and validates cracking.json without running a model."
-    },
-    {
-      "label": "FEniCSx: Inventory Elmer dam for migration",
-      "type": "process",
-      "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "inventory"],
-      "problemMatcher": [],
-      "detail": "Audits the existing procedural dam, tags and spring/load definitions without modifying Elmer files."
-    },
-    {
-      "label": "FEniCSx: Update configured results",
-      "type": "process",
-      "command": "wsl.exe",
-      "args": ["--distribution", "Ubuntu", "--cd", "${workspaceFolder}", "--exec", "python3", "-B", "FEniCSx/run.py", "run"],
-      "problemMatcher": [],
-      "group": "build",
-      "detail": "Runs enabled cracking.json scenarios, including the elastic benchmark and full dam parity. Unverified crack solves are blocked."
-    },
-    {
-      "label": "Elmer: Run solver",
+      "label": "Elmer: Run combined solver",
       "type": "process",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "args": [
@@ -82,15 +22,15 @@
         "panel": "dedicated",
         "clear": true
       },
-      "detail": "Solves the wall seated on the configured 2H bedrock with configured interface springs. Writes fresh runs under %LOCALAPPDATA%\\Lamb\\three-body-solver; prints the result path. Fixed rock bottom, free sides, zero uplift."
+      "detail": "Solves the wall+foundation+bedrock three-body model with the configured interface springs. Writes a fresh run under %LOCALAPPDATA%\\Lamb\\three-body-solver and prints the result path. Run this first; Code_Aster: Run three-body stress analysis auto-finds its most recent output."
     },
     {
-      "label": "Elmer: Run combined solver",
+      "label": "Code_Aster: Run three-body stress analysis",
       "type": "process",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "args": [
         "-m",
-        "Elmer.three_body_solver"
+        "Aster.run_three_body_pipeline"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -102,122 +42,7 @@
         "panel": "dedicated",
         "clear": true
       },
-      "detail": "Same three-body analysis as Elmer: Run solver, including the approved bedrock volume and configured interface springs. Results are isolated under %LOCALAPPDATA%\\Lamb\\three-body-solver."
-    },
-    {
-      "label": "Elmer: Run legacy wall-only foundation-spring solver",
-      "type": "process",
-      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": ["Elmer\\structure_assembly.py", "combined-solve"],
-      "options": {"cwd": "${workspaceFolder}"},
-      "problemMatcher": [],
-      "detail": "Legacy wall-only comparison: grounded foundation springs, no bedrock volume. Writes Elmer/structure_output/combined_solver/results; existing CLI defaults are unchanged."
-    },
-    {
-      "label": "Elmer: Preview wall and bedrock (geometry only)",
-      "type": "process",
-      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": [
-        "-m",
-        "Elmer.bedrock_preview",
-        "--output",
-        "${env:LOCALAPPDATA}\\Lamb\\bedrock-preview"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "clear": true
-      },
-      "detail": "Exports unsolved wall and bedrock geometry from config.json. Open %LOCALAPPDATA%\\Lamb\\bedrock-preview\\three_body_geometry.pvtu in ParaView and colour by cell RegionId (wall = 1, bedrock = 2). Does not change solver results."
-    },
-    {
-      "label": "Elmer: Regenerate legacy wall-only client results",
-      "type": "process",
-      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": [
-        "Elmer\\analyze_stress.py",
-        "--vtu",
-        "Elmer\\structure_output\\combined_solver\\results\\combined_results_mpi_t0001.pvtu",
-        "--out-dir",
-        "Elmer\\structure_output\\combined_solver\\results",
-        "--mesh",
-        "Elmer\\structure_output\\combined_solver\\combined_structure.msh"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "group": "build",
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "clear": true
-      },
-      "detail": "Legacy two-body results only; does not consume new three-body runs. Three-body stresses and GeometryIds are available directly in ParaView."
-    },
-    {
-      "label": "Code_Aster: Docker build MED mesh",
-      "type": "process",
-      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": [
-        "Aster\\build_med_mesh.py"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "group": "build",
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "clear": true
-      },
-      "detail": "Uses jesusbill/code_aster:latest to build Aster/results/00_elastic_baseline/mesh.med."
-    },
-    {
-      "label": "Code_Aster: Docker elastic baseline",
-      "type": "process",
-      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": [
-        "Aster\\run_case.py",
-        "Aster\\cases\\00_elastic_baseline.comm"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "group": "build",
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "clear": true
-      },
-      "detail": "Runs the baseline Code_Aster solve in Docker and writes both MED and VTU results under Aster/results/00_elastic_baseline."
-    },
-    {
-      "label": "Code_Aster: Convert all MED results to VTU",
-      "type": "process",
-      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": [
-        "Aster\\convert_med_to_vtu.py",
-        "Aster\\results",
-        "--overwrite"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "group": "build",
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "clear": true
-      },
-      "detail": "Converts every MED file under Aster/results to an updated sibling VTU."
+      "detail": "One-command wrapper for the full Code_Aster three-body cross-check: exports the mesh from the latest Elmer: Run combined solver run, generates the .comm case, solves it against the real Salome-Meca/Code_Aster install at C:\\SALOME-MECA\\2025\\W64\\CODE_ASTER_17.4, then prints peak displacement and peak tensile/compressive stress, Elmer vs Code_Aster (Aster/results/01_three_body_baseline/comparison_report.json). Open Aster/results/01_three_body_baseline/run/result_stress.vtu in stock ParaView for stress components, principal stresses and von Mises stress (Pa). The original result.med needs a MED reader such as Salome/ParaVis; mesh.med is geometry-only."
     }
   ]
 }

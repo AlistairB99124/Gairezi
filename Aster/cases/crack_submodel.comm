@@ -1,0 +1,149 @@
+from code_aster.Commands import *
+from code_aster import CA
+import json
+import sys
+import numpy as np
+
+DEBUT(ERREUR=_F(ALARME="EXCEPTION"))
+with open("fort.91", encoding="utf-8") as stream:
+    inputs = json.load(stream)
+sys.path.insert(0, inputs["repository_root"])
+from Aster.native_seed import initial_field
+from Aster.crack_submodel import moving_least_squares
+
+parameters = inputs["material"]["parameters"]
+loads = inputs["loads"]
+layout = inputs["layout"]
+linear = LIRE_MAILLAGE(FORMAT="MED", UNITE=20)
+MESH = CREA_MAILLAGE(MAILLAGE=linear, LINE_QUAD=_F(TOUT="OUI"))
+MESH = DEFI_GROUP(reuse=MESH, MAILLAGE=MESH, CREA_GROUP_NO=_F(GROUP_MA="CUT", NOM="CUT_NODES"))
+MODEL = AFFE_MODELE(
+    MAILLAGE=MESH,
+    AFFE=_F(TOUT="OUI", PHENOMENE="MECANIQUE", MODELISATION="3D_GRAD_VARI"),
+)
+MAT = DEFI_MATER_GC(ENDO_FISS_EXP=_F(**parameters))
+FIELD = AFFE_MATERIAU(MAILLAGE=MESH, AFFE=_F(GROUP_MA="VOLUME", MATER=MAT))
+INITIAL, audit = initial_field(MODEL, MAT, inputs["shared_seed"], inputs["seed_damage"],
+                               volume_group="VOLUME")
+
+# Cut faces follow the uncracked Elmer displacement, interpolated once per node.
+sources = inputs["boundary_sources"]
+source_points = np.asarray(sources["coordinates_m"])
+source_values = np.asarray(sources["displacement_m"])
+coordinates = np.asarray(MESH.getCoordinates().getValues()).reshape(-1, 3)
+theta = np.arctan2(coordinates[:, 0], coordinates[:, 1])
+on_cut = (np.isclose(theta, layout["theta_edges_rad"][0], rtol=0., atol=1e-9)
+          | np.isclose(theta, layout["theta_edges_rad"][-1], rtol=0., atol=1e-9)
+          | np.isclose(coordinates[:, 2], layout["z_edges_m"][0], rtol=0., atol=1e-7))
+if not layout["top_is_crest"]:
+    on_cut |= np.isclose(coordinates[:, 2], layout["z_edges_m"][-1], rtol=0., atol=1e-7)
+if not np.any(on_cut) or np.count_nonzero(on_cut) != len(MESH.getNodes("CUT_NODES")):
+    raise ValueError(
+        "Cut-face nodes found geometrically differ from the CUT face group: "
+        f"{np.count_nonzero(on_cut)} versus {len(MESH.getNodes('CUT_NODES'))}")
+cut_xyz = coordinates[on_cut]
+cut_values, nearest = moving_least_squares(source_points, source_values, cut_xyz)
+if not np.isfinite(cut_values).all():
+    raise ValueError("Nonfinite interpolated baseline displacement")
+lookup = {tuple(np.round(point, 6)): value for point, value in zip(cut_xyz, cut_values)}
+interpolation = {
+    "cut_nodes": int(len(cut_xyz)), "source_nodes": int(len(source_points)),
+    "maximum_nearest_source_distance_m": float(nearest.max()),
+    "maximum_cut_displacement_m": float(np.abs(cut_values).max()),
+    "method": "moving least squares, locally linear, 20 nearest wall nodes",
+}
+if nearest.max() > 1.0:
+    raise ValueError("Cut-face nodes lie too far from the baseline wall nodes")
+
+
+def factor(instant):
+    return min(max(instant - 1.0, 0.0), 1.0)
+
+
+def imposed(component):
+    def value(x, y, z, instant):
+        key = (round(x, 6), round(y, 6), round(z, 6))
+        if key not in lookup:
+            raise ValueError(f"Cut-face displacement requested at an unknown node {key}")
+        return factor(instant) * float(lookup[key][component])
+    return value
+
+
+UX, UY, UZ = (
+    FORMULE(NOM_PARA=("X", "Y", "Z", "INST"), VALE="u(X,Y,Z,INST)", u=imposed(component))
+    for component in range(3)
+)
+CUT = AFFE_CHAR_CINE_F(MODELE=MODEL, MECA_IMPO=_F(GROUP_MA="CUT", DX=UX, DY=UY, DZ=UZ))
+
+gradient = loads["water_pressure_gradient_pa_per_m"]
+surface = loads["upstream_surface_z_m"]
+tailwater = loads["concrete_minimum_z_m"] + loads["tailwater_head_m"]
+UPSTREAM = FORMULE(NOM_PARA="Z", VALE="g * max(s - Z, 0.)", g=gradient, s=surface)
+DOWNSTREAM = FORMULE(NOM_PARA="Z", VALE="g * max(t - Z, 0.)", g=gradient, t=tailwater)
+pressures = [_F(GROUP_MA="UPSTREAM", PRES=UPSTREAM), _F(GROUP_MA="DOWNSTREAM", PRES=DOWNSTREAM)]
+if layout["top_is_crest"]:
+    CREST = FORMULE(NOM_PARA="Z", VALE="c + 0. * Z", c=gradient * max(surface, 0.))
+    pressures.append(_F(GROUP_MA="CREST", PRES=CREST))
+WATER = AFFE_CHAR_MECA_F(MODELE=MODEL, PRES_REP=pressures)
+WEIGHT = AFFE_CHAR_MECA(
+    MODELE=MODEL,
+    FORCE_INTERNE=_F(GROUP_MA="VOLUME",
+                     FZ=loads["concrete_density_kg_m3"] * loads["gravity_z_m_s2"]),
+)
+RAMP = DEFI_FONCTION(NOM_PARA="INST", VALE=(0., 0., 1., 0., 2., 1.))
+TIMES = DEFI_LIST_REEL(VALE=inputs["times"])
+STEPS = DEFI_LIST_INST(
+    DEFI_LIST=_F(LIST_INST=TIMES),
+    ECHEC=_F(EVENEMENT="ERREUR", ACTION="DECOUPE", SUBD_METHODE="MANUEL",
+             SUBD_PAS=4, SUBD_NIVEAU=4),
+)
+RESU = STAT_NON_LINE(
+    MODELE=MODEL, CHAM_MATER=FIELD, ETAT_INIT=_F(VARI=INITIAL),
+    EXCIT=(_F(CHARGE=CUT), _F(CHARGE=WATER, FONC_MULT=RAMP), _F(CHARGE=WEIGHT, FONC_MULT=RAMP)),
+    COMPORTEMENT=_F(RELATION="ENDO_FISS_EXP", DEFORMATION="PETIT"),
+    INCREMENT=_F(LIST_INST=STEPS),
+    ARCHIVAGE=_F(LIST_INST=TIMES),
+    CONVERGENCE=_F(
+        SIGM_REFE=parameters["FT"], VARI_REFE=1.,
+        LAGR_REFE=parameters["GF"] / (parameters["LARG_BANDE"] / 2),
+        RESI_REFE_RELA=1e-6, ITER_GLOB_MAXI=50,
+    ),
+    RECH_LINEAIRE=_F(METHODE="CORDE", ITER_LINE_MAXI=20),
+    SOLVEUR=_F(METHODE="MUMPS"),
+)
+history = []
+initial_values = np.asarray(audit["damage_values"])
+for index, instant in zip(RESU.getIndexes(), RESU.getAccessParameters()["INST"]):
+    values, support = RESU.getField("VARI_ELGA", index).getValuesWithDescription(["V1"])
+    identities = [list(key) for key in zip(support[0], support[2], support[3])]
+    if identities != audit["damage_point_ids"]:
+        raise ValueError("Native crack Gauss-point identities changed during the solve")
+    values = np.asarray(values)
+    if (not np.isfinite(values).all() or values.min() < -1e-7 or values.max() > 1 + 1e-7
+            or np.any(values < initial_values - 1e-7)):
+        raise ValueError("Native cracking produced nonfinite, unbounded or healed damage")
+    if history and np.any(values < np.asarray(history[-1]["damage_values"]) - 1e-7):
+        raise ValueError("Native damage healed between converged states")
+    sief = RESU.getField("SIEF_ELGA", index)
+    stress = np.column_stack([
+        np.asarray(sief.getValuesWithDescription([name])[0])
+        for name in ("SIXX", "SIYY", "SIZZ", "SIXY", "SIXZ", "SIYZ")
+    ])
+    if not np.isfinite(stress).all():
+        raise ValueError("Nonfinite native cracking stress")
+    tensor = np.empty((len(stress), 3, 3))
+    for column, (i, j) in enumerate(((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))):
+        tensor[:, i, j] = tensor[:, j, i] = stress[:, column]
+    history.append({
+        "time": float(instant), "damage_values": values.tolist(),
+        "maximum_principal_stress_pa": float(np.linalg.eigvalsh(tensor)[:, -1].max()),
+    })
+RESU = CALC_CHAMP(reuse=RESU, RESULTAT=RESU, VARI_INTERNE="VARI_NOEU", CONTRAINTE="SIGM_NOEU")
+IMPR_RESU(
+    FORMAT="MED", UNITE=80,
+    RESU=_F(RESULTAT=RESU, NOM_RESU_MED="CRACK", NOM_CHAM=("DEPL", "SIGM_NOEU", "VARI_NOEU")),
+)
+with open("fort.90", "w", encoding="utf-8") as stream:
+    json.dump({"audit": audit, "history": history, "boundary_interpolation": interpolation},
+              stream, allow_nan=False)
+FIN()

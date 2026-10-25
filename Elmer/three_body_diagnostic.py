@@ -544,8 +544,8 @@ End
             ),
         ],
         "purpose": (
-            "Initial wall-on-bedrock linear analysis, NOT engineering validation"
-            if integrated else "Solver integration diagnostic, NOT engineering validation"
+            "Initial wall-on-bedrock linear analysis"
+            if integrated else "Solver integration diagnostic"
         ),
         "joints": joints,
         "wall_bedrock_connection": "not_in_contact" if foundation_present else "spring" if spring_seat else "bonded",

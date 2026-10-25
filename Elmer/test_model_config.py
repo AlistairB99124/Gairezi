@@ -30,6 +30,15 @@ class ModelConfigTests(unittest.TestCase):
         from_object = load_config(copy.deepcopy(self.payload))
         self.assertEqual(from_file, from_object)
 
+    def test_concrete_compressive_strength_is_positive_and_optional_for_historical_jobs(self):
+        self.assertEqual(self.payload["material"]["concrete"]["compressive_strength_pa"], 20e6)
+        for value in (0, -1, True, None, float("nan"), float("inf")):
+            payload = copy.deepcopy(self.payload)
+            payload["material"]["concrete"]["compressive_strength_pa"] = value
+            self.assert_invalid_at(payload, "material.concrete.compressive_strength_pa")
+        del self.payload["material"]["concrete"]["compressive_strength_pa"]
+        self.assertIs(validate_config(self.payload), self.payload)
+
     def test_bedrock_domain_is_optional_and_validated(self):
         domain = self.payload["geometry"]["bedrock"]["domain"]
         self.assertEqual(domain, {"stream_margin_m": 58., "bank_margin_m": 58., "bottom_z_m": -87.})
@@ -199,7 +208,7 @@ class ModelConfigTests(unittest.TestCase):
     def test_phase_field_controls_are_explicit_and_validated(self):
         self.add_legacy_crack_fixture()
         crack = self.payload["crack_simulations"][0]
-        crack["phase_field_parameters"]["model"] = "AT1"
+        crack["phase_field_parameters"]["model"] = "AT3"
         crack["phase_field_parameters"]["residual_stiffness"] = 1.0
         crack["loading"]["load_steps"] = 0
         crack["solver"]["field_output_interval"] = 0

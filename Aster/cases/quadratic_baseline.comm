@@ -1,0 +1,80 @@
+import json
+import sys
+import numpy as np
+from code_aster.Commands import *
+from code_aster.Utilities import ExecutionParameter, Options
+
+DEBUT()
+with open("fort.91", encoding="utf-8") as stream:
+    inputs = json.load(stream)
+sys.path.insert(0, inputs["repository_root"])
+from Aster.native_discrete import characteristics as discrete_characteristics
+from Aster.native_discrete import read_mesh
+mesh = read_mesh("fort.20", "fort.92")
+mesh = MODI_MAILLAGE(
+    reuse=mesh, MAILLAGE=mesh,
+    ORIE_PEAU_3D=_F(GROUP_MA=("FACE_1", "FACE_2", "FACE_3")),
+)
+model = AFFE_MODELE(
+    MAILLAGE=mesh,
+    AFFE=(
+        _F(GROUP_MA=("VOLUMES", "SURFACES"), PHENOMENE="MECANIQUE", MODELISATION="3D"),
+        _F(GROUP_MA=("QS_POINTS", "QS_LINKS"), PHENOMENE="MECANIQUE", MODELISATION="DIS_T"),
+    ),
+)
+concrete = DEFI_MATERIAU(ELAS=_F(**inputs["concrete"]))
+reference = DEFI_MATERIAU(ELAS=_F(**inputs["reference"]))
+material = AFFE_MATERIAU(
+    MAILLAGE=mesh, AFFE=(
+        _F(GROUP_MA=("WALL", "FOUNDATION"), MATER=concrete),
+        _F(GROUP_MA="REFERENCE", MATER=reference),
+    ),
+)
+ExecutionParameter().disable(Options.ShowSyntax)
+try:
+    characteristics = discrete_characteristics(mesh, model, "fort.92")
+finally:
+    ExecutionParameter().enable(Options.ShowSyntax)
+gravity = AFFE_CHAR_MECA(
+    MODELE=model,
+    PESANTEUR=_F(GROUP_MA="VOLUMES", GRAVITE=inputs["gravity_m_per_s2"], DIRECTION=(0., 0., -1.)),
+)
+up = inputs["pressures"]["UpstreamHydrostaticPressure"]
+down = inputs["pressures"]["DownstreamTailwater"]
+up_pressure = FORMULE(NOM_PARA="Z", VALE="gradient * max(0., level - Z)",
+                      gradient=up["gradient_pa_per_m"], level=up["surface_z_m"])
+down_pressure = FORMULE(NOM_PARA="Z", VALE="gradient * max(0., level - Z)",
+                        gradient=down["gradient_pa_per_m"], level=down["surface_z_m"])
+crest_pressure = DEFI_CONSTANTE(VALE=inputs["crest_pressure_pa"])
+pressure = AFFE_CHAR_MECA_F(
+    MODELE=model, PRES_REP=(
+        _F(GROUP_MA="FACE_1", PRES=up_pressure),
+        _F(GROUP_MA="FACE_2", PRES=down_pressure),
+        _F(GROUP_MA="FACE_3", PRES=crest_pressure),
+    ),
+)
+result = MECA_STATIQUE(
+    MODELE=model, CHAM_MATER=material, CARA_ELEM=characteristics,
+    EXCIT=(_F(CHARGE=gravity), _F(CHARGE=pressure)),
+    SOLVEUR=_F(METHODE="GCPC", PRE_COND="LDLT_INC", NIVE_REMPLISSAGE=1,
+               RESI_RELA=1e-8, NMAX_ITER=2000),
+)
+result = CALC_CHAMP(
+    reuse=result, RESULTAT=result, GROUP_MA=("WALL", "FOUNDATION"),
+    CONTRAINTE=("SIGM_ELNO", "SIGM_NOEU"), FORCE=("REAC_NODA",),
+)
+field = result.getField("DEPL", result.getIndexes()[-1])
+values = np.array(field.getValues())
+if not np.isfinite(values).all():
+    raise RuntimeError("Nonfinite quadratic dam displacement; not a successful baseline")
+IMPR_RESU(
+    FORMAT="MED", UNITE=80,
+    RESU=_F(RESULTAT=result, GROUP_MA=("WALL", "FOUNDATION"),
+            NOM_CHAM=("DEPL", "SIGM_ELNO", "SIGM_NOEU")),
+)
+with open("fort.90", "w", encoding="utf-8") as stream:
+    json.dump({"status": "finite_native_elastic_solve_not_baseline_acceptance",
+               "displacement_components": len(values),
+               "maximum_absolute_displacement_component_m": float(np.max(np.abs(values)))},
+              stream, allow_nan=False)
+FIN()

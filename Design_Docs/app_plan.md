@@ -117,12 +117,13 @@ workflow. The app/API now explicitly launch the three-body entry point for
 new jobs using `--config-root`, `--output-dir` and `--report-path`; historical
 jobs without a `model_kind` retain legacy paths. The worker preserves the job's
 snapshot and rejects nonempty output/report paths. API success requires the
-full PVTU partitions, 5 m reporting VTU and matching finite per-body summary.
+full PVTU partitions, concrete-only reporting VTU and matching finite per-body summary.
 The WPF schema/model preserve rock domain/mesh settings through
 load/save/submission, while bedrock remains read-only in the editor. Default
 ParaView opening uses the reporting VTU, with a separate full-domain action.
-Headline stress extrema/utilization cover concrete only; the table also shows
-near-field bedrock separately. The desktop rejects older API versions lacking
+Headline stress extrema/utilization cover the wall; the table reports wall and
+optional concrete foundation only. Reference-material stresses are excluded
+from reporting entirely. The desktop rejects older API versions lacking
 `canonical_model: three_body` before submission.
 
 FEniCSx now imports the exact saved canonical source mesh (legacy name
@@ -182,6 +183,208 @@ exactly.
 There is no automatic time limit on user app jobs; cancellation stops only the
 selected job's worker tree. API dependency staging includes Gmsh. See the
 FEniCSx README for verification evidence and remaining limitations.
+
+### Multi-solver cracking comparison objective
+
+The intended submitted-job sequence is Elmer baseline, FEniCSx baseline, Aster
+baseline, then FEniCSx and Aster cracking analyses, followed by baseline and
+cracking comparisons. The cracking comparison is the primary deliverable.
+The user accepted the observed elastic wall/foundation stress discrepancies
+for progressing this comparison work; that is not independent engineering
+validation or acceptance of unmeasured future cases.
+
+Both cracking analyses must use the location explicitly selected in the UI.
+They must share a frozen physical seed geometry and loading history, not
+independently choose a peak-stress location or seed face. Each analysis retains
+its own working directory, convergence evidence and outputs. Reports compare
+wall and optional concrete foundation separately.
+
+The current user-directed policy is **parallel-only cracking**, superseding
+the earlier below-16-GiB sequential fallback. Each new job records schema-v2
+policy metadata with mode `parallel` and concurrency two regardless of detected
+RAM. The Windows `GetPhysicallyInstalledSystemMemory` probe is retained for
+advisory diagnostics, not scheduling: below 16 GiB produces a visible memory
+warning, not a block or sequential fallback. Detection failure preserves
+parallel-only policy and exposes the failure in metadata, the cracking log and
+the desktop. Every detected capacity explicitly carries no memory-fit
+guarantee; 16 GiB for Aster alone is not a guarantee for concurrent solvers.
+Historical metadata is preserved as recorded, including schema-v1 policies;
+jobs without a policy do not acquire a fabricated one on reload.
+Future remote/VM solver hosting (for example Azure) is deferred and is not
+implemented or configured by this change.
+
+**Implementation boundary:** for three-body jobs, the API now launches native
+Aster cracking (`Aster.crack_submodel`, a local wall-block submodel driven by
+the Elmer baseline displacement) in parallel with FEniCSx cracking once the
+UI seed is frozen. Each run has its own status (`aster_cracking_status`,
+`aster_cracking_error`), log (`aster_cracking.log`, `GET
+/jobs/{id}/cracking/aster/logs`) and output root (`cracking/aster_crack_submodel`).
+The job finishes only when both runs end; cancellation stops both process
+trees. An Aster failure, including a missing installation, is reported without
+failing FEniCSx. The API checks the Aster manifest's configuration and frozen
+seed hashes before exposing scenario `Aster_Crack_Submodel`. The desktop
+shows Aster status, a summary beside the FEniCSx crack peak and a ParaView
+button.
+
+**Per-job Aster elastic baseline and grouped comparison:** after Elmer
+validation, three-body jobs also launch the full-dam Code_Aster linear elastic
+pipeline (`Aster.run_three_body_pipeline --source-mesh
+<job>/output/model/three_body.msh --output-dir
+<job>/cracking/aster_elastic_baseline`) beside the FEniCSx baseline. It has its
+own status (`aster_baseline_status`, `aster_baseline_error`), log
+(`aster_baseline.log`, `GET /jobs/{id}/aster/baseline/logs`) and report (`GET
+/jobs/{id}/aster/baseline`, concrete wall/foundation peaks only). The pipeline
+exits 2 while parity is unverified, so the API judges success from
+`run_manifest.json` status `completed`, the job's own source mesh and
+configuration hash, and finite wall peaks. Its failure never blocks FEniCSx.
+The job stays active (stage `aster_baseline`) until it ends; cancelling crack
+selection does not stop it, cancelling the job does. The Comparison table
+groups columns as Baseline (Elmer, FEniCSx, FEniCSx refined, Aster), Cracked
+Scenario (FEniCSx, Aster) and Crack Difference (FEniCSx, Aster). The Aster
+cracked value is the wall-submodel peak tension, so it is not comparable with
+the whole-wall FEniCSx peak, and the Aster crack difference stays blank until
+a same-scope uncracked submodel reference exists. Full-dam (not submodel)
+Aster cracking and resource enforcement remain future work. See
+`Aster_Porting.md` for limitations.
+
+Native Aster concrete damage versus FEniCSx AT2 was approved as a comparison
+of different formulations. The installed Aster 17.4 catalogue provides
+`ENDO_FISS_EXP` with `3D_GRAD_VARI`. Its material interface requires tensile
+strength, compressive strength, fracture energy, full damage-band width and
+either softening parameter P or initial fracture energy G_INIT. The user has
+since supplied 20 MPa compressive strength (stored in the authoritative
+`material.concrete.compressive_strength_pa`) and authorised provisional
+regularisation and softening choices. Initial Aster defaults are a 0.50 m full
+band and P = 5, explicitly not test-calibrated. Shared fracture energy is now a
+provisional 200 J/m2 (fib MC2010 estimate from 20 MPa with a large-aggregate
+allowance; previously 2700 J/m2). It is read by both solvers from the FEniCSx
+defaults, with no second material copy.
+See `Aster_Porting.md` for the documentation basis, resolution/sensitivity
+requirements and native nine-case material-admissibility check. Do not assume
+Aster's band width is equivalent to the FEniCSx phase-field length scale or G_INIT equals GF.
+
+User-located FEniCSx cracks now use AT1 with the length scale calibrated to the
+configured tensile strength, `l = 3 E Gc / (8 ft^2)` (Tanné et al. 2018), i.e.
+0.656 m for the current 35 GPa / 200 J/m2 / 2 MPa values. The previous AT2
+`l = 0.25 m` implied about 1.72 MPa with no elastic phase, which let diffuse
+damage spread below the configured strength; a job then failed when GAMG could
+not solve the resulting stiffness contrast. Mechanics now falls back once to a
+MUMPS LU preconditioner for the rest of the run, recorded in the diagnostics and
+report. Older AT2 reports remain readable. This calibration is a documented
+choice, not a fit to the Aster result or test data.
+Native 3-D nonlinear material benchmarks now cover intact, uniformly
+pre-damaged and locally pre-damaged confined tension, plus free-contraction
+tension; unloading/irreversibility and all-step ParaView output are checked.
+These are small synthetic benchmarks, not resolved dam crack propagation.
+The verified three-body FEniCSx baseline now saves the original Elmer selection
+fields with a hash. On the UI click the API freezes the physical seed and
+solver inputs once into the job's `cracking/prepared_seed.json` before spawning
+the cracking worker. It verifies the baseline, configuration and source archive;
+missing or changed source evidence explicitly fails without launching cracking.
+The FEniCSx worker consumes `--prepared-seed`, verifies the configuration and
+independently imported source fields, and never chooses another face or reads
+mutable placement defaults. Results must report the exact prepared hash and
+selection metadata. Older baselines without source evidence require a new run.
+The runner also records the hashed `shared_seed` alongside its UI-selected crack
+report, including exact geometry, face and load schedule. Placement and packet
+preparation do not require importing DOLFINx. The same frozen seed drives the
+parallel native Aster crack submodel described above.
+See `Aster_Porting.md` for evidence and limitations. Aster GRAD_VARI needs a
+quadratic displacement mesh, so a new dam zero-damage baseline and its
+interfaces/supports must be checked before app jobs can launch native cracking.
+Source-pinned quadratic degree elevation and exact TRI6 joint/support
+integration are implemented and checked on a small native matrix benchmark.
+The full candidate retains every original volume cell and split interface,
+but increases the displacement system to at least 4.30 million unknowns.
+The native characteristic setup bottleneck is resolved by coefficient grouping
+with an audited 1e-10 per-block relative encoding bound and group allocation
+during native import. The full candidate uses 17,924 coefficient groups in
+place of 421,911 individual entries; measured encoding errors are below 5e-11.
+It now reaches `MECA_STATIQUE`, but the approximately 456-second attempt fails
+native memory allocation under an 8 GiB budget: an additional 9,986 MiB was
+requested with 3,198 MiB already in use. A MUMPS out-of-core attempt still
+estimated at least 13,561 MiB for factorisation against 3,758 MiB remaining
+and did not finish within the bounded developer attempt. A distinct native
+GCPC/zero-fill incomplete-factor trial likewise produced no converged output
+within that budget; it is not an accepted solver replacement. Neither
+attempt establishes convergence or a fit on a 16 GiB machine. Resolve the
+assembly/discretisation memory or verification-host requirement and recheck the baseline before
+enabling native cracking app jobs. A zero launcher exit is not success when
+native exceptions occurred. Do not impose developer timeouts on user jobs.
+The paired scheduler and final cracking comparison remain unimplemented.
+For the planar native zero-load seed test, the official continuum damage
+equation now supplies an independent obstacle-profile reference. Targeted
+normal mesh grading preserves the exact physical seed and obtains a
+0.0678% damage-integral error and 0.235% profile L2 error at N256. A 2x2
+lateral repeat reproduces the 1x1 normal profile and all state integrals.
+This verifies that particular planar equilibrium against its analytic
+reference; the separate two-successive-refinement test remains unmet.
+Finite crack edges, loaded dam propagation and paired execution remain
+unverified. See `Aster_Porting.md` for exact scope and failed finer attempts.
+The finite-sector specimen detects damage at its sampled lateral boundary.
+Its developer runner now supports increasing the lateral domain at unchanged
+physical mesh spacing, with consistent MED geometry, volume weights and a
+fixed 0.05 m boundary diagnostic. Native mesh verification passes; the
+extent-sensitivity study is not yet accepted.
+At 0.125 m lateral spacing, increasing the finite-sector specimen width
+from 1 to 2 m changes its equilibrated scalar damage integral by 0.01016%;
+the larger specimen has zero sampled outer-shell damage. This checks only
+that integral's extent sensitivity at that spacing, not finite-edge mesh
+convergence or dam propagation.
+The finer enlarged-domain specimen currently fails reproducibly with a
+native `FULL_MECA` / `MVCA_HEXA20` floating-point exception at the same
+element under both 2048 and 4096 MiB allocations. The larger allocation
+removes the memory warning but not the exception. No accepted finer Windows
+history is available; that native exception remains unresolved, not a timeout.
+An independent Linux 17.4.0 build subsequently solved the exact failed
+Windows case in 33.3 minutes using identical saved mesh bytes and physical
+inputs (only the repository path changed). All five states pass the strict
+history gates and actual ParaView field checks. This provides a viable
+verification runtime, not a diagnosed Windows defect or mesh-converged
+dam-cracking implementation.
+Separate native TETRA10 seed checks now pass on both 1 m and 2 m lateral
+domains at the same spacing. Their equilibrium damage integrals differ by
+0.002503%, with zero sampled outer-shell damage on the larger domain.
+The coarser tetrahedral integral differs from the hexahedral result by
+12.81%; this is unresolved discretisation sensitivity, not accepted
+cross-element agreement or dam cracking verification.
+An opt-in mixed-order candidate now retains the original linear elastic
+domains and elevates only the split wall, preserving every source volume
+cell. Exact mixed TRI3/TRI6 interface assembly is verified. With explicit
+approval for longer developer runs, native GCPC completed its elastic solve
+in approximately 35.6 minutes within an 8 GiB process budget; wall/foundation
+stress VTUs were read in ParaView. This resolves execution for that candidate,
+not baseline acceptance: the wall recovered tensile peak is 1.731 MPa versus
+Elmer's 1.122 MPa, despite a 0.406% displacement L2 difference. Matching
+cell-centroid constitutive stresses have a 7.03% tensor L2 difference and
+peaks 1.090/1.135 MPa. Investigation must separate recovery, displacement
+order and joint-law effects before enabling dam cracking. Full evidence and
+separate concrete-foundation figures are in `Aster_Porting.md`.
+Six small native histories now include uniform and single-cell initial damage
+0.999, verifying retained seeded integration-point identities without healing.
+Recovered nodal damage may leave [0, 1] during extrapolation; these contours are
+explicitly named `damage_recovered_nodal`, remain unclipped and produce
+persisted warnings. Physical damage checks use integration-point histories.
+The native initial-state adapter now consumes the frozen UI seed without
+relocating or widening it, audits all nine internal variables against native
+Gauss-point identities, restricts initial damage to the wall and rejects a
+mesh that misses the physical seed. A synthetic native check confirms exact
+placement, no healing and explicit missed-seed rejection. Its very small
+domain develops strong nonlocal damage outside the seed, reported as a warning:
+this is not accepted propagation accuracy, seed-equilibration evidence or a
+resolved dam calculation. Four-thread OpenMP did not resolve the bounded
+full-dam baseline runtime blocker either; no experimental iterative solver
+was retained as an accepted replacement.
+A larger one-metre planar native specimen now holds the same 0.002 m seed
+in an explicit mesh layer. Zero-load equilibration produces a symmetric,
+localized damage profile, with seeded points retained and no damage beyond
+0.3 m from the seed plane. Normal-direction refinements N=8/16/32/64 pass
+placement, bounded state, no-healing and localization checks; all five states
+on N=16/32/64 were read in actual ParaView. The Gauss-integrated damage measure
+still changes by about 2.41% from N=32 to N=64, nonmonotonically over the
+sequence. N=128 reached its native CPU limit before accepting equilibration.
+This does not establish mesh/band convergence, finite crack-edge behavior or
+full-dam propagation accuracy. See `Aster_Porting.md` for measured evidence.
 
 Three-body stress review uses a separate reporting export: the whole wall and
 rock within 5 m of their nearest surface in reference coordinates. Keep the

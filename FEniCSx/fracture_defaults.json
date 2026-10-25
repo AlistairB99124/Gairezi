@@ -1,6 +1,7 @@
 {
-  "length_scale_m": 0.25,
-  "critical_energy_release_rate_j_m2": 2700.0,
+  "model": "AT1",
+  "length_scale_basis": "concrete_tensile_strength",
+  "critical_energy_release_rate_j_m2": 200.0,
   "internal_pressure_pa": 0.0,
   "load_steps": 10,
   "automatic_crack": {

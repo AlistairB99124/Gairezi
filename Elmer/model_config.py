@@ -61,7 +61,7 @@ PHASE_FIELD_SOLVER_KEYS = {
 }
 CRACK_TYPES = {"phase_field"}
 CRACK_SHAPES = {"rectangular"}
-PHASE_FIELD_MODELS = {"AT2"}
+PHASE_FIELD_MODELS = {"AT1", "AT2"}
 ENERGY_SPLITS = {"volumetric_deviatoric"}
 # Outer rock-box supports. "fixed_bottom" (default when material.bedrock.support
 # is absent) fixes every bottom DOF and leaves the sides free; "rollers" applies
@@ -240,7 +240,7 @@ class _ConfigValidator:
             path = f"material.{name}"
             values = self.object(
                 material.get(name) if material is not None else None, path, MATERIAL_KEYS,
-                optional={"support"} if name == "bedrock" else None,
+                optional={"support"} if name == "bedrock" else {"compressive_strength_pa"},
             )
             if values is None:
                 continue
@@ -253,6 +253,8 @@ class _ConfigValidator:
                 self.field_number(values, "density", path, positive=True)
             for key in ("youngs_modulus", "tensile_strength_pa"):
                 self.field_number(values, key, path, positive=True)
+            if name == "concrete" and "compressive_strength_pa" in values:
+                self.field_number(values, "compressive_strength_pa", path, positive=True)
             poisson = self.field_number(values, "poisson_ratio", path)
             if poisson is not None and not -1 < poisson < 0.5:
                 self.issue(f"{path}.poisson_ratio", "must lie between -1 and 0.5")

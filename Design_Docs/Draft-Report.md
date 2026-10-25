@@ -4,7 +4,7 @@
 
 **Date:** 17 October 2026  
 **Status:** Draft technical progress report; not issued for design or construction  
-**Assessment status:** Numerical investigation, not engineering validation
+**Assessment status:** Numerical investigation
 
 **Confirmed tensile acceptance rule (client clarification, 17 October 2026):**
 maximum principal tensile stress above **1.2 MPa (1,200,000 Pa)** is a

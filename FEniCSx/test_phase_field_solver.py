@@ -1,4 +1,4 @@
-"""Reduced verification problems for the coupled AT2 phase-field solver."""
+"""Reduced verification problems for the coupled AT1/AT2 phase-field solver."""
 import tempfile
 import json
 from pathlib import Path
@@ -83,6 +83,64 @@ class ForceControlledPatchTests(unittest.TestCase):
             RuntimeError, "Small-strain fracture model is invalid|failed to converge",
         ):
             self.solve_pressure(1.1)
+
+
+class HomogeneousAT1Tests(unittest.TestCase):
+    """Uniform imposed dilation: AT1 is elastic below psi_c = 3 Gc / (16 l)."""
+
+    YOUNG, POISSON, GC, ELL = 1000.0, 0.2, 1.0, 0.3
+
+    def solve(self, energy_ratio, model):
+        _, _, bulk = elastic_parameters(self.YOUNG, self.POISSON)
+        threshold = 3 * self.GC / (16 * self.ELL)
+        # Pure dilation u = e x has tensile energy 0.5 K (3 e)^2 and no deviator.
+        dilation = np.sqrt(energy_ratio * threshold / (4.5 * bulk))
+        domain = mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2)
+        domain.topology.create_connectivity(domain.topology.dim - 1, domain.topology.dim)
+        facets = mesh.exterior_facet_indices(domain.topology)
+
+        def boundary_conditions(space, factor):
+            exact = fem.Function(space)
+            exact.interpolate(lambda x: factor * dilation * x)
+            return [fem.dirichletbc(exact, fem.locate_dofs_topological(space, 2, facets))]
+
+        def external_work(test, _factor, _damage):
+            zero = fem.Constant(domain, np.zeros(3, dtype=PETSc.ScalarType))
+            return ufl.inner(zero, test) * ufl.dx
+
+        result = solve_staggered(
+            domain, self.YOUNG, self.POISSON, [], PhaseFieldSolverOptions(
+                maximum_staggered_iterations=20, staggered_tolerance=1e-10,
+                mechanics_relative_tolerance=1e-10, damage_gradient_tolerance=1e-12,
+            ),
+            external_work,
+            boundary_conditions=boundary_conditions,
+            parameters=PhaseFieldParameters(
+                length_scale_m=self.ELL, critical_energy_release_rate_j_m2=self.GC,
+                internal_pressure_pa=0.0, load_steps=1, residual_stiffness=1e-8, model=model,
+            ),
+        )
+        return result, threshold
+
+    def test_at1_has_an_elastic_phase_below_its_threshold(self):
+        result, _ = self.solve(0.9, "AT1")
+        np.testing.assert_allclose(result.damage.x.array, 0.0, atol=1e-10)
+        self.assertEqual(result.report["phase_field_model"], "AT1")
+        self.assertEqual(result.report["steps"][-1]["fracture_energy_j"], 0.0)
+
+    def test_at2_damages_at_the_same_subcritical_energy(self):
+        result, threshold = self.solve(0.9, "AT2")
+        energy = 0.9 * threshold
+        expected = 2 * energy * self.ELL / (self.GC + 2 * energy * self.ELL)
+        np.testing.assert_allclose(result.damage.x.array, expected, atol=1e-8)
+        self.assertGreater(expected, 0.1)
+
+    def test_at1_homogeneous_damage_above_threshold(self):
+        result, _ = self.solve(2.0, "AT1")
+        np.testing.assert_allclose(result.damage.x.array, 0.5, atol=1e-8)
+        self.assertAlmostEqual(
+            result.report["steps"][-1]["fracture_energy_j"], 3 * self.GC / (8 * self.ELL) * 0.5, places=8,
+        )
 
 
 class ConstitutiveTests(unittest.TestCase):
@@ -528,10 +586,49 @@ class StaggeredSolverTests(unittest.TestCase):
                 json.loads(line)
                 for line in (Path(directory) / "mechanics_diagnostics.jsonl").read_text().splitlines()
             ]
-            self.assertEqual([record["event"] for record in diagnostics], ["started", "failed"])
+            self.assertEqual(
+                [record["event"] for record in diagnostics],
+                ["started", "failed", "direct_solver_fallback", "failed"],
+            )
+            self.assertEqual(diagnostics[1]["preconditioner"], "gamg")
+            self.assertEqual(diagnostics[-1]["preconditioner"], "mumps_lu")
             self.assertEqual(diagnostics[-1]["step"], 1)
             self.assertEqual(diagnostics[-1]["iteration"], 1)
             self.assertFalse((Path(directory) / "phase_field_report.json").exists())
+
+    def test_iterative_failure_falls_back_to_mumps_for_the_rest_of_the_run(self):
+        from dolfinx.fem.petsc import LinearProblem
+        original = LinearProblem.solve
+        calls = []
+
+        def fail_first(problem):
+            calls.append(problem.solver.getPC().getType())
+            if len(calls) == 1:
+                raise PETSc.Error(91)
+            return original(problem)
+
+        _, reference = self.solve(strain=0.002)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("phase_field_solver.LinearProblem.solve", fail_first):
+                _, result = self.solve(strain=0.002, output=Path(directory))
+            diagnostics = [
+                json.loads(line)
+                for line in (Path(directory) / "mechanics_diagnostics.jsonl").read_text().splitlines()
+            ]
+        self.assertEqual(calls[0], "gamg")
+        self.assertTrue(all(kind == "lu" for kind in calls[1:]))
+        fallback = [record for record in diagnostics if record["event"] == "direct_solver_fallback"]
+        self.assertEqual(len(fallback), 1)
+        self.assertEqual((fallback[0]["step"], fallback[0]["iteration"]), (1, 1))
+        completed = [record for record in diagnostics if record["event"] == "completed"]
+        self.assertTrue(all(record["preconditioner"] == "mumps_lu" for record in completed))
+        for record in completed:
+            self.assertLessEqual(record["relative_true_residual"], self.options().mechanics_relative_tolerance)
+        used = result.report["mechanics_solver"]["direct_fallback_used"]
+        self.assertEqual((used["step"], used["iteration"]), (1, 1))
+        self.assertIsNone(reference.report["mechanics_solver"]["direct_fallback_used"])
+        np.testing.assert_allclose(result.damage.x.array, reference.damage.x.array, atol=1e-6)
+        np.testing.assert_allclose(result.displacement.x.array, reference.displacement.x.array, atol=1e-8)
 
     def test_positive_solver_reason_does_not_override_failed_true_residual(self):
         from dolfinx.fem.petsc import LinearProblem
@@ -543,7 +640,7 @@ class StaggeredSolverTests(unittest.TestCase):
             return displacement
 
         with patch("phase_field_solver.LinearProblem.solve", corrupt_solution):
-            with self.assertRaisesRegex(RuntimeError, "true residual .* exceeds tolerance"):
+            with self.assertRaisesRegex(RuntimeError, "(?i)true residual .* exceeds tolerance"):
                 self.solve()
 
     def test_mechanics_warm_start_copies_previous_displacement_into_petsc_vector(self):

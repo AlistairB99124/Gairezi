@@ -65,6 +65,11 @@ def build_engineering_results(
     strength = result["configured_tensile_strength_pa"]
     tensile_stress = result["maximum_principal_tensile_stress_pa"]
     strength_utilisation = tensile_stress / strength
+    # Historical reports were AT2-only and used an AT2-specific key.
+    model = result.get("phase_field_model", "AT2")
+    implied_strength = result.get(
+        "implied_homogeneous_tensile_strength_pa", result.get("at2_implied_homogeneous_tensile_strength_pa"),
+    )
     placement_valid = all(item["valid"] for item in placement)
     pressure = first_crack["loading"]["internal_pressure_pa"]
 
@@ -138,6 +143,7 @@ def build_engineering_results(
         f"| Concrete Poisson ratio | {concrete['poisson_ratio']:.3f} | dimensionless |",
         f"| Configured concrete tensile strength | {concrete['tensile_strength_pa'] / 1e6:.3f} | MPa |",
         f"| Fracture energy, `Gc` | {_number(parameters['critical_energy_release_rate_J_m2'], 1)} | J/m2 |",
+        f"| Phase-field model | {parameters.get('model', 'AT2')} | - |",
         f"| Phase-field length scale, `l` | {parameters['length_scale_m']:.4f} | m |",
         f"| Residual stiffness | {parameters['residual_stiffness']:.3e} | dimensionless |",
         f"| Gravity acceleration | {loads['gravity']:.3f} | m/s2 |",
@@ -214,8 +220,8 @@ def build_engineering_results(
             f"| Maximum principal compressive stress | {result.get('maximum_principal_compressive_stress_pa', 0.0) / 1e6:.3f} MPa |",
             f"| Configured tensile strength | {strength / 1e6:.3f} MPa |",
             f"| Tensile stress / configured tensile strength | {strength_utilisation:.1%} |",
-            f"| AT2 implied homogeneous tensile strength | {result['at2_implied_homogeneous_tensile_strength_pa'] / 1e6:.3f} MPa |",
-            f"| AT2 implied / configured strength | {result['implied_to_configured_strength_ratio']:.3f} |",
+            f"| {model} implied homogeneous tensile strength | {implied_strength / 1e6:.3f} MPa |",
+            f"| {model} implied / configured strength | {result['implied_to_configured_strength_ratio']:.3f} |",
             "",
             (
                 "Principal-stress peaks use consistent L2 recovery to nodal tensors, "
@@ -228,7 +234,7 @@ def build_engineering_results(
                 else "Historical report: stress-recovery metadata was not recorded."
             ),
             "",
-            "The AT2 implied strength is a calibration diagnostic. If it differs materially",
+            f"The {model} implied strength is a calibration diagnostic. If it differs materially",
             "from the intended concrete tensile strength, `Gc` and `l` are not a mutually",
             "calibrated parameter pair for that target. They should be selected from",
             "appropriate concrete test data or a documented calibration procedure, not",

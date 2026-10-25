@@ -74,7 +74,7 @@ Frobenius error <= `1.954084e-14`; the volume mesh is unchanged. Production FEni
 parity passes with displacement error `1.1998608e-7`, wall nodal stress error
 `4.6972060e-7`, and relative force imbalance `8.0311953e-11`. Results are saved under
 `results/foundation_split_parity/dam_elastic_baseline/20261022T104209944357Z`.
-No gate or physical input was changed. Passing parity is not engineering validation.
+No gate or physical input was changed.
 
 ## Running
 

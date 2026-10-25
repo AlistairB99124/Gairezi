@@ -1,0 +1,33 @@
+import json
+import sys
+import numpy as np
+from code_aster.Commands import *
+from code_aster.Utilities import ExecutionParameter, Options
+
+DEBUT()
+with open("fort.91", encoding="utf-8") as stream:
+    inputs = json.load(stream)
+sys.path.insert(0, inputs["repository_root"])
+from Aster.native_discrete import characteristics as discrete_characteristics
+from Aster.native_discrete import read_mesh
+mesh = read_mesh("fort.20", "fort.92")
+model = AFFE_MODELE(
+    MAILLAGE=mesh,
+    AFFE=_F(TOUT="OUI", PHENOMENE="MECANIQUE", MODELISATION="DIS_T"),
+)
+ExecutionParameter().disable(Options.ShowSyntax)
+try:
+    characteristics = discrete_characteristics(mesh, model, "fort.92")
+finally:
+    ExecutionParameter().enable(Options.ShowSyntax)
+ASSEMBLAGE(
+    MODELE=model, CARA_ELEM=characteristics, NUME_DDL=CO("numbering"),
+    MATR_ASSE=_F(MATRICE=CO("stiffness"), OPTION="RIGI_MECA"),
+)
+with open("fort.90", "w", encoding="utf-8") as stream:
+    json.dump({
+        "matrix": stiffness.toNumpy().tolist(),
+        "dofs": numbering.getNodeAndComponentFromDOF(),
+        "coordinates": mesh.getCoordinates().toNumpy().tolist(),
+    }, stream, allow_nan=False)
+FIN()

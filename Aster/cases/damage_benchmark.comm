@@ -1,0 +1,143 @@
+from code_aster.Commands import *
+from code_aster import CA
+import json
+import math
+import numpy as np
+
+DEBUT(ERREUR=_F(ALARME="EXCEPTION"))
+
+with open("fort.91", encoding="utf-8") as stream:
+    inputs = json.load(stream)
+parameters = inputs["material"]["parameters"]
+settings = inputs["settings"]
+MAT = DEFI_MATER_GC(ENDO_FISS_EXP=_F(**parameters))
+linear = CA.Mesh.buildCube(refine=settings["refinement"])
+MESH = CREA_MAILLAGE(MAILLAGE=linear, LINE_QUAD=_F(TOUT="OUI"))
+MESH = DEFI_GROUP(
+    reuse=MESH, MAILLAGE=MESH,
+    CREA_GROUP_MA=_F(NOM="SEED", GROUP_MA="VOLUME", NUME_INIT=1, NUME_FIN=1),
+)
+MODEL = AFFE_MODELE(
+    MAILLAGE=MESH,
+    AFFE=_F(TOUT="OUI", PHENOMENE="MECANIQUE", MODELISATION="3D_GRAD_VARI"),
+)
+FIELD = AFFE_MATERIAU(MAILLAGE=MESH, AFFE=_F(TOUT="OUI", MATER=MAT))
+m = MAT.getValueReal("ENDO_FISS_EXP", "M")
+k = MAT.getValueReal("ENDO_FISS_EXP", "K")
+p = parameters["P"]
+e, nu = parameters["E"], parameters["NU"]
+constrained_modulus = e * (1 - nu) / ((1 + nu) * (1 - 2 * nu))
+
+def stiffness(damage):
+    return (1 - damage) ** 2 / (
+        (1 - damage) ** 2 + m * damage * (1 + p * damage)
+    )
+
+target = settings["target_damage"]
+denominator = (1 - target) ** 2 + m * target * (1 + p * target)
+derivative = m * (target - 1) * (target + 1 + 2 * p * target) / denominator ** 2
+target_strain = math.sqrt(-2 * k / (constrained_modulus * derivative))
+UZ = FORMULE(NOM_PARA="Z", VALE="strain * Z", strain=target_strain)
+ZERO = DEFI_CONSTANTE(VALE=0.0)
+LOAD = AFFE_CHAR_MECA_F(
+    MODELE=MODEL, DDL_IMPO=_F(TOUT="OUI", DX=ZERO, DY=ZERO, DZ=UZ),
+)
+ROLLER = AFFE_CHAR_MECA(
+    MODELE=MODEL,
+    DDL_IMPO=(
+        _F(GROUP_MA="BACK", DX=0.),
+        _F(GROUP_MA="LEFT", DY=0.),
+        _F(GROUP_MA="BOTTOM", DZ=0.),
+    ),
+)
+PULL = AFFE_CHAR_MECA(
+    MODELE=MODEL, DDL_IMPO=_F(GROUP_MA="TOP", DZ=target_strain),
+)
+amplitudes = settings["load_history"]
+RAMP = DEFI_FONCTION(
+    NOM_PARA="INST", VALE=tuple(value for pair in amplitudes for value in pair),
+)
+TIMES = DEFI_LIST_REEL(VALE=settings["times"])
+report = {
+    "target_strain": target_strain,
+    "constrained_modulus_pa": constrained_modulus,
+    "expected_target_damage": target,
+    "expected_target_stress_zz_pa": constrained_modulus * stiffness(target) * target_strain,
+    "mesh_nodes": MESH.getNumberOfNodes(),
+    "mesh_cells_including_boundaries": MESH.getNumberOfCells(),
+    "volume_cells": len(MESH.getCells("VOLUME")),
+    "histories": {},
+}
+for label, seed in (
+    ("INTACT", 0.0), ("SEEDED", settings["initial_damage"]),
+    ("LOCAL", settings["initial_damage"]), ("FREE", 0.0),
+    ("NEAR", settings["near_complete_damage"]),
+    ("NEARLOC", settings["near_complete_damage"]),
+):
+    localized = label in ("LOCAL", "NEARLOC")
+    assignments = [_F(
+        TOUT="OUI",
+        NOM_CMP=tuple("V%d" % i for i in range(1, 10)),
+        VALE=(seed if not localized else 0., 0.,
+              stiffness(seed) if not localized else 1., 0., 0., 0., 0., 0., 0.),
+    )]
+    if localized:
+        assignments.append(_F(
+            GROUP_MA="SEED",
+            NOM_CMP=tuple("V%d" % i for i in range(1, 10)),
+            VALE=(seed, 0., stiffness(seed), 0., 0., 0., 0., 0., 0.),
+        ))
+    INITIAL = CREA_CHAMP(
+        TYPE_CHAM="ELGA_VARI_R", OPERATION="AFFE", MODELE=MODEL,
+        AFFE=tuple(assignments),
+    )
+    excitations = (_F(CHARGE=LOAD, FONC_MULT=RAMP),)
+    if label == "FREE":
+        excitations = (_F(CHARGE=ROLLER), _F(CHARGE=PULL, FONC_MULT=RAMP))
+    RESU = STAT_NON_LINE(
+        MODELE=MODEL, CHAM_MATER=FIELD,
+        ETAT_INIT=_F(VARI=INITIAL),
+        EXCIT=excitations,
+        COMPORTEMENT=_F(RELATION="ENDO_FISS_EXP", DEFORMATION="PETIT"),
+        INCREMENT=_F(LIST_INST=TIMES),
+        NEWTON=_F(MATRICE="TANGENTE", REAC_ITER=1),
+        CONVERGENCE=_F(
+            SIGM_REFE=parameters["FT"], VARI_REFE=1.,
+            LAGR_REFE=parameters["GF"] / (parameters["LARG_BANDE"] / 2),
+            RESI_REFE_RELA=settings["relative_tolerance"],
+            ITER_GLOB_MAXI=settings["maximum_iterations"],
+        ),
+        SOLVEUR=_F(METHODE="MUMPS"),
+    )
+    RESU = CALC_CHAMP(
+        reuse=RESU, RESULTAT=RESU,
+        CONTRAINTE="SIGM_NOEU", VARI_INTERNE="VARI_NOEU",
+    )
+    history = []
+    for index, instant in zip(RESU.getIndexes(), RESU.getAccessParameters()["INST"]):
+        damage_values, damage_support = RESU.getField("VARI_ELGA", index).getValuesWithDescription(["V1"])
+        damage = np.asarray(damage_values)
+        cells, components, points, subpoints = damage_support
+        if any(component != "V1" for component in components):
+            raise ValueError("Unexpected component in damage integration-point history")
+        stress = np.asarray(RESU.getField("SIEF_ELGA", index).getValuesWithDescription(["SIZZ"])[0])
+        lateral = np.asarray(
+            RESU.getField("SIEF_ELGA", index).getValuesWithDescription(["SIXX", "SIYY"])[0]
+        )
+        history.append({
+            "time": instant,
+            "damage_min": float(damage.min()), "damage_max": float(damage.max()),
+            "stress_zz_mean_pa": float(stress.mean()),
+            "maximum_lateral_stress_pa": float(np.max(np.abs(lateral))),
+            "damage_values": damage.tolist(),
+            "damage_point_ids": [list(point) for point in zip(cells, points, subpoints)],
+        })
+    report["histories"][label] = history
+    IMPR_RESU(
+        FORMAT="MED", UNITE=80,
+        RESU=_F(RESULTAT=RESU, NOM_RESU_MED=label, NOM_CHAM=("DEPL", "SIGM_NOEU", "VARI_NOEU")),
+    )
+
+with open("fort.90", "w", encoding="utf-8") as stream:
+    json.dump(report, stream, indent=2, allow_nan=False)
+FIN()

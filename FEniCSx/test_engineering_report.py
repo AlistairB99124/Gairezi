@@ -121,6 +121,23 @@ class EngineeringReportTests(unittest.TestCase):
         self.assertIn("[damage.pvd](./damage.pvd)", report)
         self.assertIn("Configuration SHA-256: `abc123`", report)
 
+    def test_historical_at2_report_keeps_its_strength_label(self):
+        report = self.build()
+        self.assertIn("| AT2 implied homogeneous tensile strength | 9.983 MPa |", report)
+
+    def test_at1_report_uses_model_neutral_strength_key(self):
+        del self.result["at2_implied_homogeneous_tensile_strength_pa"]
+        self.result.update({
+            "phase_field_model": "AT1",
+            "implied_homogeneous_tensile_strength_pa": 2.0e6,
+            "implied_to_configured_strength_ratio": 1.0,
+        })
+        self.configuration["crack_simulations"][0]["phase_field_parameters"]["model"] = "AT1"
+        report = self.build()
+        self.assertIn("| AT1 implied homogeneous tensile strength | 2.000 MPa |", report)
+        self.assertIn("| AT1 implied / configured strength | 1.000 |", report)
+        self.assertIn("| Phase-field model | AT1 | - |", report)
+
     def test_writer_creates_results_markdown(self):
         with tempfile.TemporaryDirectory() as directory:
             path = write_engineering_results(

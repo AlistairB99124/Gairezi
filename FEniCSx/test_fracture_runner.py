@@ -72,7 +72,11 @@ class FractureRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             config = output / "submitted.json"
-            config.write_bytes(LOAD_CASE.read_bytes())
+            # Match the constant-width wall represented by synthetic_fields().
+            submitted = json.loads(LOAD_CASE.read_text())
+            submitted["geometry"]["wall"].pop("thickness_steps", None)
+            submitted["geometry"]["wall"].pop("step_end_taper_ratio", None)
+            config.write_text(json.dumps(submitted))
             with self.assertRaisesRegex(ValueError, "No crack location was selected"):
                 with patch("elmer_baseline.import_baseline", side_effect=import_baseline):
                     run_fracture(config, output / "unselected", {"test_environment": True}, output / "fake.pvtu")
@@ -95,6 +99,12 @@ class FractureRunnerTests(unittest.TestCase):
             self.assertEqual(manifest["crack_scenario_names"], ["user_located_crack"])
             self.assertEqual((run / "config.json").read_bytes(), config.read_bytes())
             generated = json.loads((run / "crack_location.json").read_text())
+            from FEniCSx.crack_contract import validate_selected_seed
+            seed = validate_selected_seed(generated["shared_seed"])
+            self.assertEqual(seed["selected_location_m"], generated["selected_location_m"])
+            self.assertEqual(seed["geometry"]["annular_sector"], generated["annular_sector"])
+            self.assertEqual(seed["seed_face"], generated["seed_face"])
+            self.assertEqual(manifest["crack_location"]["shared_seed"], generated["shared_seed"])
             self.assertEqual(generated["opening_m"], 0.002)
             self.assertEqual(generated["depth_m"], 3)
             self.assertAlmostEqual(generated["selected_location_m"]["z"], -27.5)
@@ -122,6 +132,71 @@ class FractureRunnerTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as error:
                     main()
                 self.assertEqual(error.exception.code, 2)
+
+    def test_prepared_seed_cli_is_forwarded_and_rejected_elsewhere(self):
+        with (
+            patch("sys.argv", ["run.py", "run-fracture", "--dam-config", str(LOAD_CASE),
+                               "--elmer-result", "result.pvtu", "--prepared-seed", "seed.json"]),
+            patch("run.environment", return_value={"test": True}),
+            patch("run.run_fracture") as fracture,
+        ):
+            self.assertEqual(main(), 0)
+            self.assertEqual(fracture.call_args.kwargs["prepared_seed"], Path("seed.json").resolve())
+            self.assertNotIn("crack_location", fracture.call_args.kwargs)
+        for arguments in (
+            ["run-fracture", "--prepared-seed", "seed.json"],
+            ["run-baseline", "--elmer-result", "r.pvtu", "--prepared-seed", "seed.json"],
+            ["run-fracture", "--baseline-phase", "--prepared-seed", "seed.json"],
+            ["run-fracture", "--elmer-result", "r.pvtu", "--prepared-seed", "seed.json",
+             "--crack-location", "24.5", "-27.5"],
+        ):
+            with self.subTest(arguments=arguments), patch("sys.argv", ["run.py", *arguments]):
+                with self.assertRaises(SystemExit) as error:
+                    main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_prepared_seed_drives_solver_without_a_second_placement(self):
+        import numpy as np
+        from FEniCSx.selected_seed import prepare
+        from test_automatic_crack import location, synthetic_fields
+
+        fixture = test_engineering_report.EngineeringReportTests()
+        fixture.setUp()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            config = output / "submitted.json"
+            submitted = json.loads(LOAD_CASE.read_text())
+            submitted["geometry"]["wall"].pop("thickness_steps", None)
+            submitted["geometry"]["wall"].pop("step_end_taper_ratio", None)
+            config.write_text(json.dumps(submitted))
+            fields = synthetic_fields()
+            prepared = prepare(config.read_bytes(), fields, location(97.988, -27.5))
+            prepared_path = output / "shared.json"
+            prepared_path.write_text(json.dumps(prepared))
+
+            def import_baseline(structure, result, snapshot, directory):
+                np.savez_compressed(directory / "fields.npz", coordinates_m=fields[0], stress_pa=fields[1],
+                                    node_regions=fields[2])
+                return {"field_archive": "fields.npz"}
+
+            with (
+                patch("elmer_baseline.import_baseline", side_effect=import_baseline),
+                patch("FEniCSx.selected_seed.locate_crack", side_effect=AssertionError("must not reselect")),
+                patch("crack_field.refine_for_phase_field", side_effect=lambda imported, specifications, options, *_:
+                      SimpleNamespace(domain=imported.domain, cell_tags=imported.cell_tags,
+                                      facet_tags=imported.facet_tags, report=fixture.refinement)),
+                patch("dam_phase_field.solve", return_value=SimpleNamespace(report=fixture.result)) as solve,
+            ):
+                run_fracture(config, output, {"test_environment": True}, output / "fake.pvtu",
+                             prepared_seed=prepared_path)
+            directory = next((output / "dam_phase_field").iterdir())
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed_not_engineering_validated")
+            self.assertEqual(manifest["prepared_seed_sha256"], prepared["sha256"])
+            self.assertEqual(manifest["crack_location"], prepared["payload"]["generation"])
+            self.assertEqual(json.loads((directory / "prepared_seed.json").read_text()), prepared)
+            self.assertEqual(list(solve.call_args.args[2][0].annular_sector),
+                             prepared["payload"]["generation"]["shared_seed"]["payload"]["geometry"]["annular_sector"])
 
     def test_baseline_cli_routes_the_exact_api_commands(self):
         for arguments, phase in (
@@ -219,6 +294,44 @@ class FractureRunnerTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "failed")
             self.assertIn("invalid submitted mesh", manifest["error"])
             self.assertFalse((directory / "baseline_report.json").exists())
+
+    def test_canonical_baseline_persists_exact_selection_source_and_hash(self):
+        import hashlib
+        import numpy as np
+
+        points = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
+        expected = np.ones((4, 3)) * .001
+        stress = np.arange(24, dtype=float).reshape(4, 6)
+        regions = np.array([1, 1, 4, 2], dtype=np.int32)
+        structure = SimpleNamespace(
+            nodes=points, three_body_source={}, material=SimpleNamespace(tensile_strength_pa=2e6),
+        )
+        imported = SimpleNamespace(tetrahedra=np.array([[0, 1, 2, 3]]), volumes=np.array([1.]), report={})
+        report = {"stress_parity": {"relative_nodal_stress_difference": 0.},
+                  "relative_force_balance_error": 0.}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            with (
+                patch("run.submitted_structure", return_value=structure),
+                patch("dam_mesh.import_structure", return_value=imported),
+                patch("elastic_parity.read_reference", return_value=(expected, stress, regions)),
+                patch("dam_elasticity.solve", return_value=(expected, None, report)),
+                patch("crack_selection.selection_map", return_value={"source": "test"}),
+            ):
+                run_baseline(LOAD_CASE, output, {"test": True},
+                             model_directory=output / "model", elmer_result=output / "test.pvtu")
+            directory = next((output / "dam_elastic_baseline").iterdir())
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed_not_engineering_validated")
+            source = manifest["crack_seed_source"]
+            self.assertEqual(source["field_archive"], "crack_seed_fields.npz")
+            path = directory / source["field_archive"]
+            self.assertEqual(source["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            with np.load(path, allow_pickle=False) as archive:
+                np.testing.assert_array_equal(archive["coordinates_m"], points)
+                np.testing.assert_array_equal(archive["stress_pa"], stress)
+                np.testing.assert_array_equal(archive["node_regions"], regions)
+                np.testing.assert_array_equal(archive["displacement_m"], expected)
 
     def test_canonical_job_rejects_lower_explicit_resolution_before_import(self):
         with tempfile.TemporaryDirectory() as temporary:

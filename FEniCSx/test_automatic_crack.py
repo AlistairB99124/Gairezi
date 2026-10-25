@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 
 from automatic_crack import contour_intersections, locate_crack
-from crack_field import signed_distance
+from crack_field import CrackSpecification, signed_distance
 from crack_selection import selection_map
 
 CONFIG = json.loads((Path(__file__).parents[1] / "config.json").read_text())
@@ -39,6 +39,24 @@ def location(chainage, z):
     return (78 * math.cos(chainage / 78), z)
 
 
+class StrengthCalibrationTests(unittest.TestCase):
+    def test_length_scale_round_trips_to_the_target_strength(self):
+        from crack_contract import implied_tensile_strength, strength_calibrated_length_scale
+        for model in ("AT1", "AT2"):
+            ell = strength_calibrated_length_scale(model, 35e9, 200.0, 2e6)
+            self.assertAlmostEqual(implied_tensile_strength(model, 35e9, 200.0, ell), 2e6, delta=1e-3)
+        self.assertAlmostEqual(strength_calibrated_length_scale("AT1", 35e9, 200.0, 2e6), 0.65625)
+        # The previous AT2 default (l = 0.25 m) implied about 1.72 MPa.
+        self.assertAlmostEqual(implied_tensile_strength("AT2", 35e9, 200.0, 0.25) / 1e6, 1.718, places=3)
+
+    def test_rejects_unknown_models_and_non_positive_inputs(self):
+        from crack_contract import strength_calibrated_length_scale
+        with self.assertRaises(ValueError):
+            strength_calibrated_length_scale("AT3", 35e9, 200.0, 2e6)
+        with self.assertRaises(ValueError):
+            strength_calibrated_length_scale("AT1", 35e9, 200.0, 0.0)
+
+
 class UserLocatedCrackTests(unittest.TestCase):
     def setUp(self):
         # These cases check a constant 4 m wall; stepped walls are covered separately.
@@ -59,6 +77,7 @@ class UserLocatedCrackTests(unittest.TestCase):
 
     def test_selected_point_seeds_wall_crack_at_user_chainage(self):
         crack, options, report = locate_crack(self.config, location(108.5, -27.5), self.fields)
+        self.assertIs(type(crack), CrackSpecification)
         self.assertEqual(crack.name, "user_located_crack")
         self.assertEqual(report["seed_face"], "upstream")
         self.assertEqual(crack.annular_sector[:2], (77, 80))
@@ -71,7 +90,12 @@ class UserLocatedCrackTests(unittest.TestCase):
         self.assertEqual(report["warnings"], [])
         self.assertEqual(crack.centre_m[2], -27.5)
         self.assertEqual(crack.size_m[2], 0.002)
-        self.assertEqual(crack.length_scale_m, 0.25)
+        self.assertEqual(crack.model, "AT1")
+        # l = 3 E Gc / (8 ft^2) with E = 35 GPa, Gc = 200 J/m2, ft = 2 MPa.
+        self.assertAlmostEqual(crack.length_scale_m, 0.65625)
+        calibration = report["length_scale_calibration"]
+        self.assertAlmostEqual(calibration["implied_homogeneous_tensile_strength_pa"], 2.0e6)
+        self.assertEqual(report["report_crack"]["phase_field_parameters"]["model"], "AT1")
         self.assertEqual(options.maximum_refined_cells, 4_000_000)
         theta = 108.5 / 78
         self.assertLess(signed_distance([79 * math.sin(theta), 79 * math.cos(theta), -27.5], crack), 0)

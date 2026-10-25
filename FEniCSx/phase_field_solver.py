@@ -1,10 +1,13 @@
-"""Staggered hybrid AT2 phase-field fracture solver for DOLFINx 0.11.
+"""Staggered hybrid AT1/AT2 phase-field fracture solver for DOLFINx 0.11.
 
 The mechanics equation uses isotropic elasticity degraded by
 ``g(alpha) = (1 - alpha)^2 + kappa``. Damage is driven only by the tensile
 volumetric/deviatoric energy history, which excludes volumetric compression
 but retains deviatoric driving energy. This hybrid formulation does not enforce crack-face contact, so
 interpenetration under compression remains a known limitation.
+
+AT1 (``w(alpha) = alpha``) has a linear-elastic phase below its homogeneous
+strength; AT2 (``w(alpha) = alpha^2``) starts damaging at any tensile energy.
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ from petsc4py import PETSc
 import ufl
 
 from crack_field import CrackSpecification, PhaseFieldParameters, PhaseFieldSolverOptions, crack_phase_field
+from FEniCSx.crack_contract import PHASE_FIELD_MODELS, load_schedule
 from elasticity_solver import rigid_body_near_nullspace
 
 GROSS_SMALL_STRAIN_BREAKDOWN = 1.0
@@ -66,6 +70,31 @@ def degradation(damage, residual_stiffness: float):
     return (1.0 - damage) ** 2 + residual_stiffness
 
 
+def crack_surface_density(model: str, damage, length_scale: float):
+    """Regularised crack surface per unit volume (1/m); times Gc gives fracture energy."""
+    gradient = ufl.inner(ufl.grad(damage), ufl.grad(damage))
+    if model == "AT1":
+        return 3.0 / 8.0 * (damage / length_scale + length_scale * gradient)
+    if model == "AT2":
+        return damage**2 / (2.0 * length_scale) + length_scale * gradient / 2.0
+    raise ValueError(f"Unknown phase-field model {model!r}")
+
+
+def use_direct_mechanics_solver(problem) -> None:
+    """Precondition mechanics GMRES with a MUMPS LU factorisation.
+
+    Fully damaged zones (stiffness ratio ~ residual_stiffness) defeat GAMG. GMRES
+    is kept so the true-residual tolerance is still reached by iterative refinement.
+    """
+    pc = problem.solver.getPC()
+    pc.setType("lu")
+    pc.setFactorSolverType("mumps")
+    pc.setFactorSetUpSolverType()
+    # Extra MUMPS workspace (percent) for fill-in from near-singular cracked zones.
+    pc.getFactorMatrix().setMumpsIcntl(14, 80)
+    pc.setReusePreconditioner(False)
+
+
 def _global_scalar(domain, expression) -> float:
     local = fem.assemble_scalar(fem.form(expression))
     return float(domain.comm.allreduce(local, op=MPI.SUM))
@@ -92,17 +121,6 @@ def _aitken_factor(residual, previous_residual, previous_factor, owned_dofs, com
     if numerator >= 0:
         return 1.0
     return float(np.clip(-previous_factor * numerator / denominator, 0.5, 2.0))
-
-
-def load_schedule(load_steps: int, final_load_substeps: int = 1) -> list[float]:
-    """Preserve the configured ramp, optionally subdividing only its last interval."""
-    for name, value in (("load_steps", load_steps), ("final_load_substeps", final_load_substeps)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    return [step / load_steps for step in range(1, load_steps)] + [
-        (load_steps - 1 + substep / final_load_substeps) / load_steps
-        for substep in range(1, final_load_substeps + 1)
-    ]
 
 
 def _update_history(history, candidate, accepted_history=None):
@@ -172,17 +190,31 @@ def _solve_damage_obstacle(
     length_scale: float,
     options: PhaseFieldSolverOptions,
     fixed_damage_dofs=None,
+    model: str = "AT2",
 ) -> dict:
-    """Minimise the quadratic AT2 functional subject to old <= alpha <= 1."""
+    """Minimise the quadratic AT1/AT2 functional subject to old <= alpha <= 1.
+
+    Functional: int (1 - alpha)^2 H + Gc/c_w (w(alpha)/l + l |grad alpha|^2), with
+    AT2 w = alpha^2, c_w = 2 and AT1 w = alpha, c_w = 8/3.
+    """
     started = time.perf_counter()
     space = damage.function_space
     trial, test = ufl.TrialFunction(space), ufl.TestFunction(space)
     dx = ufl.Measure("dx", domain=space.mesh)
-    bilinear = (
-        (gc / length_scale + 2.0 * history) * trial * test
-        + gc * length_scale * ufl.inner(ufl.grad(trial), ufl.grad(test))
-    ) * dx
-    linear = 2.0 * history * test * dx
+    if model == "AT1":
+        bilinear = (
+            2.0 * history * trial * test
+            + 0.75 * gc * length_scale * ufl.inner(ufl.grad(trial), ufl.grad(test))
+        ) * dx
+        linear = (2.0 * history - 3.0 * gc / (8.0 * length_scale)) * test * dx
+    elif model == "AT2":
+        bilinear = (
+            (gc / length_scale + 2.0 * history) * trial * test
+            + gc * length_scale * ufl.inner(ufl.grad(trial), ufl.grad(test))
+        ) * dx
+        linear = 2.0 * history * test * dx
+    else:
+        raise ValueError(f"Unknown phase-field model {model!r}")
     matrix = fem.petsc.assemble_matrix(fem.form(bilinear))
     matrix.assemble()
     rhs = fem.petsc.assemble_vector(fem.form(linear))
@@ -293,7 +325,7 @@ def solve_staggered(
     elastic_coefficients=None,
     interface_factory=None,
 ) -> PhaseFieldResult:
-    """Solve mechanics and irreversible AT2 damage by alternate minimisation.
+    """Solve mechanics and irreversible AT1/AT2 damage by alternate minimisation.
 
     ``external_work(test, load_factor, damage)`` returns the linear load form.
     ``support_form(trial, test)`` may return a spring bilinear form.
@@ -317,8 +349,8 @@ def solve_staggered(
             or specification.load_steps != first.load_steps
         ):
             raise ValueError("All cracks in one coupled solve must share phase-field and loading parameters")
-    if first.model != "AT2":
-        raise ValueError(f"Only AT2 is implemented, got {first.model!r}")
+    if first.model not in PHASE_FIELD_MODELS:
+        raise ValueError(f"Unknown phase-field model {first.model!r}; expected one of {PHASE_FIELD_MODELS}")
     if first.energy_split != "volumetric_deviatoric":
         raise ValueError(f"Only volumetric_deviatoric energy split is implemented, got {first.energy_split!r}")
     if first.load_steps < 1:
@@ -342,7 +374,9 @@ def solve_staggered(
     history_space = fem.functionspace(domain, ("DG", 0))
     displacement = fem.Function(displacement_space, name="displacement_m")
     damage = (
-        crack_phase_field(domain, specifications, name="damage", check_resolution=False)
+        crack_phase_field(
+            domain, specifications, model=first.model.lower(), name="damage", check_resolution=False,
+        )
         if specifications else fem.Function(damage_space, name="damage")
     )
     fixed_damage_dofs = None
@@ -401,6 +435,8 @@ def solve_staggered(
     mechanics_problem = None
     nonlinear_mechanics_problem = None
     initial_mechanics_iterations = None
+    mechanics_direct = False
+    direct_fallback_event = None
     load_coefficient = fem.Constant(domain, PETSc.ScalarType(0))
     for step, load_factor in enumerate(load_factors, start=1):
         load_coefficient.value = load_factor
@@ -458,6 +494,8 @@ def solve_staggered(
                         "ksp_initial_guess_nonzero": True,
                     },
                 )
+                if mechanics_direct:
+                    use_direct_mechanics_solver(mechanics_problem)
             problem = mechanics_problem
             if problem is not None:
                 problem.A.setNearNullSpace(near_nullspace)
@@ -465,7 +503,7 @@ def solve_staggered(
             setup_seconds = time.perf_counter() - setup_started
             context = {
                 "step": step, "load_factor": load_factor, "iteration": staggered_iteration,
-                "solver": "gmres", "preconditioner": "gamg",
+                "solver": "gmres", "preconditioner": "mumps_lu" if mechanics_direct else "gamg",
                 "mechanics_formulation": mechanics_formulation,
                 "mechanics_residual_reference": (
                     "assembled load vector" if mechanics_formulation == "hybrid"
@@ -511,45 +549,58 @@ def solve_staggered(
                     nonlinear_report["residual_reference_norm"], np.finfo(float).tiny,
                 )
             else:
-                mechanics_error = None
-                try:
-                    displacement = problem.solve()
-                except PETSc.Error as error:
-                    mechanics_error = error
-                reason = int(problem.solver.getConvergedReason())
-                if mechanics_error is not None or reason <= 0:
-                    error_message = str(mechanics_error) if mechanics_error is not None else f"PETSc reason {reason}"
+                initial_guess = displacement.x.array.copy()
+                while True:
+                    mechanics_error = None
+                    try:
+                        displacement = problem.solve()
+                    except PETSc.Error as error:
+                        mechanics_error = error
+                    reason = int(problem.solver.getConvergedReason())
+                    if mechanics_error is None and reason > 0:
+                        displacement.x.scatter_forward()
+                        mechanics_iterations = int(problem.solver.getIterationNumber())
+                        residual_vector = problem.b.duplicate()
+                        try:
+                            problem.A.mult(displacement.x.petsc_vec, residual_vector)
+                            residual_vector.axpy(-1.0, problem.b)
+                            rhs_norm = float(problem.b.norm())
+                            true_residual = float(residual_vector.norm())
+                        finally:
+                            residual_vector.destroy()
+                        relative_residual = true_residual / rhs_norm if rhs_norm else true_residual
+                        if np.isfinite(relative_residual) and not (
+                            rhs_norm and relative_residual > options.mechanics_relative_tolerance
+                        ):
+                            break
+                        error_message = f"True residual {relative_residual} exceeds tolerance"
+                    else:
+                        error_message = (
+                            str(mechanics_error) if mechanics_error is not None else f"PETSc reason {reason}"
+                        )
                     mechanics_progress(
                         "failed", reason=reason,
                         iterations=int(problem.solver.getIterationNumber()), error=error_message,
                     )
-                    raise RuntimeError(
-                        f"Mechanics solve failed at load step {step}/{total_load_steps}, "
-                        f"staggered iteration {staggered_iteration}: {error_message}"
-                    ) from mechanics_error
-                displacement.x.scatter_forward()
-                mechanics_reason = int(problem.solver.getConvergedReason())
-                mechanics_iterations = int(problem.solver.getIterationNumber())
-                residual_vector = problem.b.duplicate()
-                try:
-                    problem.A.mult(displacement.x.petsc_vec, residual_vector)
-                    residual_vector.axpy(-1.0, problem.b)
-                    rhs_norm = float(problem.b.norm())
-                    true_residual = float(residual_vector.norm())
-                finally:
-                    residual_vector.destroy()
-                relative_residual = true_residual / rhs_norm if rhs_norm else true_residual
-                if not np.isfinite(relative_residual) or (
-                    rhs_norm and relative_residual > options.mechanics_relative_tolerance
-                ):
-                    mechanics_progress(
-                        "failed", reason=mechanics_reason, iterations=mechanics_iterations,
-                        error=f"True residual {relative_residual} exceeds tolerance",
-                    )
-                    raise RuntimeError(
-                        f"Mechanics true residual {relative_residual} exceeds tolerance "
-                        f"{options.mechanics_relative_tolerance} at step {step}, iteration {staggered_iteration}"
-                    )
+                    if mechanics_direct:
+                        raise RuntimeError(
+                            f"Mechanics solve failed at load step {step}/{total_load_steps}, "
+                            f"staggered iteration {staggered_iteration}: {error_message}"
+                        ) from mechanics_error
+                    # GAMG cannot cope with the stiffness contrast of fully damaged zones;
+                    # retry this same solve, and every later one, with a MUMPS LU preconditioner.
+                    mechanics_direct = True
+                    direct_fallback_event = {
+                        "step": step, "iteration": staggered_iteration, "load_factor": load_factor,
+                        "iterative_failure": error_message.splitlines()[0],
+                    }
+                    context["preconditioner"] = "mumps_lu"
+                    use_direct_mechanics_solver(problem)
+                    initial_mechanics_iterations = None
+                    displacement.x.array[:] = initial_guess
+                    fem.petsc.assign(displacement, problem.x)
+                    mechanics_progress("direct_solver_fallback", **direct_fallback_event)
+                mechanics_reason = reason
             solve_seconds = time.perf_counter() - solve_started
             mechanics_progress(
                 "completed", reason=mechanics_reason,
@@ -608,6 +659,7 @@ def solve_staggered(
                 first.length_scale_m,
                 options,
                 fixed_damage_dofs,
+                model=first.model,
             )
             damage_seconds = time.perf_counter() - damage_started
             mechanics_progress(
@@ -704,9 +756,8 @@ def solve_staggered(
                                              damage_mask=damage_mask)
         elif mechanics_formulation == "experimental_spectral":
             elastic_density = nonlinear_mechanics_problem.spectral_split.energy
-        fracture_density = first.critical_energy_release_rate_j_m2 * (
-            damage**2 / (2.0 * first.length_scale_m)
-            + first.length_scale_m * ufl.inner(ufl.grad(damage), ufl.grad(damage)) / 2.0
+        fracture_density = first.critical_energy_release_rate_j_m2 * crack_surface_density(
+            first.model, damage, first.length_scale_m,
         )
         elastic_energy = _global_scalar(domain, elastic_density * dx)
         fracture_energy = _global_scalar(domain, fracture_density * dx)
@@ -752,13 +803,14 @@ def solve_staggered(
         vtk_history.close()
     report = {
         "model": (
-            "hybrid AT2 phase-field fracture" if mechanics_formulation == "hybrid"
+            f"hybrid {first.model} phase-field fracture" if mechanics_formulation == "hybrid"
             else (
-                "experimental compression-preserving Amor AT2 phase-field fracture"
+                f"experimental compression-preserving Amor {first.model} phase-field fracture"
                 if mechanics_formulation == "experimental_amor"
-                else "experimental principal-strain spectral AT2 phase-field fracture"
+                else f"experimental principal-strain spectral {first.model} phase-field fracture"
             )
         ),
+        "phase_field_model": first.model,
         "mechanics_formulation": mechanics_formulation,
         "damage_acceleration": "bounded Aitken [0.5, 2]" if damage_acceleration else "none",
         "configured_load_steps": first.load_steps,
@@ -782,6 +834,11 @@ def solve_staggered(
         "initial_damage": "configured cracks" if specifications else "zero everywhere; no seeded crack",
         "mechanics_solver": {
             "ksp_type": "gmres", "pc_type": "gamg", "near_nullspace": "six rigid-body modes",
+            "direct_fallback": (
+                "MUMPS LU preconditioner after a GAMG failure, kept for the rest of the run"
+                if mechanics_formulation == "hybrid" else "none"
+            ),
+            "direct_fallback_used": direct_fallback_event,
             "relative_tolerance": options.mechanics_relative_tolerance,
             "maximum_iterations": options.mechanics_maximum_iterations,
             "residual_check": (

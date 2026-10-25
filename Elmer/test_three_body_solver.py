@@ -50,12 +50,12 @@ class AppJobWorkerTests(unittest.TestCase):
                         name: {"peak_tension_mpa": tension, "peak_compression_mpa": compression,
                                "reporting_cells": count}
                         for name, tension, compression, count in (
-                            ("wall", 2.4, 3.6, 30), ("bedrock", 99, 99, 5))
+                            ("wall", 2.4, 3.6, 30), ("foundation", 1.2, 2.5, 5))
                     },
-                    "rock_reporting_distance_m": 5., "limitations": ["filter only"],
+                    "reporting_scope": "concrete", "limitations": ["filter only"],
                 }
                 (reporting / "stress_summary.json").write_text(json.dumps(summary))
-                return reporting / "structure_and_near_rock.vtu"
+                return reporting / "structure.vtu"
             with patch.object(solver, "_validate_run", return_value=config), patch.object(
                 combined_structure, "build_combined_structure",
             ), patch.object(combined_structure, "audit_combined_structure", return_value=geometry), patch.object(
@@ -87,7 +87,8 @@ class AppJobWorkerTests(unittest.TestCase):
                     "geometry.bedrock.support.spring_n_per_m3: inactive for bonded foundation/bedrock interface",
                     report["inactive_inputs"],
                 )
-                self.assertEqual(report["stress_bodies"]["bedrock"]["peak_tension_mpa"], 99)
+                self.assertEqual(set(report["stress_bodies"]), {"wall", "foundation"})
+                self.assertEqual(report["reporting_scope"], "concrete")
                 self.assertEqual(json.loads(report_path.read_text()), report)
                 with self.assertRaisesRegex(ValueError, "fresh"):
                     solver.run_job(root, output, report_path)
@@ -100,13 +101,13 @@ class ReportingExportTests(unittest.TestCase):
             expected = result.parent.parent / "reporting"
             def exported(*args, **kwargs):
                 expected.mkdir(parents=True)
-                (expected / "structure_and_near_rock.vtu").touch()
+                (expected / "structure.vtu").touch()
                 (expected / "stress_summary.json").touch()
             with patch.object(solver, "pvpython_executable", return_value="pvpython"), patch.object(
                 solver.subprocess, "run", side_effect=exported,
             ) as worker:
                 path = solver.export_reporting_region(result, timeout=120)
-                self.assertEqual(path, expected / "structure_and_near_rock.vtu")
+                self.assertEqual(path, expected / "structure.vtu")
                 self.assertEqual(worker.call_args.kwargs, {"check": True, "timeout": 120})
                 self.assertEqual(worker.call_args.args[0][0], "pvpython")
                 self.assertIn(str(result), worker.call_args.args[0])
@@ -121,7 +122,7 @@ class ThreeBodySolverTests(unittest.TestCase):
     def setUp(self):
         self.reporting = self.enterContext(patch.object(
             solver, "export_reporting_region",
-            side_effect=lambda result, **kwargs: result.parent.parent / "reporting" / "structure_and_near_rock.vtu",
+            side_effect=lambda result, **kwargs: result.parent.parent / "reporting" / "structure.vtu",
         ))
 
     def test_reporting_failure_does_not_advertise_success(self):
@@ -168,7 +169,7 @@ class ThreeBodySolverTests(unittest.TestCase):
             second = solver.run(ROOT, output)
             self.assertNotEqual(first["output_directory"], second["output_directory"])
             self.assertEqual(second["status"], "succeeded")
-            self.assertTrue(second["reporting_result"].endswith("structure_and_near_rock.vtu"))
+            self.assertTrue(second["reporting_result"].endswith("structure.vtu"))
             self.assertTrue(second["stress_summary"].endswith("stress_summary.json"))
             self.assertIsNone(solve.call_args.kwargs["timeout"])
             self.assertEqual(solve.call_args.kwargs["partitions"], 4)

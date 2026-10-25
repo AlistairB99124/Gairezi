@@ -1,5 +1,6 @@
 """Run with pvpython; no solver or repository geometry needed."""
 import math
+import json
 import tempfile
 from pathlib import Path
 import unittest
@@ -100,7 +101,7 @@ def fixture():
 
 
 class StressReportingRegionTests(unittest.TestCase):
-    def test_nearest_surface_not_bounds_or_centroid_and_no_remote_bottom(self):
+    def test_only_concrete_is_retained_with_original_fields(self):
         mesh = fixture()
         result = reporting_region(mesh)
         for body in (1,):
@@ -113,13 +114,8 @@ class StressReportingRegionTests(unittest.TestCase):
                     vtk_to_numpy(after.GetPointData().GetArray(field)),
                 )
         rock = select_body(result, 2, 2)
-        points = reference_coordinates(rock)
-        self.assertGreater(rock.GetNumberOfCells(), 0)
-        self.assertGreaterEqual(points[:, 2].min(), 0.)
-        self.assertLess(points[:, 2].max(), 1.)
-        self.assertLessEqual(points[:, 0].max(), 6.000001)
-        self.assertGreater(points[:, 0].max(), 5.99)
-        self.assertLessEqual(vtk_to_numpy(rock.GetPointData().GetArray(DISTANCE_ARRAY)).max(), 5.000001)
+        self.assertEqual(rock.GetNumberOfCells(), 0)
+        self.assertEqual(result.GetNumberOfCells(), 2)
         self.assertEqual(mesh.GetNumberOfCells(), 7)
         self.assertIsNone(mesh.GetPointData().GetArray(DISTANCE_ARRAY))
         summary = stress_summary(result)
@@ -133,7 +129,7 @@ class StressReportingRegionTests(unittest.TestCase):
         vtk_to_numpy(mesh.GetPointData().GetArray("stress_xx"))[:8] = 8e6
         region = reporting_region(mesh)
         summary = stress_summary(region)
-        self.assertEqual(set(summary), {"wall", "bedrock", "foundation"})
+        self.assertEqual(set(summary), {"wall", "foundation"})
         self.assertEqual(select_body(region, 3, 3).GetNumberOfCells(), 1)
         self.assertAlmostEqual(summary["foundation"]["peak_tension_mpa"], 8.)
         self.assertAlmostEqual(summary["wall"]["peak_tension_mpa"], 2.)
@@ -173,8 +169,9 @@ class StressReportingRegionTests(unittest.TestCase):
         for distance in (0., -1., float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "distance"):
                 reporting_region(fixture(), distance)
-        with self.assertRaisesRegex(ValueError, "Expected attributed"):
-            reporting_region(select_body(fixture(), 1, 1))
+        self.assertEqual(reporting_region(select_body(fixture(), 1, 1)).GetNumberOfCells(), 2)
+        with self.assertRaisesRegex(ValueError, "wall"):
+            reporting_region(select_body(fixture(), 2, 2))
 
     def test_selection_uses_undeformed_coordinates(self):
         mesh = fixture()
@@ -203,12 +200,12 @@ class StressReportingRegionTests(unittest.TestCase):
             original = source.read_bytes()
             report = export_region(source, root / "report")
             self.assertTrue(Path(report["result"]).is_file())
-            self.assertEqual(report["rock_reporting_distance_m"], 5.)
+            self.assertEqual(report["reporting_scope"], "concrete")
             self.assertEqual(report["sharp_edge_exclusion"]["distance_m"], .5)
             for body in report["bodies"].values():
                 self.assertIn("away_from_sharp_edges", body)
             self.assertGreater(report["bodies"]["wall"]["away_from_sharp_edges"]["excluded_points"], 0)
-            self.assertEqual(report["bodies"]["bedrock"]["away_from_sharp_edges"]["excluded_points"], 0)
+            self.assertNotIn("bedrock", json.dumps(report).lower())
             self.assertEqual(source.read_bytes(), original)
             with self.assertRaisesRegex(ValueError, "empty"):
                 export_region(source, root / "report")

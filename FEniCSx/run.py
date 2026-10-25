@@ -123,7 +123,7 @@ def assert_fracture_ready(structure, baseline_directory=None):
 
 def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: bool = False,
                  model_directory: Path | None = None, elmer_result: Path | None = None) -> None:
-    """Solve the submitted uncracked dam, with or without evolving AT2 damage."""
+    """Solve the submitted uncracked dam, with or without evolving AT1/AT2 damage."""
     from automatic_crack import DEFAULTS
     from crack_field import PhaseFieldParameters, PhaseFieldSolverOptions
     from dam_mesh import import_structure
@@ -156,6 +156,10 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
             from dam_phase_field import solve
             from dolfinx.cpp.mesh import h
 
+            from FEniCSx.crack_contract import calibrate_phase_field_defaults
+
+            concrete = json.loads(snapshot.read_text(encoding="utf-8"))["material"]["concrete"]
+            defaults, calibration = calibrate_phase_field_defaults(defaults, concrete)
             parameters = PhaseFieldParameters(**defaults)
             cells = imported.cell_tags.find(1)
             maximum_diameter = float(h(imported.domain._cpp_object, 3, cells).max())
@@ -170,6 +174,7 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
             result = solve(imported, structure, [], options, directory, parameters=parameters)
             report = result.report
             report["phase_field_parameters"] = asdict(parameters)
+            report["length_scale_calibration"] = calibration
             report["mesh_resolution"] = {
                 "minimum_elements_per_length_scale": resolution,
                 "recommended_minimum": options.minimum_elements_per_length_scale,
@@ -187,6 +192,17 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
                 from elastic_parity import read_reference
                 import numpy as np
                 expected, reference_components, reference_regions = read_reference(structure, elmer_result)
+                selection_fields = directory / "crack_seed_fields.npz"
+                np.savez_compressed(
+                    selection_fields, coordinates_m=np.asarray(structure.nodes, dtype=float),
+                    stress_pa=reference_components, node_regions=reference_regions,
+                    displacement_m=np.asarray(expected, dtype=float),
+                )
+                manifest["crack_seed_source"] = {
+                    "field_archive": selection_fields.name,
+                    "sha256": hashlib.sha256(selection_fields.read_bytes()).hexdigest(),
+                }
+                write_json(directory / "manifest.json", manifest)
                 reference_stress = np.empty((len(reference_components), 3, 3))
                 for component, (i, j) in enumerate(((0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (0, 2))):
                     reference_stress[:, i, j] = reference_stress[:, j, i] = reference_components[:, component]
@@ -244,7 +260,7 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
             + ("Damage starts at zero and may evolve under load; no crack is seeded.\n\n"
                "The baseline mesh is not adaptively refined; inspect mesh_resolution in the report.\n\n"
                if phase else "Phase-field damage is disabled.\n\n")
-            + "This is a numerical baseline, not engineering validation or a dam-safety assessment.\n\n"
+            + "This is a numerical baseline.\n\n"
             + (
                 "Wall-to-bedrock seat follows the configured bonded or distributed-spring model. "
                 ""
@@ -275,6 +291,7 @@ def run_fracture(
     final_load_substeps: int = 1,
     model_directory: Path | None = None, verified_baseline: Path | None = None,
     crack_location: tuple[float, float] | None = None,
+    prepared_seed: Path | None = None,
 ) -> None:
     """Run one isolated phase-field job from the authoritative dam configuration.
 
@@ -342,7 +359,9 @@ def run_fracture(
             baseline = import_baseline(structure, elmer_result, snapshot, directory)
             manifest["elmer_baseline"] = baseline
             write_json(directory / "manifest.json", manifest)
-        generated = crack_location is not None
+        generated = crack_location is not None or prepared_seed is not None
+        if crack_location is not None and prepared_seed is not None:
+            raise ValueError("--prepared-seed cannot be combined with --crack-location.")
         if generated and specifications:
             raise ValueError("--crack-location cannot be combined with configured crack_simulations.")
         if not specifications and not generated:
@@ -354,22 +373,28 @@ def run_fracture(
             if elmer_result is None:
                 raise ValueError("A user-located crack requires --elmer-result.")
             import numpy as np
-            from automatic_crack import locate_crack
-
             with np.load(directory / baseline["field_archive"]) as archive:
                 fields = (archive["coordinates_m"], archive["stress_pa"], archive["node_regions"])
-            specification, options, generation = locate_crack(
-                json.loads(snapshot.read_text(encoding="utf-8")), crack_location, fields,
+            from FEniCSx.selected_seed import consume, prepare
+
+            prepared = (
+                json.loads(prepared_seed.read_text(encoding="utf-8")) if prepared_seed is not None
+                else prepare(snapshot.read_bytes(), fields, crack_location, final_load_substeps)
+            )
+            specification, options, generation = consume(
+                prepared, snapshot.read_bytes(), fields, final_load_substeps,
             )
             specifications = [specification]
-            generation["specification"] = asdict(specification)
+            write_json(directory / "prepared_seed.json", prepared)
+            manifest["prepared_seed_sha256"] = prepared["sha256"]
             report_config["crack_simulations"] = [generation["report_crack"]]
             write_json(directory / "crack_location.json", generation)
             manifest["crack_location"] = generation
             manifest["crack_scenario_names"] = [specification.name]
             write_json(directory / "manifest.json", manifest)
             print(
-                f"User-located crack at Y={crack_location[0]:.6f} m, Z={crack_location[1]:.6f} m "
+                f"User-located crack at Y={generation['selected_location_m']['y']:.6f} m, "
+                f"Z={generation['selected_location_m']['z']:.6f} m "
                 f"(chainage {generation['selected_chainage_m']:.6f} m, {generation['seed_face']} face)",
                 flush=True,
             )
@@ -481,7 +506,14 @@ def main() -> int:
     parser.add_argument("--scenario", help="Run one enabled scenario by id")
     parser.add_argument("--crack-location", type=float, nargs=2, metavar=("Y", "Z"),
                         help="User-selected crack location on the baseline Z-Y plot (global metres)")
+    parser.add_argument("--prepared-seed", type=Path,
+                        help="Frozen UI seed prepared once before either cracking backend is launched")
     args = parser.parse_args()
+    if args.prepared_seed is not None and (
+        args.action != "run-fracture" or args.baseline_phase or args.elmer_result is None
+        or args.crack_location is not None
+    ):
+        parser.error("--prepared-seed requires cracking run-fracture with --elmer-result, without --crack-location")
     if args.crack_location is not None and (
         args.action != "run-fracture" or args.baseline_phase or args.elmer_result is None
         or not all(math.isfinite(value) for value in args.crack_location)
@@ -525,6 +557,8 @@ def main() -> int:
             source_options["verified_baseline"] = args.verified_baseline.resolve()
         if args.crack_location is not None:
             source_options["crack_location"] = tuple(args.crack_location)
+        if args.prepared_seed is not None:
+            source_options["prepared_seed"] = args.prepared_seed.resolve()
         run_fracture(
             args.dam_config.resolve(), args.output.resolve(), versions,
             args.elmer_result.resolve() if args.elmer_result is not None else None,

@@ -66,7 +66,9 @@ class CrackConfigurationTests(unittest.TestCase):
     def test_automatic_defaults_require_two_elements_per_length_scale(self):
         defaults = json.loads(Path(__file__).with_name("fracture_defaults.json").read_text())
         self.assertEqual(defaults["solver"]["minimum_elements_per_length_scale"], 2.0)
-        self.assertEqual(defaults["length_scale_m"], 0.25)
+        self.assertEqual(defaults["model"], "AT1")
+        self.assertEqual(defaults["length_scale_basis"], "concrete_tensile_strength")
+        self.assertNotIn("length_scale_m", defaults)
         self.assertEqual(defaults["solver"]["maximum_refined_cells"], 4_000_000)
         self.assertEqual(defaults["automatic_crack"], {"depth_fraction": 0.75, "arc_length_m": 4.0})
 

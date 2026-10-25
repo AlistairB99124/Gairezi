@@ -108,7 +108,8 @@
       "density": 2400,
       "youngs_modulus": 35000000000.0,
       "poisson_ratio": 0.2,
-      "tensile_strength_pa": 2000000.0
+      "tensile_strength_pa": 2000000.0,
+      "compressive_strength_pa": 20000000.0
     },
     "bedrock": {
       "density": 2700,

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "source_config_sha256": "d804eb0f539ef3295b0e7f87c12ff8d9f7dbb0fdc61780a856d37c7b89f865ae",
+  "source_mesh_manifest_sha256": "6872b4719b22cf3120003e94168ab67bb366205410ebbf0be578458900b6585b",
+  "material": {
+    "density_kg_m3": 2400.0,
+    "youngs_modulus_pa": 35000000000.0,
+    "poissons_ratio": 0.2
+  },
+  "gravity_m_s2": 9.81,
+  "upstream_water_surface_z_m": 3.0,
+  "water_pressure_gradient_pa_per_m": 9810.0,
+  "tailwater_elevation_m": -26.0,
+  "overflow_surcharge_pa": 29430.0,
+  "foundation_elevation_m": -29.0,
+  "foundation_spring_n_per_m3": {
+    "x": 1250000000.0,
+    "y": 1250000000.0,
+    "z": 3000000000.0
+  },
+  "foundation_area_m2": 863.5943198355224,
+  "foundation_global_stiffness_n_per_m": {
+    "x": 1079492899794.403,
+    "y": 1079492899794.403,
+    "z": 2590782959506.567
+  },
+  "case_sha256": "98382e3359a577224a1c2e808b8a92b57976e220b900d67196465f68f8ae553e"
+}

@@ -1,6 +1,7 @@
 """Small end-to-end dam-load adapter check independent of the full dam mesh."""
 from pathlib import Path
 import json
+import math
 from dataclasses import replace
 import tempfile
 from types import SimpleNamespace
@@ -255,7 +256,22 @@ class DamPhaseFieldTests(unittest.TestCase):
         self.assertGreater(result.report["crack_surface_measure_m2"], 0.0)
         expected = implied_at2_tensile_strength(1000.0, 1.0, 0.3)
         self.assertAlmostEqual(result.report["at2_implied_homogeneous_tensile_strength_pa"], expected)
+        self.assertAlmostEqual(result.report["implied_homogeneous_tensile_strength_pa"], expected)
+        self.assertEqual(result.report["phase_field_model"], "AT2")
         self.assertFalse(result.report["engineering_validated"])
+
+    def test_at1_dam_adapter_reports_model_specific_strength_and_crack_measure(self):
+        imported, structure, crack, options = self.model()
+        crack = replace(crack, model="AT1")
+        with tempfile.TemporaryDirectory() as directory:
+            result = solve(imported, structure, [crack], options, Path(directory))
+        self.assertEqual(result.report["phase_field_model"], "AT1")
+        self.assertAlmostEqual(
+            result.report["implied_homogeneous_tensile_strength_pa"], math.sqrt(3 * 1000.0 * 1.0 / (8 * 0.3)),
+        )
+        self.assertNotIn("at2_implied_homogeneous_tensile_strength_pa", result.report)
+        self.assertGreater(result.report["crack_surface_measure_m2"], 0.0)
+        self.assertTrue(any("Hybrid AT1" in text for text in result.report["limitations"]))
 
 
 if __name__ == "__main__":

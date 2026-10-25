@@ -1,4 +1,4 @@
-"""Run with pvpython: retain concrete and a near-structure rock reporting region."""
+"""Run with pvpython: report wall and optional concrete foundation only."""
 from __future__ import annotations
 
 import argparse
@@ -10,11 +10,9 @@ import numpy as np
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from vtkmodules.vtkCommonCore import reference as vtk_reference, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkDataObject, vtkStaticCellLocator, vtkUnstructuredGrid
-from vtkmodules.vtkCommonExecutionModel import vtkAlgorithm
 from vtkmodules.vtkFiltersCore import (
-    vtkAppendFilter, vtkFeatureEdges, vtkImplicitPolyDataDistance, vtkThreshold,
+    vtkAppendFilter, vtkFeatureEdges, vtkThreshold,
 )
-from vtkmodules.vtkFiltersGeneral import vtkClipDataSet
 from vtkmodules.vtkFiltersGeometry import vtkDataSetSurfaceFilter
 from vtkmodules.vtkIOXML import (
     vtkXMLPUnstructuredGridReader, vtkXMLUnstructuredGridReader, vtkXMLUnstructuredGridWriter,
@@ -23,7 +21,7 @@ from vtkmodules.vtkIOXML import (
 
 DISTANCE_ARRAY = "DistanceToConcrete_m"
 EDGE_DISTANCE_ARRAY = "DistanceToSharpEdge_m"
-BODY_NAMES = {1: "wall", 2: "bedrock", 3: "foundation"}
+BODY_NAMES = {1: "wall", 3: "foundation"}
 # Concrete-surface edges whose faces meet at least this far from flat are
 # treated as stress singularities (90-degree steps, joint/face and rim edges);
 # 45-degree seat chamfers fall below it.
@@ -58,12 +56,16 @@ def reference_coordinates(mesh) -> np.ndarray:
 
 
 def reporting_region(mesh, distance_m: float = 5.):
+    # Retain the legacy distance argument for CLI compatibility; it no longer
+    # expands the reported material selection.
     if not math.isfinite(distance_m) or distance_m <= 0:
         raise ValueError("Reporting distance must be finite and positive")
     labels = mesh.GetCellData().GetArray("GeometryIds")
-    if labels is None or set(np.unique(vtk_to_numpy(labels))) not in ({1, 2}, {1, 2, 3}):
-        raise ValueError("Expected attributed wall/bedrock (1/2), optionally foundation (3)")
+    if labels is None or not set(np.unique(vtk_to_numpy(labels))).issubset({1, 2, 3}):
+        raise ValueError("Expected attributed concrete cells (wall=1, foundation=3)")
     concrete = select_body(mesh, 1, 1)
+    if not concrete.GetNumberOfCells():
+        raise ValueError("Missing reporting body: wall")
     foundation = select_body(mesh, 3, 3)
     if foundation.GetNumberOfCells():
         joined = vtkAppendFilter()
@@ -73,49 +75,8 @@ def reporting_region(mesh, distance_m: float = 5.):
         joined.Update()
         concrete = vtkUnstructuredGrid()
         concrete.DeepCopy(joined.GetOutput())
-    rock = select_body(mesh, 2, 2)
-    reference = vtkUnstructuredGrid()
-    reference.DeepCopy(concrete)
-    points = vtkPoints()
-    points.SetData(numpy_to_vtk(reference_coordinates(concrete), deep=True))
-    reference.SetPoints(points)
-    surface = vtkDataSetSurfaceFilter()
-    surface.SetInputData(reference)
-    surface.Update()
-    distance = vtkImplicitPolyDataDistance()
-    distance.SetInput(surface.GetOutput())
-    rock_distances = np.asarray([
-        abs(distance.EvaluateFunction(point)) for point in reference_coordinates(rock)
-    ])
-    for body, values in ((concrete, np.zeros(concrete.GetNumberOfPoints())), (rock, rock_distances)):
-        array = numpy_to_vtk(values, deep=True)
-        array.SetName(DISTANCE_ARRAY)
-        body.GetPointData().AddArray(array)
-    clip = vtkClipDataSet()
-    clip.SetInputData(rock)
-    clip.SetInputArrayToProcess(0, 0, 0, vtkDataObject.FIELD_ASSOCIATION_POINTS, DISTANCE_ARRAY)
-    clip.SetValue(distance_m)
-    clip.SetOutputPointsPrecision(vtkAlgorithm.DOUBLE_PRECISION)
-    clip.InsideOutOn()
-    clip.Update()
-    if not clip.GetOutput().GetNumberOfCells():
-        raise ValueError("No bedrock remains in reporting region")
-    append = vtkAppendFilter()
-    append.MergePointsOff()
-    append.AddInputData(concrete)
-    append.AddInputData(clip.GetOutput())
-    append.Update()
-    result = vtkUnstructuredGrid()
-    result.DeepCopy(append.GetOutput())
-    retained_distances = vtk_to_numpy(result.GetPointData().GetArray(DISTANCE_ARRAY))
-    # VTK clip-edge weights have sub-micrometre interpolation roundoff even
-    # with double-precision output coordinates.
-    if not np.isfinite(retained_distances).all() or retained_distances.max() > distance_m + 1e-6:
-        raise ValueError(
-            f"Reporting-region distance check failed: range "
-            f"{retained_distances.min()} to {retained_distances.max()}, threshold {distance_m}"
-        )
-    return result
+    concrete.GetPointData().RemoveArray(DISTANCE_ARRAY)
+    return concrete
 
 
 def sharp_concrete_edges(mesh, angle_deg: float = SHARP_EDGE_ANGLE_DEG):
@@ -247,7 +208,7 @@ def export_region(
     region = add_edge_distance(reporting_region(source, distance_m))
     summary = stress_summary(region, edge_exclusion_m)
     output.mkdir(parents=True, exist_ok=True)
-    path = output / "structure_and_near_rock.vtu"
+    path = output / "structure.vtu"
     writer = vtkXMLUnstructuredGridWriter()
     writer.SetFileName(str(path))
     writer.SetInputData(region)
@@ -273,14 +234,10 @@ def export_region(
             np.testing.assert_array_equal(vtk_to_numpy(array), vtk_to_numpy(saved_array))
     report = {
         "source_full_domain_result": str(result.resolve()),
-        "result": str(path.resolve()), "rock_reporting_distance_m": distance_m,
-        "selection": "All wall and optional foundation; rock within nearest concrete-surface distance in undeformed coordinates",
-        "boundary_approximation": "Exact surface distance at rock vertices; linearly interpolated within cells, clipped at threshold",
-        "stress_method": "Principal eigenvalues of recovered nodal stress tensor; interpolated tensors at clip intersections",
-        "full_domain_cells": source.GetNumberOfCells(),
-        "maximum_exported_distance_m": float(
-            vtk_to_numpy(saved.GetPointData().GetArray(DISTANCE_ARRAY)).max()
-        ),
+        "result": str(path.resolve()), "reporting_scope": "concrete",
+        "selection": "Wall and optional concrete foundation only",
+        "stress_method": "Principal eigenvalues of recovered nodal stress tensor",
+        "reporting_cells": region.GetNumberOfCells(),
         "bodies": summary,
         "sharp_edge_exclusion": {
             "distance_m": edge_exclusion_m,
@@ -292,9 +249,6 @@ def export_region(
         },
         "limitations": [
             "Reporting filter only: full solver domain and restraints are unchanged",
-            "Hiding remote stresses does not eliminate boundary influence or prove domain independence",
-            "Rock gravity/geostatic stress is not separated from dam-induced stress",
-            "Clip-boundary stresses are interpolated; mesh refinement is needed for a more exact 5 m surface",
             "Edge-excluded peaks depend on the chosen exclusion distance and are not a design stress",
         ],
     }

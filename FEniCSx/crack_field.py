@@ -34,68 +34,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from Elmer.model_config import load_config  # noqa: E402  (requires ROOT on sys.path)
+from FEniCSx.crack_contract import CrackSpecification, PhaseFieldParameters, PhaseFieldSolverOptions
 
 # Minimum elements across the phase-field length scale for a regularised solution.
 MINIMUM_ELEMENTS_PER_LENGTH_SCALE = 2.0
 
-
-@dataclass(frozen=True)
-class CrackSpecification:
-    """One configured crack, in SI units, exactly as declared in config.json."""
-
-    type: str
-    shape: str
-    centre_m: tuple[float, float, float]
-    size_m: tuple[float, float, float]
-    normal: tuple[float, float, float]
-    length_scale_m: float
-    critical_energy_release_rate_j_m2: float
-    internal_pressure_pa: float
-    name: str = ""
-    model: str = "AT2"
-    energy_split: str = "volumetric_deviatoric"
-    residual_stiffness: float = 1e-8
-    load_steps: int = 1
-    annular_sector: tuple[float, float, float, float] | None = None
-
-    @property
-    def half_extents_m(self) -> np.ndarray:
-        """Half extents in the crack frame: in-plane, in-plane, then along the normal."""
-        return np.asarray(self.size_m, dtype=float) / 2.0
-
-    @property
-    def unit_normal(self) -> np.ndarray:
-        normal = np.asarray(self.normal, dtype=float)
-        return normal / np.linalg.norm(normal)
-
-
-@dataclass(frozen=True)
-class PhaseFieldParameters:
-    """Constitutive and loading controls for an initially intact baseline."""
-
-    length_scale_m: float
-    critical_energy_release_rate_j_m2: float
-    internal_pressure_pa: float
-    load_steps: int
-    model: str = "AT2"
-    energy_split: str = "volumetric_deviatoric"
-    residual_stiffness: float = 1e-8
-
-
-@dataclass(frozen=True)
-class PhaseFieldSolverOptions:
-    maximum_staggered_iterations: int = 50
-    staggered_tolerance: float = 1e-5
-    mechanics_relative_tolerance: float = 1e-8
-    mechanics_maximum_iterations: int = 2000
-    damage_gradient_tolerance: float = 1e-8
-    damage_maximum_iterations: int = 500
-    field_output_interval: int = 1
-    minimum_elements_per_length_scale: float = 2.0
-    maximum_refinement_levels: int = 5
-    # Global tetrahedron budget for crack-band refinement; exceeding it fails cleanly
-    # instead of letting the operating system kill the process for lack of memory.
-    maximum_refined_cells: int = 4_000_000
 
 def load_crack_specifications(config: Path | dict | None = None) -> list[CrackSpecification]:
     """Read and validate crack_simulations from the authoritative dam configuration."""

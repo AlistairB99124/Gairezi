@@ -4,10 +4,14 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import sys
 
 import numpy as np
 
 DEFAULTS = Path(__file__).with_name("fracture_defaults.json")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def contour_intersections(contours: list[dict], z: float) -> tuple[float, float]:
@@ -49,8 +53,13 @@ def locate_crack(config: dict, location, fields):
     they choose the seeded face (the face of the highest local principal stress) and confirm
     which concrete bodies the crack crosses. No location is chosen automatically.
     """
-    from crack_field import CrackSpecification, PhaseFieldSolverOptions
-    from crack_selection import plan_angle, principal_stresses
+    from FEniCSx.crack_contract import (
+        CrackSpecification, PhaseFieldSolverOptions, calibrate_phase_field_defaults,
+    )
+    if __package__:
+        from .crack_selection import plan_angle, principal_stresses
+    else:
+        from crack_selection import plan_angle, principal_stresses
 
     try:
         y, z = (float(value) for value in location)
@@ -88,7 +97,9 @@ def locate_crack(config: dict, location, fields):
     if not math.isfinite(arc_length) or arc_length <= 0:
         raise ValueError("automatic_crack.arc_length_m must be finite and positive.")
     depth = depth_fraction * thickness
-    length_scale = float(defaults["length_scale_m"])
+    # Strength-based calibration (Tanne et al. 2018): the homogeneous peak stress equals ft.
+    defaults, calibration = calibrate_phase_field_defaults(defaults, config["material"]["concrete"])
+    length_scale = calibration["length_scale_m"]
     # The wall exists above the surveyed bedrock and up to the crest.
     try:
         concrete_left, concrete_right = contour_intersections(geometry["bedrock"]["contours"], z)
@@ -187,12 +198,14 @@ def locate_crack(config: dict, location, fields):
             "the selected point.",
         ],
         "defaults": json.loads(DEFAULTS.read_text(encoding="utf-8")),
+        "length_scale_calibration": calibration,
         "report_crack": {
             "name": specification.name,
             "central_crack_pos_m": dict(zip(("x", "y", "z"), specification.centre_m)),
             "size_m": dict(zip(("x", "y", "z"), specification.size_m)),
             "orientation": {"normal_x": 0.0, "normal_y": 0.0, "normal_z": 1.0},
             "phase_field_parameters": {
+                "model": specification.model,
                 "length_scale_m": specification.length_scale_m,
                 "critical_energy_release_rate_J_m2": specification.critical_energy_release_rate_j_m2,
                 "residual_stiffness": specification.residual_stiffness,

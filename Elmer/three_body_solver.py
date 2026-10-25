@@ -27,7 +27,7 @@ def export_reporting_region(result: Path, *, timeout: int | None = None) -> Path
          "--result", str(result), "--output", str(output)],
         check=True, timeout=timeout,
     )
-    path = output / "structure_and_near_rock.vtu"
+    path = output / "structure.vtu"
     if not path.is_file() or not (output / "stress_summary.json").is_file():
         raise RuntimeError("Reporting-region export did not produce its result and summary")
     return path
@@ -100,7 +100,7 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "solver_input": str((output / "model" / "dam_model.sif").resolve()),
         "reporting_summary": str(summary_path.resolve()),
         "stress_bodies": summary["bodies"],
-        "reporting_distance_m": summary["rock_reporting_distance_m"],
+        "reporting_scope": summary["reporting_scope"],
         "reporting_limitations": summary["limitations"],
         "foundation": diagnostic.get("foundation", {"present": False}),
         "wall_foundation_connection": diagnostic.get("wall_foundation_connection"),
@@ -122,7 +122,7 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "nodes": diagnostic["nodes"],
         "cells": sum(diagnostic["cells_by_body"].values()),
         "stress_analysis": {
-            "scope": "wall only; foundation separately when present; bedrock separately within 5 m",
+            "scope": "wall only; concrete foundation separately when present",
             "max_tensile_principal_stress_pa": {"value_pa": tension},
             "max_compressive_principal_stress_pa": {"value_pa": compression},
             "tensile_strength_pa": strength,

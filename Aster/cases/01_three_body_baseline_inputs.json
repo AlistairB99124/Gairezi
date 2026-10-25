@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "source_config_sha256": "d804eb0f539ef3295b0e7f87c12ff8d9f7dbb0fdc61780a856d37c7b89f865ae",
+  "source_mesh_manifest_sha256": "2104e76bfa0d5dd83bc17272acaca0bd555ffb4be586c1f6c21c965aae44c297",
+  "material": {
+    "concrete": {
+      "density_kg_m3": 2400.0,
+      "youngs_modulus_pa": 35000000000.0,
+      "poissons_ratio": 0.2
+    },
+    "bedrock": {
+      "density_kg_m3": 2700.0,
+      "youngs_modulus_pa": 50000000000.0,
+      "poissons_ratio": 0.25
+    }
+  },
+  "gravity_m_s2": 9.81,
+  "upstream_water_surface_z_m": 3.0,
+  "water_pressure_gradient_pa_per_m": 9810.0,
+  "tailwater_elevation_m": -27.4726681642,
+  "overflow_surcharge_pa": 29430.0,
+  "foundation_elevation_m": -30.4726681642,
+  "rock_outer_spring_n_per_m3": {
+    "x": 1000000000000.0,
+    "y": 1000000000000.0,
+    "z": 1000000000000.0
+  },
+  "rock_bottom_area_m2": 41801.380450123834,
+  "rock_bottom_global_stiffness_n_per_m": 4.180138045012383e+16,
+  "wall_foundation_spring_n_per_m3": {
+    "x": 1250000000.0,
+    "y": 1250000000.0,
+    "z": 1250000000.0
+  },
+  "wall_foundation_spring_pairs": 3412,
+  "wall_foundation_spring_total_area_m2": 846.3320421022878,
+  "simplifications_vs_elmer": [
+    "wall internal joints (z=-20 m and z=-25 m) are still welded into one bonded continuum, instead of Elmer's compliant Mortar BC springs there (see module docstring); this is a smaller, still-documented simplification",
+    "the wall/foundation interface is now modelled with discrete DIS_T springs (3412 node pairs) using the same per-axis N/m^3 stiffness as Elmer's Mortar BC, lumped onto each pair's tributary area -- it is no longer welded bonded",
+    "the foundation/bedrock interface remains welded bonded, matching Elmer (which also bonds this interface)",
+    "bedrock's 4 slanted side boundaries are approximated as fully fixed (DDL_IMPO) instead of Elmer's local-frame normal-only roller springs; only the axis-aligned bottom keeps a true RIGI_PARASOL roller spring",
+    "15540 severely sliver bedrock tetrahedra (shape quality > 50, inherited from Elmer's own graded_bedrock.py mesh grading in the far-field domain-truncation region) were dropped: Code_Aster's MECA_STATIQUE solved 'successfully' on the full mesh but silently produced an all-NaN displacement field with them present (see BEDROCK_SLIVER_QUALITY_THRESHOLD's docstring)",
+    "a further 1815 bedrock tetrahedra were dropped because they were the sole/near-sole (< 3) support of a free (non-boundary, non-concrete) node: such nodes caused a MUMPS 'pivot nul ou presque nul' (FACTOR_11) solve failure even after the sliver-quality cleanup above (see MIN_FREE_NODE_SUPPORT's docstring)"
+  ],
+  "case_sha256": "7ca84c8ba76162a9c3f4a4d79463f5dce311e37c97f0d576ca0ca04f76e1c0e0"
+}

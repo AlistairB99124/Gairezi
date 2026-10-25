@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import argparse
+import base64
 import csv
 import json
 import re
-import struct
+import zlib
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -32,41 +33,155 @@ class DataArraySpec:
     components: int
 
 
-def _parse_vtu_piece(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
-    data = path.read_bytes()
-    appended_tag = b'<AppendedData encoding="raw">'
-    appended_start = data.index(appended_tag)
-    appended_data_start = data.index(b"_", appended_start) + 1
-    appended_data_end = data.index(b"</AppendedData>", appended_data_start)
-    header = data[:appended_start].decode("utf-8", errors="replace")
-    appended = data[appended_data_start:appended_data_end]
+_ATTR_PATTERN = re.compile(r'(\w+)="([^"]*)"')
+_HEADER_WORD_DTYPE = {"UInt32": np.dtype("<u4"), "UInt64": np.dtype("<u8")}
+_ELEMENT_DTYPE = {
+    "Float64": np.dtype("<f8"),
+    "Int32": np.dtype("<i4"),
+    "Int64": np.dtype("<i8"),
+    "UInt8": np.dtype("u1"),
+}
 
-    pattern = re.compile(
-        r'<DataArray type="(?P<dtype>[^"]+)"(?: Name="(?P<name>[^"]+)")?(?: NumberOfComponents="(?P<comps>\d+)")? format="appended" offset="(?P<offset>\d+)"/>'
-    )
+
+def _tag_attrs(tag_text: str) -> dict[str, str]:
+    return dict(_ATTR_PATTERN.findall(tag_text))
+
+
+def _parse_vtu_piece(path: Path, body_ids: tuple[int, ...] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
+    # Two ResultOutputSolver write paths in this codebase produce structurally
+    # different VTU files that both must parse here: the legacy single-WALL
+    # pipeline writes uncompressed, raw-encoded appended data with a fixed
+    # DataArray attribute order (type, [Name], [NumberOfComponents], format,
+    # offset); Elmer.three_body_solver's pipeline writes zlib-compressed,
+    # base64-encoded appended data with RangeMin/RangeMax metadata and a
+    # different attribute order. Attributes are parsed generically (order-
+    # independent key="value" pairs) and the appended-data decode branches on
+    # the actual <VTKFile>/<AppendedData> attributes rather than assuming
+    # either format.
+    data = path.read_bytes()
+    appended_tag_match = re.search(rb"<AppendedData\b[^>]*>", data)
+    if appended_tag_match is None:
+        raise ValueError(f"{path} has no <AppendedData> section")
+    appended_start = appended_tag_match.start()
+    header = data[:appended_start].decode("utf-8", errors="replace")
+    appended_tag_attrs = _tag_attrs(appended_tag_match.group(0).decode("utf-8", errors="replace"))
+    appended_data_start = data.index(b"_", appended_tag_match.end()) + 1
+    appended_data_end = data.index(b"</AppendedData>", appended_data_start)
+    raw_appended = data[appended_data_start:appended_data_end]
+    is_base64 = appended_tag_attrs.get("encoding") == "base64"
+    # With raw encoding, each DataArray's "offset" is a true byte offset into
+    # one shared decoded buffer. With base64 encoding, VTK instead
+    # base64-encodes EACH array's block independently (its own padding, since
+    # a single array's byte length is not always a multiple of 3) and
+    # concatenates the resulting base64 TEXT back-to-back; "offset" there is
+    # a CHARACTER offset into that concatenated base64 text, and the whole
+    # blob is NOT valid base64 on its own (interior "=" padding breaks a
+    # single combined decode, as discovered empirically on this file: decoding
+    # the full blob at once silently drops no invalid characters yet still
+    # comes up short by multiples of 4, because binascii stops at each
+    # interior padding boundary). So base64 arrays must be decoded one at a
+    # time, slicing the base64 TEXT between consecutive offsets.
+    base64_text = raw_appended.translate(None, b" \t\r\n") if is_base64 else None
+
+    vtkfile_match = re.search(r"<VTKFile\b[^>]*>", header)
+    vtkfile_attrs = _tag_attrs(vtkfile_match.group(0)) if vtkfile_match else {}
+    compressor = vtkfile_attrs.get("compressor")
+    word_dtype = _HEADER_WORD_DTYPE.get(vtkfile_attrs.get("header_type", "UInt32"), np.dtype("<u4"))
+    word_size = word_dtype.itemsize
+
     arrays: dict[str, DataArraySpec] = {}
     unnamed_index = 0
-    for match in pattern.finditer(header):
-        name = match.group("name") or f"unnamed_{unnamed_index}"
-        if match.group("name") is None:
+    for tag_match in re.finditer(r"<DataArray\b[^>]*?/>", header, re.DOTALL):
+        attrs = _tag_attrs(tag_match.group(0))
+        if attrs.get("format") != "appended":
+            continue
+        name = attrs.get("Name")
+        if name is None:
+            name = f"unnamed_{unnamed_index}"
             unnamed_index += 1
         arrays[name] = DataArraySpec(
             name=name,
-            offset=int(match.group("offset")),
-            dtype=match.group("dtype"),
-            components=int(match.group("comps") or "1"),
+            offset=int(attrs["offset"]),
+            dtype=attrs["type"],
+            components=int(attrs.get("NumberOfComponents", "1")),
         )
 
+    sorted_offsets = sorted(spec.offset for spec in arrays.values())
+
+    def _b64_chars_for_bytes(num_bytes: int) -> int:
+        # Base64 encodes 3-byte groups as 4 characters, padding the final
+        # partial group up to a 4-character boundary.
+        return ((num_bytes + 2) // 3) * 4
+
+    def block_header_and_payload(spec: DataArraySpec) -> tuple[bytes, bytes]:
+        """Split one DataArray's "appended" block into its header bytes
+        (block-size table for compressed data, or just the length word for
+        uncompressed data) and its payload bytes.
+
+        For raw encoding this is a single shared buffer indexed by byte
+        offset, so the header/payload split is a plain byte slice. For
+        base64 encoding, VTK encodes each array's header words and its
+        payload as two SEPARATE base64 quanta placed back-to-back in the
+        base64 text (discovered empirically: decoding an array's whole
+        offset-to-next-offset text span as one base64 string fails with
+        "Incorrect padding" because of this interior encoding boundary), so
+        the header must be decoded on its own first to learn its true byte
+        length (and, for compressed data, the block count) before the
+        payload's base64 span can be located and decoded separately.
+        """
+        if not is_base64:
+            base = spec.offset
+            if compressor:
+                num_blocks = int(np.frombuffer(raw_appended[base : base + word_size], dtype=word_dtype)[0])
+                header_len = 3 * word_size + num_blocks * word_size
+                header = raw_appended[base : base + header_len]
+                sizes = np.frombuffer(header[3 * word_size :], dtype=word_dtype).tolist()
+                payload_len = sum(sizes)
+            else:
+                header_len = word_size
+                header = raw_appended[base : base + header_len]
+                payload_len = int(np.frombuffer(header, dtype=word_dtype)[0])
+            payload = raw_appended[base + header_len : base + header_len + payload_len]
+            return header, payload
+
+        later = [offset for offset in sorted_offsets if offset > spec.offset]
+        text_end = later[0] if later else len(base64_text)
+        text = base64_text[spec.offset : text_end]
+        if compressor:
+            # Decode just the first 3 header words to learn num_blocks (a
+            # length-aligned prefix of a base64 string decodes correctly on
+            # its own, since base64 groups 3 bytes <-> 4 chars independently
+            # except for the stream's final padding).
+            prefix_chars = _b64_chars_for_bytes(3 * word_size)
+            num_blocks = int(np.frombuffer(base64.b64decode(text[:prefix_chars]), dtype=word_dtype)[0])
+            header_bytes_len = 3 * word_size + num_blocks * word_size
+            header_chars = _b64_chars_for_bytes(header_bytes_len)
+            header = base64.b64decode(text[:header_chars])[:header_bytes_len]
+            payload = base64.b64decode(text[header_chars:])
+        else:
+            header_chars = _b64_chars_for_bytes(word_size)
+            header = base64.b64decode(text[:header_chars])[:word_size]
+            payload = base64.b64decode(text[header_chars:])
+        return header, payload
+
     def read_array(spec: DataArraySpec) -> np.ndarray:
-        chunk_len = struct.unpack("<I", appended[spec.offset : spec.offset + 4])[0]
-        start = spec.offset + 4
-        chunk = appended[start : start + chunk_len]
-        dtype_map = {
-            "Float64": np.dtype("<f8"),
-            "Int32": np.dtype("<i4"),
-            "UInt8": np.dtype("u1"),
-        }
-        values = np.frombuffer(chunk, dtype=dtype_map[spec.dtype])
+        header, payload = block_header_and_payload(spec)
+        if compressor:
+            num_blocks = int(np.frombuffer(header[0:word_size], dtype=word_dtype)[0])
+            sizes_start = 3 * word_size
+            block_sizes = np.frombuffer(
+                header[sizes_start : sizes_start + num_blocks * word_size], dtype=word_dtype,
+            ).tolist()
+            position = 0
+            chunks = []
+            for compressed_size in block_sizes:
+                chunks.append(zlib.decompress(payload[position : position + compressed_size]))
+                position += compressed_size
+            raw_bytes = b"".join(chunks)
+        else:
+            chunk_len = int(np.frombuffer(header, dtype=word_dtype)[0])
+            raw_bytes = payload[:chunk_len]
+        values = np.frombuffer(raw_bytes, dtype=_ELEMENT_DTYPE[spec.dtype])
         if spec.components > 1:
             values = values.reshape((-1, spec.components))
         return values
@@ -76,27 +191,42 @@ def _parse_vtu_piece(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, li
         read_array(arrays[name])
         for name in ("stress_xx", "stress_yy", "stress_zz", "stress_xy", "stress_yz", "stress_xz")
     ])
-    points = read_array(arrays["unnamed_0"])
+    # Legacy writer leaves the coordinate DataArray unnamed; Elmer.three_body_solver's
+    # writer names it "Points" explicitly.
+    points = read_array(arrays["Points"] if "Points" in arrays else arrays["unnamed_0"])
     connectivity = read_array(arrays["connectivity"])
     offsets = read_array(arrays["offsets"])
     cell_types = read_array(arrays["types"])
+    if body_ids is not None and "GeometryIds" not in arrays:
+        raise ValueError(f"Missing GeometryIds for concrete reporting: {path}")
+    bodies = read_array(arrays["GeometryIds"]) if body_ids is not None else None
 
     cells: list[tuple[int, np.ndarray]] = []
     start = 0
-    for end, cell_type in zip(offsets.tolist(), cell_types.tolist()):
-        if cell_type in (10, 12, 13, 14):  # VTK tetrahedron, hexahedron, wedge, pyramid
+    for index, (end, cell_type) in enumerate(zip(offsets.tolist(), cell_types.tolist())):
+        if cell_type in (10, 12, 13, 14) and (bodies is None or bodies[index] in body_ids):
             cells.append((cell_type, connectivity[start:end]))
         start = end
 
+    if body_ids is not None:
+        used = np.unique(np.concatenate([ids for _, ids in cells])) if cells else np.array([], dtype=np.int64)
+        remap = np.full(len(points), -1, dtype=np.int64)
+        remap[used] = np.arange(len(used))
+        cells = [(kind, remap[ids]) for kind, ids in cells]
+        points, displacement, stress_components = points[used], displacement[used], stress_components[used]
     return points, displacement, stress_components, cells
 
 
-def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
+def parse_vtu(path: Path, body_ids: tuple[int, ...] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[int, np.ndarray]]]:
     if path.suffix != ".pvtu":
-        return _parse_vtu_piece(path)
+        return _parse_vtu_piece(path, body_ids)
 
     manifest = path.read_text()
-    piece_paths = [path.parent / source for source in re.findall(r'<Piece Source="([^"]+)"/>', manifest)]
+    # Optional whitespace before "/>": different ResultOutputSolver write paths
+    # in this codebase emit both '<Piece Source="..."/>' (no space) and
+    # '<Piece Source="..." />' (one space) -- both are equivalent self-closing
+    # XML tags.
+    piece_paths = [path.parent / source for source in re.findall(r'<Piece Source="([^"]+)"\s*/>', manifest)]
     if not piece_paths:
         raise ValueError(f"PVTU manifest has no result pieces: {path}")
 
@@ -106,7 +236,7 @@ def parse_vtu(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tupl
     cells: list[tuple[int, np.ndarray]] = []
     point_offset = 0
     for piece_path in piece_paths:
-        points, displacement, stress_components, piece_cells = _parse_vtu_piece(piece_path)
+        points, displacement, stress_components, piece_cells = _parse_vtu_piece(piece_path, body_ids)
         points_parts.append(points)
         displacement_parts.append(displacement)
         stress_parts.append(stress_components)
@@ -563,8 +693,7 @@ def analyze_result(
         "tensile_strength_pa": tensile_strength_pa,
         "tension_utilization": (max_tension["value_pa"] / tensile_strength_pa) if tensile_strength_pa else None,
         "note": (
-            "Positive principal stress indicates tension. Negative principal stress indicates compression. "
-            "Successful execution or convergence is not engineering validation or proof of dam safety."
+            "Positive principal stress indicates tension. Negative principal stress indicates compression."
         ),
     }
     summary_path = out_dir / "stress_summary.json"

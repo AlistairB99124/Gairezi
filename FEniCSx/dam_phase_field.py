@@ -16,8 +16,10 @@ from crack_field import (
     PhaseFieldSolverOptions,
     validate_crack_placement,
 )
+from FEniCSx.crack_contract import implied_tensile_strength
 from phase_field_solver import (
     PhaseFieldResult,
+    crack_surface_density,
     degradation,
     elastic_parameters,
     strain,
@@ -33,7 +35,7 @@ def _global_scalar(domain, expression) -> float:
 
 def implied_at2_tensile_strength(young: float, gc: float, length_scale: float) -> float:
     """One-dimensional homogeneous AT2 strength used only as a calibration diagnostic."""
-    return math.sqrt(27.0 * young * gc / (256.0 * length_scale))
+    return implied_tensile_strength("AT2", young, gc, length_scale)
 
 
 def solve(
@@ -216,8 +218,7 @@ def solve(
     length_scale = first.length_scale_m
     crack_density.interpolate(
         fem.Expression(
-            result.damage**2 / (2.0 * length_scale)
-            + length_scale * ufl.inner(ufl.grad(result.damage), ufl.grad(result.damage)) / 2.0,
+            crack_surface_density(first.model, result.damage, length_scale),
             scalar_space.element.interpolation_points,
         )
     )
@@ -260,7 +261,8 @@ def solve(
     applied_norm = float(np.linalg.norm(applied))
     relative_balance = float(np.linalg.norm(imbalance) / applied_norm) if applied_norm else 0.0
     configured_strength = material.tensile_strength_pa
-    implied_strength = implied_at2_tensile_strength(
+    implied_strength = implied_tensile_strength(
+        first.model,
         material.youngs_modulus_pa,
         first.critical_energy_release_rate_j_m2,
         length_scale,
@@ -298,14 +300,19 @@ def solve(
             "maximum_principal_compressive_stress_pa": maximum_compressive_stress,
             "crack_surface_measure_m2": integral(crack_density * dx),
             "configured_tensile_strength_pa": configured_strength,
-            "at2_implied_homogeneous_tensile_strength_pa": implied_strength,
+            "phase_field_model": first.model,
+            "implied_homogeneous_tensile_strength_pa": implied_strength,
+            **(
+                {"at2_implied_homogeneous_tensile_strength_pa": implied_strength}
+                if first.model == "AT2" else {}
+            ),
             "implied_to_configured_strength_ratio": implied_strength / configured_strength,
             "internal_pressure_model": (
                 "diffuse pressure force -p*grad(alpha)" if pressure_value else "disabled (0 Pa)"
             ),
             "limitations": [
                 (
-                    "Hybrid AT2 degrades full stiffness but only tensile energy drives damage."
+                    f"Hybrid {first.model} degrades full stiffness but only tensile energy drives damage."
                     if mechanics_formulation == "hybrid"
                     else "Experimental Amor mechanics preserves negative volumetric energy only; shear remains degraded."
                 ),

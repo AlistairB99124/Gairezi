@@ -45,8 +45,7 @@ can produce zero-volume tetrahedra and a native Netgen optimizer access violatio
 with some thickness-step configurations (observed with Gmsh 4.15.2 on Windows).
 Bottom mesh connectivity may change; physical geometry, configured mesh sizes,
 locked interface triangles, and the volume/conformity/quality checks are retained.
-Low scaled-Jacobian warnings still require mesh-quality inspection; completing
-meshing is not engineering validation.
+Low scaled-Jacobian warnings still require mesh-quality inspection; completing.
 
 Open the printed `model\results\three_body_results_t0001.pvtu` in ParaView.
 Keep its adjacent VTU pieces. Colour by cell `GeometryIds`: **1 = wall,
@@ -294,7 +293,6 @@ of scope. The rock-only snapped-lip variant cuts the sub-5-degree count by
 investigation. The design deliberately does not broaden or coarsen the terrain
 or change far-field sizes; only the documented lip lowering/interpolation is
 introduced.
-These are numerical checks, **not engineering validation**.
 
 #### Benched/snapped-lip solve
 
@@ -319,8 +317,7 @@ Maximum vector gaps: wall/foundation **0.001111929 m**, foundation/rock
 zero unmatched, zero maximum coincidence distance, and identical spring faces:
 8282 triangles/1012.700568 m2 per wall/foundation side, and
 13216 triangles/1612.038554 m2 per foundation/rock side. Relative spring
-displacements are not unilateral contact openings. These results remain
-numerical diagnostics, not engineering validation.
+displacements are not unilateral contact openings.
 
 #### Exact-plane staircase mortar split
 
@@ -440,7 +437,6 @@ side) and 1612.038554 m2 foundation/rock (13216 per side). All plane-side source
 coordinates and areas match; spring node IDs remain duplicated. Downstream
 FEniCSx/API consumers must adapt to the nested contract and independent plane
 elimination; this Elmer-only change does not claim a new downstream parity run.
-Not engineering validation.
 
 #### Localisation and staircase wall corner sensitivity
 
@@ -479,25 +475,20 @@ transfer, even though materials/loads/spring coefficients are unchanged.
 It does **not** prove an elastic singularity, establish mesh convergence, or
 justify excluding corners from an engineering assessment.
 
-### Stress reporting region: concrete and nearby bedrock
+### Stress reporting region: concrete only
 
-Three-body runs also generate `model\reporting\structure_and_near_rock.vtu`
+Three-body runs also generate `model\reporting\structure.vtu`
 and `model\reporting\stress_summary.json`. **Use this VTU for stress review**:
-it contains all wall and foundation cells and only bedrock within **5 m of the
-nearest concrete surface**, in undeformed coordinates. Wall and foundation peaks
+it contains only wall and optional concrete foundation cells. Wall and foundation peaks
 are separate; headline stress/utilization remains wall-only. All solved fields
 are retained. Rescale ParaView's colour map to this filtered dataset; do not
 reuse the full-domain colour range.
 
 The full-domain PVTU is preserved and remains `result` in the run manifest.
 `reporting_result` and `stress_summary` identify the filtered deliverables.
-This is post-processing only: it does not shorten the rock domain, alter
-restraints or rerun the solver. Remote bottom stresses are excluded from the
-filtered bedrock summary, **not erased from the full solution**. Fixed-boundary
-stresses can include physical overburden as well as restraint/domain effects;
-hiding them does not establish that the 5 m region is free of boundary effects.
-Foundation-domain sensitivity and geostatic initialization remain separate
-verification tasks.
+This is post-processing only: it does not change the analysis domain,
+restraints or solver. Engineering reports, stress summaries, comparison peaks
+and default ParaView exports are concrete-only.
 
 The VTU also carries `DistanceToSharpEdge_m`: the undeformed distance to the
 nearest sharp wall/foundation surface edge (faces meeting at 60 degrees or
@@ -952,8 +943,10 @@ output-flag types. Validation errors include JSON-style field paths.
 entry declares `type` (`phase_field`), `shape` (`rectangular`),
 `central_crack_pos_m`, `size_m`, an `orientation` normal,
 `phase_field_parameters`, loading increments and explicit solver/refinement
-controls. Only `model: AT2` and `energy_split: volumetric_deviatoric` are
-currently supported; unsupported alternatives fail validation.
+controls. `model` may be `AT2` or `AT1`, and only `energy_split:
+volumetric_deviatoric` is currently supported; unsupported alternatives fail
+validation. AT1 (`w = alpha`) is linear elastic until its homogeneous strength
+`sqrt(3 E Gc / (8 l))`; AT2 (`w = alpha^2`) starts damaging at any tensile energy.
 
 `size_m.x` and `size_m.y` span the crack plane while `size_m.z` is the opening
 measured **along the orientation normal**, so a crack is a thin rectangular box
@@ -969,8 +962,9 @@ stiffness-retention factor. The field is an *initial condition* representing a
 declared crack: it is neither a computed crack path nor a physical crack opening
 displacement, and producing it asserts nothing about dam safety.
 
-The initial field saturates at 1 inside the crack box and uses the AT2 optimal
-profile `exp(-d / l)` outside it. Overlapping cracks combine by maximum damage.
+The initial field saturates at 1 inside the crack box and uses the optimal
+profile of the selected model outside it: `exp(-d / l)` for AT2 and
+`(1 - d / (2 l))^2` (support `2 l`) for AT1. Overlapping cracks combine by maximum damage.
 The solver locally refines the diffuse band until the configured minimum
 elements per `length_scale_m` is reached or fails after the configured maximum
 levels. It preserves cell and exterior-facet tags through refinement.
@@ -986,19 +980,27 @@ then perform a mesh/length-scale convergence study. The app workflow instead
 pauses after the elastic baseline and asks the user to click the crack location
 on a Z-Y plot of baseline wall stress (no automatic placement), then
 seeds a local 4 m crack there so that the wall (but not
-bedrock) can damage, with a 0.25 m length scale and a 4,000,000-cell refinement
-budget; see [FEniCSx/README.md](FEniCSx/README.md).
+bedrock) can damage, with an AT1 model whose length scale is calibrated to the
+configured concrete tensile strength (`l = 3 E Gc / (8 ft^2)`, Tanné et al.
+2018; 0.656 m for E = 35 GPa, Gc = 200 J/m2, ft = 2 MPa) and a 4,000,000-cell
+refinement budget; see [FEniCSx/README.md](FEniCSx/README.md). The earlier AT2
+default `l = 0.25 m` implied only about 1.72 MPa and had no elastic phase.
 
 The staggered solve alternates degraded linear mechanics and a PETSc TAO
-bound-constrained AT2 damage minimisation. The lower bound is the damage from
-the previous converged load step, enforcing irreversibility. Gravity,
+bound-constrained AT1/AT2 damage minimisation. The lower bound is the damage from
+the previous converged load step, enforcing irreversibility. Mechanics uses
+GMRES with GAMG; if that fails (for example the stiffness contrast of fully
+damaged zones), the same solve is retried once with a MUMPS LU preconditioner,
+which is then kept for the rest of the run. The switch is recorded as a
+`direct_solver_fallback` event in `mechanics_diagnostics.jsonl` and as
+`mechanics_solver.direct_fallback_used` in the report; a MUMPS failure still
+fails the run. MUMPS needs considerably more memory than GAMG. Gravity,
 hydrostatic boundary pressure and the existing directional support springs are
 included. Nonzero internal crack pressure uses the regularised force
 `-p*grad(alpha)`; this is not an explicit face traction. Outputs include
 displacement, damage, tensile-energy history, degraded stress, strain,
 crack-surface density, energies, convergence histories, reactions and force
-balance. Successful convergence is explicitly marked as not engineering
-validated.
+balance.
 
 `solver.field_output_interval` controls expensive ParaView field snapshots;
 JSON convergence and energy diagnostics are still recorded at every load step.
@@ -1314,7 +1316,6 @@ peaks are unavailable; prior split-case values (wall tension/compression
 chamfer results. Downstream integration has been notified not to consume this
 unconverged reference. Next work must address solver conditioning/cost without
 weakening the accuracy gate or silently changing mesh/material/load semantics.
-This is not engineering validation.
 
 
 ### Near-planar chamfer mortar groups: audit passed, equilibrium still blocked
@@ -1417,7 +1418,7 @@ staircase/benched-split minima and counts remain 1.684/26, 1.643/27, 1.279/29,
 0.842/197, 0.945/53, respectively. `mesh_quality.json` records the exact array
 comparison supporting reuse of the measured chamfer quality, rather than
 claiming a new mesh measurement. Diagnostic, audit, validation and source
-snapshots are retained in the fresh run. This is not engineering validation.
+snapshots are retained in the fresh run.
 
 
 ### Installed solver capability check and final bounded AMG attempt
@@ -1475,4 +1476,4 @@ prior grouped ILU2 residual 6.222e-9 versus required 1e-10 remains the best logg
 bounded iterative progress. A user-submitted app job may run without the
 agent-development cap, but the verified internal-AMG implementation failure
 will not be fixed merely by allowing more time. No FEniCSx/API/WPF/config edits,
-no contract change, no commits. Not engineering validation.
+no contract change, no commits.

@@ -1,0 +1,120 @@
+from code_aster.Commands import *
+from code_aster import CA
+import json
+import sys
+import numpy as np
+
+DEBUT(ERREUR=_F(ALARME="EXCEPTION"))
+with open("fort.91", encoding="utf-8") as stream:
+    inputs = json.load(stream)
+sys.path.insert(0, inputs["repository_root"])
+from Aster.native_seed import initial_field
+from FEniCSx.crack_contract import _seed_hash
+import copy
+
+resolved = inputs.get("specimen_divisions") is not None
+if resolved:
+    linear = LIRE_MAILLAGE(FORMAT="MED", UNITE=20)
+else:
+    linear = CA.Mesh.buildCube(refine=1)
+    linear = MODI_MAILLAGE(reuse=linear, MAILLAGE=linear, ECHELLE=.004)
+    linear = MODI_MAILLAGE(
+        reuse=linear, MAILLAGE=linear, TRANSLATION=inputs["translation_m"],
+    )
+MESH = CREA_MAILLAGE(MAILLAGE=linear, LINE_QUAD=_F(TOUT="OUI"))
+if not resolved:
+    MESH = DEFI_GROUP(
+        reuse=MESH, MAILLAGE=MESH,
+        CREA_GROUP_MA=_F(NOM="WALL", GROUP_MA="VOLUME", NUME_INIT=8, NUME_FIN=8),
+    )
+MODEL = AFFE_MODELE(
+    MAILLAGE=MESH,
+    AFFE=_F(GROUP_MA="VOLUME", PHENOMENE="MECANIQUE", MODELISATION="3D_GRAD_VARI"),
+)
+MAT = DEFI_MATER_GC(ENDO_FISS_EXP=_F(**inputs["material"]["parameters"]))
+FIELD = AFFE_MATERIAU(MAILLAGE=MESH, AFFE=_F(GROUP_MA="VOLUME", MATER=MAT))
+missed = copy.deepcopy(inputs["shared_seed"])
+missed["payload"]["geometry"]["elevation_m"] += 1.
+missed["payload"]["selected_location_m"]["z"] += 1.
+missed["sha256"] = _seed_hash(missed["payload"])
+try:
+    initial_field(MODEL, MAT, missed, .999, volume_group="VOLUME")
+except ValueError as error:
+    if "mesh misses the physical UI seed" not in str(error):
+        raise
+else:
+    raise ValueError("Native seed silently accepted a mesh that misses the physical crack")
+INITIAL, audit = initial_field(
+    MODEL, MAT, inputs["shared_seed"], .999, volume_group="VOLUME",
+)
+geometry = inputs["shared_seed"]["payload"]["geometry"]
+from FEniCSx.automatic_crack import sector_signed_distance
+inside = sector_signed_distance(
+    np.asarray(audit["coordinates_m"]), tuple(geometry["annular_sector"]),
+    geometry["elevation_m"], geometry["seed_thickness_m"],
+) <= 0.
+wall = set(MESH.getCells("WALL"))
+excluded = [inside[i] and identity[0] not in wall
+            for i, identity in enumerate(audit["damage_point_ids"])]
+if not resolved and not any(excluded):
+    raise ValueError("Synthetic native benchmark did not exercise wall-only filtering")
+audit["excluded_nonwall_points_inside_seed"] = int(sum(excluded))
+audit["unsampled_seed_rejected"] = True
+ZERO = DEFI_CONSTANTE(VALE=0.)
+UZ = FORMULE(NOM_PARA="Z", VALE="1e-6 * (Z - bottom)", bottom=inputs["translation_m"][2])
+if resolved:
+    LOAD = AFFE_CHAR_CINE_F(
+        MODELE=MODEL, MECA_IMPO=_F(GROUP_MA="VOLUME", DX=ZERO, DY=ZERO, DZ=UZ),
+    )
+else:
+    LOAD = AFFE_CHAR_MECA_F(
+        MODELE=MODEL, DDL_IMPO=_F(TOUT="OUI", DX=ZERO, DY=ZERO, DZ=UZ),
+    )
+TIMES = DEFI_LIST_REEL(VALE=inputs["times"])
+RAMP = DEFI_FONCTION(
+    NOM_PARA="INST", VALE=(0., 0., 1., 0., 2., 1.) if resolved else (0., 0., 1., 1.),
+)
+search = ({"RECH_LINEAIRE": _F(METHODE="CORDE", ITER_LINE_MAXI=20)}
+          if not resolved or inputs.get("line_search", False) else {})
+RESU = STAT_NON_LINE(
+    MODELE=MODEL, CHAM_MATER=FIELD, ETAT_INIT=_F(VARI=INITIAL),
+    EXCIT=_F(CHARGE=LOAD, FONC_MULT=RAMP),
+    COMPORTEMENT=_F(RELATION="ENDO_FISS_EXP", DEFORMATION="PETIT"),
+    INCREMENT=_F(LIST_INST=TIMES),
+    CONVERGENCE=_F(
+        SIGM_REFE=inputs["material"]["parameters"]["FT"], VARI_REFE=1.,
+        LAGR_REFE=inputs["material"]["parameters"]["GF"] /
+                  (inputs["material"]["parameters"]["LARG_BANDE"] / 2),
+        RESI_REFE_RELA=1e-8, ITER_GLOB_MAXI=400 if inputs.get("line_search", False) else 40,
+    ),
+    SOLVEUR=_F(METHODE="MUMPS"),
+    **search,
+)
+history = []
+for index, instant in zip(RESU.getIndexes(), RESU.getAccessParameters()["INST"]):
+    values, support = RESU.getField("VARI_ELGA", index).getValuesWithDescription(["V1"])
+    identities = [list(key) for key in zip(support[0], support[2], support[3])]
+    if identities != audit["damage_point_ids"]:
+        raise ValueError("Native UI-seed point identities changed during nonlinear solve")
+    values = np.asarray(values)
+    initial_values = np.asarray(audit["damage_values"])
+    if (not np.isfinite(values).all() or values.min() < -1e-7 or values.max() > 1 + 1e-7
+            or np.any(values < initial_values - 1e-7)):
+        raise ValueError("Native UI-seed produced nonfinite, unbounded or healed damage")
+    seeded = initial_values > 0.
+    if np.any(values[seeded] < initial_values[seeded] - 1e-7):
+        raise ValueError("Native UI-seed initial near-complete damage was not retained")
+    if history and np.any(values < np.asarray(history[-1]["damage_values"]) - 1e-7):
+        raise ValueError("Native UI-seed damage healed between converged states")
+    stress = np.asarray(RESU.getField("SIEF_ELGA", index).getValues())
+    if not np.isfinite(stress).all():
+        raise ValueError("Nonfinite native UI-seed benchmark stress")
+    history.append({"time": instant, "damage_values": values.tolist()})
+RESU = CALC_CHAMP(reuse=RESU, RESULTAT=RESU, VARI_INTERNE="VARI_NOEU", CONTRAINTE="SIGM_NOEU")
+IMPR_RESU(
+    FORMAT="MED", UNITE=80,
+    RESU=_F(RESULTAT=RESU, NOM_RESU_MED="SEED", NOM_CHAM=("DEPL", "SIGM_NOEU", "VARI_NOEU")),
+)
+with open("fort.90", "w", encoding="utf-8") as stream:
+    json.dump({"audit": audit, "history": history}, stream, indent=2, allow_nan=False)
+FIN()
