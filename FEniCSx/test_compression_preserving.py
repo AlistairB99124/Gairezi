@@ -8,7 +8,9 @@ import numpy as np
 from petsc4py import PETSc
 import ufl
 
-from compression_preserving import MechanicsProblem, elastic_energy, solve_mechanics, stress
+from compression_preserving import (
+    MechanicsProblem, NewtonIterationLimit, elastic_energy, solve_mechanics, stress,
+)
 from phase_field_solver import elastic_parameters
 
 
@@ -121,6 +123,70 @@ class CompressionPreservingTests(unittest.TestCase):
 
     def test_pressure_closure_reopening_and_shear_with_direct_solver(self):
         self.check_pressure_cycles(direct_solver=True)
+
+    def closure_problem(self, **kwargs):
+        """Tension-to-compression closure at alpha=0.99, which needs several Newton steps."""
+        _, mu, bulk = elastic_parameters(1000.0, 0.2)
+        domain = mesh.create_unit_cube(MPI.COMM_WORLD, 2, 2, 2)
+        space = fem.functionspace(domain, ("Lagrange", 1, (3,)))
+        damage = fem.Function(fem.functionspace(domain, ("Lagrange", 1)))
+        damage.x.array[:] = 0.99
+        displacement = fem.Function(space)
+        bcs = []
+        for component in range(3):
+            facets = mesh.locate_entities_boundary(domain, 2, lambda x, i=component: np.isclose(x[i], 0))
+            dofs = fem.locate_dofs_topological(space.sub(component), 2, facets)
+            bcs.append(fem.dirichletbc(PETSc.ScalarType(0), dofs, space.sub(component)))
+        normal = ufl.FacetNormal(domain)
+        pressure = fem.Constant(domain, PETSc.ScalarType(3 * bulk * 1e-4 * ((1 - 0.99)**2 + 1e-8)))
+        problem = MechanicsProblem(
+            displacement, damage, bulk, mu, 1e-8,
+            lambda test, _damage: ufl.inner(pressure * normal, test) * ufl.ds,
+            bcs=bcs, relative_tolerance=1e-10, absolute_tolerance=1e-13, **kwargs,
+        )
+        problem.solve()
+        pressure.value = -3 * bulk * 1e-4
+        return problem, displacement, space
+
+    def test_newton_iteration_limit_continues_from_last_iterate(self):
+        reference_problem, reference_displacement, _ = self.closure_problem()
+        reference = reference_problem.solve()
+        self.assertGreater(reference["nonlinear_iterations"], 1)
+        progress = []
+        problem, displacement, space = self.closure_problem(
+            maximum_iterations=1, maximum_continuations=100,
+            newton_progress=lambda *values: progress.append(values),
+        )
+        progress.clear()
+        report = problem.solve()
+        self.assertGreater(report["newton_continuations"], 0)
+        self.assertLessEqual(report["true_residual_norm"], report["residual_limit"])
+        np.testing.assert_allclose(
+            displacement.x.array.reshape(-1, 3), -1e-4 * space.tabulate_dof_coordinates(),
+            rtol=1e-6, atol=1e-10,
+        )
+        np.testing.assert_allclose(displacement.x.array, reference_displacement.x.array, rtol=1e-6, atol=1e-12)
+        # Newton counts are cumulative across continuations and carry the residual target.
+        self.assertEqual(len(progress), report["nonlinear_iterations"])
+        self.assertEqual([entry[0] for entry in progress], list(range(1, len(progress) + 1)))
+        self.assertTrue(all(entry[2] == report["residual_limit"] for entry in progress))
+
+    def test_exhausted_newton_limit_is_not_a_linear_solver_failure(self):
+        problem, displacement, _ = self.closure_problem(maximum_iterations=1, maximum_continuations=0)
+        initial_guess = displacement.x.array.copy()
+        with self.assertRaises(NewtonIterationLimit) as caught:
+            problem.solve()
+        self.assertIn("SNES reason=-5", str(caught.exception))
+        np.testing.assert_array_equal(displacement.x.array, initial_guess)
+
+    def test_linear_solver_failure_is_not_reported_as_newton_limit(self):
+        problem, _, _ = self.closure_problem()
+        ksp = problem.problem.solver.getKSP()
+        ksp.getPC().setType("none")
+        ksp.setTolerances(max_it=1)
+        with self.assertRaises(RuntimeError) as caught:
+            problem.solve()
+        self.assertNotIsInstance(caught.exception, NewtonIterationLimit)
 
     def test_pressure_closure_reopening_and_shear_with_gmres(self):
         self.check_pressure_cycles(direct_solver=False)

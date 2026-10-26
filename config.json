@@ -139,5 +139,39 @@
     "max_displacement": true,
     "max_tensile_stress": true,
     "cracking_risk": true
+  },
+  "cracking": [
+    {
+      "face": "upstream",
+      "depth_m": 3.0,
+      "opening_m": 0.002,
+      "full_width": true,
+      "buffer_m": 1.0,
+      "length_m": null
+    }
+  ],
+  "fracture_debug": {
+    "model": "AT2",
+    "critical_energy_release_rate_j_m2": 2700.0,
+    "length_scale_m": 0.25,
+    "residual_stiffness": 1e-08,
+    "crack_water_pressure_factor": 0.0,
+    "load_steps": 10,
+    "solver": {
+      "maximum_staggered_iterations": 50,
+      "staggered_tolerance": 1e-05,
+      "mechanics_relative_tolerance": 1e-08,
+      "mechanics_maximum_iterations": 2000,
+      "damage_gradient_tolerance": 1e-08,
+      "damage_maximum_iterations": 500,
+      "field_output_interval": 10,
+      "minimum_elements_per_length_scale": 2.0,
+      "maximum_refinement_levels": 5,
+      "maximum_refined_cells": 4000000
+    },
+    "aster": {
+      "band_width_m": 0.5,
+      "softening_p": 5.0
+    }
   }
 }

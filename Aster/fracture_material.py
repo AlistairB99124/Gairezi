@@ -38,13 +38,21 @@ def material_contract(
     The native macro additionally checks its coupled admissibility conditions.
     """
     concrete = load_config(config)["material"]["concrete"]
+    debug = config.get("fracture_debug") or {}
+    aster_debug = debug.get("aster") or {}
     if "compressive_strength_pa" not in concrete:
         raise ValueError("material.concrete.compressive_strength_pa is required for Aster damage")
     defaults = json.loads(defaults_path.read_text(encoding="utf-8"))
     shared = json.loads(fenicsx_defaults_path.read_text(encoding="utf-8"))
-    width = _positive(defaults["band_width_m"] if band_width_m is None else band_width_m,
-                      "band_width_m")
-    p = _positive(defaults["softening_p"] if softening_p is None else softening_p, "softening_p")
+    # Precedence: explicit argument (sensitivity studies), then fracture_debug, then defaults.
+    if band_width_m is None:
+        band_width_m = aster_debug.get("band_width_m", defaults["band_width_m"])
+    if softening_p is None:
+        softening_p = aster_debug.get("softening_p", defaults["softening_p"])
+    fracture_energy = debug.get("critical_energy_release_rate_j_m2",
+                                shared["critical_energy_release_rate_j_m2"])
+    width = _positive(band_width_m, "band_width_m")
+    p = _positive(softening_p, "softening_p")
     if p < 1:
         raise ValueError("softening_p must be at least 1 for ENDO_FISS_EXP")
     parameters = {
@@ -52,7 +60,7 @@ def material_contract(
         "NU": concrete["poisson_ratio"],
         "FT": _positive(concrete["tensile_strength_pa"], "tensile_strength_pa"),
         "FC": _positive(concrete["compressive_strength_pa"], "compressive_strength_pa"),
-        "GF": _positive(shared["critical_energy_release_rate_j_m2"], "fracture_energy"),
+        "GF": _positive(fracture_energy, "fracture_energy"),
         "LARG_BANDE": width,
         "P": p,
         "Q": 0.0,
@@ -79,8 +87,11 @@ def material_contract(
         },
         "provenance": {
             "strengths_and_elasticity": "submitted config: material.concrete",
-            "fracture_energy": str(fenicsx_defaults_path.resolve()),
-            "regularisation_and_softening": str(defaults_path.resolve()),
+            "fracture_energy": ("submitted config: fracture_debug.critical_energy_release_rate_j_m2"
+                                if "critical_energy_release_rate_j_m2" in debug
+                                else str(fenicsx_defaults_path.resolve())),
+            "regularisation_and_softening": ("submitted config: fracture_debug.aster" if aster_debug
+                                             else str(defaults_path.resolve())),
             "documentation": DOCUMENTATION,
             "fracture_energy_basis": (
                 "fib MC2010 GF = 73*fcm^0.18 with fcm = fc + 8 MPa = 28 MPa gives about 133 J/m2; "

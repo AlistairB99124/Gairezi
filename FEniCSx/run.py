@@ -149,7 +149,12 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
             assert_fracture_ready(structure)
         imported = import_structure(structure, maximum_volume_change=0.001)
         write_json(directory / "import_report.json", imported.report)
-        defaults = json.loads(DEFAULTS.read_text(encoding="utf-8"))
+        from FEniCSx.crack_contract import apply_fracture_debug
+
+        defaults, _ = apply_fracture_debug(
+            json.loads(DEFAULTS.read_text(encoding="utf-8")),
+            json.loads(snapshot.read_text(encoding="utf-8")),
+        )
         options = PhaseFieldSolverOptions(**defaults.pop("solver"))
         defaults.pop("automatic_crack")
         if phase:

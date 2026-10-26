@@ -306,6 +306,35 @@ def _require_cell_budget(cells: int, options: PhaseFieldSolverOptions, level: in
         )
 
 
+def _long_band_edges(domain, damage_cells, specifications, reports, options):
+    """Edges of damageable cells that are longer than the target size near an under-resolved crack.
+
+    The resolution check takes the longest edge of every damageable cell whose midpoint lies within
+    ``2 l + D / 2`` of the crack. Distance is 1-Lipschitz, so that edge's midpoint lies within
+    ``2 l + 1.5 L`` and is always marked; bisecting only these edges avoids the eightfold growth
+    of refining whole cells in a band tens of metres long. Returns the edges and the minimum
+    number of cells their refinement adds.
+    """
+    dimension = domain.topology.dim
+    domain.topology.create_connectivity(dimension, 1)
+    domain.topology.create_connectivity(1, 0)
+    domain.topology.create_connectivity(1, dimension)
+    candidates = mesh.compute_incident_entities(domain.topology, damage_cells, dimension, 1)
+    candidates = candidates[candidates < domain.topology.index_map(1).size_local]
+    vertices = domain.geometry.x[mesh.entities_to_geometry(domain, 1, candidates)]
+    lengths = np.linalg.norm(vertices[:, 1] - vertices[:, 0], axis=1)
+    midpoints = vertices.mean(axis=1)
+    marked = np.zeros(len(candidates), dtype=bool)
+    for specification, report in zip(specifications, reports):
+        if report["elements_per_length_scale"] < options.minimum_elements_per_length_scale:
+            target = specification.length_scale_m / options.minimum_elements_per_length_scale
+            near = signed_distance(midpoints, specification) <= 2.0 * specification.length_scale_m + 1.5 * lengths
+            marked |= near & (lengths > target)
+    edges = candidates[marked]
+    added = int(np.diff(domain.topology.connectivity(1, dimension).offsets)[edges].sum())
+    return edges, added
+
+
 @dataclass
 class RefinedPhaseFieldMesh:
     domain: mesh.Mesh
@@ -362,34 +391,16 @@ def refine_for_phase_field(
             break
 
         dimension = domain.topology.dim
-        cells = np.arange(domain.topology.index_map(dimension).size_local, dtype=np.int32)
-        diameters = cell_diameters(domain._cpp_object, dimension, cells)
-        midpoints = mesh.compute_midpoints(domain, dimension, cells)
-        marked = np.zeros(len(cells), dtype=bool)
-        damageable = np.zeros(len(cells), dtype=bool)
-        damageable[damage_cells] = True
-        bedrock = np.zeros(len(cells), dtype=bool)
-        bedrock[cell_tags.find(2)] = True
-        for specification, report in zip(specifications, reports):
-            if report["elements_per_length_scale"] < options.minimum_elements_per_length_scale:
-                distance = signed_distance(midpoints, specification)
-                marked |= (
-                    damageable
-                    & (distance <= 3.0 * specification.length_scale_m + diameters)
-                    & (diameters > specification.length_scale_m / options.minimum_elements_per_length_scale)
-                )
-        marked_cells = cells[marked]
-        levels[-1]["marked_wall_cells"] = int(np.count_nonzero(marked & ~bedrock))
-        if not len(marked_cells):
-            raise RuntimeError("No cells were selected for required crack-band refinement")
+        edges, added_cells = _long_band_edges(domain, damage_cells, specifications, reports, options)
+        levels[-1]["marked_edges"] = int(len(edges))
+        if not len(edges):
+            raise RuntimeError("No edges were selected for required crack-band refinement")
         from mpi4py import MPI
 
         total_cells = domain.topology.index_map(dimension).size_global
-        # Each marked tetrahedron splits into 8, so this lower bound ignores conformity closure.
-        predicted = total_cells + 7 * domain.comm.allreduce(len(marked_cells), op=MPI.SUM)
+        # Every marked edge of a tetrahedron adds at least one child cell; closure is ignored.
+        predicted = total_cells + domain.comm.allreduce(added_cells, op=MPI.SUM)
         _require_cell_budget(predicted, options, level + 1, levels, "predicted at least")
-        domain.topology.create_connectivity(dimension, 1)
-        edges = mesh.compute_incident_entities(domain.topology, marked_cells, dimension, 1)
         refined, parent_cell, parent_facet = mesh.refine(
             domain,
             edges,

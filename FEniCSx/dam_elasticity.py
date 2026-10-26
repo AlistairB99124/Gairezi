@@ -101,6 +101,9 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
             if domain.comm.rank == 0 and iteration % 50 == 0:
                 print(f"Three-body elastic GMRES iteration {iteration}: residual={norm:.6g}", flush=True)
         problem.solver.setMonitor(monitor)
+        if domain.comm.rank == 0:
+            # Lets progress monitors normalise the residuals above by this solve's own tolerance.
+            print(f"Three-body elastic GMRES tolerance: rtol={solver_options['ksp_rtol']:.6g}", flush=True)
     try:
         displacement = problem.solve()
     except PETSc.Error as error:

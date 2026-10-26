@@ -142,7 +142,7 @@ class DamPhaseFieldTests(unittest.TestCase):
         self.assertTrue(set(marked).issubset(set(wall)))
         self.assertFalse(set(marked) & set(bedrock))
         self.assertGreater(refined.report["levels"][0]["bedrock_cells"], 0)
-        self.assertGreater(refined.report["levels"][0]["marked_wall_cells"], 0)
+        self.assertGreater(refined.report["levels"][0]["marked_edges"], 0)
         self.assertGreater(refined.report["levels"][-1]["wall_cells"], len(wall))
 
     def test_bedrock_damage_stays_exactly_zero_during_real_solve(self):

@@ -126,6 +126,31 @@ class StressRecoveryTests(unittest.TestCase):
             recover_stress(imported.domain, ufl.Identity(3), Path(temporary),
                            sample_points={"outside": [100, 100, 100]})
 
+    def test_boundary_node_with_roundoff_outside_its_body_is_still_sampled(self):
+        # Peak coordinates come from tabulated dof coordinates, which can sit ~1e-14 m
+        # outside the cells of their body (e.g. the wall base on the foundation).
+        from test_three_body import foundation_column
+        imported = import_structure(foundation_column(), 1e-12)
+        domain = imported.domain
+        space = fem.functionspace(domain, ("DG", 0, (3, 3)))
+        stress = fem.Function(space)
+        for cell, region in zip(imported.cell_tags.indices, imported.cell_tags.values):
+            stress.x.array.reshape(-1, 3, 3)[space.dofmap.cell_dofs(int(cell))[0]] = np.diag(
+                (10. * region, -20. * region, 0.))
+        wall = mesh.entities_to_geometry(domain, 3, imported.cell_tags.find(1)).ravel()
+        base = domain.geometry.x[wall][np.argmin(domain.geometry.x[wall][:, 2])].copy()
+        base[2] -= 1e-13
+        top = domain.geometry.x[np.argmax(domain.geometry.x[:, 2])].copy()
+        top[2] += 1e-13
+        with tempfile.TemporaryDirectory() as temporary:
+            report = recover_stress(domain, stress, Path(temporary), cell_tags=imported.cell_tags,
+                                    sample_points={"wall_base": {"coordinate_xyz_m": base.tolist(), "region_id": 1},
+                                                   "crest": top.tolist()})
+        np.testing.assert_allclose(report["matched_point_stresses"]["wall_base"]["principal_stresses_pa"],
+                                   [-20., 0., 10.], atol=1e-6)
+        np.testing.assert_allclose(report["matched_point_stresses"]["crest"]["principal_stresses_pa"],
+                                   [-20., 0., 10.], atol=1e-6)
+
     def test_coincident_interface_nodes_do_not_share_recovered_stress(self):
         structure = DamMeshTests().cube()
         structure.nodes = np.vstack((structure.nodes, structure.nodes))

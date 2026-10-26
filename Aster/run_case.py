@@ -14,9 +14,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -43,23 +45,125 @@ RESULT_UNIT = 80  # must match IMPR_RESU(UNITE=...) in the .comm file.
 MED_CONVERT_TIMEOUT_S = 120
 
 
-def run_solver(command: list[str], run_dir: Path, timeout: int) -> subprocess.CompletedProcess:
-    """Keep a timeout from leaving a solver child running behind its launcher."""
+def run_solver(command: list[str], run_dir: Path, timeout: int,
+               live_log: Path | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Keep a timeout from leaving a solver child running behind its launcher.
+
+    With ``live_log``, output is also appended to that file line by line while
+    the solver runs so progress can be followed; the returned output, timeout
+    and process-tree kill are unchanged. ``env`` replaces the inherited
+    environment (for example a relocated Linux Code_Aster runtime)."""
+    if live_log is not None:
+        return _run_solver_streaming(command, run_dir, timeout, live_log, env)
     with subprocess.Popen(command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True) as process:
+                          text=True, env=env) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True,
-                               capture_output=True, timeout=30)
-            else:
-                process.kill()
+            _terminate_tree(process)
             stdout, stderr = process.communicate()
             (run_dir / "stdout.log").write_text(stdout, encoding="utf-8")
             (run_dir / "stderr.log").write_text(stderr, encoding="utf-8")
             raise
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _terminate_tree(process: subprocess.Popen) -> None:
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True,
+                       capture_output=True, timeout=30)
+    else:
+        process.kill()
+
+
+def _run_solver_streaming(command: list[str], run_dir: Path, timeout: int,
+                          live_log: Path, env: dict | None = None) -> subprocess.CompletedProcess:
+    # Solver children write to a pipe, which Python and gfortran block-buffer
+    # by default; ask them to flush per line so the live log is actually live.
+    environment = {**(os.environ if env is None else env), "PYTHONUNBUFFERED": "1",
+                   "GFORTRAN_UNBUFFERED_PRECONNECTED": "y"}
+    captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    write_lock = threading.Lock()
+    finished = threading.Event()
+    tails: list[threading.Thread] = []
+    with subprocess.Popen(command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, env=environment) as process, \
+            live_log.open("a", encoding="utf-8") as live:
+        def write(line: str) -> None:
+            with write_lock:
+                live.write(line)
+                live.flush()
+
+        def pump(stream, name: str) -> None:
+            for line in stream:
+                captured[name].append(line)
+                if tails:
+                    # The solver's own output is being tailed; skip the launcher's end-of-run copy of it.
+                    continue
+                write(line)
+                work = _RUN_ASTER_WORKDIR.search(line) if name == "stdout" else None
+                # A Linux run_aster (natively or through wsl.exe) streams stdout live, and its
+                # /tmp working directory is not a Windows path, so only Windows runs are tailed.
+                if work and os.name == "nt" and Path(work.group(1).strip()).is_absolute():
+                    tail = threading.Thread(target=_tail_file, daemon=True,
+                                            args=(Path(work.group(1).strip()) / RUN_ASTER_MESSAGE, write, finished))
+                    tails.append(tail)
+                    tail.start()
+
+        pumps = [threading.Thread(target=pump, args=(process.stdout, "stdout"), daemon=True),
+                 threading.Thread(target=pump, args=(process.stderr, "stderr"), daemon=True)]
+        for thread in pumps:
+            thread.start()
+        try:
+            process.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            _terminate_tree(process)
+            process.wait()
+            for thread in pumps:
+                thread.join(timeout=30)
+            finished.set()
+            for thread in tails:
+                thread.join(timeout=30)
+            (run_dir / "stdout.log").write_text("".join(captured["stdout"]), encoding="utf-8")
+            (run_dir / "stderr.log").write_text("".join(captured["stderr"]), encoding="utf-8")
+            raise
+        for thread in pumps:
+            thread.join()
+        finished.set()
+        for thread in tails:
+            thread.join(timeout=30)
+    return subprocess.CompletedProcess(command, process.returncode, "".join(captured["stdout"]),
+                                       "".join(captured["stderr"]))
+
+
+# On Windows, run_aster sends the solver's output to ``fort.6`` in a temporary
+# working directory and prints it only after the solve, so follow that file.
+RUN_ASTER_MESSAGE = "fort.6"
+_RUN_ASTER_WORKDIR = re.compile(r"Prepare environment in (.+)$")
+
+
+def _tail_file(path: Path, write, finished: threading.Event, interval_s: float = 0.5) -> None:
+    """Copy complete lines appended to ``path`` until ``finished``; a missing file is waited for."""
+    offset, partial = 0, b""
+    while True:
+        done = finished.is_set()
+        try:
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                data = stream.read()
+        except OSError:
+            data = b""
+        if data:
+            offset += len(data)
+            lines = (partial + data).split(b"\n")
+            partial = lines.pop()
+            for raw in lines:
+                write(raw.decode("utf-8", errors="replace").rstrip("\r") + "\n")
+        if done:
+            if partial:
+                write(partial.decode("utf-8", errors="replace").rstrip("\r") + "\n")
+            return
+        finished.wait(interval_s)
 
 
 def bundled_python_for(launcher_path: str) -> Path | None:

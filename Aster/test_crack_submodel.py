@@ -7,7 +7,7 @@ import numpy as np
 
 from Aster.crack_submodel import (
     block_layout, boundary_sources, crack_metrics, moving_least_squares, normal_edges,
-    thickness_segment, uniform_edges,
+    require_local_seed, thickness_segment, uniform_edges,
 )
 
 RADIUS = 78.0
@@ -98,6 +98,13 @@ class LayoutTests(unittest.TestCase):
         regions[points[:, 2] <= -15.5] = 4
         with self.assertRaisesRegex(ValueError, "at least 0.5 m"):
             layout_for(seed(), points, regions)
+
+    def test_bedrock_to_bedrock_seed_is_rejected_with_its_reason(self):
+        with self.assertRaisesRegex(ValueError, "full wall length .* whole-model Code_Aster cracking"):
+            require_local_seed({"concrete_chainage_extent_m": [50.0, 151.1],
+                                "crack_chainage_m": [50.0, 151.1]})
+        require_local_seed({"concrete_chainage_extent_m": [50.0, 151.1], "crack_chainage_m": [100.0, 104.0]})
+        require_local_seed({})
 
     def test_boundary_sources_are_wall_only(self):
         points, regions = wall_nodes(abutment=107.0)

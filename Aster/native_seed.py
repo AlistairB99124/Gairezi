@@ -36,8 +36,12 @@ def stiffness_ratio(damage: np.ndarray, m: float, p: float) -> np.ndarray:
 
 
 def initial_field(model, material, contract: dict, initial_damage: float,
-                  wall_group: str = "WALL", volume_group: str = "VOLUMES"):
-    """Build and audit the nine native internal variables at actual Gauss points."""
+                  wall_group: str = "WALL", volume_group: str = "VOLUMES", elastic_elsewhere: bool = False):
+    """Build and audit the nine native internal variables at actual Gauss points.
+
+    ``elastic_elsewhere`` zero-fills cells outside ``volume_group`` for models whose
+    remaining cells are linear elastic; the audit covers ``volume_group`` only.
+    """
     from code_aster.Commands import CREA_CHAMP, FORMULE
     from code_aster.Cata.Syntax import _F
 
@@ -89,10 +93,11 @@ def initial_field(model, material, contract: dict, initial_damage: float,
     )
     initial = CREA_CHAMP(
         TYPE_CHAM="ELGA_VARI_R", OPERATION="ASSE", MODELE=model,
+        PROL_ZERO="OUI" if elastic_elsewhere else "NON",
         ASSE=_F(GROUP_MA=volume_group, CHAM_GD=values, NOM_CMP=components,
                 NOM_CMP_RESU=tuple(f"V{i}" for i in range(1, 10))),
     )
-    damage_values, support = initial.getValuesWithDescription(["V1"])
+    damage_values, support = initial.getValuesWithDescription(["V1"], [volume_group])
     cells, _, points, subpoints = support
     identities = list(zip(cells, points, subpoints))
     if len(set(identities)) != len(identities) or not identities:
@@ -114,7 +119,7 @@ def initial_field(model, material, contract: dict, initial_damage: float,
     if not np.any(expected > 0):
         raise ValueError("Native mesh misses the physical UI seed; refine it without relocating or expanding the seed")
     for number in range(2, 10):
-        data, description = initial.getValuesWithDescription([f"V{number}"])
+        data, description = initial.getValuesWithDescription([f"V{number}"], [volume_group])
         if list(zip(description[0], description[2], description[3])) != identities:
             raise ValueError("Native internal-variable Gauss-point identities differ")
         expected_component = stiffness_ratio(expected, m, p) if number == 3 else np.zeros_like(expected)

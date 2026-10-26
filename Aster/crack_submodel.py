@@ -36,6 +36,8 @@ SEED_DAMAGE = 0.999
 LOAD_FACTORS = tuple(round(0.1 * step, 10) for step in range(1, 11))
 # User jobs are not capped; the launcher still needs a finite number.
 UNBOUNDED_S = 30 * 24 * 3600
+# Code_Aster output streamed while solving, so the app can show live convergence.
+LIVE_LOG_NAME = "solver.live.log"
 
 
 def uniform_edges(lower: float, upper: float, size: float, required=()) -> list[float]:
@@ -102,6 +104,24 @@ def thickness_segment(wall: dict, elevation: float) -> dict:
         "upper_z_m": min(above) if above else 0.0, "upper_is_crest": not above,
         "lower_z_m": max(below) if below else -math.inf,
     }
+
+
+def require_local_seed(generation: dict) -> None:
+    """Reject a seed that spans the wall between its bedrock intersections.
+
+    The block is bounded by concrete margins beyond both seed ends, so it cannot hold a
+    bedrock-to-bedrock crack; whole-model Aster cracking is not implemented.
+    """
+    extent = generation.get("concrete_chainage_extent_m")
+    span = generation.get("crack_chainage_m")
+    if extent is None or span is None:
+        return
+    if span[0] - extent[0] < MINIMUM_MARGIN_M or extent[1] - span[1] < MINIMUM_MARGIN_M:
+        raise ValueError(
+            f"The selected crack runs the full wall length at this elevation (chainage {span[0]:.1f}-"
+            f"{span[1]:.1f} m, bedrock to bedrock). The Code_Aster crack submodel is a local wall block "
+            "and cannot represent it; whole-model Code_Aster cracking is not implemented. "
+            "FEniCSx models the full-length crack on the whole dam.")
 
 
 def block_layout(config: dict, shared_seed: dict, coordinates: np.ndarray, regions: np.ndarray,
@@ -311,6 +331,7 @@ def run(dam_config: Path, prepared_seed: Path, baseline_fields: Path, output_roo
     try:
         prepared = json.loads(prepared_seed.read_text(encoding="utf-8"))
         payload = validate_prepared_seed(prepared, config_bytes)
+        require_local_seed(payload["generation"])
         shared = payload["generation"]["shared_seed"]
         with np.load(baseline_fields, allow_pickle=False) as archive:
             if "displacement_m" not in archive.files:
@@ -358,7 +379,8 @@ def run(dam_config: Path, prepared_seed: Path, baseline_fields: Path, output_roo
             f"F comm {CASE} D 1\nF libr {inputs} D 91\nF mmed {mesh} D 20\n"
             f"F libr {native} R 90\nF rmed {result} R 80\n", encoding="utf-8")
         print(f"Running native Code_Aster cracking submodel in {directory}", flush=True)
-        completed = run_solver([installation["launcher_path"], str(export)], directory, time_limit_s)
+        completed = run_solver([installation["launcher_path"], str(export)], directory, time_limit_s,
+                               live_log=directory / LIVE_LOG_NAME)
         (directory / "solver.log").write_text(completed.stdout + completed.stderr, encoding="utf-8")
         markers = ("<EXCEPTION>", "Traceback (most recent call last)", "Windows fatal exception",
                    "Fatal Python error")

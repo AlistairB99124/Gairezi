@@ -8,12 +8,14 @@ is not a prohibition on developing that next stage. The primary goal is
 comparing FEniCSx cracking with Aster cracking at the **same UI-selected crack**,
 with separate wall/foundation reporting.
 
-Cracking execution is now **parallel-only** by user direction, replacing the
-earlier RAM-based sequential fallback. Installed RAM remains an advisory
-diagnostic; insufficient/unknown capacity produces a warning, not a change to
-sequential mode. This policy does not establish that both solvers fit.
+Cracking execution is now **sequential**: FEniCSx cracking runs first and
+native Aster cracking starts when it (and the Aster elastic baseline) ends.
+The earlier parallel-only policy was reversed after a real job ran out of
+memory: FEniCSx cracking held about 10 GB while the whole-model Aster crack
+reached its 18 GB limit, inside a 24 GB WSL VM. Installed RAM remains an
+advisory diagnostic and does not establish that a solver fits.
 Paired execution is implemented for three-body app jobs through the native
-Aster crack submodel (see "Native dam crack submodel" below). Future VM/cloud
+Aster whole-model crack (see "Native whole-model crack" below). Future VM/cloud
 hosting is deferred. See `Design_Docs/app_plan.md` for the current workflow boundary.
 
 App jobs also run the full-dam linear elastic Aster pipeline
@@ -112,7 +114,7 @@ retained separately. `Aster.quadratic_baseline --threads 1..4` now records
 the explicitly requested thread count; the default remains one. This does
 not change the uncapped user-job policy or establish a successful solver.
 
-Parallel-only cracking remains the requested policy. A lower-memory
+Cracking is now sequential (see the top of this document). A lower-memory
 discretisation/assembly strategy or an adequately provisioned verification
 host, followed by a new checked baseline, is required. Do not automatically
 raise allocations into memory occupied by other processes. Full native
@@ -849,8 +851,123 @@ Resolved full-dam seed equilibration, resolution/convergence and
 dam-result extraction remain to be verified. Aster dam cracking, paired
 scheduling and the final cracking comparison are still not wired into app jobs.
 
+### Native whole-model crack (app jobs)
+
+The client's crack runs horizontally at the selected elevation along the
+wall, stopping `cracking[0].buffer_m` (default 1 m) short of the wall/foundation contour at each
+end (measured as true distance at the seed's inner radius), or for a centred `length_m` when
+`full_width` is false, `depth_m` (default 3 m) deep from the configured `face` with the
+configured `opening_m` as the frozen `seed_thickness_m`. Selections closer than the buffer to the
+foundation are snapped to the
+nearest valid point before the seed is frozen. The local block below cannot hold that, so app jobs now run
+`python -m Aster.whole_model_crack` (superseding `Aster.crack_submodel` for app
+jobs) on the job's own three-body mesh:
+
+- `whole_model_crack_mesh.py` cuts the wall (only) conformingly at the two seed
+  faces (z ± 0.001 m), so the 2 mm seed layer spans the full wall length, then
+  elevates wall cells whose centroid is within 0.75 m of the crack to TETRA10.
+  All other wall, foundation and bedrock cells stay TETRA4 with the baseline
+  wall-foundation springs and support springs. Band mid-edge nodes on faces
+  shared with linear cells (`HANGING_NODES`) are tied with `LIAISON_MAIL`.
+- `convert_whole_model_to_med.py` writes the mixed-order MED (bundled
+  MEDCoupling; identifier width follows `MEDCouplingSizeOfIDs`).
+- `cases/whole_model_crack.comm`: `3D_GRAD_VARI` + `ENDO_FISS_EXP` on
+  `DAMAGE_BAND`, `3D` + `ELAS` elsewhere, `DIS_T` springs. The frozen seed
+  (`native_seed.initial_field(..., elastic_elsewhere=True)`) is applied only in
+  the band; the band carries the concrete density so gravity is uniform.
+  Water, crest surcharge and self-weight ramp together over load factors
+  0.1 to 1.0. `RESI_REFE_RELA` 1e-6 with `EFFORT_REFE` = FT x median
+  wall-foundation tributary area (an assumption for the spring residual).
+  Wall, foundation and bedrock peak principal stresses are recorded per state.
+- `extract_whole_model_crack.py` writes `crack.pvd` / VTU per state with
+  displacement, damage (zero outside the band) and principal / von Mises stress
+  over the whole model.
+- Output root and scenario stay `cracking/aster_crack_submodel` /
+  `Aster_Crack_Submodel` so the API, progress monitor and desktop are unchanged;
+  the report has `"analysis_scope": "whole_model"`.
+
+**Runtime requirement:** Linux Code_Aster in WSL (the Windows MUMPS build
+returns NaN at this size). The root is `LAMB_LINUX_CODE_ASTER_ROOT` or the
+newest `~/opt/code_aster_*`; the distribution is `LAMB_ASTER_WSL_DISTRIBUTION`
+(default `Ubuntu`). Defaults are 8 OpenMP threads and 20,480 MiB (the run has
+the WSL VM to itself because cracking is sequential); give WSL at least 24 GB
+in `.wslconfig`. run_aster's configured `tmpdir` is `/tmp`, which WSL backs
+with RAM, so the solve passes `--wrkdir /var/tmp/lamb_aster_crack/<run>` (ext4
+disk) and deletes that directory afterwards, even on failure.
+
+Verification: on a synthetic 5 m wall arc (8,448 cells, 299 tied nodes) all
+11 states converged in 51 s and damage grew to 0.72 beside the seed. On the
+repository dam (seed z = -15.73 m) the mesh has 402,054 nodes, 148,448 band
+cells and 10,266 tied nodes; a full run is a user job and was not completed
+during development.
+
+Linear solver: the real mesh has about 1.33 million DOFs (about 61.6k of them
+Lagrange multipliers from `LIAISON_MAIL`). Double-precision MUMPS failed with
+`FACTOR_66` at a VmPeak of 11.2 GB, because the run_aster work directory is
+on WSL `/tmp`, which is RAM-backed tmpfs, so out-of-core gives no relief. The
+case therefore uses PETSc FGMRES with a single-precision MUMPS `LDLT_SP`
+preconditioner (BLR `LOW_RANK_SEUIL` 1e-8, linear `RESI_RELA` 1e-8). The
+synthetic results were identical. A capped 540 s probe on the repository dam
+completed setup and assembly at a VmPeak of 4.6 GB. The figure was printed
+before `STAT_NON_LINE` ended, so it does not include the solve. The first app
+job (2026-10-25, run in parallel with FEniCSx, which held about 10 GB) failed
+at load factor 0.1. Out-of-core MUMPS factorisation in the preconditioner
+failed (`FACTOR_66`) at a VmPeak of 17.5 GB, with 10.5 GB of out-of-core files
+written to the RAM-backed `/tmp`. This led to the sequential policy and the
+on-disk work directory. A full real-dam run has still not been verified.
+
+Probes on that job's mesh, running alone on disk with a hard kill at
+420–480 s, found a second cause:
+- With the default `REAC_PRECOND=30`, the factor from the elastic prediction
+  converged the prediction in 9 FGMRES iterations, but the first Newton
+  correction (tangent softened by the seeded damage) stalled near 0.22 relative
+  residual. It would have run to 500 iterations before refactorising.
+- With `REAC_PRECOND=1` (refactorise every Newton iteration, about 20 s), the
+  correction converged in 8 iterations to 1e-8. Peak memory was 19.4 GB
+  (VmPeak), including an 8.5 GB MUMPS factor. This fits the 20,480 MiB limit
+  only because Aster runs alone.
+- Rejected options:
+  - Symmetric support springs: the damage tangent is non-symmetric anyway.
+  - `ELIM_LAGR="OUI"`: this PETSc build has no SuperLU.
+  - `LOW_RANK_SEUIL=1e-5`: the factor dropped to 3.9 GB, but the correction was
+    still at 1e-3 after 28 iterations.
+
+Expect the full 11-state run to take hours.
+
+Crack water pressure: the prepared seed carries `loading.internal_pressure_pa`,
+the full hydrostatic head of the seeded face at the crack elevation. It is
+computed once by `FEniCSx.automatic_crack.hydrostatic_crack_pressure` with the
+Elmer datums: for the upstream face, reservoir surface = lowest contour +
+water height + overflow head; for the downstream face, tailwater = lowest
+contour + tailwater head. There is no drainage reduction, and the pressure is
+zero above the tailwater. FEniCSx applies it as its diffuse crack force. Aster
+checks it against its own load datums and applies it with `PRES_REP` to the
+`CRACK_FACES` group. These are the 0.002 m seed-slab faces, with their normals
+fixed into the slab, so `VERI_NORM="NON"` is set and positive pressure opens
+the crack. The pressure is ramped with the other loads. Seeds prepared before
+this change carry 0 Pa and are refused; select the crack location again. A
+synthetic run at 130.5 kPa converged and increased the mean crack-face
+separation (`CRACK_TOP` minus `CRACK_BOTTOM` DZ) from 3.757e-5 m to
+3.946e-5 m.
+
+Limitations: only band cells can damage; the seed is horizontal and does not
+follow the sloped bedrock at its ends; hanging-node ties slightly stiffen the
+band edge; Aster applies crack water to the seed faces only and does not move
+it with damage growth; uplift on the wall-foundation interface is not
+modelled for any solver; mesh and band-width convergence are unverified.
+Converging is not engineering validation.
+
+```powershell
+.\.venv\Scripts\python.exe -m Aster.whole_model_crack --dam-config config.json `
+  --prepared-seed <job>\cracking\prepared_seed.json `
+  --source-mesh <job>\output\model\three_body.msh --output <job>\cracking
+.\.venv\Scripts\python.exe -m unittest Aster.test_whole_model_crack
+```
+
 ### Native dam crack submodel (app MVP)
 
+Earlier local approach, kept for reference; app jobs now use the whole-model
+crack above.
 Superseding the paragraph above for app jobs: submitted three-body jobs now run
 `python -m Aster.crack_submodel` **in parallel** with FEniCSx cracking, at the
 same frozen UI seed (`cracking/prepared_seed.json`). The full quadratic dam
@@ -884,6 +1001,11 @@ curved **wall-only block** around the seed (option A, user-approved):
   `crack.pvd`/VTU. The API validates the manifest against the job and lists the
   report as scenario `Aster_Crack_Submodel`; the desktop shows a summary beside
   the FEniCSx crack peak with an **Open Aster Crack in ParaView** button.
+- Live progress: on Windows `run_aster` sends solver output to `fort.6` in a
+  temporary work directory and prints it only after the solve. `run_solver`
+  (with `live_log`) tails that `fort.6` into `solver.live.log` during the run;
+  `solver.log` still holds the complete output afterwards. The API's
+  `/jobs/{id}/progress` endpoint parses these files for the activity monitor.
 
 Developer run on the repository configuration, seed at y = 17.53 m,
 z = -15.61 m (downstream face, 3 m radial by 4 m chainage): 2,688 HEXA20

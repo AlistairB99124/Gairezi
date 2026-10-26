@@ -2,7 +2,7 @@
 
 Only the negative volumetric energy is undegraded. Deviatoric energy remains
 degraded, including in compression. This is not a spectral split or friction.
-The dam workflow does not select this experimental formulation automatically.
+The desktop app submits it by default; the CLI and Python defaults remain hybrid.
 """
 from __future__ import annotations
 
@@ -14,7 +14,20 @@ from petsc4py import PETSc
 import ufl
 
 from elasticity_solver import rigid_body_near_nullspace
-from phase_field_solver import degradation, strain, tensile_energy
+from phase_field_solver import degradation, strain, tensile_energy, use_mumps_out_of_core_directory
+
+# PETSc SNESConvergedReason for "maximum Newton iterations reached".
+SNES_DIVERGED_MAX_IT = -5
+# Refactorise the MUMPS preconditioner once a lagged factor needs this many GMRES iterations.
+DIRECT_REFACTOR_LINEAR_ITERATIONS = 30
+
+
+class NewtonIterationLimit(RuntimeError):
+    """Newton stopped at its iteration limit; the linear solves themselves converged.
+
+    A different linear solver cannot help, so callers must not treat this as a
+    linear-solver failure.
+    """
 
 
 def elastic_energy(displacement, damage, bulk: float, mu: float, kappa: float, *, damage_mask=1.):
@@ -48,6 +61,8 @@ class MechanicsProblem:
         spectral: bool = False,
         interface_springs=None,
         damage_mask=1.,
+        maximum_continuations: int = 3,
+        newton_progress=None,
     ):
         for name, value in (
             ("bulk modulus", bulk), ("shear modulus", mu), ("residual stiffness", kappa),
@@ -60,10 +75,20 @@ class MechanicsProblem:
         for value in (maximum_iterations, linear_maximum_iterations):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError("Experimental iteration limits must be positive integers")
+        if isinstance(maximum_continuations, bool) or not isinstance(maximum_continuations, int) \
+                or maximum_continuations < 0:
+            raise ValueError("Experimental Newton continuations must be a non-negative integer")
         self.displacement, self.damage = displacement, damage
         self.kappa, self.bcs = kappa, bcs
         self.rtol, self.atol = relative_tolerance, absolute_tolerance
         self.direct_solver = direct_solver
+        self.maximum_iterations = maximum_iterations
+        self.maximum_continuations = maximum_continuations
+        # Called as newton_progress(iteration, residual_norm, residual_limit) after each Newton update.
+        self.newton_progress = newton_progress
+        self.residual_limit = None
+        self.round_initial_norm = 0.0
+        self.completed_newton_iterations = 0
         self.previous_degradation = None
         self.initial_linear_iterations = None
         self.rebuild_requested = True
@@ -92,15 +117,25 @@ class MechanicsProblem:
         if support_form is not None:
             residual += support_form(displacement, test)
             tangent += support_form(trial, test)
-        linear_options = (
-            {"ksp_type": "preonly", "pc_type": "lu"}
-            if direct_solver else {
-                "ksp_type": "gmres", "ksp_gmres_restart": 100,
-                "ksp_norm_type": "unpreconditioned", "ksp_pc_side": "right",
-                "ksp_rtol": relative_tolerance, "ksp_max_it": linear_maximum_iterations,
-                "ksp_atol": 0.1 * absolute_tolerance, "pc_type": "gamg",
-            }
-        )
+        linear_options = {
+            "ksp_type": "gmres", "ksp_gmres_restart": 100,
+            "ksp_norm_type": "unpreconditioned", "ksp_pc_side": "right",
+            "ksp_rtol": relative_tolerance, "ksp_max_it": linear_maximum_iterations,
+            "ksp_atol": 0.1 * absolute_tolerance,
+        }
+        if direct_solver:
+            # GMRES keeps each Newton step exact while a MUMPS factor from an earlier
+            # tangent is reused, so a full-dam factorisation is not repeated every iteration.
+            linear_options.update({
+                "pc_type": "lu", "pc_factor_mat_solver_type": "mumps",
+                # Extra MUMPS workspace (percent) for fill-in from near-singular cracked zones.
+                "mat_mumps_icntl_14": 80,
+                # Out-of-core factors on disk; a full-dam factor can exceed RAM.
+                "mat_mumps_icntl_22": 1,
+            })
+            use_mumps_out_of_core_directory()
+        else:
+            linear_options["pc_type"] = "gamg"
         self.problem = NonlinearProblem(
             residual, displacement, J=tangent, bcs=bcs, petsc_options_prefix="experimental_amor_",
             petsc_options={
@@ -109,7 +144,9 @@ class MechanicsProblem:
                 "snes_stol": 0.0, "snes_max_it": maximum_iterations,
                 "snes_lag_preconditioner": -2,
                 "snes_lag_preconditioner_persists": True,
-                "snes_error_if_not_converged": True,
+                # Checked in solve(): a raised SNES error stops later monitor callbacks,
+                # which would silence progress and preconditioner refreshes on continuation.
+                "snes_error_if_not_converged": False,
                 "ksp_error_if_not_converged": True, **linear_options,
             },
         )
@@ -157,12 +194,26 @@ class MechanicsProblem:
 
     def _monitor(self, snes, iteration, norm):
         self.norms.append(float(norm))
+        if iteration == 0:
+            self.round_initial_norm = float(norm)
+            if self.residual_limit is None:
+                # Displacement-driven (zero-load) solves converge relative to this residual.
+                self.residual_limit = max(self.atol, self.rtol * float(norm))
+        if self.newton_progress is not None and iteration > 0:
+            self.newton_progress(
+                self.completed_newton_iterations + iteration, float(norm), self.residual_limit,
+            )
         # A further Newton correction may switch compression branches.
         rtol, atol, _, _ = snes.getTolerances()
-        if iteration > 0 and norm > max(atol, rtol * self.norms[0]):
+        unconverged = iteration > 0 and norm > max(atol, rtol * self.round_initial_norm)
+        if self.direct_solver:
+            # A lagged MUMPS factor stays a near-exact preconditioner unless GMRES struggles.
+            unconverged = unconverged and (
+                snes.getKSP().getIterationNumber() > DIRECT_REFACTOR_LINEAR_ITERATIONS
+            )
+        if unconverged:
             self._set_preconditioner_lag(rebuild=True)
-        if not self.direct_solver:
-            snes.getKSP().setTolerances(atol=self.linear_absolute_tolerance)
+        snes.getKSP().setTolerances(atol=self.linear_absolute_tolerance)
 
     def _set_preconditioner_lag(self, *, rebuild):
         # SNES otherwise overrides PC-level reuse on its first Jacobian.
@@ -178,6 +229,13 @@ class MechanicsProblem:
             self.problem.solver.setTolerances(*tolerances)
             del options["snes_lag_preconditioner"]
             del options["snes_lag_preconditioner_persists"]
+
+    def _restore(self, values):
+        # A failed solve leaves the caller's initial guess unchanged, as before.
+        self.displacement.x.array[:] = values
+        self.displacement.x.scatter_forward()
+        if self.spectral_split is not None:
+            self.spectral_split.update()
 
     def solve(self) -> dict:
         domain = self.displacement.function_space.mesh
@@ -211,15 +269,48 @@ class MechanicsProblem:
         self._set_preconditioner_lag(rebuild=refresh)
         self.linear_absolute_tolerance = 0.1 * max(self.atol, self.rtol * load_norm)
         self.norms.clear()
-        try:
-            problem.solve()
-        except PETSc.Error as error:
-            raise RuntimeError(
+        self.residual_limit = max(self.atol, self.rtol * load_norm) if load_norm else None
+        nonlinear_iterations = linear_iterations = continuations = 0
+        initial_guess = self.displacement.x.array.copy()
+        while True:
+            round_start = len(self.norms)
+            self.completed_newton_iterations = nonlinear_iterations
+            linear_error = None
+            try:
+                problem.solve()
+            except PETSc.Error as error:
+                linear_error = error
+            snes_reason = int(problem.solver.getConvergedReason())
+            ksp_reason = int(problem.solver.getKSP().getConvergedReason())
+            nonlinear_iterations += int(problem.solver.getIterationNumber())
+            linear_iterations += int(problem.solver.getLinearSolveIterations())
+            if linear_error is None and snes_reason > 0:
+                break
+            message = (
                 "Experimental compression-preserving mechanics failed: "
-                f"SNES reason={int(problem.solver.getConvergedReason())}, "
-                f"KSP reason={int(problem.solver.getKSP().getConvergedReason())}, "
-                f"nonlinear residuals={self.norms}"
-            ) from error
+                f"SNES reason={snes_reason}, KSP reason={ksp_reason}, "
+                f"Newton continuations={continuations}, nonlinear residuals={self.norms}"
+            )
+            round_norms = self.norms[round_start:]
+            # Early damped Newton steps can reduce the residual very little (as in the
+            # full dam); the continuation cap, not a reduction ratio, bounds wasted work.
+            progressing = (
+                len(round_norms) > 1 and all(np.isfinite(round_norms))
+                and round_norms[-1] < round_norms[0]
+            )
+            if linear_error is not None or snes_reason != SNES_DIVERGED_MAX_IT or ksp_reason <= 0:
+                self._restore(initial_guess)
+                raise RuntimeError(message) from linear_error
+            if not progressing or continuations >= self.maximum_continuations:
+                self._restore(initial_guess)
+                raise NewtonIterationLimit(message)
+            # Newton was still converging: DOLFINx has copied its last accepted iterate
+            # into the displacement, so resume from it. The convergence test is unchanged.
+            continuations += 1
+            if not load_norm:
+                # Keep the zero-load test relative to the first round's initial residual.
+                problem.solver.setTolerances(rtol=0.0, atol=max(self.atol, self.rtol * self.norms[0]))
+            self._set_preconditioner_lag(rebuild=True)
         self.displacement.x.scatter_forward()
         vector = problem.b.duplicate()
         try:
@@ -231,8 +322,6 @@ class MechanicsProblem:
         initial_norm = self.norms[0]
         reference_norm = load_norm if load_norm else initial_norm
         limit = max(self.atol, self.rtol * reference_norm)
-        nonlinear_iterations = int(problem.solver.getIterationNumber())
-        linear_iterations = int(problem.solver.getLinearSolveIterations())
         report = {
             "formulation": (
                 "experimental principal-strain spectral split" if self.spectral_split is not None
@@ -240,8 +329,9 @@ class MechanicsProblem:
             ),
             "compression_contact": False, "engineering_validated": False,
             "nonlinear_reason": reason, "nonlinear_iterations": nonlinear_iterations,
+            "newton_continuations": continuations,
             "linear_iterations": linear_iterations,
-            "linear_solver": "direct LU" if self.direct_solver else "GMRES/GAMG",
+            "linear_solver": "GMRES/MUMPS LU" if self.direct_solver else "GMRES/GAMG",
             "initial_residual_norm": initial_norm, "load_vector_norm": load_norm,
             "residual_reference_norm": reference_norm,
             "residual_reference": "applied load" if load_norm else "initial residual (zero applied load)",

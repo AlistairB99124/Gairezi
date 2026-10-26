@@ -5,8 +5,9 @@
   "internal_pressure_pa": 0.0,
   "load_steps": 10,
   "automatic_crack": {
-    "depth_fraction": 0.75,
-    "arc_length_m": 4.0
+    "depth_m": 3.0,
+    "foundation_clearance_m": 1.0,
+    "face_search_half_length_m": 2.0
   },
   "solver": {
     "maximum_staggered_iterations": 50,

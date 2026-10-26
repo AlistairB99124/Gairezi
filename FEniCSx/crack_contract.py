@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import dataclasses
 import hashlib
 import json
 import math
@@ -51,14 +52,19 @@ def calibrate_phase_field_defaults(defaults: dict, concrete: dict) -> tuple[dict
     dictionary (without the basis key) and a JSON-ready calibration record.
     """
     parameters = dict(defaults)
-    basis = parameters.pop("length_scale_basis")
-    if basis != "concrete_tensile_strength":
-        raise ValueError(f"Unsupported length_scale_basis {basis!r}; expected 'concrete_tensile_strength'.")
+    basis = parameters.pop("length_scale_basis", None)
     model = parameters["model"]
     young = float(concrete["youngs_modulus"])
     tensile_strength = float(concrete["tensile_strength_pa"])
     gc = float(parameters["critical_energy_release_rate_j_m2"])
-    length_scale = strength_calibrated_length_scale(model, young, gc, tensile_strength)
+    if basis is None and "length_scale_m" in parameters:
+        # A fixed fracture_debug length scale: record the strength it implies instead.
+        basis = "fixed (fracture_debug.length_scale_m)"
+        length_scale = float(parameters["length_scale_m"])
+    elif basis != "concrete_tensile_strength":
+        raise ValueError(f"Unsupported length_scale_basis {basis!r}; expected 'concrete_tensile_strength'.")
+    else:
+        length_scale = strength_calibrated_length_scale(model, young, gc, tensile_strength)
     parameters["length_scale_m"] = length_scale
     return parameters, {
         "basis": basis,
@@ -127,6 +133,101 @@ class PhaseFieldSolverOptions:
     maximum_refinement_levels: int = 5
     maximum_refined_cells: int = 4_000_000
 
+
+# Debug overrides of fracture_defaults.json carried by the dam config's optional
+# ``fracture_debug`` block, so each job freezes its own values (process of elimination).
+FRACTURE_DEBUG_KEYS = (
+    "model", "critical_energy_release_rate_j_m2", "length_scale_m", "residual_stiffness",
+    "crack_water_pressure_factor", "load_steps", "solver", "aster",
+)
+FRACTURE_DEBUG_ASTER_KEYS = ("band_width_m", "softening_p")
+DEFAULT_RESIDUAL_STIFFNESS = 1e-8
+DEFAULT_CRACK_WATER_PRESSURE_FACTOR = 1.0
+
+
+def default_fracture_debug(defaults: dict, aster_defaults: dict) -> dict:
+    """Fully populated ``fracture_debug`` block holding the current shipped defaults.
+
+    ``length_scale_m`` null keeps the strength calibration (Tanne et al. 2018);
+    a crack water factor of 1 applies the full hydrostatic head in the crack.
+    """
+    return {
+        "model": defaults["model"],
+        "critical_energy_release_rate_j_m2": defaults["critical_energy_release_rate_j_m2"],
+        "length_scale_m": defaults.get("length_scale_m"),
+        "residual_stiffness": defaults.get("residual_stiffness", DEFAULT_RESIDUAL_STIFFNESS),
+        "crack_water_pressure_factor": DEFAULT_CRACK_WATER_PRESSURE_FACTOR,
+        "load_steps": defaults["load_steps"],
+        "solver": {field.name: defaults["solver"].get(field.name, field.default)
+                   for field in dataclasses.fields(PhaseFieldSolverOptions)},
+        "aster": {key: aster_defaults[key] for key in FRACTURE_DEBUG_ASTER_KEYS},
+    }
+
+
+def apply_fracture_debug(defaults: dict, config: dict) -> tuple[dict, float]:
+    """fracture_defaults.json with ``config["fracture_debug"]`` overrides applied.
+
+    Returns the defaults dictionary (same shape as the JSON file) and the crack water
+    pressure factor (0 = dry crack, 1 = full hydrostatic head). Missing keys keep the
+    defaults. Elmer/model_config.py validates ranges before a job is accepted.
+    """
+    parameters = json.loads(json.dumps(defaults))
+    debug = config.get("fracture_debug")
+    if debug is None:
+        return parameters, DEFAULT_CRACK_WATER_PRESSURE_FACTOR
+    if not isinstance(debug, dict):
+        raise ValueError("fracture_debug must be an object")
+    unknown = set(debug) - set(FRACTURE_DEBUG_KEYS)
+    if unknown:
+        raise ValueError(f"Unsupported fracture_debug fields: {sorted(unknown)}")
+    if "model" in debug:
+        if debug["model"] not in PHASE_FIELD_MODELS:
+            raise ValueError(f"fracture_debug.model must be one of {PHASE_FIELD_MODELS}")
+        parameters["model"] = debug["model"]
+    if "critical_energy_release_rate_j_m2" in debug:
+        parameters["critical_energy_release_rate_j_m2"] = _debug_number(
+            debug, "critical_energy_release_rate_j_m2")
+    if debug.get("length_scale_m") is not None:
+        parameters.pop("length_scale_basis", None)
+        parameters["length_scale_m"] = _debug_number(debug, "length_scale_m")
+    if "residual_stiffness" in debug:
+        parameters["residual_stiffness"] = _debug_number(debug, "residual_stiffness")
+    if "load_steps" in debug:
+        parameters["load_steps"] = _debug_integer(debug, "load_steps", 1)
+    solver = debug.get("solver") or {}
+    if not isinstance(solver, dict):
+        raise ValueError("fracture_debug.solver must be an object")
+    known = {field.name: field.type for field in dataclasses.fields(PhaseFieldSolverOptions)}
+    for key, value in solver.items():
+        if key not in known:
+            raise ValueError(f"Unsupported fracture_debug.solver field {key!r}")
+        parameters["solver"][key] = (
+            _debug_integer(solver, key, 0 if key == "maximum_refinement_levels" else 1)
+            if known[key] in (int, "int") else _debug_number(solver, key)
+        )
+    factor = DEFAULT_CRACK_WATER_PRESSURE_FACTOR
+    if "crack_water_pressure_factor" in debug:
+        factor = _debug_number(debug, "crack_water_pressure_factor", allow_zero=True)
+        if factor > 1:
+            raise ValueError("fracture_debug.crack_water_pressure_factor must lie between 0 and 1")
+    return parameters, factor
+
+
+def _debug_number(values: dict, key: str, allow_zero: bool = False) -> float:
+    value = values[key]
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or value < 0 or (value == 0 and not allow_zero)):
+        raise ValueError(f"fracture_debug {key} must be a finite {'nonnegative' if allow_zero else 'positive'} number")
+    return float(value)
+
+
+def _debug_integer(values: dict, key: str, minimum: int) -> int:
+    value = values[key]
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"fracture_debug {key} must be an integer of at least {minimum}")
+    return value
 
 def load_schedule(load_steps: int, final_load_substeps: int = 1) -> list[float]:
     """Preserve the configured ramp, optionally subdividing only its last interval."""

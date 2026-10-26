@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import Callable
@@ -80,6 +82,41 @@ def crack_surface_density(model: str, damage, length_scale: float):
     raise ValueError(f"Unknown phase-field model {model!r}")
 
 
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def use_mumps_out_of_core_directory() -> Path:
+    """Point MUMPS out-of-core factor files at a per-process disk directory.
+
+    A full-dam LU factor can exceed RAM (MUMPS INFOG(1)=-13). Out-of-core keeps
+    only the active fronts in memory. WSL's /tmp is RAM-backed tmpfs, so the
+    default location would not help; this uses ``$MUMPS_OOC_TMPDIR`` when set,
+    otherwise ``~/.cache/lamb/mumps_ooc``. Directories left by killed runs are removed.
+    """
+    configured = os.environ.get("MUMPS_OOC_TMPDIR")
+    root = Path(configured) if configured else Path.home() / ".cache" / "lamb" / "mumps_ooc"
+    # A repeated call sees this process's own directory from the previous call.
+    if root.name.startswith("pid-"):
+        root = root.parent
+    root.mkdir(parents=True, exist_ok=True)
+    for stale in root.glob("pid-*"):
+        suffix = stale.name.removeprefix("pid-")
+        if suffix.isdigit() and int(suffix) != os.getpid() and not _process_alive(int(suffix)):
+            shutil.rmtree(stale, ignore_errors=True)
+    directory = root / f"pid-{os.getpid()}"
+    directory.mkdir(exist_ok=True)
+    # Read by MUMPS at factorisation time because PETSc does not set OOC_TMPDIR.
+    os.environ["MUMPS_OOC_TMPDIR"] = str(directory)
+    return directory
+
+
 def use_direct_mechanics_solver(problem) -> None:
     """Precondition mechanics GMRES with a MUMPS LU factorisation.
 
@@ -90,8 +127,11 @@ def use_direct_mechanics_solver(problem) -> None:
     pc.setType("lu")
     pc.setFactorSolverType("mumps")
     pc.setFactorSetUpSolverType()
+    factor = pc.getFactorMatrix()
     # Extra MUMPS workspace (percent) for fill-in from near-singular cracked zones.
-    pc.getFactorMatrix().setMumpsIcntl(14, 80)
+    factor.setMumpsIcntl(14, 80)
+    use_mumps_out_of_core_directory()
+    factor.setMumpsIcntl(22, 1)
     pc.setReusePreconditioner(False)
 
 
@@ -523,26 +563,48 @@ def solve_staggered(
             solve_started = time.perf_counter()
             nonlinear_report = None
             if mechanics_formulation != "hybrid":
-                from compression_preserving import MechanicsProblem
+                from compression_preserving import MechanicsProblem, NewtonIterationLimit
 
-                try:
-                    if nonlinear_mechanics_problem is None:
-                        nonlinear_mechanics_problem = MechanicsProblem(
-                            displacement, damage, bulk, mu, first.residual_stiffness,
-                            lambda test, alpha: external_work(test, load_coefficient, alpha),
-                            bcs=bcs, support_form=support_form,
-                            interface_springs=interfaces, damage_mask=damage_mask,
-                            relative_tolerance=options.mechanics_relative_tolerance,
-                            linear_maximum_iterations=options.mechanics_maximum_iterations,
-                            spectral=mechanics_formulation == "experimental_spectral",
-                        )
-                    nonlinear_report = nonlinear_mechanics_problem.solve()
-                except RuntimeError as error:
-                    mechanics_progress("failed", error=str(error))
-                    raise RuntimeError(
-                        f"Experimental mechanics failed at load step {step}/{total_load_steps}, "
-                        f"staggered iteration {staggered_iteration}: {error}"
-                    ) from error
+                initial_guess = displacement.x.array.copy()
+                while True:
+                    try:
+                        if nonlinear_mechanics_problem is None:
+                            nonlinear_mechanics_problem = MechanicsProblem(
+                                displacement, damage, bulk, mu, first.residual_stiffness,
+                                lambda test, alpha: external_work(test, load_coefficient, alpha),
+                                bcs=bcs, support_form=support_form,
+                                interface_springs=interfaces, damage_mask=damage_mask,
+                                relative_tolerance=options.mechanics_relative_tolerance,
+                                linear_maximum_iterations=options.mechanics_maximum_iterations,
+                                spectral=mechanics_formulation == "experimental_spectral",
+                                direct_solver=mechanics_direct,
+                                # Resolved at call time, so it reports the current staggered iteration.
+                                newton_progress=lambda newton, residual, limit: mechanics_progress(
+                                    "newton_iteration", newton_iteration=newton,
+                                    residual_norm=residual, residual_limit=limit,
+                                ),
+                            )
+                        nonlinear_report = nonlinear_mechanics_problem.solve()
+                        break
+                    except RuntimeError as error:
+                        mechanics_progress("failed", error=str(error))
+                        # More Newton iterations, not a different linear solver, were needed.
+                        if mechanics_direct or isinstance(error, NewtonIterationLimit):
+                            raise RuntimeError(
+                                f"Experimental mechanics failed at load step {step}/{total_load_steps}, "
+                                f"staggered iteration {staggered_iteration}: {error}"
+                            ) from error
+                        # GAMG cannot cope with the stiffness contrast of fully damaged zones;
+                        # rebuild with MUMPS LU and keep it for this and every later solve.
+                        mechanics_direct = True
+                        direct_fallback_event = {
+                            "step": step, "iteration": staggered_iteration, "load_factor": load_factor,
+                            "iterative_failure": str(error).splitlines()[0][:500],
+                        }
+                        context["preconditioner"] = "mumps_lu"
+                        nonlinear_mechanics_problem = None
+                        displacement.x.array[:] = initial_guess
+                        mechanics_progress("direct_solver_fallback", **direct_fallback_event)
                 mechanics_reason = nonlinear_report["nonlinear_reason"]
                 mechanics_iterations = nonlinear_report["linear_iterations"]
                 relative_residual = nonlinear_report["true_residual_norm"] / max(
@@ -702,6 +764,7 @@ def solve_staggered(
             mechanics_progress(
                 "staggered_completed", relative_displacement_change=displacement_change,
                 maximum_damage_change=damage_change, staggered_residual=residual,
+                staggered_tolerance=options.staggered_tolerance,
                 damage_change_location=damage_change_details,
                 damage_relaxation_factor=relaxation_factor,
                 stiffness_change_factor=stiffness_change_factor,
@@ -836,7 +899,12 @@ def solve_staggered(
             "ksp_type": "gmres", "pc_type": "gamg", "near_nullspace": "six rigid-body modes",
             "direct_fallback": (
                 "MUMPS LU preconditioner after a GAMG failure, kept for the rest of the run"
-                if mechanics_formulation == "hybrid" else "none"
+                if mechanics_formulation == "hybrid"
+                else (
+                    "GMRES with a reused MUMPS LU preconditioner after a GAMG linear-solve failure, "
+                    "kept for the rest of the run; a Newton iteration limit continues from the last "
+                    "iterate (up to 3 times) instead of switching solvers"
+                )
             ),
             "direct_fallback_used": direct_fallback_event,
             "relative_tolerance": options.mechanics_relative_tolerance,

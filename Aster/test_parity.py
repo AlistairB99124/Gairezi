@@ -123,6 +123,86 @@ class SourceContractTests(unittest.TestCase):
                 ["taskkill", "/PID", "12345", "/T", "/F"], check=True, capture_output=True, timeout=30)
             self.assertEqual((directory / "stdout.log").read_text(), "out")
 
+    def test_live_log_streams_output_before_the_solver_exits(self):
+        from Aster.run_case import run_solver
+        script = ("import sys, time\n"
+                  "print('first', flush=True)\n"
+                  "sys.stderr.write('warn\\n'); sys.stderr.flush()\n"
+                  "time.sleep(3)\n"
+                  "print('second', flush=True)\n")
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            live = directory / "solver.live.log"
+            seen_before_exit = []
+
+            def watch():
+                import time
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline:
+                    if live.is_file() and "first" in live.read_text(encoding="utf-8"):
+                        seen_before_exit.append(True)
+                        return
+                    time.sleep(0.05)
+
+            import threading
+            watcher = threading.Thread(target=watch)
+            watcher.start()
+            completed = run_solver([sys.executable, "-c", script], directory, 60, live_log=live)
+            watcher.join()
+            self.assertEqual(seen_before_exit, [True])
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout.splitlines(), ["first", "second"])
+            self.assertEqual(completed.stderr, "warn\n")
+            self.assertEqual(sorted(live.read_text(encoding="utf-8").splitlines()), ["first", "second", "warn"])
+
+    def test_live_log_follows_run_aster_work_file_without_duplicating_its_dump(self):
+        from Aster.run_case import run_solver
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            work = directory / "run_aster_work"
+            work.mkdir()
+            # Mimics Windows run_aster: names its work dir, the solver appends to
+            # fort.6, then the launcher prints the whole file once the solve ends.
+            script = ("import sys, time\n"
+                      f"work = {str(work)!r}\n"
+                      "print('Prepare environment in ' + work, flush=True)\n"
+                      "with open(work + '/fort.6', 'a') as f:\n"
+                      "    f.write('row 1\\n'); f.flush(); time.sleep(3)\n"
+                      "    f.write('row 2\\n'); f.flush()\n"
+                      "print(open(work + '/fort.6').read(), end='', flush=True)\n"
+                      "print('EXECUTION_CODE_ASTER_EXIT_1=0', flush=True)\n")
+            live = directory / "solver.live.log"
+            seen_before_exit = []
+
+            def watch():
+                import time
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline:
+                    if live.is_file() and "row 1" in live.read_text(encoding="utf-8"):
+                        seen_before_exit.append(True)
+                        return
+                    time.sleep(0.05)
+
+            import threading
+            watcher = threading.Thread(target=watch)
+            watcher.start()
+            completed = run_solver([sys.executable, "-c", script], directory, 60, live_log=live)
+            watcher.join()
+            self.assertEqual(seen_before_exit, [True])
+            self.assertEqual(live.read_text(encoding="utf-8").splitlines(),
+                             [f"Prepare environment in {work}", "row 1", "row 2"])
+            self.assertIn("row 2\nEXECUTION_CODE_ASTER_EXIT_1=0", completed.stdout)
+
+    def test_live_log_timeout_stops_tree_and_preserves_logs(self):
+        from Aster.run_case import run_solver
+        script = "import time\nprint('started', flush=True)\ntime.sleep(60)\n"
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_solver([sys.executable, "-c", script], directory, 2, live_log=directory / "live.log")
+            self.assertEqual((directory / "stdout.log").read_text(encoding="utf-8"), "started\n")
+            self.assertEqual((directory / "live.log").read_text(encoding="utf-8"), "started\n")
+
     def test_verifier_starts_without_a_prior_freezer_import(self):
         completed = subprocess.run(
             [sys.executable, "-m", "Aster.verify_parity", "--help"],

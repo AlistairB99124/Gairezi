@@ -1,0 +1,167 @@
+from code_aster.Commands import *
+from code_aster import CA
+import json
+import sys
+import numpy as np
+
+DEBUT(LANG="EN")
+with open("fort.91", encoding="utf-8") as stream:
+    inputs = json.load(stream)
+sys.path.insert(0, inputs["repository_root"])
+from Aster.native_seed import initial_field
+
+parameters = inputs["material"]["parameters"]
+elastic = inputs["elastic"]
+loads = inputs["loads"]
+MESH = LIRE_MAILLAGE(FORMAT="MED", UNITE=20, NOM_MED="THREE_BODY", VERI_MAIL=_F(VERIF="NON"))
+MESH = MODI_MAILLAGE(reuse=MESH, MAILLAGE=MESH,
+                     ORIE_PEAU_3D=_F(GROUP_MA=("UPSTREAM", "DOWNSTREAM", "CREST")))
+MODEL = AFFE_MODELE(
+    MAILLAGE=MESH,
+    AFFE=(
+        _F(GROUP_MA=("LINEAR_VOLUMES", "UPSTREAM", "DOWNSTREAM", "CREST", "ROCK_BOTTOM", "ROCK_SIDES",
+                     "CRACK_FACES"),
+           PHENOMENE="MECANIQUE", MODELISATION="3D"),
+        _F(GROUP_MA="DAMAGE_BAND", PHENOMENE="MECANIQUE", MODELISATION="3D_GRAD_VARI"),
+        _F(GROUP_MA=("OUTER_SPRINGS", "WALL_FOUNDATION_SPRINGS"), PHENOMENE="MECANIQUE",
+           MODELISATION="DIS_T"),
+    ),
+)
+CONCRETE = DEFI_MATERIAU(ELAS=_F(E=elastic["concrete"]["youngs_modulus_pa"],
+                                 NU=elastic["concrete"]["poissons_ratio"],
+                                 RHO=elastic["concrete"]["density_kg_m3"]))
+BEDROCK = DEFI_MATERIAU(ELAS=_F(E=elastic["bedrock"]["youngs_modulus_pa"],
+                                NU=elastic["bedrock"]["poissons_ratio"],
+                                RHO=elastic["bedrock"]["density_kg_m3"]))
+DAMAGE = DEFI_MATER_GC(ENDO_FISS_EXP=_F(**parameters), RHO=elastic["concrete"]["density_kg_m3"])
+FIELD = AFFE_MATERIAU(
+    MAILLAGE=MESH,
+    AFFE=(_F(GROUP_MA="CONCRETE", MATER=CONCRETE), _F(GROUP_MA="BEDROCK", MATER=BEDROCK),
+          _F(GROUP_MA="DAMAGE_BAND", MATER=DAMAGE)),
+)
+springs = AFFE_CARA_ELEM(
+    MODELE=MODEL,
+    DISCRET=[_F(GROUP_MA=spring["group"], REPERE="GLOBAL", CARA="K_T_D_L",
+                VALE=tuple(spring["stiffness_n_per_m"])) for spring in inputs["wall_foundation_springs"]]
+    + [_F(GROUP_MA=spring["group"], REPERE="GLOBAL", CARA="K_T_N", SYME="NON",
+          VALE=tuple(spring["matrix_column_major_n_per_m"])) for spring in inputs["support_springs"]],
+)
+INITIAL, audit = initial_field(MODEL, DAMAGE, inputs["shared_seed"], inputs["seed_damage"],
+                               wall_group="DAMAGE_BAND", volume_group="DAMAGE_BAND",
+                               elastic_elsewhere=True)
+
+# Band mid-edge nodes on faces shared with linear cells follow the linear trace.
+excitation = []
+if inputs["hanging_nodes"]:
+    TIES = AFFE_CHAR_MECA(MODELE=MODEL, LIAISON_MAIL=_F(GROUP_MA_MAIT="HANGING_MASTER",
+                                                        GROUP_NO_ESCL="HANGING_NODES"))
+    excitation.append(_F(CHARGE=TIES))
+UPSTREAM = FORMULE(NOM_PARA="Z", VALE="g * max(s - Z, 0.)", g=loads["water_pressure_gradient_pa_per_m"],
+                   s=loads["upstream_water_surface_z_m"])
+DOWNSTREAM = FORMULE(NOM_PARA="Z", VALE="g * max(t - Z, 0.)", g=loads["water_pressure_gradient_pa_per_m"],
+                     t=loads["tailwater_elevation_m"])
+WATER = AFFE_CHAR_MECA_F(MODELE=MODEL, PRES_REP=(_F(GROUP_MA="UPSTREAM", PRES=UPSTREAM),
+                                                 _F(GROUP_MA="DOWNSTREAM", PRES=DOWNSTREAM)))
+SURCHARGE = AFFE_CHAR_MECA(MODELE=MODEL, PRES_REP=_F(GROUP_MA="CREST", PRES=loads["overflow_surcharge_pa"]))
+WEIGHT = AFFE_CHAR_MECA(MODELE=MODEL, PESANTEUR=_F(GRAVITE=loads["gravity_m_s2"], DIRECTION=(0., 0., -1.)))
+loading = [WATER, SURCHARGE, WEIGHT]
+# Water in the seeded crack: CRACK_FACES normals point into the seed slab (no ORIE_PEAU_3D on
+# these internal faces), so positive pressure pushes the concrete above and below apart.
+# VERI_NORM="NON" because each internal face lies between two volume cells; the mesh writer
+# fixes the normals explicitly.
+if loads["crack_pressure_pa"] > 0:
+    loading.append(AFFE_CHAR_MECA(MODELE=MODEL, VERI_NORM="NON",
+                                  PRES_REP=_F(GROUP_MA="CRACK_FACES", PRES=loads["crack_pressure_pa"])))
+RAMP = DEFI_FONCTION(NOM_PARA="INST", VALE=(0., 0., 1., 1.))
+TIMES = DEFI_LIST_REEL(VALE=inputs["times"])
+STEPS = DEFI_LIST_INST(
+    DEFI_LIST=_F(LIST_INST=TIMES),
+    ECHEC=_F(EVENEMENT="ERREUR", ACTION="DECOUPE", SUBD_METHODE="MANUEL", SUBD_PAS=4, SUBD_NIVEAU=4),
+)
+for charge in loading:
+    excitation.append(_F(CHARGE=charge, FONC_MULT=RAMP))
+RESU = STAT_NON_LINE(
+    MODELE=MODEL, CHAM_MATER=FIELD, CARA_ELEM=springs, ETAT_INIT=_F(VARI=INITIAL),
+    EXCIT=excitation,
+    COMPORTEMENT=(_F(TOUT="OUI", RELATION="ELAS"),
+                  _F(GROUP_MA="DAMAGE_BAND", RELATION="ENDO_FISS_EXP", DEFORMATION="PETIT")),
+    INCREMENT=_F(LIST_INST=STEPS),
+    ARCHIVAGE=_F(LIST_INST=TIMES),
+    NEWTON=_F(MATRICE="TANGENTE", REAC_ITER=1),
+    CONVERGENCE=_F(
+        SIGM_REFE=parameters["FT"], VARI_REFE=1.,
+        LAGR_REFE=parameters["GF"] / (parameters["LARG_BANDE"] / 2),
+        EFFORT_REFE=inputs["spring_force_reference_n"],
+        RESI_REFE_RELA=1e-6, ITER_GLOB_MAXI=50,
+    ),
+    RECH_LINEAIRE=_F(METHODE="CORDE", ITER_LINE_MAXI=20),
+    # 1.3M DOFs: a double-precision direct factor exceeds a 24 GB WSL budget, so a
+    # single-precision low-rank MUMPS factor preconditions FGMRES. It is refreshed every
+    # Newton iteration: once seeded damage softens the tangent, a reused prediction factor
+    # left FGMRES stalled near 0.2 relative residual (refactorising takes about 20 s and
+    # converges in about 8 iterations). The linear residual stays well below the Newton
+    # reference. A looser LOW_RANK_SEUIL saves factor memory but weakens it too much.
+    SOLVEUR=_F(METHODE="PETSC", PRE_COND="LDLT_SP", RENUM="METIS", LOW_RANK_SEUIL=1e-8,
+               REAC_PRECOND=1, RESI_RELA=1e-8, NMAX_ITER=500),
+)
+
+band_cells = np.asarray(MESH.getCells("DAMAGE_BAND"))
+group_cells = {name: np.asarray(MESH.getCells(name)) for name in ("WALL", "FOUNDATION", "BEDROCK")}
+damage_ids = [tuple(key) for key in audit["damage_point_ids"]]
+initial_values = np.asarray(audit["damage_values"])
+history, damage_steps = [], []
+for index, instant in zip(RESU.getIndexes(), RESU.getAccessParameters()["INST"]):
+    values, support = RESU.getField("VARI_ELGA", index).getValuesWithDescription(["V1"], ["DAMAGE_BAND"])
+    lookup = dict(zip(zip(support[0], support[2], support[3]), values))
+    if len(lookup) != len(damage_ids) or not set(damage_ids).issubset(lookup):
+        raise ValueError("Native crack Gauss-point identities changed during the solve")
+    values = np.asarray([lookup[key] for key in damage_ids])
+    if (not np.isfinite(values).all() or values.min() < -1e-7 or values.max() > 1 + 1e-7
+            or np.any(values < initial_values - 1e-7)):
+        raise ValueError("Native cracking produced nonfinite, unbounded or healed damage")
+    if history and np.any(values < damage_steps[-1] - 1e-7):
+        raise ValueError("Native damage healed between converged states")
+    damage_steps.append(values)
+    sief = RESU.getField("SIEF_ELGA", index)
+    peaks = {}
+    for name, cells in group_cells.items():
+        columns, description = [], None
+        for component in ("SIXX", "SIYY", "SIZZ", "SIXY", "SIXZ", "SIYZ"):
+            data, description = sief.getValuesWithDescription([component], [name])
+            columns.append(np.asarray(data))
+        stress = np.column_stack(columns)
+        if not np.isfinite(stress).all():
+            raise ValueError(f"Nonfinite native cracking stress in {name}")
+        tensor = np.empty((len(stress), 3, 3))
+        for column, (i, j) in enumerate(((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))):
+            tensor[:, i, j] = tensor[:, j, i] = stress[:, column]
+        principal = np.linalg.eigvalsh(tensor)
+        peaks[name.lower()] = {"maximum_principal_stress_pa": float(principal[:, -1].max()),
+                               "minimum_principal_stress_pa": float(principal[:, 0].min())}
+    displacement = np.asarray(RESU.getField("DEPL", index).getValuesWithDescription(["DX", "DY", "DZ"])[0])
+    crack_dz = {side: np.asarray(RESU.getField("DEPL", index).getValuesWithDescription(["DZ"], [side])[0])
+                for side in ("CRACK_TOP", "CRACK_BOTTOM")}
+    history.append({
+        "time": float(instant), "region_stress": peaks,
+        "maximum_principal_stress_pa": peaks["wall"]["maximum_principal_stress_pa"],
+        "maximum_displacement_component_m": float(np.abs(displacement).max()),
+        # Node-averaged vertical separation of the seeded crack faces (positive = opening).
+        "mean_crack_face_separation_m": float(crack_dz["CRACK_TOP"].mean() - crack_dz["CRACK_BOTTOM"].mean()),
+    })
+RESU = CALC_CHAMP(reuse=RESU, RESULTAT=RESU, GROUP_MA=("CONCRETE", "BEDROCK"), CONTRAINTE="SIGM_NOEU")
+RESU = CALC_CHAMP(reuse=RESU, RESULTAT=RESU, GROUP_MA="DAMAGE_BAND", VARI_INTERNE="VARI_NOEU")
+IMPR_RESU(
+    FORMAT="MED", UNITE=80,
+    RESU=(_F(RESULTAT=RESU, NOM_RESU_MED="CRACK", NOM_CHAM="DEPL", NOM_CMP=("DX", "DY", "DZ")),
+          _F(RESULTAT=RESU, NOM_RESU_MED="CRACK", NOM_CHAM="SIGM_NOEU"),
+          _F(RESULTAT=RESU, NOM_RESU_MED="CRACK", NOM_CHAM="VARI_NOEU", NOM_CMP="V1")),
+)
+with open("fort.89", "wb") as stream:
+    np.savez_compressed(stream, coordinates_m=np.asarray(audit["coordinates_m"]),
+                        initial_damage=initial_values, damage=np.asarray(damage_steps),
+                        times=np.asarray([state["time"] for state in history]))
+summary = {key: value for key, value in audit.items()
+           if key not in ("coordinates_m", "damage_point_ids", "damage_values", "seeded_point_ids")}
+with open("fort.90", "w", encoding="utf-8") as stream:
+    json.dump({"audit": summary, "history": history}, stream, allow_nan=False)
+FIN()

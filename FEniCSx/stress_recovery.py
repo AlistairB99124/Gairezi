@@ -3,6 +3,7 @@ from pathlib import Path
 
 from dolfinx import fem, geometry, io, mesh
 from dolfinx.fem.petsc import LinearProblem
+from mpi4py import MPI
 import numpy as np
 import ufl
 
@@ -131,7 +132,10 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
                         "compressive_peak_region_id": compressive_peak[4]}
     samples = {}
     if sample_points:
-        tree = geometry.bb_tree(domain, 3)
+        # Peak coordinates are tabulated dof coordinates and may lie ~1e-14 m outside the
+        # cells of their own body (wall base on the foundation, crest); pad the search.
+        extent = domain.comm.allreduce(float(np.abs(domain.geometry.x).max(initial=0.)), op=MPI.MAX)
+        tree = geometry.bb_tree(domain, 3, padding=1e-9 * max(extent, 1.))
         for name, point in sample_points.items():
             region = point.get("region_id") if isinstance(point, dict) else None
             point = point["coordinate_xyz_m"] if isinstance(point, dict) else point

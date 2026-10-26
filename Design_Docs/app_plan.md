@@ -171,7 +171,13 @@ and the user's click is submitted with `POST /jobs/{id}/crack-location`
 runs `run-fracture --crack-location Y Z`. Cancelling while paused skips cracking
 and keeps the completed baselines.
 Failures preserve the completed Elmer result and expose the failed FEniCSx
-stage. Hybrid and explicit experimental Amor are supported; the historical
+stage. Hybrid and experimental Amor are supported; Amor is the app default
+(the API `POST /jobs` default and the pre-ticked checkbox; unticking sends an
+explicit `fracture_mechanics=hybrid`), and the Python `JobManager.submit` default
+and stored historical jobs stay hybrid. Hybrid degrades compressive stiffness:
+a full-dam job's seeded, fully damaged band collapsed under self-weight (strain
+norm about 13.7 at load step 2). Amor cracking runs on 4 MPI processes; hybrid
+stays serial because its parallel parity is unverified. The historical
 bonded-reference hold remains for legacy jobs. Full-size elastic parity and
 small serial/MPI fracture benchmarks are verified, not full-dam fracture
 convergence or engineering safety. Historical results remain readable.
@@ -199,28 +205,61 @@ independently choose a peak-stress location or seed face. Each analysis retains
 its own working directory, convergence evidence and outputs. Reports compare
 wall and optional concrete foundation separately.
 
-The current user-directed policy is **parallel-only cracking**, superseding
-the earlier below-16-GiB sequential fallback. Each new job records schema-v2
-policy metadata with mode `parallel` and concurrency two regardless of detected
-RAM. The Windows `GetPhysicallyInstalledSystemMemory` probe is retained for
-advisory diagnostics, not scheduling: below 16 GiB produces a visible memory
-warning, not a block or sequential fallback. Detection failure preserves
-parallel-only policy and exposes the failure in metadata, the cracking log and
-the desktop. Every detected capacity explicitly carries no memory-fit
-guarantee; 16 GiB for Aster alone is not a guarantee for concurrent solvers.
+The seed rule comes from the optional `cracking` array in `config.json`
+(zero or one crack object is currently accepted; an empty array means no crack,
+so the job skips crack selection and both cracking analyses, reports
+`cracking_status` `skipped`, and runs only the FEniCSx and Code_Aster
+baselines; the array leaves room for
+multiple cracks, which are not yet implemented; the app has no Outputs tab and
+always writes displacement and tensile-stress outputs, with `outputs.cracking_risk`
+true exactly when a crack is defined, which the validator requires)
+(edited on the Configuration > Cracking tab; validated by
+`Elmer/model_config.py` `validate_cracking`), falling back to
+`FEniCSx/fracture_defaults.json` `automatic_crack` when absent: `face`
+upstream or downstream (downstream seeds start at the local downstream face and
+carry tailwater pressure), `depth_m` (default 3 m, less than the wall radial
+width), `opening_m` (0.001-0.01 m, default 2 mm), and either `full_width` (end
+`buffer_m`, 0-2 m, default 1 m, true distance at the seed's inner radius, from
+the wall/foundation contour so only the wall is cracked) or a `length_m` arc
+centred on the selection and clipped to that buffer. A zero buffer still keeps
+0.01 m so the seed stays in wall concrete. The API snaps a selection inside that
+clearance, or above the crest, to the nearest valid point, stores both the
+snapped `crack_location` and the `requested_crack_location`, logs the snap and
+the UI reports it.
+
+An optional `fracture_debug` block (Configuration > Cracking > Debug, which
+also holds the Amor/hybrid mechanics choice) overrides the FEniCSx and Aster
+`fracture_defaults.json` values per job for process-of-elimination debugging.
+The block is nullable: null or absent means the solvers use those files
+unchanged. `config.json` ships it with Friday's working values (returned as-is
+by `/config/default`); `/config/fracture-defaults` builds the shipped-default
+block from the two files so they stay the single source. `Elmer/model_config.py`
+`validate_fracture_debug` checks it. See the README cracking section for the
+fields.
+
+The current policy is **sequential cracking** (schema-v3 metadata: mode
+`sequential`, concurrency one), superseding the earlier parallel-only policy.
+Running both solvers exhausted the 24 GB WSL VM: FEniCSx cracking held about
+10 GB, and the whole-model Aster crack failed at its 18 GB limit. FEniCSx
+cracking runs first. Aster cracking is `queued` and starts when FEniCSx
+cracking and the Aster elastic baseline have both ended, whatever their
+outcome. The Windows `GetPhysicallyInstalledSystemMemory` probe is retained
+for advisory diagnostics only: below 16 GiB produces a visible memory warning,
+not a block. Every detected capacity explicitly carries no memory-fit
+guarantee.
 Historical metadata is preserved as recorded, including schema-v1 policies;
 jobs without a policy do not acquire a fabricated one on reload.
 Future remote/VM solver hosting (for example Azure) is deferred and is not
 implemented or configured by this change.
 
 **Implementation boundary:** for three-body jobs, the API now launches native
-Aster cracking (`Aster.crack_submodel`, a local wall-block submodel driven by
-the Elmer baseline displacement) in parallel with FEniCSx cracking once the
-UI seed is frozen. Each run has its own status (`aster_cracking_status`,
+Aster cracking (`Aster.whole_model_crack`: the whole three-body model with a
+damageable wall band at the selected elevation, run by Linux Code_Aster in WSL)
+after FEniCSx cracking ends, at the same frozen UI seed. Each run has its own status (`aster_cracking_status`,
 `aster_cracking_error`), log (`aster_cracking.log`, `GET
 /jobs/{id}/cracking/aster/logs`) and output root (`cracking/aster_crack_submodel`).
-The job finishes only when both runs end; cancellation stops both process
-trees. An Aster failure, including a missing installation, is reported without
+The job finishes only when both runs end; cancellation stops the running
+process tree and cancels a queued Aster run. An Aster failure, including a missing installation, is reported without
 failing FEniCSx. The API checks the Aster manifest's configuration and frozen
 seed hashes before exposing scenario `Aster_Crack_Submodel`. The desktop
 shows Aster status, a summary beside the FEniCSx crack peak and a ParaView
@@ -268,9 +307,20 @@ configured tensile strength, `l = 3 E Gc / (8 ft^2)` (Tanné et al. 2018), i.e.
 0.656 m for the current 35 GPa / 200 J/m2 / 2 MPa values. The previous AT2
 `l = 0.25 m` implied about 1.72 MPa with no elastic phase, which let diffuse
 damage spread below the configured strength; a job then failed when GAMG could
-not solve the resulting stiffness contrast. Mechanics now falls back once to a
-MUMPS LU preconditioner for the rest of the run, recorded in the diagnostics and
-report. Older AT2 reports remain readable. This calibration is a documented
+not solve the resulting stiffness contrast. After a linear-solver failure,
+mechanics falls back once to MUMPS LU for the rest of the run, as the GMRES
+preconditioner (hybrid; and Amor, which reuses the factor and refactorises
+only when GMRES needs more than 30 iterations). This is recorded in the
+diagnostics and report. The fallback factorises out-of-core on the WSL disk
+after an in-core MUMPS factor of a refined hybrid dam (about 2.9 million cells,
+serial) failed to allocate 7.9 GB (INFOG(1)=-13); in a 181,875-DOF benchmark
+this cut MUMPS memory from 2,717 MB to 340 MB at the same solve time. When Amor Newton reaches its 30-iteration limit while
+its residual is still falling, it continues from the last iterate, up to 3
+more rounds, with the same convergence test. It does not switch to MUMPS,
+because the linear solves had converged. Each Newton iteration is logged as a
+`newton_iteration` mechanics event, which the app shows as the live stage text
+(residual and target). Older AT2
+reports remain readable. This calibration is a documented
 choice, not a fit to the Aster result or test data.
 Native 3-D nonlinear material benchmarks now cover intact, uniformly
 pre-damaged and locally pre-damaged confined tension, plus free-contraction
@@ -455,6 +505,7 @@ compatibility with the project's selected Python interpreter.
 | `GET /jobs` | List persisted local job history |
 | `GET /jobs/{id}` | State, stage, timestamps, warnings and failure information |
 | `GET /jobs/{id}/logs?offset=...` | Incremental bounded log retrieval |
+| `GET /jobs/{id}/progress?since=...` | Normalised solver convergence events (log10 residual/tolerance per iteration) for the activity monitor; reads the job's own logs only (`job.log`, `cracking.log`, Aster `solver.live.log`/`solver.log`) |
 | `POST /jobs/{id}/cancel` | Request cancellation of that job's process tree |
 | `GET /jobs/{id}/crack-selection` | Baseline Z-Y stress map for user crack-location selection (409 until the verified baseline map exists) |
 | `POST /jobs/{id}/crack-location` | Submit the selected `y_m`, `z_m` and start cracking (only while awaiting) |

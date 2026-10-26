@@ -28,6 +28,42 @@ from phase_field_solver import (
 from elasticity_solver import rigid_body_near_nullspace
 
 
+class MumpsOutOfCoreDirectoryTests(unittest.TestCase):
+    def test_uses_per_process_disk_directory_and_removes_dead_run_directories(self):
+        import os
+        from phase_field_solver import use_mumps_out_of_core_directory
+
+        with tempfile.TemporaryDirectory() as root:
+            dead = Path(root) / "pid-999999999"
+            dead.mkdir()
+            (dead / "mumps_factor").write_bytes(b"x")
+            alive = Path(root) / f"pid-{os.getppid()}"
+            alive.mkdir()
+            unrelated = Path(root) / "keep"
+            unrelated.mkdir()
+            with patch.dict(os.environ, {"MUMPS_OOC_TMPDIR": root}):
+                first = use_mumps_out_of_core_directory()
+                second = use_mumps_out_of_core_directory()
+                self.assertEqual(os.environ["MUMPS_OOC_TMPDIR"], str(first))
+            self.assertEqual(first, Path(root) / f"pid-{os.getpid()}")
+            self.assertEqual(second, first)
+            self.assertTrue(first.is_dir())
+            self.assertFalse(dead.exists())
+            self.assertTrue(alive.is_dir())
+            self.assertTrue(unrelated.is_dir())
+
+    def test_default_directory_is_not_ram_backed_tmp(self):
+        import os
+        from phase_field_solver import use_mumps_out_of_core_directory
+
+        with tempfile.TemporaryDirectory() as home:
+            environment = {key: value for key, value in os.environ.items() if key != "MUMPS_OOC_TMPDIR"}
+            environment["HOME"] = home
+            with patch.dict(os.environ, environment, clear=True):
+                directory = use_mumps_out_of_core_directory()
+            self.assertEqual(directory.parent, Path(home) / ".cache" / "lamb" / "mumps_ooc")
+
+
 class ForceControlledPatchTests(unittest.TestCase):
     def solve_pressure(self, fraction):
         young, poisson, gc, ell = 1000.0, 0.2, 1.0, 0.3
@@ -490,6 +526,85 @@ class StaggeredSolverTests(unittest.TestCase):
         self.assertTrue(np.all(actual.damage.x.array >= 0))
         self.assertTrue(np.all(actual.damage.x.array <= 1))
 
+    def test_amor_iterative_failure_falls_back_to_mumps_for_the_rest_of_the_run(self):
+        from compression_preserving import MechanicsProblem
+        original = MechanicsProblem.solve
+        calls = []
+
+        def fail_first(problem):
+            calls.append(problem.direct_solver)
+            if len(calls) == 1:
+                raise RuntimeError("Experimental compression-preserving mechanics failed: forced")
+            return original(problem)
+
+        _, reference = self.solve(strain=0.002, mechanics_formulation="experimental_amor")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(MechanicsProblem, "solve", fail_first):
+                _, result = self.solve(
+                    strain=0.002, output=Path(directory), mechanics_formulation="experimental_amor",
+                )
+            diagnostics = [
+                json.loads(line)
+                for line in (Path(directory) / "mechanics_diagnostics.jsonl").read_text().splitlines()
+            ]
+        self.assertFalse(calls[0])
+        self.assertTrue(all(calls[1:]))
+        self.assertEqual(
+            [record["event"] for record in diagnostics[:3]],
+            ["started", "failed", "direct_solver_fallback"],
+        )
+        completed = [record for record in diagnostics if record["event"] == "completed"]
+        self.assertTrue(all(record["preconditioner"] == "mumps_lu" for record in completed))
+        used = result.report["mechanics_solver"]["direct_fallback_used"]
+        self.assertEqual((used["step"], used["iteration"]), (1, 1))
+        self.assertIsNone(reference.report["mechanics_solver"]["direct_fallback_used"])
+        np.testing.assert_allclose(result.damage.x.array, reference.damage.x.array, atol=1e-6)
+        np.testing.assert_allclose(
+            result.displacement.x.array, reference.displacement.x.array, rtol=1e-6, atol=1e-8,
+        )
+
+    def test_amor_newton_limit_does_not_switch_to_mumps(self):
+        from compression_preserving import MechanicsProblem, NewtonIterationLimit
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                MechanicsProblem, "solve", side_effect=NewtonIterationLimit("SNES reason=-5"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "load step 1/3, staggered iteration 1"):
+                    self.solve(output=Path(directory), mechanics_formulation="experimental_amor")
+            events = [
+                json.loads(line)["event"]
+                for line in (Path(directory) / "mechanics_diagnostics.jsonl").read_text().splitlines()
+            ]
+        self.assertEqual(events, ["started", "failed"])
+
+    def test_amor_reports_each_newton_iteration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.solve(strain=0.002, output=Path(directory), mechanics_formulation="experimental_amor")
+            diagnostics = [
+                json.loads(line)
+                for line in (Path(directory) / "mechanics_diagnostics.jsonl").read_text().splitlines()
+            ]
+        newton = [record for record in diagnostics if record["event"] == "newton_iteration"]
+        self.assertTrue(newton)
+        for record in newton:
+            self.assertGreaterEqual(record["newton_iteration"], 1)
+            self.assertGreater(record["residual_limit"], 0)
+            self.assertIn("step", record)
+
+    def test_amor_direct_failure_is_not_retried(self):
+        from compression_preserving import MechanicsProblem
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                MechanicsProblem, "solve", side_effect=RuntimeError("forced"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "load step 1/3, staggered iteration 1"):
+                    self.solve(output=Path(directory), mechanics_formulation="experimental_amor")
+            events = [
+                json.loads(line)["event"]
+                for line in (Path(directory) / "mechanics_diagnostics.jsonl").read_text().splitlines()
+            ]
+        self.assertEqual(events, ["started", "failed", "direct_solver_fallback", "failed"])
+
     def test_experimental_amor_couples_to_damage_without_changing_default(self):
         _, result = self.solve(strain=0.002, mechanics_formulation="experimental_amor")
         self.assertEqual(result.report["mechanics_formulation"], "experimental_amor")
@@ -602,14 +717,18 @@ class StaggeredSolverTests(unittest.TestCase):
         calls = []
 
         def fail_first(problem):
-            calls.append(problem.solver.getPC().getType())
+            pc = problem.solver.getPC()
+            calls.append(pc.getType())
             if len(calls) == 1:
                 raise PETSc.Error(91)
+            out_of_core.append(pc.getFactorMatrix().getMumpsIcntl(22))
             return original(problem)
 
         _, reference = self.solve(strain=0.002)
-        with tempfile.TemporaryDirectory() as directory:
-            with patch("phase_field_solver.LinearProblem.solve", fail_first):
+        out_of_core = []
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as ooc_root:
+            with patch("phase_field_solver.LinearProblem.solve", fail_first), \
+                    patch.dict("os.environ", {"MUMPS_OOC_TMPDIR": ooc_root}):
                 _, result = self.solve(strain=0.002, output=Path(directory))
             diagnostics = [
                 json.loads(line)
@@ -617,6 +736,7 @@ class StaggeredSolverTests(unittest.TestCase):
             ]
         self.assertEqual(calls[0], "gamg")
         self.assertTrue(all(kind == "lu" for kind in calls[1:]))
+        self.assertTrue(out_of_core and all(value == 1 for value in out_of_core))
         fallback = [record for record in diagnostics if record["event"] == "direct_solver_fallback"]
         self.assertEqual(len(fallback), 1)
         self.assertEqual((fallback[0]["step"], fallback[0]["iteration"]), (1, 1))

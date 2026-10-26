@@ -30,6 +30,24 @@ class ModelConfigTests(unittest.TestCase):
         from_object = load_config(copy.deepcopy(self.payload))
         self.assertEqual(from_file, from_object)
 
+    def test_foundation_step_levels_must_lie_on_the_global_course_grid(self):
+        # The submitted job: 0.75 m courses with steps at -20 m and -25 m failed meshing.
+        self.payload["geometry"]["global_element_size_m"] = 0.75
+        self.payload["geometry"]["local_element_size_m"] = 0.25
+        with self.assertRaises(ConfigurationValidationError) as context:
+            validate_config(self.payload)
+        messages = {issue.path: issue.message for issue in context.exception.issues}
+        self.assertIn("-19.5 m and -20.25 m", messages["geometry.wall.thickness_steps[0].top_z_m"])
+        self.assertIn("geometry.wall.thickness_steps[1].top_z_m", messages)
+        steps = self.payload["geometry"]["wall"]["thickness_steps"]
+        steps[0]["top_z_m"], steps[1]["top_z_m"] = -19.5, -24.75
+        validate_config(self.payload)
+        # Without a chamfered foundation the wall has no riser rule.
+        steps[0]["top_z_m"], steps[1]["top_z_m"] = -20.0, -25.0
+        del self.payload["geometry"]["foundation"]
+        self.payload["geometry"]["wall"].pop("step_end_taper_ratio", None)
+        validate_config(self.payload)
+
     def test_concrete_compressive_strength_is_positive_and_optional_for_historical_jobs(self):
         self.assertEqual(self.payload["material"]["concrete"]["compressive_strength_pa"], 20e6)
         for value in (0, -1, True, None, float("nan"), float("inf")):
@@ -204,6 +222,44 @@ class ModelConfigTests(unittest.TestCase):
     def test_output_flags_must_be_booleans(self):
         self.payload["outputs"]["max_displacement"] = 1
         self.assert_invalid_at(self.payload, "outputs.max_displacement")
+
+    def test_cracking_seed_settings_are_optional_and_validated(self):
+        from Elmer.model_config import collect_warnings
+        self.assertEqual(self.payload["cracking"], [{
+            "face": "upstream", "depth_m": 3.0, "opening_m": 0.002,
+            "full_width": True, "buffer_m": 1.0, "length_m": None,
+        }])
+        self.assertIs(self.payload["outputs"]["cracking_risk"], True)
+        for key, value in (("face", "crest"), ("depth_m", 0.0), ("depth_m", 4.0),
+                           ("opening_m", 0.0005), ("opening_m", 0.02), ("buffer_m", -0.1),
+                           ("buffer_m", 2.5), ("full_width", "yes"), ("length_m", 0.0),
+                           ("length_m", True), ("unknown", 1)):
+            payload = copy.deepcopy(self.payload)
+            payload["cracking"][0][key] = value
+            with self.subTest(key=key, value=value):
+                self.assert_invalid_at(payload, f"cracking[0].{key}")
+        payload = copy.deepcopy(self.payload)
+        payload["cracking"][0]["full_width"] = False
+        self.assert_invalid_at(payload, "cracking[0].length_m")
+        payload["cracking"][0].update(length_m=10.0, buffer_m=0.0, face="downstream")
+        self.assertIs(validate_config(payload), payload)
+        payload["cracking"][0]["full_width"] = True
+        self.assertIn("cracking[0].length_m", {w.path for w in collect_warnings(payload)})
+        for cracks in ({"face": "upstream"}, [copy.deepcopy(self.payload["cracking"][0])] * 2):
+            payload = copy.deepcopy(self.payload)
+            payload["cracking"] = cracks
+            with self.subTest(cracks=cracks):
+                self.assert_invalid_at(payload, "cracking")
+        payload = copy.deepcopy(self.payload)
+        payload["outputs"]["cracking_risk"] = False
+        self.assert_invalid_at(payload, "outputs.cracking_risk")
+        # An empty array means no crack (baselines only) and needs cracking_risk false.
+        payload["cracking"] = []
+        self.assertIs(validate_config(payload), payload)
+        payload["outputs"]["cracking_risk"] = True
+        self.assert_invalid_at(payload, "outputs.cracking_risk")
+        del self.payload["cracking"]
+        self.assertIs(validate_config(self.payload), self.payload)
 
     def test_phase_field_controls_are_explicit_and_validated(self):
         self.add_legacy_crack_fixture()

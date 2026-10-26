@@ -70,7 +70,9 @@ class CrackConfigurationTests(unittest.TestCase):
         self.assertEqual(defaults["length_scale_basis"], "concrete_tensile_strength")
         self.assertNotIn("length_scale_m", defaults)
         self.assertEqual(defaults["solver"]["maximum_refined_cells"], 4_000_000)
-        self.assertEqual(defaults["automatic_crack"], {"depth_fraction": 0.75, "arc_length_m": 4.0})
+        self.assertEqual(defaults["automatic_crack"], {
+            "depth_m": 3.0, "foundation_clearance_m": 1.0, "face_search_half_length_m": 2.0,
+        })
 
     def test_reads_the_configured_crack_from_the_root_config(self):
         config = configured_test_case()
@@ -431,6 +433,36 @@ class CrackPlacementAndRefinementTests(unittest.TestCase):
                 imported, crack,
                 PhaseFieldSolverOptions(maximum_refinement_levels=3, maximum_refined_cells=total + 1),
             )
+
+    def test_refinement_splits_only_long_edges_near_the_crack(self):
+        from crack_field import _long_band_edges, cell_diameters
+
+        imported = self.imported_box()
+        domain = imported.domain
+        crack = specification(centre_m=(0.5, 0.5, 0.5), size_m=(0.4, 0.4, 0.02), length_scale_m=0.05)
+        options = PhaseFieldSolverOptions(minimum_elements_per_length_scale=2.0)
+        report = resolution_report(domain, crack)
+        cells = np.arange(domain.topology.index_map(3).size_local, dtype=np.int32)
+        edges, added = _long_band_edges(domain, cells, [crack], [report], options)
+        vertices = domain.geometry.x[mesh.entities_to_geometry(domain, 1, edges)]
+        lengths = np.linalg.norm(vertices[:, 1] - vertices[:, 0], axis=1)
+        self.assertGreater(len(edges), 0)
+        self.assertTrue(np.all(lengths > crack.length_scale_m / 2.0))
+        distance = signed_distance(vertices.mean(axis=1), crack)
+        self.assertTrue(np.all(distance <= 2.0 * crack.length_scale_m + 1.5 * lengths))
+        self.assertGreaterEqual(added, len(edges))
+        # Every band cell's longest edge must be selected, so each level makes progress.
+        diameters = cell_diameters(domain._cpp_object, 3, cells)
+        band = signed_distance(mesh.compute_midpoints(domain, 3, cells), crack) <= (
+            2.0 * crack.length_scale_m + diameters / 2.0
+        )
+        cell_edges = domain.topology.connectivity(3, 1)
+        selected = set(edges.tolist())
+        for cell in cells[band & (diameters > crack.length_scale_m / 2.0)]:
+            local = cell_edges.links(cell)
+            ends = domain.geometry.x[mesh.entities_to_geometry(domain, 1, local)]
+            longest = local[np.argmax(np.linalg.norm(ends[:, 1] - ends[:, 0], axis=1))]
+            self.assertIn(int(longest), selected)
 
 
 class CrackSurfaceDensityTests(unittest.TestCase):

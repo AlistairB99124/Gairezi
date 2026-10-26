@@ -23,7 +23,27 @@ CONFIG_KEYS = {
     },
     "outputs": {"max_displacement", "max_tensile_stress", "cracking_risk"},
 }
-OPTIONAL_CONFIG_KEYS = {"crack_simulations"}
+OPTIONAL_CONFIG_KEYS = {"crack_simulations", "cracking", "fracture_debug"}
+# Optional UI crack-seed settings (see FEniCSx/automatic_crack.cracking_settings).
+CRACKING_KEYS = {"face", "depth_m", "opening_m", "full_width", "buffer_m", "length_m"}
+# Optional fracture debug overrides (see FEniCSx/crack_contract.apply_fracture_debug).
+FRACTURE_DEBUG_KEYS = {
+    "model", "critical_energy_release_rate_j_m2", "length_scale_m", "residual_stiffness",
+    "crack_water_pressure_factor", "load_steps", "solver", "aster",
+}
+FRACTURE_DEBUG_SOLVER_INTEGERS = {
+    "maximum_staggered_iterations": 1, "mechanics_maximum_iterations": 1,
+    "damage_maximum_iterations": 1, "field_output_interval": 1,
+    "maximum_refinement_levels": 0, "maximum_refined_cells": 1,
+}
+FRACTURE_DEBUG_SOLVER_NUMBERS = {
+    "staggered_tolerance", "mechanics_relative_tolerance", "damage_gradient_tolerance",
+    "minimum_elements_per_length_scale",
+}
+FRACTURE_DEBUG_ASTER_KEYS = {"band_width_m", "softening_p"}
+CRACK_SEED_FACES = {"upstream", "downstream"}
+CRACK_OPENING_RANGE_M = (0.001, 0.01)
+CRACK_BUFFER_MAX_M = 2.0
 MATERIAL_KEYS = {"density", "youngs_modulus", "poisson_ratio", "tensile_strength_pa"}
 RADIUS_KEYS = {"radial_width_m", "upstream_radius_m", "centerline_radius_m", "downstream_radius_m"}
 SUPPORT_KEYS = {"model", "material", "spring_n_per_m3"}
@@ -216,6 +236,29 @@ class _ConfigValidator:
                 if upstream is not None and width >= upstream:
                     self.issue(f"{row_path}.radial_width_m", "must be less than upstream_radius_m")
                 previous_width = width
+
+    def validate_steps_on_course_grid(self, value: object, element_size: float) -> None:
+        """With a foundation, every step elevation must lie on a wall course.
+
+        The wall is seated on courses spaced global_element_size_m apart and on
+        step treads, and the chamfered foundation needs every seat riser to be
+        exactly one course; an off-grid step creates partial risers.
+        """
+        if not isinstance(value, list):
+            return
+        for index, row in enumerate(value):
+            top_z = row.get("top_z_m") if isinstance(row, Mapping) else None
+            if not isinstance(top_z, (int, float)) or isinstance(top_z, bool) or not math.isfinite(top_z):
+                continue
+            courses = top_z / element_size
+            if abs(courses - round(courses)) * element_size > 1e-6:
+                below = math.floor(courses) * element_size
+                self.issue(
+                    f"geometry.wall.thickness_steps[{index}].top_z_m",
+                    f"must be a multiple of geometry.global_element_size_m ({element_size:g} m) "
+                    f"when geometry.foundation is present; nearest valid levels are "
+                    f"{below + element_size:g} m and {below:g} m",
+                )
 
     def validate_wall_joint_support(self, value: object) -> None:
         """Joints between thickness bands: bonded, or linear springs in global x/y/z (N/m^3)."""
@@ -530,6 +573,8 @@ class _ConfigValidator:
                 self.validate_thickness_steps(
                     wall["thickness_steps"], wall_upstream, wall_downstream,
                 )
+                if "foundation" in geometry and global_size is not None:
+                    self.validate_steps_on_course_grid(wall["thickness_steps"], global_size)
             if wall is not None and "joint_support" in wall:
                 self.validate_wall_joint_support(wall["joint_support"])
             if wall is not None and "step_end_taper_ratio" in wall:
@@ -594,17 +639,105 @@ class _ConfigValidator:
                 value = outputs.get(key)
                 if key in outputs and not isinstance(value, bool):
                     self.issue(f"outputs.{key}", "must be a boolean")
-            # Output selections are not fully wired yet: toggling these flags
-            # does not currently change what the worker computes or reports.
-            if outputs.get("cracking_risk") is True:
-                self.warn(
-                    "outputs.cracking_risk",
-                    "is not fully implemented; enabling it does not add cracking-risk "
-                    "output to the analysis result.",
-                )
+            # Displacement and tensile stress are always reported; cracking_risk follows
+            # whether a crack is defined in ``cracking`` (an empty array means no crack).
+            cracks = root.get("cracking")
+            if isinstance(cracks, list) and isinstance(outputs.get("cracking_risk"), bool):
+                if cracks and not outputs["cracking_risk"]:
+                    self.issue("outputs.cracking_risk", "must be true when a crack is defined in cracking")
+                elif not cracks and outputs["cracking_risk"]:
+                    self.issue("outputs.cracking_risk", "must be false when cracking defines no crack")
         if "crack_simulations" in root:
             self.validate_cracks(root["crack_simulations"])
+        if "cracking" in root:
+            geometry_value = root.get("geometry")
+            wall = geometry_value.get("wall") if isinstance(geometry_value, dict) else None
+            width = wall.get("radial_width_m") if isinstance(wall, dict) else None
+            self.validate_cracking(root["cracking"], width)
+        if root.get("fracture_debug") is not None:
+            self.validate_fracture_debug(root["fracture_debug"])
         return self.issues
+
+    def validate_fracture_debug(self, value: object) -> None:
+        """Optional per-job overrides of FEniCSx/fracture_defaults.json (and Aster softening).
+
+        Null (or an absent block) means the solvers use their shipped defaults.
+        """
+        path = "fracture_debug"
+        debug = self.object(value, path, set(), optional=FRACTURE_DEBUG_KEYS)
+        if debug is None:
+            return
+        if "model" in debug and debug["model"] not in ("AT1", "AT2"):
+            self.issue(f"{path}.model", "must be 'AT1' or 'AT2'")
+        self.field_number(debug, "critical_energy_release_rate_j_m2", path, positive=True)
+        if debug.get("length_scale_m") is not None:
+            self.field_number(debug, "length_scale_m", path, positive=True)
+        stiffness = self.field_number(debug, "residual_stiffness", path, positive=True)
+        if stiffness is not None and stiffness >= 1:
+            self.issue(f"{path}.residual_stiffness", "must be less than 1")
+        factor = self.field_number(debug, "crack_water_pressure_factor", path, nonnegative=True)
+        if factor is not None and factor > 1:
+            self.issue(f"{path}.crack_water_pressure_factor", "must lie between 0 and 1")
+        if "load_steps" in debug:
+            self.debug_integer(debug["load_steps"], f"{path}.load_steps", 1)
+        if "solver" in debug:
+            solver = self.object(debug["solver"], f"{path}.solver", set(),
+                                 optional=set(FRACTURE_DEBUG_SOLVER_INTEGERS) | FRACTURE_DEBUG_SOLVER_NUMBERS)
+            for key, minimum in FRACTURE_DEBUG_SOLVER_INTEGERS.items():
+                if solver is not None and key in solver:
+                    self.debug_integer(solver[key], f"{path}.solver.{key}", minimum)
+            for key in FRACTURE_DEBUG_SOLVER_NUMBERS:
+                self.field_number(solver, key, f"{path}.solver", positive=True)
+        if "aster" in debug:
+            aster = self.object(debug["aster"], f"{path}.aster", set(), optional=FRACTURE_DEBUG_ASTER_KEYS)
+            self.field_number(aster, "band_width_m", f"{path}.aster", positive=True)
+            softening = self.field_number(aster, "softening_p", f"{path}.aster", positive=True)
+            if softening is not None and softening < 1:
+                self.issue(f"{path}.aster.softening_p", "must be at least 1")
+
+    def debug_integer(self, value: object, path: str, minimum: int) -> None:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not float(value).is_integer()):
+            self.issue(path, "must be an integer")
+        elif value < minimum:
+            self.issue(path, f"must be at least {minimum}")
+
+    def validate_cracking(self, value: object, wall_width: object) -> None:
+        """Array of UI crack-seed definitions: empty (no crack; baselines only) or one crack."""
+        if not isinstance(value, list):
+            self.issue("cracking", "must be an array of crack objects")
+            return
+        if len(value) > 1:
+            self.issue("cracking", "must contain at most one crack; multiple cracks are not supported yet")
+        for index, crack in enumerate(value):
+            self.validate_crack_seed(crack, f"cracking[{index}]", wall_width)
+
+    def validate_crack_seed(self, value: object, path: str, wall_width: object) -> None:
+        """One crack seed: face, radial depth, Z opening, along-wall extent, buffer."""
+        cracking = self.object(value, path, CRACKING_KEYS)
+        if cracking is None:
+            return
+        if "face" in cracking and cracking["face"] not in CRACK_SEED_FACES:
+            self.issue(f"{path}.face", "must be 'upstream' or 'downstream'")
+        depth = self.field_number(cracking, "depth_m", path, positive=True)
+        if (depth is not None and isinstance(wall_width, (int, float)) and not isinstance(wall_width, bool)
+                and math.isfinite(wall_width) and depth >= wall_width):
+            self.issue(f"{path}.depth_m", f"must be less than the {wall_width:g} m wall radial width")
+        opening = self.field_number(cracking, "opening_m", path, positive=True)
+        if opening is not None and not CRACK_OPENING_RANGE_M[0] <= opening <= CRACK_OPENING_RANGE_M[1]:
+            self.issue(f"{path}.opening_m", "must be between 0.001 and 0.01 m")
+        buffer = self.field_number(cracking, "buffer_m", path, nonnegative=True)
+        if buffer is not None and buffer > CRACK_BUFFER_MAX_M:
+            self.issue(f"{path}.buffer_m", "must not exceed 2 m")
+        full_width = cracking.get("full_width")
+        if "full_width" in cracking and not isinstance(full_width, bool):
+            self.issue(f"{path}.full_width", "must be a boolean")
+        if "length_m" in cracking and cracking["length_m"] is not None:
+            length = self.number(cracking["length_m"], f"{path}.length_m", positive=True)
+            if length is not None and full_width is True:
+                self.warn(f"{path}.length_m", "is ignored while full_width is true")
+        elif full_width is False:
+            self.issue(f"{path}.length_m", "is required when full_width is false")
 
 
 def wall_thickness_steps(wall: Mapping[str, object]) -> list[tuple[float, float]]:
@@ -692,7 +825,7 @@ def validate_config(payload: object) -> dict[str, object]:
 
 def collect_warnings(payload: object, *, three_body: bool = False) -> list[ValidationIssue]:
     """Return non-fatal warnings for nominal or currently inactive configuration
-    properties (e.g. wall height_m, bedrock material, cracking_risk output)
+    properties (e.g. wall height_m, bedrock material, an ignored crack length_m)
     without reinterpreting or rejecting the submitted values. Intended to be called
     only once the configuration has already passed validate_config.
     """

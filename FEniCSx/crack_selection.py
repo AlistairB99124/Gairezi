@@ -16,8 +16,17 @@ import math
 import numpy as np
 
 Y_BIN_M = 1.0
+# Fallback only: rows are normally one wall course (geometry.global_element_size_m) tall.
 Z_BIN_M = 0.5
 BODY_BITS = {"wall": 1}
+
+
+def course_spacing(config: dict) -> float:
+    """Vertical spacing (m) of the wall's horizontal node courses."""
+    value = config.get("geometry", {}).get("global_element_size_m")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+        return float(value)
+    return Z_BIN_M
 
 
 def principal_stresses(stress: np.ndarray) -> np.ndarray:
@@ -76,12 +85,16 @@ def selection_map(points: np.ndarray, stress: np.ndarray, node_regions: np.ndarr
         raise ValueError("Concrete plan angles must lie between 0 and pi for a unique Z-Y projection.")
     y = radius * np.cos(theta)
     z = points[concrete, 2]
+    # Wall nodes lie on horizontal courses one element apart. A fixed bin height that
+    # does not match the course spacing leaves empty rows (0.5 m bins on 0.75 m courses
+    # left every third row blank), so each row is one course tall and centred on it.
+    z_bin = course_spacing(config)
     y_min = math.floor(y.min() / Y_BIN_M) * Y_BIN_M
-    z_min = math.floor(z.min() / Z_BIN_M) * Z_BIN_M
+    z_min = (round(z.min() / z_bin) - 0.5) * z_bin
     y_count = max(1, math.ceil((y.max() - y_min) / Y_BIN_M))
-    z_count = max(1, math.ceil((z.max() - z_min) / Z_BIN_M))
+    z_count = max(1, math.ceil((z.max() - z_min) / z_bin))
     iy = np.clip(np.floor((y - y_min) / Y_BIN_M).astype(int), 0, y_count - 1)
-    iz = np.clip(np.floor((z - z_min) / Z_BIN_M).astype(int), 0, z_count - 1)
+    iz = np.clip(np.floor((z - z_min) / z_bin).astype(int), 0, z_count - 1)
     grid = np.full((z_count, y_count), -np.inf)
     np.maximum.at(grid, (iz, iy), principal[:, -1])
     values = [
@@ -119,8 +132,8 @@ def selection_map(points: np.ndarray, stress: np.ndarray, node_regions: np.ndarr
         ),
         "chainage_radius_m": radius,
         "field": "Elmer nodal maximum principal stress over wall nodes (tension positive)",
-        "bin_statistic": "maximum over the radial thickness and nodes in each bin",
-        "y_bin_m": Y_BIN_M, "z_bin_m": Z_BIN_M,
+        "bin_statistic": "maximum over the radial thickness and nodes in each bin; rows are one wall course",
+        "y_bin_m": Y_BIN_M, "z_bin_m": z_bin,
         "y_min_m": y_min, "z_min_m": z_min,
         "y_count": y_count, "z_count": z_count,
         "max_principal_stress_mpa": values,

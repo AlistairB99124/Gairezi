@@ -16,6 +16,8 @@ from Elmer.model_config import load_config
 class FractureMaterialTests(unittest.TestCase):
     def setUp(self):
         self.config = load_config()
+        # Null fracture_debug: the shipped defaults files apply.
+        self.config["fracture_debug"] = None
 
     def test_nominal_inputs_keep_shared_material_and_energy(self):
         original = copy.deepcopy(self.config)
@@ -60,6 +62,19 @@ class FractureMaterialTests(unittest.TestCase):
             defaults.write_text('{"critical_energy_release_rate_j_m2": 150}')
             contract = material_contract(self.config, fenicsx_defaults_path=defaults)
         self.assertEqual(contract["parameters"]["GF"], 150)
+
+    def test_fracture_debug_overrides_energy_band_and_softening(self):
+        self.config["fracture_debug"] = {
+            "critical_energy_release_rate_j_m2": 2700.0,
+            "aster": {"band_width_m": 0.25, "softening_p": 2.0},
+        }
+        contract = material_contract(self.config)
+        p = contract["parameters"]
+        self.assertEqual((p["GF"], p["LARG_BANDE"], p["P"]), (2700.0, 0.25, 2.0))
+        self.assertIn("fracture_debug", contract["provenance"]["fracture_energy"])
+        self.assertIn("fracture_debug", contract["provenance"]["regularisation_and_softening"])
+        # Explicit sensitivity arguments still win over the debug block.
+        self.assertEqual(material_contract(self.config, band_width_m=1.0)["parameters"]["LARG_BANDE"], 1.0)
 
     def test_sensitivity_grid_preserves_strength_and_energy(self):
         contracts = sensitivity_contracts(self.config)

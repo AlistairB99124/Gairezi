@@ -921,6 +921,7 @@ the deleted `Elmer/load_cases.json` is read by these workflows.
 | `loads` | Gravity, water density, reference water depth, overflow and tailwater heads |
 | `outputs` | Requested result metadata; the existing solver/post-processor still writes its standard result fields |
 | `crack_simulations` | Optional; declared phase-field cracks consumed by [FEniCSx/crack_field.py](FEniCSx/crack_field.py) |
+| `fracture_debug` | Optional; per-job overrides of the fracture defaults (see the cracking section below) |
 
 Contour `height` is a signed elevation relative to crest z = 0, not a positive
 wall height. Bedrock stations must be strictly increasing and must dip below
@@ -979,12 +980,50 @@ memory. Use parallel/distributed meshing and solve resources for that target,
 then perform a mesh/length-scale convergence study. The app workflow instead
 pauses after the elastic baseline and asks the user to click the crack location
 on a Z-Y plot of baseline wall stress (no automatic placement), then
-seeds a local 4 m crack there so that the wall (but not
-bedrock) can damage, with an AT1 model whose length scale is calibrated to the
+seeds a horizontal crack at that elevation running along the wall to within
+the configured `cracking[0].buffer_m` (default 1 m) of the foundation contour at each end, or for a
+centred `cracking[0].length_m` when `full_width` is false (opened `depth_m`, default 3 m, from the
+configured `face`, default upstream, with a Z thickness of `opening_m`, default 2 mm; a config
+without `cracking` uses these defaults; clicks within the buffer of the foundation are
+snapped to the nearest valid point and the snap is logged and shown) so that the wall (but not bedrock) can damage, with an AT1 model whose length scale is calibrated to the
 configured concrete tensile strength (`l = 3 E Gc / (8 ft^2)`, Tanné et al.
 2018; 0.656 m for E = 35 GPa, Gc = 200 J/m2, ft = 2 MPa) and a 4,000,000-cell
-refinement budget; see [FEniCSx/README.md](FEniCSx/README.md). The earlier AT2
+refinement budget; see [FEniCSx/README.md](FEniCSx/README.md). Refinement
+bisects only the wall edges longer than `l / target` near the crack, so a
+101 m crack at z = -15.7 m reaches 2.15 elements per length scale with
+3.25 million cells (whole-cell refinement predicted over 7 million). After
+FEniCSx cracking ends, app jobs run Code_Aster cracking on the whole three-body
+model with the same
+wall-length seed (`Aster.whole_model_crack`, Linux Code_Aster in WSL;
+only the wall can damage, foundation and bedrock respond elastically); see
+[Aster_Porting.md](Aster_Porting.md). Both solvers load the crack with the
+full hydrostatic head of the seeded face at the crack elevation (reservoir or
+tailwater, the Elmer datums, no drainage), stored in the shared prepared seed;
+seeds prepared earlier carry 0 Pa and must be selected again. Uplift on the
+wall-foundation interface is still not modelled. The earlier AT2
 default `l = 0.25 m` implied only about 1.72 MPa and had no elastic phase.
+
+For process-of-elimination debugging, an optional top-level `fracture_debug`
+block (Configuration > Cracking > Debug in the app) overrides, per job, the
+values in [FEniCSx/fracture_defaults.json](FEniCSx/fracture_defaults.json) and
+[Aster/fracture_defaults.json](Aster/fracture_defaults.json) without editing
+them: `model` (AT1/AT2), `critical_energy_release_rate_j_m2` (both solvers),
+`length_scale_m` (null = calibrate to the tensile strength, otherwise fixed; the
+report records the implied strength), `residual_stiffness`,
+`crack_water_pressure_factor` (0 = dry crack, 1 = full head; both solvers),
+FEniCSx `load_steps`, the ten `solver` fields of `PhaseFieldSolverOptions`, and
+`aster.band_width_m`/`aster.softening_p`. Any subset may be given; validation is
+in `Elmer/model_config.py` `validate_fracture_debug`. The block is nullable:
+`"fracture_debug": null` (or omitting it) means the solvers use the shipped
+defaults files unchanged. [config.json](config.json) ships the block with
+Friday's working values, so the API's `/config/default` (config.json returned
+unchanged) and the app's Load Default show them: AT2, Gc 2700 J/m2, fixed
+`l = 0.25 m`, residual stiffness 1e-8, factor 0 (dry crack) and 10 load steps
+(implied strength about 6.3 MPa). Friday also used hybrid mechanics (the Amor
+checkbox) and a local 4 m seed, which are set separately. In the app, unticking
+Override solver defaults sends null; ticking it loads the shipped defaults from
+`/config/fracture-defaults` for editing. The block is part of the job's frozen
+config.
 
 The staggered solve alternates degraded linear mechanics and a PETSc TAO
 bound-constrained AT1/AT2 damage minimisation. The lower bound is the damage from
@@ -994,7 +1033,11 @@ damaged zones), the same solve is retried once with a MUMPS LU preconditioner,
 which is then kept for the rest of the run. The switch is recorded as a
 `direct_solver_fallback` event in `mechanics_diagnostics.jsonl` and as
 `mechanics_solver.direct_fallback_used` in the report; a MUMPS failure still
-fails the run. MUMPS needs considerably more memory than GAMG. Gravity,
+fails the run. MUMPS needs considerably more memory than GAMG, so the fallback
+factorises out-of-core (ICNTL(22)=1): factors are written to a per-process
+directory under `$MUMPS_OOC_TMPDIR`, defaulting to `~/.cache/lamb/mumps_ooc`
+(WSL `/tmp` is RAM-backed tmpfs). Directories left by killed runs are removed
+the next time the fallback starts. Gravity,
 hydrostatic boundary pressure and the existing directional support springs are
 included. Nonzero internal crack pressure uses the regularised force
 `-p*grad(alpha)`; this is not an explicit face traction. Outputs include
@@ -1024,8 +1067,8 @@ section are always global Cartesian coordinates, not chainage/radius values.
 | Bedrock material properties | Retained and validated; no bedrock volume is currently meshed |
 | `loads.water_height`, `loads.overflow_head`, gravity and water density | Active in hydrostatic loading |
 | `loads.overflow_water_level` | Reservoir depth above the deepest seat; must equal `water_height + overflow_head` |
-| `outputs.*` flags | Validated metadata only; the current solver still writes its standard fields and reports |
-| `outputs.cracking_risk` | Not a crack/damage analysis; the elastic model does not implement crack propagation |
+| `outputs.*` flags | Validated metadata only; the current solver still writes its standard fields and reports. The app fixes `max_displacement`/`max_tensile_stress` to true and sets `cracking_risk` to whether `cracking` defines a crack (no Outputs tab) |
+| `outputs.cracking_risk` | Must be true when `cracking` defines a crack and false for an empty `cracking` array (no crack: app jobs run baselines only); the elastic Elmer model itself does not implement crack propagation |
 | `crack_simulations[*]` | Active in the FEniCSx `run-fracture` action; placement, refinement, load stepping and solver controls are validated |
 
 The supplied model has a **4 m wall** at radii **76-80 m** (centreline 78 m)
@@ -1236,7 +1279,12 @@ tops. The 114 former 0.5 m risers become chamfers: actual wall-interface triangl
 angles are 45.000187--46.847796 degrees across the arch thickness. There are no
 vertical wall/foundation faces. Any nonzero riser other than exactly one course
 is rejected explicitly rather than silently chamfering across a joint or several
-stations. No wedge crosses a wall joint: each belongs to the block below its
+stations. Because the seat can also sit on a thickness-step tread, the
+configuration validator (and the app's schema) rejects any
+`thickness_steps[].top_z_m` that is not a multiple of `global_element_size_m`
+when a foundation is present, naming the nearest valid levels; for example
+0.75 m courses with steps at -20 m and -25 m produced 0.25, 0.5 and 1.0 m
+risers. No wedge crosses a wall joint: each belongs to the block below its
 higher endpoint. Without foundation, the previous wall behavior is unchanged.
 
 The cut wedges transfer **62.188918 m3** from foundation to wall, independently
