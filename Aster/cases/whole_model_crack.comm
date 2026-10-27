@@ -9,11 +9,12 @@ with open("fort.91", encoding="utf-8") as stream:
     inputs = json.load(stream)
 sys.path.insert(0, inputs["repository_root"])
 from Aster.native_seed import initial_field
+from Aster.native_discrete import read_mesh, characteristics
 
 parameters = inputs["material"]["parameters"]
 elastic = inputs["elastic"]
 loads = inputs["loads"]
-MESH = LIRE_MAILLAGE(FORMAT="MED", UNITE=20, NOM_MED="THREE_BODY", VERI_MAIL=_F(VERIF="NON"))
+MESH = read_mesh("fort.20", "fort.92")
 MESH = MODI_MAILLAGE(reuse=MESH, MAILLAGE=MESH,
                      ORIE_PEAU_3D=_F(GROUP_MA=("UPSTREAM", "DOWNSTREAM", "CREST")))
 MODEL = AFFE_MODELE(
@@ -23,7 +24,7 @@ MODEL = AFFE_MODELE(
                      "CRACK_FACES"),
            PHENOMENE="MECANIQUE", MODELISATION="3D"),
         _F(GROUP_MA="DAMAGE_BAND", PHENOMENE="MECANIQUE", MODELISATION="3D_GRAD_VARI"),
-        _F(GROUP_MA=("OUTER_SPRINGS", "WALL_FOUNDATION_SPRINGS"), PHENOMENE="MECANIQUE",
+        _F(GROUP_MA=("QS_POINTS", "QS_LINKS"), PHENOMENE="MECANIQUE",
            MODELISATION="DIS_T"),
     ),
 )
@@ -39,13 +40,7 @@ FIELD = AFFE_MATERIAU(
     AFFE=(_F(GROUP_MA="CONCRETE", MATER=CONCRETE), _F(GROUP_MA="BEDROCK", MATER=BEDROCK),
           _F(GROUP_MA="DAMAGE_BAND", MATER=DAMAGE)),
 )
-springs = AFFE_CARA_ELEM(
-    MODELE=MODEL,
-    DISCRET=[_F(GROUP_MA=spring["group"], REPERE="GLOBAL", CARA="K_T_D_L",
-                VALE=tuple(spring["stiffness_n_per_m"])) for spring in inputs["wall_foundation_springs"]]
-    + [_F(GROUP_MA=spring["group"], REPERE="GLOBAL", CARA="K_T_N", SYME="NON",
-          VALE=tuple(spring["matrix_column_major_n_per_m"])) for spring in inputs["support_springs"]],
-)
+springs = characteristics(MESH, MODEL, "fort.92")
 INITIAL, audit = initial_field(MODEL, DAMAGE, inputs["shared_seed"], inputs["seed_damage"],
                                wall_group="DAMAGE_BAND", volume_group="DAMAGE_BAND",
                                elastic_elsewhere=True)
@@ -92,7 +87,12 @@ RESU = STAT_NON_LINE(
         SIGM_REFE=parameters["FT"], VARI_REFE=1.,
         LAGR_REFE=parameters["GF"] / (parameters["LARG_BANDE"] / 2),
         EFFORT_REFE=inputs["spring_force_reference_n"],
-        RESI_REFE_RELA=1e-6, ITER_GLOB_MAXI=50,
+        # 1e-6 sat below the round-off floor of this whole-dam model: on the first load
+        # increment Newton reached RESI_GLOB_RELA ~1e-14 (max nodal residual ~3e-7 N) while
+        # RESI_REFE_RELA stagnated at 2-5e-6 until ITER_GLOB_MAXI, and step cutting repeated
+        # the stall. 1e-4 of the reference stress/force is still well converged and was met
+        # once Newton entered its quadratic phase (iteration 30, RESI_GLOB_RELA 4e-12).
+        RESI_REFE_RELA=1e-4, ITER_GLOB_MAXI=50,
     ),
     RECH_LINEAIRE=_F(METHODE="CORDE", ITER_LINE_MAXI=20),
     # 1.3M DOFs: a double-precision direct factor exceeds a 24 GB WSL budget, so a

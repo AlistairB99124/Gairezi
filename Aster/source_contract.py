@@ -201,6 +201,7 @@ def source_springs(source_mesh: Path, coords: np.ndarray, faces: np.ndarray, tag
     blocks = sif_boundaries(sif.read_text(encoding="utf-8"))
     diag = json.loads(diagnostic.read_text(encoding="utf-8"))
     pairs, stiffness, names, areas, interface_names = [], [], [], [], []
+    joint_slave, joint_master, joint_coefficients = [], [], []
     for block in blocks.values():
         mortar = re.search(r"Mortar BC = Integer (\d+)", block)
         if mortar is None:
@@ -222,6 +223,19 @@ def source_springs(source_mesh: Path, coords: np.ndarray, faces: np.ndarray, tag
         coefficients = np.array([real_value(block, f"Mortar BC Coefficient Displacement {i}") for i in (1, 2, 3)])
         if (coefficients <= 0).any():
             raise ValueError(f"Nonpositive interface stiffness on {name}")
+        if any(tuple(np.round(coords[node], 8)) not in coordinate_to_master
+               for node in np.unique(slave_faces)):
+            raise ValueError(f"Nonmatching two-sided spring surface {name}")
+        master_topology = {tuple(sorted(face)) for face in master_faces.tolist()}
+        mapped = np.asarray([[coordinate_to_master[tuple(np.round(coords[node], 8))]
+                              for node in face] for face in slave_faces], dtype=np.int64)
+        mapped_topology = {tuple(sorted(face)) for face in mapped.tolist()}
+        if (len(mapped) != len(master_faces) or len(master_topology) != len(master_faces)
+                or len(mapped_topology) != len(mapped) or mapped_topology != master_topology):
+            raise ValueError(f"Source interface triangulations do not match on {name}")
+        joint_slave.extend(slave_faces)
+        joint_master.extend(mapped)
+        joint_coefficients.extend([coefficients] * len(slave_faces))
         for node, area in slave_area.items():
             other = coordinate_to_master.get(tuple(np.round(coords[node], 8)))
             if other is None or node == other or np.linalg.norm(coords[node] - coords[other]) > 1e-7:
@@ -263,6 +277,9 @@ def source_springs(source_mesh: Path, coords: np.ndarray, faces: np.ndarray, tag
         "names": names,
         "areas": np.asarray(areas),
         "interfaces": interface_names,
+        "joint_slave_tri3": np.asarray(joint_slave, dtype=np.int64),
+        "joint_master_tri3": np.asarray(joint_master, dtype=np.int64),
+        "joint_coefficients_n_per_m3": np.asarray(joint_coefficients),
         "support_nodes": nodes,
         "support_matrices": np.asarray([support_by_node[node] for node in nodes]),
         "source_hashes": {path.name: sha256(path) for path in (source_mesh, config, sif, diagnostic)},

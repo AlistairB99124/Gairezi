@@ -2,6 +2,11 @@
 
 ## 1. Goal and scope
 
+Saved-job Code_Aster discrepancy investigation: see
+[stage-by-stage diagnostic tasks](../Aster/CASE_STUDY_DIAGNOSTICS.md).
+These operate outside the app pipeline on a Git-ignored job copy, preserving
+the production configuration and archived outputs.
+
 Build a Windows WPF application in Visual Studio that edits one dam configuration,
 submits it to a lightweight local Python API, runs the existing Elmer workflow,
 and displays the resulting analysis and reports.
@@ -509,6 +514,8 @@ compatibility with the project's selected Python interpreter.
 | `POST /jobs/{id}/cancel` | Request cancellation of that job's process tree |
 | `GET /jobs/{id}/crack-selection` | Baseline Z-Y stress map for user crack-location selection (409 until the verified baseline map exists) |
 | `POST /jobs/{id}/crack-location` | Submit the selected `y_m`, `z_m` and start cracking (only while awaiting) |
+| `POST /jobs/{id}/stages/{stage}/rerun` | Rerun a failed, cancelled or interrupted cracking stage (`fenicsx_cracking` or `aster_cracking`) with `{"fracture_debug": {...} \| null}`; 409 frozen/busy, 422 invalid (Phase 6) |
+| `GET /jobs/{id}/attempts` | Every attempt of the job, oldest first, with its `fracture_debug`, stage results and archive folders (Phase 6) |
 | `GET /jobs/{id}/results` | Structured metrics and available artifact manifest |
 | `GET /jobs/{id}/artifacts/{artifact-id}` | Serve an allowlisted file belonging to that job |
 
@@ -539,6 +546,10 @@ Show stage and elapsed time, not fabricated percentage progress from solver logs
 - On restart, reconcile persisted active jobs and owned process identifiers;
   mark abandoned jobs interrupted and prevent orphaned workers from overlapping.
 - Poll status/logs from WPF for the MVP; streaming/WebSockets are unnecessary.
+- A finished three-body job can rerun a failed, cancelled or interrupted
+  cracking stage (Phase 6). The job returns to `running`; earlier stages are
+  reused, succeeded stages are frozen, and superseded outputs and logs are
+  archived under `attempts/<n>/` rather than deleted.
 
 ### Local-service boundary
 
@@ -787,6 +798,250 @@ without explicit consent.
 **Gate:** installation and launch work outside the developer workspace without
 manual dependency or environment-variable configuration, and the bundled backend
 successfully runs an analysis.
+
+### Phase 6 - stage pipeline view and rerunning failed stages
+
+**Goal:** the History tab shows each job as a pipeline, like an Azure DevOps
+stage view, and lets the user rerun a failed or cancelled cracking stage without
+repeating the Elmer and elastic-baseline work. Motivation: in job 3e9220fe,
+FEniCSx cracking succeeded but the Aster crack submodel stalled, so the whole
+job had to be cancelled.
+
+**Agreed behaviour**
+- Selecting a job in History shows the pipeline below the job table:
+  Elmer baseline -> FEniCSx baseline and Aster baseline (in parallel) ->
+  crack location -> FEniCSx cracking -> Aster cracking. Each box shows its state
+  (succeeded, failed, cancelled, interrupted, blocked, running, queued, skipped
+  or waiting), duration, attempt number and error. Running boxes update live.
+- **Rerunnable stages:** FEniCSx cracking and Aster cracking.
+- **A stage that succeeded is frozen** and can't be rerun. Any other finished
+  state can be rerun: failed, cancelled, interrupted or blocked. A job's overall
+  `succeeded` status does not freeze its stages, because a job counts as
+  succeeded even when Aster cracking failed.
+- **Downstream stages chain automatically:** rerunning FEniCSx cracking then runs
+  Aster cracking, unless Aster cracking already succeeded (frozen).
+- A rerun may **edit `fracture_debug`**. The Debug panel opens prefilled from the
+  latest attempt, and null means the solvers' defaults. The edit applies to that
+  attempt only.
+- **Every attempt is kept.** Results views show the latest attempt; earlier
+  attempts stay on disk with their logs, config and errors, and are listed per
+  job.
+- A rerun starts only when no other job is active (the existing one-active-job
+  rule) and can be cancelled like a normal run. If the API restarts during a
+  rerun, the stage becomes `interrupted` and can be rerun again.
+
+**Config and hash rules**
+- The job's `config.json` stays the submitted snapshot and keeps binding the
+  Elmer, FEniCSx and Aster elastic baselines. Attempt N uses
+  `attempts/N/config.json`.
+- An attempt config may differ from the submitted snapshot **only in
+  `fracture_debug`**, and the API enforces this. The baseline and refined-baseline
+  checks (`_prepare_cracking_seed`, `_validate_fenicsx_output`, and the
+  `verified_elastic_baseline` check in `FEniCSx/run.py`) compare against the
+  submitted config's hash. The cracking-stage checks (prepared seed, Aster
+  manifest) compare against the attempt config's hash.
+- The prepared seed is rebuilt for each attempt from the job's crack location
+  and the baseline fields.
+- FEniCSx and Aster must always analyse the same shared seed
+  (`shared_seed.sha256`). An edit that changes the seed (model, Gc, length scale,
+  residual stiffness, water factor, load steps) moves an Aster-only rerun up to
+  start at FEniCSx cracking, then Aster runs after it. This is the only case
+  where a stage that already succeeded is run again; its earlier result is
+  archived as an attempt, not lost. Edits that leave the seed unchanged (for
+  example `aster.*`) can rerun Aster on its own.
+- Each attempt records the Gairezi `git HEAD` and dirty flag, so a rerun that
+  picks up a code fix (for example the Aster `RESI_REFE_RELA` tolerance) is
+  traceable.
+
+**Design by layer**
+1. *API, job model* (`Lamb.API/app/jobs.py`):
+   - per-stage `started_at` and `finished_at`;
+   - `attempts`: number, stages, `started_at`, `finished_at`, per-stage
+     status and error, `fracture_debug`, config SHA-256, prepared-seed and
+     shared-seed SHA-256, Gairezi commit, and archive folder;
+   - persisted in `job.json`; older jobs load with no attempts and unknown
+     durations.
+2. *API, pipeline*: `to_dict` adds `pipeline`, a list of
+   `{id, label, column, status, error, started_at, finished_at, attempt,
+   rerunnable, rerun_blocker}`. The server decides whether a stage can be
+   rerun; the client only displays it.
+3. *API, rerun*: `POST /jobs/{id}/stages/{stage}/rerun` with
+   `{"fracture_debug": {...} | null}`.
+   - The request is validated with `validate_fracture_debug` and the hash rules.
+   - The current outputs of the stage and its downstream stages are moved to
+     `attempts/<n>/`: `dam_phase_field/`, `aster_crack_submodel/`,
+     `prepared_seed.json`, `cracking.log`, `aster_cracking.log`.
+   - The job returns to `running` and the existing `_start_cracking` or
+     `_start_aster_cracking` path runs, so the "exactly one manifest" checks
+     still hold.
+   - The response is 409 when the stage is frozen or another job is active, and
+     422 for an invalid `fracture_debug`. A shared-seed change on an Aster-only
+     rerun moves it up to start at FEniCSx cracking; the response reports this.
+   - `GET /jobs/{id}/attempts` lists the attempts.
+4. *Solvers* (as implemented): no new argument. FEniCSx compares the verified
+   baseline's own `config.json` (its SHA-256 must match the baseline manifest
+   and report) with the attempt config using `physical_configuration`, which
+   drops only `fracture_debug`; any other difference is rejected. The API
+   checks the baseline evidence against the submitted snapshot's hash and
+   passes the attempt config (`attempts/<n>/config.json`) to the cracking
+   commands.
+5. *WPF*:
+   - pipeline columns in `HistoryView` (stage cards with status-coloured edges,
+     duration, attempt and a Rerun button; blockers in the tooltip);
+   - `HistoryViewModel`: selected-job pipeline, polling while the job runs, a
+     rerun command and an attempts list;
+   - rerun dialog reusing the Debug panel fields, extracted into a shared
+     `FractureDebugEditor` UserControl so Configuration and History stay
+     identical;
+   - `LambApiClient.RerunStageAsync` and `GetAttemptsAsync`;
+   - after a rerun starts, the Run/Results view follows the job as it does now.
+
+**Risks**
+- Hash rebinding is the critical part: a mistake would let a cracking run use
+  a baseline from a different physical config. Tests must show that any change
+  outside `fracture_debug` is rejected.
+- Archiving moves large result folders; use a same-volume rename, never copy and
+  delete.
+- Stage history of jobs created before this phase is incomplete; display
+  "unknown" rather than inventing durations.
+
+#### Pipeline and rerun TODOs
+
+- [x] Job model: per-stage times, `attempts`, and persistence and loading of
+  older jobs.
+- [x] Attempt config snapshot; enforce "differs only in fracture_debug"; split
+  the baseline hash binding from the attempt hash binding.
+- [x] Baseline binding through `physical_configuration` in
+  `FEniCSx/three_body_model.py` (replaces the planned `--baseline-config`);
+  first attempts are unchanged.
+- [x] Rerun endpoint: archive, restart, auto-chain, check the shared-seed hash
+  on Aster-only reruns, plus the attempts endpoint.
+- [x] `pipeline` in the job DTO, with server-side rerunnable flags and reasons.
+- [x] WPF: History pipeline columns, `FractureDebugEditor` extraction,
+  `StageRerunWindow`, client methods, attempts list and polling.
+- [x] Tests:
+  - API, using fake executables: Aster-only rerun after a failure; FEniCSx rerun
+    auto-chains Aster; rejection of succeeded or frozen stages; 409 when another
+    job is active; changes outside `fracture_debug` rejected; Aster-only rerun
+    that changes the shared seed moved up to FEniCSx cracking; archived attempt contents; restart
+    leaves the stage `interrupted`, which can be rerun;
+  - FEniCSx baseline binding (`test_rerun_configuration.py`);
+  - WPF: pipeline states, rerun enabled only when allowed, request payload,
+    unchanged Debug panel behaviour.
+- [x] Update the README job-lifecycle section and the app_plan endpoints table.
+- [ ] Gate below: one real Aster-only rerun from History (not yet run).
+
+**Gate:** on a job whose Aster cracking failed or was cancelled, Aster cracking
+alone reruns from History with edited `aster.*` values. FEniCSx results are
+untouched and the first attempt's logs and config stay available. A FEniCSx
+cracking rerun with a new Gc rebuilds the seed and chains Aster.
+### Phase 7 - multi-point crack path (on hold)
+
+**Goal:** on the baseline crack-location plot, the user clicks several points that
+are joined by straight segments to define the crack trace. Both FEniCSx and
+Code_Aster honour that path. One point keeps today's horizontal crack, so existing
+behaviour and numerics are unchanged.
+
+**Agreed behaviour**
+- A click **adds a point**; there is no freehand drawing or smoothing. Right-click
+  or Backspace undoes the last point. **Clear** and **Submit crack** buttons replace
+  today's immediate submit-on-click. Submit is enabled with at least one point.
+- One point gives the existing `horizontal_annular_sector` seed. Two or more points
+  give a path crack.
+- Segments are straight in the physical unrolled face (chainage
+  s = R acos(y/R), z). The plot is drawn in y, so segments are sampled and may
+  look slightly curved.
+- Through-thickness, the trace is **extruded radially by `depth_m`** from
+  `cracking[0].face`. The radial band follows the wall face, using
+  `wall_radii_at(z)`, so it follows thickness steps.
+- `opening_m` is measured normal to the path, and `buffer_m` and the minimum
+  clearance still apply. For path cracks the endpoints define the extent, so
+  `full_width` and `length_m` are ignored and the report says so.
+- Crack water pressure is **hydrostatic and varies with z** along the path,
+  scaled by `fracture_debug.crack_water_pressure_factor`.
+- Server-side validation is authoritative:
+  - at most 20 points, each snapped like today's single point;
+  - each segment, sampled densely, stays on wall concrete within the clearance;
+  - each segment is at least `opening_m` long;
+  - the path does not intersect itself;
+  - `depth_m` is less than the wall thickness at every z along the path.
+- The seed is an initial notch, not a prescribed crack path; phase-field damage
+  can still propagate elsewhere. The UI wording must say so.
+
+**Design by layer**
+1. *Shared geometry* (`FEniCSx/automatic_crack.py`): a path geometry in (s, z) and
+   `path_signed_distance`. This is the distance in the (s, z) plane to the
+   polyline minus opening/2, intersected with the radial band and end caps.
+   `locate_crack_path` reuses snapping, buffer, concrete-crossing and
+   peak-stress reporting.
+2. *Frozen seed contract* (`FEniCSx/crack_contract.py`): `schema_version` 2.
+   - Geometry: `shape: "path_band"`, `path_m`, face, `depth_m`, seed thickness.
+   - Loading: `pressure_model: "hydrostatic"`, water level, density and factor.
+   - Version 1 stays valid and unchanged; the hash covers the whole payload.
+3. *FEniCSx* (`crack_field.py`, `dam_phase_field.py`): `signed_distance`
+   dispatches to the path distance, so refinement and the initial damage reuse it.
+   Audit `_long_band_edges` and `resolution_report` for sector assumptions. Path
+   cracks use the pressure term `-p(z) grad(alpha)` with a UFL expression of
+   `SpatialCoordinate`; horizontal cracks keep the constant p.
+4. *Code_Aster* (`whole_model_crack_mesh.py`, `whole_model_crack.py`,
+   `native_seed.py`):
+   - Generalise `slice_plane` from `z - Z` to a nodal level set phi, the signed
+     offset from the path, and cut at phi = +/- t/2 by linear interpolation along
+     edges.
+   - Order cap polygons in the local tangent plane rather than in xy.
+   - Keep the volume-conservation and orientation checks.
+   - Band selection, `crack_faces` and the native seed damage use the path
+     distance.
+   - `PRES_REP` on `CRACK_FACES` becomes a FORMULE in Z.
+5. *API* (`Lamb.API/app/jobs.py`, `main.py`): `POST /jobs/{id}/crack-location`
+   accepts `{y_m, z_m}` (unchanged) or `{points: [{y_m, z_m}, ...]}`. Each point
+   is checked against the selection map, then the whole path is validated.
+   `job.json` stores `crack_path` (requested and snapped); `crack_location`
+   remains for single points. `selected_seed.prepare` handles both.
+6. *WPF* (`CrackLocationPlot.cs`, `RunResultsViewModel.cs`,
+   `RunResultsView.xaml`, `LambApiClient.cs`):
+   - pending points on the plot and view model;
+   - add, undo, clear and submit commands;
+   - the polyline and its vertices drawn on the plot;
+   - the read-only results plot shows the submitted, snapped path;
+   - the client sends `points`.
+
+**Risks**
+- In the cylindrical wall, a sloped crack is a curved (helicoidal) surface. The
+  Aster cut is a linear level-set approximation within each tetrahedron and must
+  be reported as such.
+- A path that crosses a thickness step gets a radial band jump at the step. This
+  is validated and reported, not smoothed.
+- Horizontal (one-point) runs must reproduce today's seed and contract exactly.
+
+#### Crack path TODOs
+
+- [ ] Path geometry, signed distance, path validation and `locate_crack_path`.
+- [ ] Seed contract schema v2 (`path_band` and hydrostatic loading), keeping v1.
+- [ ] FEniCSx: path distance in refinement and initial damage, plus the
+  hydrostatic `p(z)` pressure term.
+- [ ] Aster: level-set wall cut, path band and crack faces, path native seed, and
+  the hydrostatic PRES_REP FORMULE.
+- [ ] API: multi-point request, validation, `crack_path` persistence and seed
+  preparation.
+- [ ] WPF: add, undo, clear and submit; polyline rendering; read-only results
+  path; client payload.
+- [ ] Tests:
+  - path distance and validation (off-wall, self-intersection, step crossing,
+    clearance);
+  - contract v1/v2 round-trip and tamper rejection;
+  - FEniCSx refinement and initial damage on a small mesh (WSL), and the
+    hydrostatic pressure against the analytic value;
+  - Aster level-set cut (volume conserved, no degenerate cells, faces on
+    phi = +/- t/2) and the PRES_REP formula;
+  - API single-point and multi-point acceptance and rejection;
+  - WPF view-model and payload checks;
+  - a regression test pinning the one-point seed.
+- [ ] Update the Gairezi README cracking section.
+
+**Gate:** a two-point sloped crack runs end to end through FEniCSx and Aster on
+the default dam, and both report the same frozen path and hydrostatic loading. A
+one-point selection reproduces the existing seed hash and results.
 
 ### Later milestones
 

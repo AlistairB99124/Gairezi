@@ -3,8 +3,9 @@
 Only the wall cracks: a quadratic ENDO_FISS_EXP (3D_GRAD_VARI) band around the
 selected elevation carries the frozen shared seed, which runs bedrock to bedrock.
 All other wall, foundation and bedrock cells keep their linear elastic baseline
-elements, springs and loads, so the rest of the model responds to the softening
-wall. It runs in WSL with Linux Code_Aster because the Windows MUMPS build returns
+elements and loads. Source joint coefficients are integrated consistently on both
+refined traces; the unchanged linear rock retains its original exterior supports.
+It runs in WSL with Linux Code_Aster because the Windows MUMPS build returns
 NaN on this mesh and its MULT_FRONT factorisation is too slow for Newton steps.
 The result is native ENDO_FISS_EXP damage, not AT2 damage or a crack opening.
 """
@@ -50,6 +51,7 @@ DEFAULT_WSL_DISTRIBUTION = "Ubuntu"
 ROOT_ENVIRONMENT = "LAMB_LINUX_CODE_ASTER_ROOT"
 DISTRIBUTION_ENVIRONMENT = "LAMB_ASTER_WSL_DISTRIBUTION"
 CONVERSION_TIMEOUT_S = 1800
+INTERFACE_OPERATOR = "consistent_two_sided_TRI3_TRI6"
 
 
 def wsl_path(path: Path) -> str:
@@ -207,7 +209,6 @@ def prepare(directory: Path, dam_config: Path, prepared_seed: Path, source_mesh:
     if (not math.isclose(material["parameters"]["E"], concrete["youngs_modulus_pa"], rel_tol=1e-12)
             or not math.isclose(material["parameters"]["NU"], concrete["poissons_ratio"], rel_tol=1e-12)):
         raise ValueError("Damage material elasticity differs from the baseline concrete")
-    wall_springs, support_springs = spring_inputs(manifest)
     areas = np.asarray([spring["tributary_area_m2"] for spring in manifest["wall_foundation_springs"]])
     times = [0.0, *LOAD_FACTORS]
     inputs = {
@@ -217,7 +218,7 @@ def prepare(directory: Path, dam_config: Path, prepared_seed: Path, source_mesh:
             "gravity_m_s2", "upstream_water_surface_z_m", "water_pressure_gradient_pa_per_m",
             "tailwater_elevation_m", "overflow_surcharge_pa")}, "crack_pressure_pa": water["pressure_pa"]},
         "times": times, "hanging_nodes": int(len(built["hanging_nodes"])),
-        "wall_foundation_springs": wall_springs, "support_springs": support_springs,
+        "interface_operator": INTERFACE_OPERATOR,
         # Spring residual reference: tensile strength over a median interface tributary area.
         "spring_force_reference_n": float(material["parameters"]["FT"] * np.median(areas)),
     }
@@ -249,6 +250,7 @@ def export_file(directory: Path, threads: int, memory_mib: int, time_limit_s: in
     export.write_bytes((
         f"P time_limit {time_limit_s}\nP memory_limit {memory_mib}\nP mpi_nbcpu 1\nP ncpus {threads}\n"
         f"F comm {wsl_path(CASE)} D 1\nF libr {linux('inputs.json')} D 91\nF mmed {linux('mesh.med')} D 20\n"
+        f"F libr {linux('quadratic_discrete.npz')} D 92\n"
         f"F libr {linux('native_crack.json')} R 90\nF libr {linux('damage_history.npz')} R 89\n"
         f"F rmed {linux('result.med')} R 80\n").encode("utf-8"))
     return export
@@ -271,6 +273,10 @@ def run(dam_config: Path, prepared_seed: Path, source_mesh: Path, output_root: P
         "started_at_utc": timestamp, "case_sha256": file_hash(CASE),
         "converter_sha256": file_hash(CONVERTER), "mesher_sha256": file_hash(MESHER),
         "source_mesh_sha256": file_hash(source_mesh),
+        "interface_operator": INTERFACE_OPERATOR,
+        "interface_code_sha256": {name: file_hash(CASE.parent.parent / name) for name in (
+            "source_contract.py", "build_three_body_mesh_arrays.py", "refined_interface.py",
+            "quadratic_surface.py", "native_discrete.py", "convert_quadratic_to_med.py")},
     }
     _write(directory / "manifest.json", manifest)
     started = time.monotonic()
@@ -295,6 +301,10 @@ def run(dam_config: Path, prepared_seed: Path, source_mesh: Path, output_root: P
         mesh = directory / "mesh.med"
         if conversion.returncode or not mesh.is_file() or mesh.stat().st_size == 0:
             raise RuntimeError("Whole-model crack MED conversion failed; see conversion.log")
+        discrete = directory / "quadratic_discrete.npz"
+        if not discrete.is_file() or discrete.stat().st_size == 0:
+            raise RuntimeError("Whole-model crack conversion has no quadratic_discrete.npz")
+        manifest["quadratic_discrete_sha256"] = file_hash(discrete)
         (directory / "whole_model_mesh.npz").unlink()
         export = export_file(directory, threads, memory_mib, time_limit_s)
         work = f"{LINUX_WORK_ROOT}/{timestamp}"

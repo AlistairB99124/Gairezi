@@ -1,0 +1,61 @@
+# Appended to the production setup/solve by case_study_diagnostics.py.
+GEOMETRY = CREA_CHAMP(TYPE_CHAM="NOEU_GEOM_R", OPERATION="EXTR",
+                      MAILLAGE=MESH, NOM_CHAM="GEOMETRIE")
+GAUSS_GEOMETRY = CREA_CHAMP(TYPE_CHAM="ELGA_GEOM_R", OPERATION="DISC",
+                            MODELE=MODEL, CHAM_GD=GEOMETRY)
+coordinates = {}
+for component in ("X", "Y", "Z"):
+    data, support = GAUSS_GEOMETRY.getValuesWithDescription([component])
+    coordinates[component] = dict(zip(zip(support[0], support[2], support[3]), data))
+history = []
+for index, instant in zip(RESU.getIndexes(), RESU.getAccessParameters()["INST"]):
+    sief = RESU.getField("SIEF_ELGA", index)
+    regions = {}
+    for group in ("WALL", "FOUNDATION", "BEDROCK", "DAMAGE_BAND"):
+        columns, identities = [], None
+        for component in ("SIXX", "SIYY", "SIZZ", "SIXY", "SIXZ", "SIYZ"):
+            values, support = sief.getValuesWithDescription([component], [group])
+            keys = list(zip(support[0], support[2], support[3]))
+            if identities is not None and keys != identities:
+                raise ValueError("Stress component Gauss-point identities differ")
+            identities = keys
+            columns.append(np.asarray(values))
+        stress = np.column_stack(columns)
+        if not len(stress) or not np.isfinite(stress).all():
+            raise ValueError("Empty or nonfinite diagnostic stress in " + group)
+        tensor = np.empty((len(stress), 3, 3))
+        for column, (i, j) in enumerate(((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))):
+            tensor[:, i, j] = tensor[:, j, i] = stress[:, column]
+        principal = np.linalg.eigvalsh(tensor)
+        maximum, minimum = int(principal[:, -1].argmax()), int(principal[:, 0].argmin())
+        regions[group.lower()] = {
+            "maximum_principal_stress_pa": float(principal[maximum, -1]),
+            "minimum_principal_stress_pa": float(principal[minimum, 0]),
+            "tensile_peak_xyz_m": [float(coordinates[c][identities[maximum]]) for c in ("X", "Y", "Z")],
+            "compressive_peak_xyz_m": [float(coordinates[c][identities[minimum]]) for c in ("X", "Y", "Z")],
+            "tensile_peak_cell_gauss_subpoint": [int(v) for v in identities[maximum]],
+            "compressive_peak_cell_gauss_subpoint": [int(v) for v in identities[minimum]],
+        }
+    displacement = np.asarray(RESU.getField("DEPL", index).getValuesWithDescription(["DX", "DY", "DZ"])[0])
+    if not np.isfinite(displacement).all():
+        raise ValueError("Nonfinite diagnostic displacement")
+    row = {"time": float(instant), "regions": regions,
+           "maximum_displacement_component_m": float(np.abs(displacement).max())}
+    if inputs["diagnostic_stage"] != "elastic":
+        damage = np.asarray(RESU.getField("VARI_ELGA", index).getValuesWithDescription(["V1"], ["DAMAGE_BAND"])[0])
+        if not len(damage) or not np.isfinite(damage).all() or damage.min() < -1e-7 or damage.max() > 1 + 1e-7:
+            raise ValueError("Invalid diagnostic damage")
+        row["maximum_band_damage"] = float(damage.max())
+    history.append(row)
+RESU = CALC_CHAMP(reuse=RESU, RESULTAT=RESU, GROUP_MA=("CONCRETE", "BEDROCK"), CONTRAINTE="SIGM_NOEU")
+fields = ["DEPL", "SIGM_NOEU"]
+if inputs["diagnostic_stage"] != "elastic":
+    RESU = CALC_CHAMP(reuse=RESU, RESULTAT=RESU, GROUP_MA="DAMAGE_BAND", VARI_INTERNE="VARI_NOEU")
+    fields.append("VARI_NOEU")
+IMPR_RESU(FORMAT="MED", UNITE=80,
+          RESU=_F(RESULTAT=RESU, NOM_RESU_MED="DIAG", NOM_CHAM=tuple(fields)))
+with open("fort.90", "w", encoding="utf-8") as stream:
+    json.dump({"stage": inputs["diagnostic_stage"], "engineering_validated": False,
+               "stress_measure": "Gauss-point principal extrema", "history": history},
+              stream, allow_nan=False)
+FIN()

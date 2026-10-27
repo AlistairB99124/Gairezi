@@ -1,8 +1,8 @@
 /Elmer/structure_output/combined_solver/results/
 /Elmer/structure_output/combined_solver/mesh/
 /Aster/results/
+/case_study_00/
 __pycache__/
 *.pyc
 *.bak
 *.bak_*
-

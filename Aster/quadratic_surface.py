@@ -135,6 +135,22 @@ def compact_blocks(pairs: np.ndarray, blocks: np.ndarray) -> tuple[np.ndarray, n
     return unique[keep], summed[keep]
 
 
+def split_blocks(pairs: np.ndarray, blocks: np.ndarray, node_count: int) -> tuple:
+    """Compact a symmetric operator into native point diagonals and upper links."""
+    pairs, blocks = compact_blocks(pairs, blocks)
+    if np.any(pairs < 0) or np.any(pairs >= node_count):
+        raise ValueError("Surface operator references an invalid node identity")
+    points, links = pairs[:, 0] == pairs[:, 1], pairs[:, 0] < pairs[:, 1]
+    keys = pairs[:, 0] * node_count + pairs[:, 1]
+    transpose = np.searchsorted(keys, pairs[:, 1] * node_count + pairs[:, 0])
+    if (np.any(transpose >= len(keys))
+            or not np.array_equal(pairs[transpose], pairs[:, ::-1])
+            or not np.isfinite(blocks).all()
+            or not np.allclose(blocks[transpose], blocks.transpose(0, 2, 1), rtol=1e-12, atol=1e-8)):
+        raise ValueError("Surface operator has missing/nonsymmetric transpose blocks")
+    return pairs[points, 0], pairs[links], blocks[points], blocks[links]
+
+
 def discrete_entries(
     pairs: np.ndarray, blocks: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, list[dict], list[dict]]:

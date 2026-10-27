@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from Aster.convert_three_body_to_med import MESH_NAME, _build_seg2_spring_level, mc, np  # noqa: E402
+from Aster.convert_three_body_to_med import MESH_NAME, mc, np  # noqa: E402
+from Aster.convert_quadratic_to_med import save_discrete  # noqa: E402
+from Aster.quadratic_surface import split_blocks  # noqa: E402
 
 # Linux MEDCoupling builds use 64-bit identifiers; the Windows bundle uses 32-bit.
 IDS = np.int64 if mc.MEDCouplingSizeOfIDs() == 64 else np.int32
@@ -73,27 +75,25 @@ def convert(archive: Path, output: Path) -> dict:
         if count:
             face_groups.append(_group(name, face_position[start:start + count]))
         start += count
-    spring_mesh, spring_groups = _build_seg2_spring_level(MESH_NAME, coordinates,
-                                                          arrays["spring_pairs"])
-    support = arrays["support_nodes"].reshape(-1, 1)
-    point_mesh = mc.MEDCouplingUMesh.New(MESH_NAME, 0)
-    point_mesh.setConnectivity(
-        mc.DataArrayInt(np.column_stack([np.full(len(support), mc.NORM_POINT1), support])
-                        .astype(IDS).ravel()),
-        mc.DataArrayInt(np.arange(0, 2 * len(support) + 1, 2, dtype=IDS)), True)
-    point_mesh.setCoords(coordinates)
-    point_groups = [_group("OUTER_SPRINGS", np.arange(len(support)))]
-    point_groups += [_group(f"SPR_OUT_{i:05d}", [i]) for i in range(len(support))]
+    points, links, point_matrices, link_matrices = split_blocks(
+        arrays["surface_block_pairs"], arrays["surface_block_matrices_n_per_m"], len(coordinates))
     med = mc.MEDFileUMesh.New()
     med.setName(MESH_NAME)
     med.setMeshAtLevel(0, volume)
     med.setMeshAtLevel(-1, face_mesh)
-    med.setMeshAtLevel(-2, spring_mesh)
-    med.setMeshAtLevel(-3, point_mesh)
     med.setGroupsAtLevel(0, volume_groups)
     med.setGroupsAtLevel(-1, face_groups)
-    med.setGroupsAtLevel(-2, spring_groups)
-    med.setGroupsAtLevel(-3, point_groups)
+    for level, conn, norm, group, dimension in (
+            (-2, links, mc.NORM_SEG2, "QS_LINKS", 1),
+            (-3, points[:, None], mc.NORM_POINT1, "QS_POINTS", 0)):
+        count, width = conn.shape
+        mesh = mc.MEDCouplingUMesh.New(MESH_NAME, dimension)
+        mesh.setConnectivity(
+            mc.DataArrayInt(np.column_stack([np.full(count, norm), conn]).astype(IDS).ravel()),
+            mc.DataArrayInt(np.arange(0, (count + 1) * (width + 1), width + 1, dtype=IDS)), True)
+        mesh.setCoords(coordinates)
+        med.setMeshAtLevel(level, mesh)
+        med.setGroupsAtLevel(level, [_group(group, np.arange(count))])
     node_groups = [_group(name, arrays[key]) for name, key in (
         ("HANGING_NODES", "hanging_nodes"), ("CRACK_TOP", "crack_top_nodes"),
         ("CRACK_BOTTOM", "crack_bottom_nodes")) if len(arrays[key])]
@@ -102,10 +102,12 @@ def convert(archive: Path, output: Path) -> dict:
     med.write(str(output), 2)
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError("Whole-model crack MED export produced no mesh")
+    save_discrete(output.with_name("quadratic_discrete.npz"), arrays["nodes"], points, links,
+                  point_matrices, link_matrices)
     summary = {"nodes": int(len(arrays["nodes"])), "volume_cells": int(len(arrays["cells"])),
                "quadratic_cells": int(np.count_nonzero(arrays["cells"][:, 4] >= 0)),
-               "face_cells": int(len(faces)), "springs": int(len(arrays["spring_pairs"])),
-               "support_points": int(len(support)), "hanging_nodes": int(len(arrays["hanging_nodes"]))}
+               "face_cells": int(len(faces)), "discrete_links": int(len(links)),
+               "discrete_points": int(len(points)), "hanging_nodes": int(len(arrays["hanging_nodes"]))}
     print(json.dumps(summary))
     return summary
 

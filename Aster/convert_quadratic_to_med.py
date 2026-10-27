@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
 from Aster.convert_three_body_to_med import mc, np
 from Aster.quadratic_surface import compact_blocks, group_stiffness_blocks
 
+IDS = np.int64 if mc.MEDCouplingSizeOfIDs() == 64 else np.int32
+
 
 def _level(coordinates, connectivity, norm, names):
     """Build a uniform cell level and explicit families in linear time."""
@@ -33,12 +35,12 @@ def _level(coordinates, connectivity, norm, names):
         names = names[order]
         types = np.where(linear, {10: mc.NORM_TETRA4, 6: mc.NORM_TRI3}[width], norm)
         padded = np.column_stack([types, connectivity])
-        flat = padded[padded >= 0].astype(np.int32)
+        flat = padded[padded >= 0].astype(IDS)
         sizes = np.where(linear, linear_width + 1, width + 1)
-        offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int32)
+        offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(IDS)
     else:
-        flat = np.column_stack([np.full(count, norm), connectivity]).astype(np.int32).ravel()
-        offsets = np.arange(0, (count + 1) * (width + 1), width + 1, dtype=np.int32)
+        flat = np.column_stack([np.full(count, norm), connectivity]).astype(IDS).ravel()
+        offsets = np.arange(0, (count + 1) * (width + 1), width + 1, dtype=IDS)
     mesh.setConnectivity(mc.DataArrayInt(flat.ravel()), mc.DataArrayInt(offsets), True)
     mesh.setCoords(coordinates)
     return mesh, names
@@ -78,7 +80,7 @@ def convert(archive: Path, output: Path) -> dict:
         mesh, names = _level(coordinates, conn, norm, names)
         med.setMeshAtLevel(level, mesh)
         distinct, inverse = np.unique(names, return_inverse=True)
-        family_ids = np.arange(next_family, next_family - len(distinct), -1, dtype=np.int32)
+        family_ids = np.arange(next_family, next_family - len(distinct), -1, dtype=IDS)
         families = [f"F{-int(value)}" for value in family_ids]
         family_info.update(zip(families, family_ids.tolist()))
         group_info.update({str(name): [family] for name, family in zip(distinct, families)})

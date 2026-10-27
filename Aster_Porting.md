@@ -866,17 +866,26 @@ jobs) on the job's own three-body mesh:
 - `whole_model_crack_mesh.py` cuts the wall (only) conformingly at the two seed
   faces (z ± 0.001 m), so the 2 mm seed layer spans the full wall length, then
   elevates wall cells whose centroid is within 0.75 m of the crack to TETRA10.
-  All other wall, foundation and bedrock cells stay TETRA4 with the baseline
-  wall-foundation springs and support springs. Band mid-edge nodes on faces
+  All other wall, foundation and bedrock cells stay TETRA4. Source joint
+  coefficients are retained but are now integrated consistently on both actual
+  refined traces, including wall-to-wall joints and wall-to-foundation
+  interfaces; vertex-only joint springs are no longer carried into this mesh.
+  The unchanged linear rock retains its original exterior support operator.
+  Band mid-edge nodes on faces
   shared with linear cells (`HANGING_NODES`) are tied with `LIAISON_MAIL`.
 - `convert_whole_model_to_med.py` writes the mixed-order MED (bundled
-  MEDCoupling; identifier width follows `MEDCouplingSizeOfIDs`).
+  MEDCoupling; identifier width follows `MEDCouplingSizeOfIDs`) and mandatory
+  `quadratic_discrete.npz` (export input unit 92). `refined_interface.py`
+  integrates the common refinement of both traces with exact TRI6 mass
+  products, retaining source triangle identities and checking area/coverage.
+  `native_discrete` imports grouped POI1 diagonals and general SEG2
+  off-diagonal blocks without double-counting the old joint springs.
 - `cases/whole_model_crack.comm`: `3D_GRAD_VARI` + `ENDO_FISS_EXP` on
   `DAMAGE_BAND`, `3D` + `ELAS` elsewhere, `DIS_T` springs. The frozen seed
   (`native_seed.initial_field(..., elastic_elsewhere=True)`) is applied only in
   the band; the band carries the concrete density so gravity is uniform.
   Water, crest surcharge and self-weight ramp together over load factors
-  0.1 to 1.0. `RESI_REFE_RELA` 1e-6 with `EFFORT_REFE` = FT x median
+  0.1 to 1.0. `RESI_REFE_RELA` 1e-4 (was 1e-6; see below) with `EFFORT_REFE` = FT x median
   wall-foundation tributary area (an assumption for the spring residual).
   Wall, foundation and bedrock peak principal stresses are recorded per state.
 - `extract_whole_model_crack.py` writes `crack.pvd` / VTU per state with
@@ -895,11 +904,23 @@ in `.wslconfig`. run_aster's configured `tmpdir` is `/tmp`, which WSL backs
 with RAM, so the solve passes `--wrkdir /var/tmp/lamb_aster_crack/<run>` (ext4
 disk) and deletes that directory afterwards, even on failure.
 
-Verification: on a synthetic 5 m wall arc (8,448 cells, 299 tied nodes) all
+Before the consistent-interface correction, verification on a synthetic
+5 m wall arc (8,448 cells, 299 tied nodes) found all
 11 states converged in 51 s and damage grew to 0.72 beside the seed. On the
 repository dam (seed z = -15.73 m) the mesh has 402,054 nodes, 148,448 band
 cells and 10,266 tied nodes; a full run is a user job and was not completed
 during development.
+
+The corrected saved-dam elastic check completed in 475.69 s under a 540 s
+watchdog on the identical volume mesh, with unchanged physical spring
+coefficients, loads and ties. Wall Gauss-point extrema changed from
+26.232/-40.348 to 1.517/-2.937 MPa. Native refined-interface assembly matches
+every matrix entry to 1.23e-11 relative error; global force/moment balance
+errors are 1.52e-11/2.80e-11. The actual production preparation reproduces
+the verified operator array-for-array. Corrected nonlinear damage runs and
+mesh convergence remain unverified. See
+[the diagnostic correction and verification record](Aster/CASE_STUDY_DIAGNOSTICS.md#implemented-consistent-interface-correction);
+archived vertex-only results are historical, not corrected fracture results.
 
 Linear solver: the real mesh has about 1.33 million DOFs (about 61.6k of them
 Lagrange multipliers from `LIAISON_MAIL`). Double-precision MUMPS failed with
@@ -993,7 +1014,9 @@ curved **wall-only block** around the seed (option A, user-approved):
   definitions as the FEniCSx three-body runner. The schedule is seed
   equilibration at zero load (times 0 to 1), then load factors 0.1 to 1.0.
 - `ENDO_FISS_EXP` / `3D_GRAD_VARI` use the shared provisional material contract
-  with `RESI_REFE_RELA` 1e-6 (the synthetic benchmarks used 1e-8), Newton line
+  with `RESI_REFE_RELA` 1e-4 (the synthetic benchmarks used 1e-8; 1e-6 stagnated at
+  2-5e-6 on the full dam while RESI_GLOB_RELA reached ~1e-14, i.e. below the
+  round-off floor, so every step cut repeated a 1.7 h stall), Newton line
   search and automatic step subdivision. User jobs have no runtime cap.
 - Outputs per run: `manifest.json` (configuration and prepared-seed hashes),
   `crack_report.json` (layout, loads, interpolation distance, native seed,

@@ -1,5 +1,6 @@
 """Run with the native bundled Python/MED interpreter, not Windows .venv."""
 import json
+import importlib.util
 from pathlib import Path
 import sys
 import tempfile
@@ -13,13 +14,56 @@ from Aster.quadratic_surface import surface_blocks
 NATIVE_MED_AVAILABLE = (
     Path(sys.executable).parent.parent / "medcoupling-9.11.0" / "lib"
     / "python3.10" / "site-packages" / "medcoupling.py"
-).is_file()
+).is_file() or importlib.util.find_spec("medcoupling") is not None
 if NATIVE_MED_AVAILABLE:
     from Aster.convert_quadratic_to_med import convert, mc
 
 
 @unittest.skipUnless(NATIVE_MED_AVAILABLE, "Requires Code_Aster's bundled MED interpreter")
 class QuadraticMedTests(unittest.TestCase):
+    def test_corrected_whole_model_roundtrip_keeps_groups_and_operator_identities(self):
+        from Aster.convert_whole_model_to_med import convert as convert_whole, FACE_GROUPS, VOLUME_GROUPS
+        from Aster.test_whole_model_crack import three_body, SEED
+        from Aster.whole_model_crack_mesh import archive_arrays, build
+        from Aster.quadratic_surface import split_blocks
+
+        arrays = three_body()
+        built = build(arrays, SEED, .75)
+        saved = archive_arrays(arrays, built)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            archive, output = directory / "mesh.npz", directory / "mesh.med"
+            np.savez(archive, **saved)
+            convert_whole(archive, output)
+            native = mc.MEDFileUMesh.New(str(output))
+            np.testing.assert_array_equal(native.getCoords().toNumPyArray(), saved["nodes"])
+            for name in VOLUME_GROUPS:
+                expected = saved["cells"][saved[f"group_{name.lower()}"]]
+                group = native.getGroup(0, name)
+                self.assertEqual(group.getNumberOfCells(), len(expected))
+                self.assertEqual({tuple(row[row >= 0]) for row in expected},
+                                 {tuple(group.getNodeIdsOfCell(i)) for i in range(len(expected))})
+            for name in FACE_GROUPS:
+                expected = saved[f"faces_{name.lower()}"]
+                group = native.getGroup(-1, name)
+                self.assertEqual({tuple(row[row >= 0]) for row in expected},
+                                 {tuple(group.getNodeIdsOfCell(i)) for i in range(len(expected))})
+            self.assertNotIn("WALL_FOUNDATION_SPRINGS", native.getGroupsNames())
+            expected = split_blocks(saved["surface_block_pairs"],
+                                    saved["surface_block_matrices_n_per_m"], len(saved["nodes"]))
+            with np.load(directory / "quadratic_discrete.npz") as data:
+                for key, value in zip(("point_node_ids", "link_node_ids", "point_matrices_n_per_m",
+                                       "link_matrices_n_per_m"), expected):
+                    np.testing.assert_array_equal(data[key], value)
+                for key, level, group in (("point_node_ids", -3, "QS_POINTS"),
+                                           ("link_node_ids", -2, "QS_LINKS")):
+                    mesh = native.getGroup(level, group)
+                    actual = np.asarray([mesh.getNodeIdsOfCell(i)
+                                         for i in range(mesh.getNumberOfCells())])
+                    np.testing.assert_array_equal(actual, data[key].reshape(len(actual), -1))
+            np.testing.assert_array_equal(native.getGroupArr(1, "HANGING_NODES").toNumPyArray(),
+                                          saved["hanging_nodes"])
+
     def test_mixed_order_roundtrip_keeps_source_cells_body_groups_and_surface_orders(self):
         tetra = np.array([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.], [0., 0., 4.]])
         nodes = np.vstack([tetra, tetra, tetra])

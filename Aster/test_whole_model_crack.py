@@ -63,6 +63,8 @@ def three_body():
     r_mean, z_mean = radius[wall_faces].mean(1), nodes[wall_faces, 2].mean(1)
     bottom = np.flatnonzero(np.isclose(nodes[:len(wall_nodes), 2], -14))
     rock_faces = boundary(rock)
+    joint = wall_faces[np.isclose(nodes[wall_faces, 2], -14).all(1)]
+    joint_master = np.array([[lookup[tuple(np.round(nodes[w], 6))] for w in face] for face in joint])
     return {
         "nodes": nodes, "tetra4_concrete": np.vstack([wall, found]), "tetra4_bedrock": rock,
         "concrete_body_ids": np.concatenate([np.ones(len(wall), int), np.full(len(found), 3)]),
@@ -72,7 +74,11 @@ def three_body():
         "tri3_rock_sides": rock_faces[np.isclose(np.arctan2(nodes[rock_faces, 0], nodes[rock_faces, 1]),
                                                  THETA[0]).all(1)],
         "seg2_wall_foundation_springs": np.array([[w, lookup[tuple(np.round(nodes[w], 6))]] for w in bottom]),
+        "joint_slave_tri3": joint, "joint_master_tri3": joint_master,
+        "joint_coefficients_n_per_m3": np.tile([2e9, 2e9, 5e9], (len(joint), 1)),
         "support_nodes": np.flatnonzero(np.isclose(nodes[:, 2], -20)),
+        "support_matrices_n_per_m": np.tile(np.eye(3) * 1e9,
+                                             (np.count_nonzero(np.isclose(nodes[:, 2], -20)), 1, 1)),
     }
 
 
@@ -140,7 +146,9 @@ class BuildTest(unittest.TestCase):
                                       np.ones(count, bool))
         self.assertFalse((archive["group_hanging_master"] & archive["group_damage_band"]).any())
         self.assertEqual(archive["faces_upstream"].shape[1], 6)
-        self.assertEqual(len(archive["spring_pairs"]), len(self.arrays["seg2_wall_foundation_springs"]))
+        self.assertNotIn("spring_pairs", archive)
+        self.assertEqual(archive["surface_block_pairs"].shape[1], 2)
+        self.assertEqual(self.built["report"]["interface_integration"]["law"], wm.INTERFACE_OPERATOR)
 
     def test_crack_faces_cover_the_seed_sector_and_point_into_the_slab(self):
         faces, nodes, report = self.built["crack_faces"], self.built["nodes"], self.built["report"]
@@ -202,6 +210,7 @@ class OrchestrationTest(unittest.TestCase):
             if "rm" in command:
                 return subprocess.CompletedProcess(command, 0, "", "")
             (Path(self.output) / "mesh.med").write_bytes(b"med")
+            (Path(self.output) / "quadratic_discrete.npz").write_bytes(b"operator")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as root:
@@ -243,7 +252,7 @@ class OrchestrationTest(unittest.TestCase):
         self.assertNotIn("\r", text)
         self.assertIn("P ncpus 8\n", text)
         self.assertIn("P memory_limit 18000\n", text)
-        for unit in ("D 1", "D 91", "D 20", "R 90", "R 89", "R 80"):
+        for unit in ("D 1", "D 91", "D 20", "D 92", "R 90", "R 89", "R 80"):
             self.assertRegex(text, rf"F \w+ /mnt/\S+ {unit}\n" if wm.os.name == "nt" else rf"F \w+ /\S+ {unit}\n")
 
     def test_crack_metrics_count_new_damage_outside_the_seed(self):
@@ -268,6 +277,12 @@ class OrchestrationTest(unittest.TestCase):
         self.assertIn("elastic_elsewhere=True", case)
         self.assertIn('_F(GROUP_MA="DAMAGE_BAND", RELATION="ENDO_FISS_EXP"', case)
         self.assertIn("LIAISON_MAIL", case)
+
+    def test_case_reference_tolerance_stays_above_round_off_floor(self):
+        # 1e-6 stagnated at 2-5e-6 with RESI_GLOB_RELA ~1e-14 on the full dam model.
+        case = wm.CASE.read_text(encoding="utf-8")
+        self.assertIn("RESI_REFE_RELA=1e-4, ITER_GLOB_MAXI=50", case)
+        self.assertNotIn("ARRET", case)
 
     def test_case_applies_crack_water_pressure_without_reorienting_crack_faces(self):
         case = wm.CASE.read_text(encoding="utf-8")

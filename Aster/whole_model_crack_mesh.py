@@ -54,12 +54,14 @@ def _triangulate(polygon):
 
 
 def slice_plane(nodes: np.ndarray, tets: np.ndarray, selected: np.ndarray, faces: dict,
-                elevation: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+                elevation: float, face_origins: dict | None = None
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Cut selected tetrahedra (and their boundary triangles) by the plane z = elevation.
 
     Returns new nodes (old ids unchanged, cut nodes appended), new cells, the parent
     cell index of every new cell and the new face arrays. Each piece of a cut cell is
     convex, so a fan from its lowest node id over its other faces gives positive tets.
+    If supplied, face_origins is updated in place alongside the new face arrays.
     """
     nodes = np.asarray(nodes, dtype=float)
     tets = np.asarray(tets, dtype=np.int64)
@@ -122,12 +124,19 @@ def slice_plane(nodes: np.ndarray, tets: np.ndarray, selected: np.ndarray, faces
         triangle_sides = side[triangles]
         cut_faces = (triangle_sides.max(1) > 0) & (triangle_sides.min(1) < 0)
         rows = [triangles[~cut_faces]]
-        for triangle in triangles[cut_faces]:
+        origins = [face_origins[name][~cut_faces]] if face_origins is not None else []
+        for index in np.flatnonzero(cut_faces):
+            triangle = triangles[index]
             for sign in (1, -1):
                 polygon = _clip([int(value) for value in triangle], side_of, sign, _strict(cut_ids))
                 if len(polygon) >= 3:
-                    rows.append(np.asarray(_triangulate(polygon), dtype=np.int64))
+                    pieces = np.asarray(_triangulate(polygon), dtype=np.int64)
+                    rows.append(pieces)
+                    if face_origins is not None:
+                        origins.append(np.full(len(pieces), face_origins[name][index], dtype=np.int64))
         new_faces[name] = np.vstack(rows)
+        if face_origins is not None:
+            face_origins[name] = np.concatenate(origins)
     return all_nodes, cells, parent, new_faces
 
 
@@ -261,13 +270,22 @@ def build(arrays: dict, geometry: dict, band_half_height_m: float) -> dict:
     if np.intersect1d(wall_nodes, concrete[~wall]).size or np.intersect1d(wall_nodes, bedrock).size:
         raise ValueError("The wall shares nodes with the foundation or bedrock; it cannot be cut alone")
     faces = {name: np.asarray(arrays[name], dtype=np.int64) for name in FACE_ARRAYS}
+    for side in ("slave", "master"):
+        faces[f"joint_{side}"] = np.asarray(arrays[f"joint_{side}_tri3"], dtype=np.int64)
+    if len(faces["joint_slave"]) != len(faces["joint_master"]):
+        raise ValueError("Incomplete source interface face correspondence")
     wall_faces = {name: triangles[np.isin(triangles, wall_nodes).all(1)] for name, triangles in faces.items()}
     other_faces = {name: triangles[~np.isin(triangles, wall_nodes).all(1)] for name, triangles in faces.items()}
+    wall_origins = {name: np.flatnonzero(np.isin(triangles, wall_nodes).all(1))
+                    for name, triangles in faces.items()}
+    other_origins = {name: np.flatnonzero(~np.isin(triangles, wall_nodes).all(1))
+                     for name, triangles in faces.items()}
     cells, body = concrete, bodies
     report = {"original_concrete_cells": int(len(concrete)), "cut_planes_m": []}
     for plane in (elevation - half, elevation + half):
         before = len(cells)
-        nodes, cells, parent, wall_faces = slice_plane(nodes, cells, body == 1, wall_faces, plane)
+        nodes, cells, parent, wall_faces = slice_plane(nodes, cells, body == 1, wall_faces, plane,
+                                                      wall_origins)
         body = body[parent]
         report["cut_planes_m"].append({"z_m": plane, "cells_added": int(len(cells) - before)})
     centroid_z = nodes[cells, 2].mean(1)
@@ -279,16 +297,27 @@ def build(arrays: dict, geometry: dict, band_half_height_m: float) -> dict:
         raise ValueError("The damage band does not contain the whole seed slab")
     if np.any(signed_volumes(nodes, cells) <= 0):
         raise ValueError("The cut wall mesh contains inverted cells")
-    all_faces = {name: np.vstack([other_faces[name], wall_faces[name]]) for name in FACE_ARRAYS}
+    all_faces = {name: np.vstack([other_faces[name], wall_faces[name]]) for name in faces}
     elevated = elevate_band(nodes, cells, band, all_faces)
+    from Aster.refined_interface import interface_blocks
+    source_xyz = np.asarray(arrays["nodes"])[arrays["joint_slave_tri3"]]
+    source_areas = np.linalg.norm(np.cross(source_xyz[:, 1] - source_xyz[:, 0],
+                                          source_xyz[:, 2] - source_xyz[:, 0]), axis=1) / 2
+    joint_pairs, joint_blocks, joint_audit = interface_blocks(
+        elevated["nodes"], elevated["faces"]["joint_slave"], elevated["faces"]["joint_master"],
+        np.concatenate([other_origins["joint_slave"], wall_origins["joint_slave"]]),
+        np.concatenate([other_origins["joint_master"], wall_origins["joint_master"]]),
+        arrays["joint_coefficients_n_per_m3"], source_areas_m2=source_areas)
     crack = crack_faces(elevated["nodes"], elevated["cells"], seed_layer, geometry)
     report.update({
         "concrete_cells": int(len(cells)), "damage_band_cells": int(band.sum()),
         "seed_layer_cells": int(seed_layer.sum()), "hanging_nodes": int(len(elevated["hanging_nodes"])),
         "band_half_height_m": band_half_height_m, "nodes": int(len(elevated["nodes"])),
         **crack["report"],
+        "interface_integration": joint_audit,
     })
     return {**elevated, "body_ids": body, "band": band, "seed_layer": seed_layer,
+            "joint_block_pairs": joint_pairs, "joint_block_matrices_n_per_m": joint_blocks,
             "crack_faces": crack["faces"], "report": report}
 
 
@@ -325,8 +354,11 @@ def archive_arrays(arrays: dict, built: dict) -> dict:
         "faces_crack_faces": built["crack_faces"],
         "faces_rock_bottom": pad(arrays["tri3_rock_bottom"]),
         "faces_rock_sides": pad(arrays["tri3_rock_sides"]),
-        "spring_pairs": np.asarray(arrays["seg2_wall_foundation_springs"], dtype=np.int64),
-        "support_nodes": np.asarray(arrays["support_nodes"], dtype=np.int64),
+        "surface_block_pairs": np.vstack([
+            built["joint_block_pairs"],
+            np.repeat(np.asarray(arrays["support_nodes"], dtype=np.int64)[:, None], 2, axis=1)]),
+        "surface_block_matrices_n_per_m": np.concatenate([
+            built["joint_block_matrices_n_per_m"], arrays["support_matrices_n_per_m"]]),
         "hanging_nodes": np.asarray(built["hanging_nodes"], dtype=np.int64),
         **crack_node_groups(built),
     }

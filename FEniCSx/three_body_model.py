@@ -23,6 +23,15 @@ def is_three_body(structure):
     return getattr(structure, "three_body_config", None) is not None
 
 
+def physical_configuration(config):
+    """The configuration without fracture_debug, which only tunes the cracking solvers.
+
+    A stage rerun may change fracture_debug while reusing the meshes and the elastic
+    baseline built from the originally submitted configuration.
+    """
+    return {key: value for key, value in config.items() if key != "fracture_debug"}
+
+
 def require_fracture_resolution(options):
     from crack_field import MINIMUM_ELEMENTS_PER_LENGTH_SCALE
 
@@ -331,7 +340,7 @@ def source_wall_bedrock_seat(config, diagnostic):
 
 def load_structure(config_path: Path, model: Path, structure):
     config = json.loads(config_path.read_text())
-    if json.loads((model / "config.json").read_text()) != config:
+    if physical_configuration(json.loads((model / "config.json").read_text())) != physical_configuration(config):
         raise ValueError("Three-body source mesh configuration differs from the submitted snapshot")
     diagnostic = json.loads((model / "diagnostic.json").read_text())
     if diagnostic["joints"] != "spring":
@@ -442,8 +451,12 @@ def require_verified_baseline(structure, directory):
     if (manifest.get("status") != "completed_not_engineering_validated"
             or manifest.get("scenario_name") != "Baseline_NoPhase"):
         raise ValueError("Three-body baseline has not completed successfully")
-    if any(document.get("configuration_sha256") != structure.submitted_configuration_sha256
-           for document in (manifest, report)):
+    # The baseline's own config snapshot must be the one its evidence was hashed from and be
+    # physically identical to this job's configuration (fracture_debug may differ on a rerun).
+    baseline_bytes = (directory / "config.json").read_bytes()
+    baseline_sha256 = hashlib.sha256(baseline_bytes).hexdigest()
+    if (any(document.get("configuration_sha256") != baseline_sha256 for document in (manifest, report))
+            or physical_configuration(json.loads(baseline_bytes)) != physical_configuration(structure.three_body_config)):
         raise ValueError("Verified baseline configuration does not match this fracture job")
     if source.get("sha256") != structure.three_body_source["sha256"]:
         raise ValueError("Verified baseline source mesh/configuration/diagnostic hashes have changed")
@@ -458,7 +471,7 @@ def require_verified_baseline(structure, directory):
             or report.get("stress_recovery", {}).get("peak_measure") != "recovered_nodal"
             or not 0 <= balance <= 1e-6):
         raise ValueError("Three-body elastic parity/equilibrium gate did not pass")
-    return {"directory": str(directory.resolve()), "configuration_sha256": manifest["configuration_sha256"],
+    return {"directory": str(directory.resolve()), "configuration_sha256": baseline_sha256,
             "source_sha256": source["sha256"], "verification": gate}
 
 
