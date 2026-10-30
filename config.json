@@ -10,6 +10,7 @@
     },
     "global_element_size_m": 0.5,
     "local_element_size_m": 0.1,
+    "target_wall_tetrahedral_elements": 150000,
     "wall": {
       "radial_width_m": 4.0,
       "height_m": 29.0,
@@ -109,7 +110,10 @@
       "youngs_modulus": 35000000000.0,
       "poisson_ratio": 0.2,
       "tensile_strength_pa": 2000000.0,
-      "compressive_strength_pa": 20000000.0
+      "compressive_strength_pa": 30000000.0,
+      "cohesive_fracture_energy_j_m2": 100.0,
+      "selected_youngs_modulus": 15000000000.0,
+      "selected_tensile_strength_pa": 500000.0
     },
     "bedrock": {
       "density": 2700,

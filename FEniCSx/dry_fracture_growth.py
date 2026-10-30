@@ -392,6 +392,7 @@ def solve_dry_contact_growth(
     contact_options, growth_options: GrowthOptions, output: Path,
     interface_springs=None, linear_support=None, additional_nodal_forces=None,
     opening_limit_m=0.002, previously_broken=(), selected_tensile_strength_pa=0.,
+    selected_young_pa=None,
 ):
     """Dry native selected-material/contact candidate growth; no crack pressure."""
     return _solve_contact_growth(
@@ -401,7 +402,7 @@ def solve_dry_contact_growth(
         growth_options=growth_options, output=output, interface_springs=interface_springs,
         linear_support=linear_support, additional_nodal_forces=additional_nodal_forces,
         opening_limit_m=opening_limit_m, previously_broken=previously_broken,
-        selected_tensile_strength_pa=selected_tensile_strength_pa,
+        selected_tensile_strength_pa=selected_tensile_strength_pa, selected_young_pa=selected_young_pa,
         hydraulic_factory=None, state_factory=contact_event_growth_state,
         equilibrium_type=DryGrowthEquilibrium, mode="dry")
 
@@ -412,7 +413,7 @@ def _solve_contact_growth(
     contact_options, growth_options, output, interface_springs, linear_support,
     additional_nodal_forces, opening_limit_m, previously_broken,
     hydraulic_factory, state_factory, equilibrium_type, mode, problem_provenance=None,
-    selected_tensile_strength_pa=0., trial_bound_factory=None,
+    selected_tensile_strength_pa=0., trial_bound_factory=None, selected_young_pa=None,
 ):
     """Native candidate search retaining unbroken faces as full vector bonds.
 
@@ -486,6 +487,7 @@ def _solve_contact_growth(
                 linear_support=linear_support, additional_nodal_forces=additional_nodal_forces,
                 opening_limit_m=opening_limit_m, released_face_mask=released,
                 selected_tensile_strength_pa=selected_tensile_strength_pa,
+                selected_young_pa=selected_young_pa,
                 equilibrium_seed=initial_event,
                 hydraulics=hydraulic_factory(released) if hydraulic_factory is not None and released.any() else None,
             )
@@ -554,6 +556,7 @@ def solve_source_dry_growth(
     structure, affected_source_rows, marker_source_edges, *, maximum_volume_change,
     event_options, contact_options, growth_options: GrowthOptions, output: Path,
     opening_limit_m=0.002, selection_provenance=None, selected_tensile_strength_pa=0.,
+    selected_young_pa=None,
 ):
     """Experimental source-to-equilibrium dry mesh-facet energy search.
 
@@ -571,7 +574,7 @@ def solve_source_dry_growth(
         maximum_volume_change=maximum_volume_change, event_options=event_options,
         contact_options=contact_options, growth_options=growth_options, output=output,
         opening_limit_m=opening_limit_m, selection_provenance=selection_provenance,
-        selected_tensile_strength_pa=selected_tensile_strength_pa,
+        selected_tensile_strength_pa=selected_tensile_strength_pa, selected_young_pa=selected_young_pa,
         prepared_driver=driver, mode="dry",
         water_model="explicitly dry new surfaces; unchanged exterior reservoir/tailwater loads")
 
@@ -580,6 +583,7 @@ def _solve_source_growth(
     structure, affected_source_rows, marker_source_edges, *, maximum_volume_change,
     event_options, contact_options, growth_options, output, opening_limit_m,
     selection_provenance, prepared_driver, mode, water_model, selected_tensile_strength_pa=0.,
+    selected_young_pa=None,
 ):
     """Canonical source/load/support preparation shared by growth specializations."""
     from dolfinx import fem
@@ -622,6 +626,7 @@ def _solve_source_growth(
         "selection_provenance": selection_provenance,
         "internal_crack_water_model": water_model,
         "selected_tensile_strength_pa": selected_tensile_strength_pa,
+        "selected_young_pa": selected_young_pa,
     }
 
     def persist_source():
@@ -645,6 +650,7 @@ def _solve_source_growth(
             event_options=event_options, contact_options=contact_options,
             growth_options=growth_options, opening_limit_m=opening_limit_m, output=output / "trials",
             selected_tensile_strength_pa=selected_tensile_strength_pa,
+            **({"selected_young_pa": selected_young_pa} if selected_young_pa is not None else {}),
         )
         result.update({key: value for key, value in source_report.items() if key != "status"})
         result["accepted_event_directory"] = str(Path("trials") / result["accepted_event_directory"])

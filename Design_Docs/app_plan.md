@@ -1,5 +1,126 @@
 # Dam Analysis Workbench - implementation plan
 
+## Automatic whole-wall cracking: formulation gate
+
+The planned replacement for manual painting is a read-only whole-wall assessment
+followed by explicit submission. It is not a drop of whole-element Young's
+modulus to 1,000 Pa. The proposed cohesive/discrete approach must preserve
+compressive contact and include verified water pressure on evolving,
+reservoir-connected cracks before automatic app submission can be enabled.
+Existing painted submissions and historical results are not changed by this
+formulation work.
+
+`FEniCSx/cohesive_mode_i.py` supplies the experimental, already-initiated
+Mode-I interface law for specimen verification: linear traction-opening
+softening with critical opening `2*G_f/f_t`, secant unloading/reloading,
+irreversible maximum-opening history and explicit stored/dissipated energy.
+Trials return new history; only an audited equilibrium may commit it.
+Do not charge the legacy `Gc*area` fracture cost again for this cohesive process.
+This module alone does not implement intact bonds, stress-driven initiation,
+topology insertion, compression contact, tangential transfer, equilibrium or
+hydraulic access (see `cohesive_contact.py` below). Its unit tests do not verify coupled crack propagation.
+
+The proposed tensile fracture energy is user-supplied 400 J/m2; no traceable
+test/material source has yet been supplied, so it remains independently
+unverified. The existing `fracture_debug.critical_energy_release_rate_j_m2`
+must not silently be treated as this separate cohesive material property.
+The 400 J/m2 and 2 MPa unit-test values give a 0.0004 m terminal softening
+opening, not an accepted dam calibration or the existing 0.002 m opening
+warning threshold. It is now the optional configuration field
+`material.concrete.cohesive_fracture_energy_j_m2` (validated positive in
+Python and WPF, editable in the Configuration view). Historical configurations
+without it remain valid and are never given a guessed value; automatic
+screening reports it as absent and cannot be confirmed for them.
+Softening invalidates assumptions behind the current convex hydraulic-bound
+certificate.
+
+`FEniCSx/cohesive_contact.py` adds the experimental coupled specimen solver:
+uninitiated paired vertices are exactly tied, an audited initiation releases a
+pair whose recovered normal tie traction reaches `f_t` to the cohesive law,
+initiated pairs carry cohesive traction in opening and frictionless unilateral
+contact in closure (closure never heals history), and reservoir water is
+applied to cracks connected to the reservoir. Its specimen tests pass; they do
+not verify the real dam. Paired nodes must belong to exactly one pair;
+`FEniCSx/cohesive_network.py` adds the node-junction network used for
+whole-wall facet growth.
+
+`FEniCSx/automatic_screening.py` is the read-only first step of the automatic
+workflow. It solves the job's intact native equilibrium
+(`tensile_loss_event.solve_source_event(intact_only=True)`), computes each wall
+cell's maximum principal stress and lists cells above
+`f_t*(1+relative_tolerance)` with their volume, peak, location and direction,
+plus the near-critical count. It is an initial-state screening, not a crack
+prediction: redistribution after cracking can extend or arrest damage. The API
+exposes it at `/jobs/{id}/automatic-cracking/screening` (start/read/cancel) and
+`/confirmation` (immutable record of the exact run, its configuration digest,
+baseline and Gf). The desktop crack-definition window defaults to this
+automatic mode, highlighting overstressed cells in magenta; manual painting
+remains available as the experimental alternative. For the saved reference job
+the intact wall peak is 1.051 MPa (0.53 `f_t`), so screening reports no
+overstressed cells.
+
+`FEniCSx/automatic_cracking.py` is the experimental real-dam runner. It takes a
+completed screening, rebuilds the native wall candidates and runs the cohesive
+network under proportional load control (reservoir water only on cracks
+connected to tag 2). Outcomes: `no_damage_initiated` (exact when the screening
+peak is below `f_t*(1-tol)` for proportional linear loading) and
+`accepted_equilibrium` are the only accepted results; `unsupported_geometry`,
+`unsupported_hydraulics`, `nonconvergence`, `unresolved_initiation`,
+`resource_limit` and `cancelled` are reported honestly as not accepted. When
+the cell principal peak exceeds `f_t`, the runner first evaluates the
+network's own initiation measure, the one-sided facet-normal stress
+`max(n.sigma_L.n, n.sigma_R.n)` (larger owner cell; the two-cell average
+diluted one-element-thick surface tension below `f_t` and never initiated), on
+every interior wall facet from the verified screening archives
+(`intact_facet_screening` in the summary; the screening reports the same
+`facet_check` so review shows whether cracking will initiate). If every facet
+is below `f_t*(1-tol)` the result is `no_damage_initiated` without mesh work;
+otherwise the cells beside critical facets seed the candidate region, which
+sheds neighbour rings (down to zero) to fit the face preflight. The final
+state is accepted only if no non-candidate wall facet reaches `f_t`. Screening
+cell counts therefore overstate initiation: isolated P1 cell peaks (for example
+a 1.24 MPa surface-layer peak with `f_t` = 1 MPa) need not act normal to any
+shared facet. It
+writes `summary.json` (load factor, steps, dissipation, wet faces, bonded peak)
+and, when cracks exist, `cohesive_surface.vtu`.
+
+Submission is gated: `POST /jobs/{id}/automatic-cracking/submit` returns 202
+only when the latest screening succeeded, has a verified confirmation
+(matching run id, configuration digest, screening digest and Gf) and nothing
+else runs for the job; otherwise 409. A newer unconfirmed screening supersedes
+an older confirmation. `GET /jobs/{id}/automatic-cracking/run` returns the
+latest run (`summary` without per-step data, `accepted`,
+`engineering_validated: false`) and `POST .../run/cancel` stops it. The API
+verifies the runner manifest, summary digest and provenance before reporting
+success. The desktop Submit button follows `submission_allowed`, shows the run
+description and limitations, and opens the crack surface in ParaView.
+
+A submitted run is the job's fracture stage, exactly as a painted event is:
+the job becomes `running` with stage `automatic_cracking`, `fracture_source`
+becomes `automatic` (a later painted event sets it back to `painted`), Crack
+definition shows succeeded and the three fracture stages (group "Fracture
+analysis (automatic cohesive)") follow the runner manifest phase: screening
+checks, mesh import and candidate preparation are Preparing; assembling the
+native system is Initial equilibrium; the cohesive network solve is Growth.
+When the runner ends the job returns to its previous status and
+`automatic_cracking_status` records the outcome: `succeeded` only for an
+accepted outcome; a completed but unaccepted outcome is `failed` with its
+`outcome_basis` (at Preparing when refused before any load step, otherwise at
+Growth). Cancel Job stops only this run (`cancelled`); an API restart marks a
+running run `interrupted`; restarting a fracture stage resubmits the latest
+confirmed screening. The desktop window closes on submit and the Run/Results
+pipeline, activity monitor and job log (the runner log, via
+`/painted-event/logs`) take over. The network solve reports no per-step
+progress, so Growth has no ETA.
+
+Known limits: on structured hex-derived tetrahedral meshes, growth beyond
+initial softening stops with `unsupported_geometry` (a detaching wedge needs
+two normals at one vertex pair); load control cannot trace snap-back (coarse
+meshes report `nonconvergence`); real-scale solve cost, Gf (400 J/m2) and an
+overstressed real-dam run are unverified. Jobs submitted before the Gf field
+existed cannot run: the provenance chain forbids adding Gf afterwards, so a new
+job must be submitted.
+
 ## Current execution restriction
 
 Legacy seeded-crack app submission and cracking reruns are retired. New API jobs
@@ -24,6 +145,13 @@ the preview into the legacy seed workflow.
   zero reproduces the no-tension case. This is not irreversible softening or
   strength-calibrated nucleation. The cap, energy and tangent are used together
   in the growth equilibria and recorded in numerical inputs/results.
+- Optional `material.concrete.selected_youngs_modulus` sets the damaged-concrete
+  Young's modulus of painted cells (positive, not above the concrete modulus;
+  absent keeps the original stiffness). It applies with the tensile cap after
+  the intact equilibrium and is recorded in the manifest, event report and
+  native inputs. The shipped values follow `element_matrix.csv` (35/15 GPa,
+  2/0.5 MPa, fc 30 MPa, Gf 100 J/m2). Automatic cohesive cracking does not use
+  the damaged properties.
 - The painter and API require hydrostatic mode. Pressure on released faces is
   derived from proven reservoir connectivity/head and retained exterior loads;
   arbitrary pressure on every internal face is not assigned. Reservoir
@@ -967,7 +1095,8 @@ independent sensitivity verification. See the README for existing-run export.
 | Wall radii and radial width | Validate width and midpoint relationships; display units in metres |
 | Contour `height` | Label as signed elevation relative to crest z = 0 |
 | `geometry.wall.height_m` | Clearly identify current nominal metadata; contours control the actual height |
-| Global element size | Starting suggestion; the wall analysis mesh scales it to stay at or below 150,000 final tetrahedra, while the conforming foundation and near-seat bedrock adapt to the effective target size |
+| Global element size | Starting suggestion; the wall analysis mesh scales it to stay at or below `geometry.target_wall_tetrahedral_elements` (default 150,000) final tetrahedra, while the conforming foundation and near-seat bedrock adapt to the effective target size |
+| Target wall tetrahedral elements | Optional integer ≥ 1,000 (default 150,000) capping wall-body tetrahedra; a number input in the Geometry tab |
 | Local element size | Identify which generator uses it; do not imply it refines the current combined mesh |
 | `water_height` | Reservoir depth above the deepest wall seat; with `overflow_head` sets the water surface |
 | `overflow_head` | Depth above the crest when overflowing; adds the crest surcharge |

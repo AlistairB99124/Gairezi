@@ -23,7 +23,7 @@ class FractureMaterialTests(unittest.TestCase):
         original = copy.deepcopy(self.config)
         contract = material_contract(self.config)
         p = contract["parameters"]
-        self.assertEqual(p["FC"], 20e6)
+        self.assertEqual(p["FC"], 30e6)
         self.assertEqual(p["FT"], self.config["material"]["concrete"]["tensile_strength_pa"])
         self.assertEqual(p["E"], self.config["material"]["concrete"]["youngs_modulus"])
         self.assertEqual(p["GF"], json.loads(FENICSX_DEFAULTS.read_text())["critical_energy_release_rate_j_m2"])
@@ -81,7 +81,7 @@ class FractureMaterialTests(unittest.TestCase):
         self.assertEqual(len(contracts), 9)
         self.assertEqual({c["parameters"]["LARG_BANDE"] for c in contracts}, {.25, .5, 1.})
         self.assertEqual({c["parameters"]["P"] for c in contracts}, {2., 5., 8.})
-        self.assertEqual({c["parameters"]["FC"] for c in contracts}, {20e6})
+        self.assertEqual({c["parameters"]["FC"] for c in contracts}, {30e6})
         self.assertEqual(len({c["parameters"]["GF"] for c in contracts}), 1)
         compile(command_text(contracts), "material.comm", "exec")
 
@@ -106,7 +106,7 @@ class FractureMaterialTests(unittest.TestCase):
             altered[0]["internal"][key] = value
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 validate_responses(contracts, altered)
-        responses[0]["parameters"]["FC"] = 30e6
+        responses[0]["parameters"]["FC"] = p["FC"] + 10e6
         with self.assertRaisesRegex(ValueError, "changed"):
             validate_responses(contracts, responses)
 

@@ -129,6 +129,40 @@ class PaintedRunnerTests(unittest.TestCase):
         self.assertEqual(report["growth_options"]["fracture_energy_j_m2"], 2700.)
         self.assertEqual(report["selected_tensile_strength_pa"], 1e6)
 
+    def test_damaged_youngs_modulus_is_validated_and_forwarded(self):
+        config = json.loads(self.configuration.read_text())
+        concrete = config["material"]["concrete"]
+        concrete.update({"youngs_modulus": 35e9, "selected_youngs_modulus": 15e9})
+        self.configuration.write_text(json.dumps(config))
+        packet = json.loads(self.saved.read_text())
+        packet.pop("selection_sha256")
+        packet["configuration_digest"] = hashlib.sha256(json.dumps(
+            config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        packet["selection_sha256"] = hashlib.sha256(json.dumps(
+            packet, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.saved.write_text(json.dumps(packet))
+        with patch("FEniCSx.painted_event_runner.environment", return_value={"test": True}), patch(
+            "FEniCSx.painted_event_runner.verified_source_selection",
+            return_value=(self.structure, self.binding)
+        ), patch("FEniCSx.painted_event_runner.solve_source_dry_growth",
+                 side_effect=RuntimeError("stop after forwarding")) as dry:
+            with self.assertRaisesRegex(RuntimeError, "stop after forwarding"):
+                self.run_event()
+            self.assertEqual(dry.call_args.kwargs["selected_young_pa"], 15e9)
+        report = json.loads((self.root / "output" / "manifest.json").read_text())
+        self.assertEqual(report["selected_youngs_modulus_pa"], 15e9)
+        self.assertIn("damaged concrete", report["selected_material_law"])
+
+    def test_omitted_damaged_modulus_keeps_intact_stiffness_call(self):
+        with patch("FEniCSx.painted_event_runner.environment", return_value={"test": True}), patch(
+            "FEniCSx.painted_event_runner.verified_source_selection",
+            return_value=(self.structure, self.binding)
+        ), patch("FEniCSx.painted_event_runner.solve_source_dry_growth",
+                 side_effect=RuntimeError("stop after forwarding")) as dry:
+            with self.assertRaisesRegex(RuntimeError, "stop after forwarding"):
+                self.run_event()
+            self.assertNotIn("selected_young_pa", dry.call_args.kwargs)
+
     def test_cli_requires_explicit_experiment_and_forwards_saved_input_paths(self):
         numerical = self.root / "numerical.json"
         numerical.write_text(json.dumps(self.options))

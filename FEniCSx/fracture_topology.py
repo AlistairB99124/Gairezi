@@ -4,7 +4,7 @@ Node-star connectivity across uncut faces defines which corners remain tied.
 No coordinates are merged and no initial opening or material change is imposed.
 The caller supplies fracture initiation/growth decisions and all external tags.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -12,6 +12,12 @@ if __package__:
     from .fracture_faces import PairedCrackFaces, _vectors
 else:
     from fracture_faces import PairedCrackFaces, _vectors
+
+
+class _FullyTiedCut(ValueError):
+    def __init__(self, keys):
+        super().__init__("Cut is fully tied at its front; refine/enlarge the surface to represent a P1 opening")
+        self.keys = list(keys)
 
 
 @dataclass(frozen=True)
@@ -24,6 +30,7 @@ class SplitTetrahedra:
     source_faces: np.ndarray
     adjacent_cells: np.ndarray
     faces: PairedCrackFaces
+    tied_source_faces: np.ndarray = None
 
     def transfer_nodal_values(self, source_values) -> np.ndarray:
         """Duplicate the accepted state; initiation creates no displacement jump."""
@@ -214,13 +221,31 @@ class NodeStarPatchResolver:
                 and len(vertices) - len(edge_faces) + len(patch) == 1)
 
 
-def split_interior_wall_faces(coordinates_m, cells, region_ids, cut_faces) -> SplitTetrahedra:
+def split_interior_wall_faces(coordinates_m, cells, region_ids, cut_faces, *,
+                              drop_fully_tied: bool = False) -> SplitTetrahedra:
     """Split source-node triples; support shared tip nodes but reject fully tied cuts.
 
     All cell rows and regions are retained unchanged. Appended nodes map back to
     original nodes. Repeated growth must carry provenance through successive
     results; output node indices alone are not catalog/source identities.
+    With ``drop_fully_tied`` such cuts are instead removed (repeatedly, as each
+    removal ties more nodes) and listed in ``tied_source_faces``.
     """
+    if drop_fully_tied:
+        cuts = np.asarray(cut_faces)
+        dropped = []
+        while True:
+            try:
+                result = split_interior_wall_faces(coordinates_m, cells, region_ids, cuts)
+            except _FullyTiedCut as error:
+                tied = set(error.keys)
+                keep = np.array([tuple(sorted(map(int, row))) not in tied for row in cuts])
+                dropped.extend(sorted(tied))
+                if not keep.any():
+                    raise ValueError("Every cut is fully tied at its front; nothing can open") from None
+                cuts = cuts[keep]
+                continue
+            return replace(result, tied_source_faces=np.asarray(dropped, dtype=np.int64).reshape(-1, 3))
     points, tetrahedra, regions, owners = _source_inventory(coordinates_m, cells, region_ids)
     cuts = np.asarray(cut_faces)
     if (cuts.dtype.kind not in "iu" or cuts.ndim != 2 or cuts.shape[1] != 3 or not len(cuts)
@@ -277,14 +302,15 @@ def split_interior_wall_faces(coordinates_m, cells, region_ids, cut_faces) -> Sp
                     node_parents.append(int(node))
             result[cell_id, corner] = by_component[component]
 
-    minus, plus, normals, adjacent_rows = [], [], [], []
+    minus, plus, normals, adjacent_rows, tied_keys = [], [], [], [], []
     for key in cut_keys:
         left, right = owners[key]
         sides = []
         for cell_id in (left, right):
             sides.append([int(result[cell_id, np.flatnonzero(tetrahedra[cell_id] == node)[0]]) for node in key])
         if sides[0] == sides[1]:
-            raise ValueError("Cut is fully tied at its front; refine/enlarge the surface to represent a P1 opening")
+            tied_keys.append(key)
+            continue
         minus.append(sides[0])
         plus.append(sides[1])
         normal = np.cross(points[key[1]] - points[key[0]], points[key[2]] - points[key[0]])
@@ -292,6 +318,8 @@ def split_interior_wall_faces(coordinates_m, cells, region_ids, cut_faces) -> Sp
             normal = -normal
         normals.append(normal / np.linalg.norm(normal))
         adjacent_rows.append([left, right])
+    if tied_keys:
+        raise _FullyTiedCut(tied_keys)
     node_parents = np.asarray(node_parents, dtype=np.int64)
     new_points = points[node_parents].copy()
     paired = PairedCrackFaces(new_points, minus, plus, normals)

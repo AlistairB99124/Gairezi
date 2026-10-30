@@ -67,6 +67,26 @@ class FractureTopologyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fully tied"):
             split_interior_wall_faces(points, cells, [1] * 4, [[0, 1, 4]])
 
+    def test_opt_in_drop_reports_fully_tied_cuts_and_keeps_openable_ones(self):
+        points = np.array([(0., 0., -1.), (0., 0., 1.), (1., 0., 0.),
+                           (-.5, .866, 0.), (-.5, -.866, 0.)])
+        cells = np.array([[0, 1, 2, 3], [0, 1, 3, 4], [0, 1, 4, 2]])
+        result = split_interior_wall_faces(points, cells, [1] * 3, [[0, 1, 2]], drop_fully_tied=True)
+        self.assertEqual(result.tied_source_faces.shape, (0, 3))
+        self.assertEqual(len(result.faces.minus), 1)
+        points = np.array([(0., 0., 0.), (1., 0., 0.), (0., 1., 0.),
+                           (0., 0., 1.), (.25, .25, .25)])
+        cells = [[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4]]
+        with self.assertRaisesRegex(ValueError, "Every cut is fully tied"):
+            split_interior_wall_faces(points, cells, [1] * 4, [[0, 1, 4]], drop_fully_tied=True)
+        result = split_interior_wall_faces(points, cells, [1] * 4, [[0, 1, 4], [0, 2, 4], [0, 3, 4]],
+                                           drop_fully_tied=True)
+        self.assertEqual(result.tied_source_faces.shape[1], 3)
+        kept = {tuple(sorted(face)) for face in result.source_faces.tolist()}
+        dropped = {tuple(face) for face in result.tied_source_faces.tolist()}
+        self.assertFalse(kept & dropped)
+        self.assertEqual(kept | dropped, {(0, 1, 4), (0, 2, 4), (0, 3, 4)})
+
     def test_node_star_completion_unlocks_seed_without_releasing_unlisted_faces(self):
         from itertools import combinations
         if __package__:

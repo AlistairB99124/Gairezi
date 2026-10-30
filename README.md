@@ -917,7 +917,8 @@ the deleted `Elmer/load_cases.json` is read by these workflows.
 
 | Section | Meaning |
 |---|---|
-| `geometry.global_element_size_m` | Starting size suggestion; the wall analysis mesh is adjusted to stay at or below 150,000 final tetrahedra, and attached foundation/near-seat bedrock adapt to the effective size |
+| `geometry.global_element_size_m` | Starting size suggestion; the wall analysis mesh is adjusted to stay at or below `geometry.target_wall_tetrahedral_elements` final tetrahedra, and attached foundation/near-seat bedrock adapt to the effective size |
+| `geometry.target_wall_tetrahedral_elements` | Optional integer ≥ 1,000 (default 150,000): maximum wall-body tetrahedra. Element size scales with its cube root, so raising it refines the whole wall uniformly at higher solve time and memory |
 | `geometry.local_element_size_m` | Corner refinement for standalone geometry generators |
 | `geometry.wall` | Wall face radii, radial width and centreline (crest section); optional downstream `thickness_steps`, `joint_support`, `step_end_taper_ratio` |
 | `geometry.bedrock` | Signed bedrock contour elevations (the wall seat) and wall/rock seat support |
@@ -1283,9 +1284,10 @@ end). The wall/foundation split interpolates straight between these station
 tops. The 0.5 m global size is now a starting suggestion, not a fixed course
 spacing. With a foundation, the wall mesh selects a course spacing compatible
 with the thickness steps, estimates a coarser target from the generated
-tetrahedral count, and rebuilds until the wall body is at or below 150,000
+tetrahedral count, and rebuilds until the wall body is at or below
+`geometry.target_wall_tetrahedral_elements` (default 150,000)
 tetrahedra. Other bodies are not included in this limit. The current
-configuration produces a wall target spacing of 0.833333 m and 141,846 wall
+configuration (150,000) produces a wall target spacing of 0.833333 m and 141,846 wall
 tetrahedra. The FEniCSx run manifest records the suggestion, effective target
 size and achieved count. No wedge crosses a wall joint: each belongs to the
 block below its higher endpoint. Without a foundation, the thickness steps

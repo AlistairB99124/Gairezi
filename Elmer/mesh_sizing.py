@@ -9,7 +9,18 @@ from math import gcd, lcm
 
 
 TARGET_WALL_TETRAHEDRAL_ELEMENTS = 150_000
+MINIMUM_WALL_TETRAHEDRAL_TARGET = 1_000
 TETRAHEDRA_PER_SOURCE_CELL = {4: 1, 5: 6, 6: 3}
+
+
+def wall_tetrahedral_target(geometry: dict) -> int:
+    """Configured wall tetrahedron cap (geometry.target_wall_tetrahedral_elements), else the default."""
+    value = geometry.get("target_wall_tetrahedral_elements", TARGET_WALL_TETRAHEDRAL_ELEMENTS)
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not float(value).is_integer() or value < MINIMUM_WALL_TETRAHEDRAL_TARGET):
+        raise ValueError("geometry.target_wall_tetrahedral_elements must be an integer of at least "
+                         f"{MINIMUM_WALL_TETRAHEDRAL_TARGET:,}")
+    return int(value)
 
 
 def config_for_wall_element_size(config: dict, size_m: float) -> dict:
@@ -76,7 +87,7 @@ def course_compatible_size(
     )
     if divisions < 1:
         raise ValueError(
-            "The 150,000-element target cannot be met while keeping thickness steps "
+            "The wall element target cannot be met while keeping thickness steps "
             "on the wall course grid"
         )
     return float(course_unit / divisions)

@@ -56,6 +56,7 @@ def solve_hydrostatic_contact_growth(
     event_options, contact_options, growth_options, output,
     interface_springs=None, linear_support=None, additional_nodal_forces=None,
     opening_limit_m=.002, previously_broken=(), selected_tensile_strength_pa=0.,
+    selected_young_pa=None,
 ):
     """Compare actual equilibria with pressure on reservoir-connected cuts.
 
@@ -196,7 +197,7 @@ def solve_hydrostatic_contact_growth(
 
     result = _solve_contact_growth(
         space, faces, parents, marker_edges, young_pa=young_pa, poisson=poisson,
-        selected_tensile_strength_pa=selected_tensile_strength_pa,
+        selected_tensile_strength_pa=selected_tensile_strength_pa, selected_young_pa=selected_young_pa,
         selected_cells=selected_cells, boundary_conditions=boundary_conditions, external_load=external_load,
         event_options=event_options, contact_options=contact_options, growth_options=growth_options,
         output=output, interface_springs=interface_springs, linear_support=linear_support,
@@ -267,7 +268,7 @@ def solve_source_hydrostatic_growth(
     structure, affected_source_rows, marker_source_edges, *, maximum_volume_change,
     event_options, contact_options, growth_options, closure_tolerance_m,
     flow_relative_tolerance, output, opening_limit_m=.002, selection_provenance=None,
-    selected_tensile_strength_pa=0.,
+    selected_tensile_strength_pa=0., selected_young_pa=None,
 ):
     """Experimental canonical source adapter with proven exterior hydraulic inlets."""
     if __package__:
@@ -289,7 +290,7 @@ def solve_source_hydrostatic_growth(
         maximum_volume_change=maximum_volume_change, event_options=event_options,
         contact_options=contact_options, growth_options=growth_options, output=output,
         opening_limit_m=opening_limit_m, selection_provenance=selection_provenance,
-        selected_tensile_strength_pa=selected_tensile_strength_pa,
+        selected_tensile_strength_pa=selected_tensile_strength_pa, selected_young_pa=selected_young_pa,
         prepared_driver=driver, mode="common_head_hydrostatic",
         water_model="canonical exterior-tag reservoirs; pressure only on connected released surfaces; exact waterline clipping; no filling history")
 

@@ -1,5 +1,61 @@
 # FEniCSx dam analysis adapter
 
+## Automatic crack screening and cohesive building blocks
+
+`automatic_screening.py` solves a job's intact native equilibrium and lists
+wall cells (region 1) whose unsmoothed cell maximum principal stress exceeds
+`f_t*(1+relative_tolerance)`. It writes `manifest.json`, an `inputs/config.json`
+snapshot, the intact archive under `intact/` and `screening.json`; it never
+cracks, softens or submits anything. Results are an initial-state screening,
+not a crack prediction. From the `Gairezi` directory in WSL:
+
+```bash
+timeout 600 python3 -B -m FEniCSx.automatic_screening --config JOB/config.json \
+  --model JOB/output/model --baseline JOB/cracking/dam_elastic_baseline/<run> \
+  --output OUT --job-id JOB_ID --maximum-volume-change 1e-12 --relative-tolerance 1e-3
+```
+
+The reference job's 141,846 wall cells screen in about 70 s with a 1.051 MPa
+peak (0.53 `f_t`). The API wraps this per job.
+
+`cohesive_mode_i.py` is the linear-softening Mode-I law (critical opening
+`2*G_f/f_t`, irreversible history). `cohesive_contact.py` couples exact
+pre-initiation ties, audited initiation, cohesive opening, unilateral contact
+and reservoir water on paired P1 lips; `cohesive_network.py` extends this to
+node-junction facet networks. `G_f` comes from the optional
+`material.concrete.cohesive_fracture_energy_j_m2` (user-supplied 400 J/m2,
+unverified); configurations without it are refused.
+
+`automatic_cracking.py` runs the network on a job after a completed screening:
+
+```bash
+timeout 600 python3 -u -B -m FEniCSx.automatic_cracking --config JOB/config.json \
+  --model JOB/output/model --screening SCREENING_OUT --output OUT \
+  --job-id JOB_ID --maximum-volume-change 1e-12
+```
+
+Only `no_damage_initiated` and `accepted_equilibrium` are accepted outcomes;
+other statuses (`unsupported_geometry`, `nonconvergence`, `resource_limit`, ...)
+are reported as not accepted. If cohesive Newton stalls (a snap-back 2-cycle or
+its iteration budget) it restarts once from the fully separated state
+(`newton_restarts` in the solve report) and still accepts only a converged equilibrium. Before any mesh work the runner checks the
+intact one-sided facet-normal stress (larger of the two owner cells'
+`n.sigma.n`) on every interior wall facet (the network initiation measure,
+also reported as `facet_check` by screening) from the screening archives; below `f_t*(1-tol)` it returns
+`no_damage_initiated`, otherwise cells beside critical facets seed the region,
+which drops neighbour rings to fit `--maximum-candidate-faces`. Outputs: `manifest.json`, `summary.json` and
+`cohesive_surface.vtu` when cracks exist. Growth on structured tetrahedral
+meshes currently stops with `unsupported_geometry` after initial softening, and
+an overstressed real-dam run is unverified. The API submits it only after a
+confirmed screening (`/jobs/{id}/automatic-cracking/submit`, `/run`,
+`/run/cancel`).
+
+Tests: `FEniCSx.test_cohesive_mode_i`, `FEniCSx.test_cohesive_contact`,
+`FEniCSx.test_cohesive_network` and `FEniCSx.test_fracture_topology` (run from
+`Gairezi`); `test_automatic_cracking`, `test_automatic_screening` and
+`test_tensile_loss_event.TensileLossEventTests.test_source_intact_only_persists_native_cell_tensors_for_automatic_screening`
+(run from `FEniCSx`).
+
 ## Painted tensile-loss building blocks
 
 These are experimental verification components, **not a runnable painted dam
@@ -666,6 +722,15 @@ the cap, and unchanged compressive compliance. Zero recovers the original
 no-tension law. This reversible experimental model is **not** irreversible
 softening or strength-calibrated nucleation; discrete surface growth still
 uses the finite-candidate energy test and configured fracture energy.
+Optional `material.concrete.selected_youngs_modulus` (Pa; positive and not
+above `youngs_modulus`) gives painted cells a damaged-concrete stiffness. The
+intact bonded solve keeps the concrete modulus; painted cells switch to the
+damaged modulus (and its tangent) together with the tensile cap. Omitting it
+keeps the original stiffness exactly. The shipped configuration follows
+`element_matrix.csv` (E 35 GPa intact / 15 GPa damaged, ft 2 / 0.5 MPa,
+fc 30 MPa, Gf 100 J/m2); damaged fc and Gf equal the intact values and are not
+separate inputs (no crushing law; the painted cap does not use Gf). Automatic
+cohesive cracking does not use the damaged properties.
 Native event archives and the run manifest record the actual selected
 strength. Existing job snapshots/results are not rewritten; changing the
 slider requires a new job/baseline. Hydrostatic pressure is applied only to

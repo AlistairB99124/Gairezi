@@ -35,13 +35,41 @@ class ModelConfigTests(unittest.TestCase):
         self.payload["geometry"]["local_element_size_m"] = 0.25
         validate_config(self.payload)
 
+    def test_wall_tetrahedral_target_is_an_optional_integer_of_at_least_1000(self):
+        from Elmer.mesh_sizing import wall_tetrahedral_target
+
+        geometry = self.payload["geometry"]
+        self.assertEqual(geometry["target_wall_tetrahedral_elements"], 150000)
+        self.assertEqual(wall_tetrahedral_target(geometry), 150000)
+        geometry["target_wall_tetrahedral_elements"] = 300000.0
+        self.assertIs(validate_config(self.payload), self.payload)
+        self.assertEqual(wall_tetrahedral_target(geometry), 300000)
+        for value in (999, 1500.5, True, None, "big", float("inf")):
+            payload = copy.deepcopy(self.payload)
+            payload["geometry"]["target_wall_tetrahedral_elements"] = value
+            self.assert_invalid_at(payload, "geometry.target_wall_tetrahedral_elements")
+            with self.assertRaises(ValueError):
+                wall_tetrahedral_target(payload["geometry"])
+        del geometry["target_wall_tetrahedral_elements"]
+        self.assertIs(validate_config(self.payload), self.payload)
+        self.assertEqual(wall_tetrahedral_target(geometry), 150000)
+
     def test_concrete_compressive_strength_is_positive_and_optional_for_historical_jobs(self):
-        self.assertEqual(self.payload["material"]["concrete"]["compressive_strength_pa"], 20e6)
+        self.assertEqual(self.payload["material"]["concrete"]["compressive_strength_pa"], 30e6)
         for value in (0, -1, True, None, float("nan"), float("inf")):
             payload = copy.deepcopy(self.payload)
             payload["material"]["concrete"]["compressive_strength_pa"] = value
             self.assert_invalid_at(payload, "material.concrete.compressive_strength_pa")
         del self.payload["material"]["concrete"]["compressive_strength_pa"]
+        self.assertIs(validate_config(self.payload), self.payload)
+
+    def test_cohesive_fracture_energy_is_positive_and_optional_for_historical_jobs(self):
+        self.assertEqual(self.payload["material"]["concrete"]["cohesive_fracture_energy_j_m2"], 100.)
+        for value in (0, -1, True, None, float("nan"), float("inf")):
+            payload = copy.deepcopy(self.payload)
+            payload["material"]["concrete"]["cohesive_fracture_energy_j_m2"] = value
+            self.assert_invalid_at(payload, "material.concrete.cohesive_fracture_energy_j_m2")
+        del self.payload["material"]["concrete"]["cohesive_fracture_energy_j_m2"]
         self.assertIs(validate_config(self.payload), self.payload)
 
     def test_bedrock_domain_is_optional_and_validated(self):
@@ -191,6 +219,15 @@ class ModelConfigTests(unittest.TestCase):
         for value in (-1., True, float("nan"), float("inf")):
             self.payload["material"]["concrete"]["selected_tensile_strength_pa"] = value
             self.assert_invalid_at(self.payload, "material.concrete.selected_tensile_strength_pa")
+
+    def test_damaged_youngs_modulus_is_optional_positive_and_not_stiffer(self):
+        concrete = self.payload["material"]["concrete"]
+        for value in (1e3, 15e9, concrete["youngs_modulus"]):
+            concrete["selected_youngs_modulus"] = value
+            validate_config(self.payload)
+        for value in (0., -1., True, float("nan"), concrete["youngs_modulus"] * 2):
+            concrete["selected_youngs_modulus"] = value
+            self.assert_invalid_at(self.payload, "material.concrete.selected_youngs_modulus")
 
     def test_obsolete_interface_overrides_are_rejected(self):
         self.assertNotIn("interfaces", self.payload)

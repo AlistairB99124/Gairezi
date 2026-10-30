@@ -714,7 +714,7 @@ def export_preview(
         "body_ids": BODY_IDS,
         "cell_counts": counts,
         "mesh_sizing": {
-            "scope": "wall body only; bedrock is excluded from the 150,000-element cap",
+            "scope": "wall body only; bedrock is excluded from the wall tetrahedral element target",
             "suggested_global_element_size_m": structure.suggested_global_element_size_m,
             "effective_wall_element_size_m": structure.element_size_target_m,
             "target_wall_tetrahedral_elements": structure.target_wall_tetrahedral_elements,

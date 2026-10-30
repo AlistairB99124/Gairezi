@@ -297,6 +297,8 @@ class PreparedWallCandidates:
     parent_node_ids: np.ndarray
     source_triangles: np.ndarray
     report: dict
+    split: object = None
+    original: ImportedDam = None
 
 
 def wall_candidate_triangles(imported, marker_source_edges):
@@ -339,13 +341,17 @@ def wall_candidate_triangles(imported, marker_source_edges):
     return triangles
 
 
-def prepare_wall_candidates(structure, marker_source_edges, maximum_volume_change) -> PreparedWallCandidates:
+def prepare_wall_candidates(structure, marker_source_edges, maximum_volume_change, *,
+                            candidate_triangles=None, original=None) -> PreparedWallCandidates:
     """Split actual interior wall facets, preserving source rows/exterior tags.
 
     All candidates start geometrically closed. Their bond/contact state is
     subsequently decided by the energy trial, not by this preparation. This
     experimental all-facet preparation is serial and not resource-validated
     for the full dam; it does not choose unrestricted physical crack paths.
+    Explicit ``candidate_triangles`` (source-node triples) replace the
+    all-facet marker inventory; cuts that cannot open in P1 are dropped and
+    reported. ``original`` reuses an existing import of the same structure.
     """
     from copy import copy
     from dolfinx import fem
@@ -362,9 +368,15 @@ def prepare_wall_candidates(structure, marker_source_edges, maximum_volume_chang
             or not isinstance(maximum_volume_change, (int, float))
             or not np.isfinite(maximum_volume_change) or not 0 <= maximum_volume_change < 1):
         raise ValueError("maximum_volume_change must be finite and in [0, 1)")
-    original = import_structure(structure, maximum_volume_change)
-    candidates = wall_candidate_triangles(original, marker_source_edges)
-    split = split_interior_wall_faces(original.points, original.tetrahedra, original.regions, candidates)
+    if original is None:
+        original = import_structure(structure, maximum_volume_change)
+    if candidate_triangles is None:
+        candidates = wall_candidate_triangles(original, marker_source_edges)
+        split = split_interior_wall_faces(original.points, original.tetrahedra, original.regions, candidates)
+    else:
+        split = split_interior_wall_faces(original.points, original.tetrahedra, original.regions,
+                                          candidate_triangles, drop_fully_tied=True)
+        candidates = split.source_faces
     # Export inherited exterior identities from native connectivity, including
     # canonical default rock boundaries; never infer labels from coordinates.
     domain = original.domain
@@ -395,10 +407,12 @@ def prepare_wall_candidates(structure, marker_source_edges, maximum_volume_chang
     report = {
         "status": "prepared_experimental_wall_facet_candidates",
         "solver_ready": False, "engineering_validated": False,
-        "candidate_faces": len(candidates), "original_nodes": len(original.points),
+        "candidate_faces": len(candidates),
+        "dropped_fully_tied_faces": 0 if split.tied_source_faces is None else len(split.tied_source_faces),
+        "original_nodes": len(original.points),
         "prepared_nodes": len(prepared.points), "source_cells": original.report["source_cells"],
         "tetrahedra": len(prepared.tetrahedra),
         "original_import": original.report,
         "limitations": "All interior wall mesh facets only; zero initial gap, no growth decision, no full-dam resource validation or API submission.",
     }
-    return PreparedWallCandidates(prepared, split.faces, split.parent_node_ids, candidates, report)
+    return PreparedWallCandidates(prepared, split.faces, split.parent_node_ids, candidates, report, split, original)

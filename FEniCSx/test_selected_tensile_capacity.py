@@ -14,7 +14,7 @@ import test_open_crack_equilibrium as bulk
 
 
 class SelectedTensileCapacityTests(unittest.TestCase):
-    def specimen(self, traction, output):
+    def specimen(self, traction, output, selected_young_pa=None):
         space, faces, _, _, _ = bulk.BulkFlowTests().fixture()
         domain = space.mesh
         vertices = np.arange(domain.topology.index_map(0).size_local, dtype=np.int32)
@@ -32,7 +32,30 @@ class SelectedTensileCapacityTests(unittest.TestCase):
             external_load=lambda v: fem.Constant(domain, float(traction)) * v[1] * ds(1),
             options=EventSolverOptions(maximum_iterations=5),
             contact_options=ContactOptions(1e-12, 1e-7, 1e-8, 100),
-            release_cut=False, output=output)
+            release_cut=False, output=output, selected_young_pa=selected_young_pa)
+
+    def test_damaged_modulus_softens_only_after_the_intact_solve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "event"
+            event = self.specimen(.4e6, output, selected_young_pa=15e9)
+            intact = event.intact_displacement.x.array
+            damaged = event.post_event_displacement.x.array
+            # Uniaxial, Poisson 0: displacement scales with 1/E below the tensile cap.
+            scale = np.abs(intact).max()
+            self.assertGreater(scale, 0.)
+            np.testing.assert_allclose(damaged, intact * 35e9 / 15e9, rtol=1e-6, atol=1e-9 * scale)
+            self.assertAlmostEqual(
+                event.report["iterations"][-1]["maximum_selected_principal_stress_pa"] / 1e6, .4, places=6)
+            self.assertEqual(event.report["selected_young_pa"], 15e9)
+            with np.load(output / "native_inputs.npz") as inputs:
+                self.assertEqual(float(inputs["selected_young_pa"]), 15e9)
+                np.testing.assert_array_equal(inputs["young_pa"], np.full(len(inputs["selected_local_cells"]), 35e9))
+
+    def test_damaged_modulus_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for value in (0., -1., float("nan"), True):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Young's modulus"):
+                    self.specimen(.4e6, Path(directory) / f"event_{value}", selected_young_pa=value)
 
     def test_point_four_mpa_tension_stays_elastic_below_point_five_mpa_strength(self):
         with tempfile.TemporaryDirectory() as directory:

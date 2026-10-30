@@ -406,6 +406,43 @@ class TensileLossEventTests(unittest.TestCase):
         np.testing.assert_allclose(actual, source_displacement, rtol=1e-8, atol=1e-11)
         self.assertLess(report["relative_force_balance_error"], 1e-8)
 
+    def test_source_intact_only_persists_native_cell_tensors_for_automatic_screening(self):
+        from automatic_screening import screening_from_archives
+
+        structure = self.wet_source_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, "must not receive affected source rows"):
+                solve_source_event(structure, [1], maximum_volume_change=1e-12, options=EventSolverOptions(),
+                                   output=root / "rejected", intact_only=True)
+            reference = solve_source_event(structure, [1], maximum_volume_change=1e-12,
+                                           options=EventSolverOptions(), output=root / "reference")
+            output = root / "intact"
+            event = solve_source_event(structure, [], maximum_volume_change=1e-12,
+                                       options=EventSolverOptions(), output=output, intact_only=True)
+            self.assertEqual(event.report["status"], "passed_intact_loaded_only")
+            self.assertEqual([row["stage"] for row in event.report["stages"]], ["intact_loaded"])
+            self.assertFalse((output / "post_event_state.npz").exists())
+            np.testing.assert_allclose(event.intact_displacement.x.array,
+                                       reference.intact_displacement.x.array, rtol=1e-10, atol=1e-14)
+            with np.load(output / "intact_cell_stress.npz", allow_pickle=False) as cells, \
+                    np.load(output / "intact_state.npz", allow_pickle=False) as state, \
+                    np.load(output / "native_inputs.npz", allow_pickle=False) as inputs:
+                self.assertFalse(inputs["selected_local_cells"].any())
+                np.testing.assert_array_equal(cells["cell_region_tags"], inputs["cell_region_tags"])
+                np.testing.assert_array_equal(cells["source_cell_rows"], inputs["source_cell_rows"])
+                np.testing.assert_allclose(cells["cell_stress_pa"].reshape(-1),
+                                           state["stress_pa"].reshape(-1, 3, 3)[event.material.tensor_dofs].reshape(-1))
+                wall = cells["cell_region_tags"] == 1
+                self.assertTrue(wall.any())
+                peak = np.linalg.eigvalsh(cells["cell_stress_pa"][wall])[:, -1].max()
+            for strength, status in ((peak * 2, "no_overstressed_cells"), (peak / 2, "overstressed_cells_found")):
+                result = screening_from_archives(output / "intact_cell_stress.npz", output / "native_inputs.npz",
+                                                 strength, relative_tolerance=1e-6)
+                self.assertEqual(result["status"], status)
+                self.assertAlmostEqual(result["peak_principal_stress_pa"], peak)
+                self.assertEqual(result["wall_cells"], int(wall.sum()))
+
     def test_source_adapter_integrates_waterline_crossing_exactly(self):
         for boundary, head, horizontal in (("tailwater_head_m", .5, -28750.),
                                            ("upstream_surface_z_m", 1.5, 8750.)):

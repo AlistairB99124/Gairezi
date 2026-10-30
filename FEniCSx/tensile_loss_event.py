@@ -100,12 +100,15 @@ def verified_source_selection(configuration: Path, model_directory: Path, baseli
 
 def solve_source_event(structure, affected_source_rows, *, maximum_volume_change,
                        options: EventSolverOptions, output: Path,
-                       selection_provenance=None) -> TensileLossEvent:
+                       selection_provenance=None, intact_only=False) -> TensileLossEvent:
     """Experimental source-import adapter, not an authenticated app scenario.
 
     Source row IDs refer to the supplied structure's volume cells. This entry
     point imports that structure itself, never reuses unrelated native tags.
     No selected-edge growth, crack water flow or saved-catalog binding is implied.
+    ``intact_only`` requires no affected rows and stops after the verified
+    intact equilibrium, persisting native cell tensors and region tags for
+    automatic screening; no altered state is solved.
     """
     if __package__:
         from .dam_mesh import import_structure, source_cell_tags, selected_wall_cells
@@ -131,7 +134,18 @@ def solve_source_event(structure, affected_source_rows, *, maximum_volume_change
         raise ValueError("maximum_volume_change must be finite and in [0, 1)")
     imported = import_structure(structure, maximum_volume_change)
     source_tags = source_cell_tags(imported)
-    selected = selected_wall_cells(source_tags, imported.cell_tags, affected_source_rows)
+    if type(intact_only) is not bool:
+        raise ValueError("intact_only must be an explicit boolean")
+    if intact_only:
+        if len(np.asarray(affected_source_rows)):
+            raise ValueError("Intact-only screening must not receive affected source rows")
+        local = np.arange(len(source_tags.values), dtype=np.int32)
+        if (not np.array_equal(source_tags.indices, local)
+                or not np.array_equal(imported.cell_tags.indices, local)):
+            raise ValueError("Complete local source/region cell tags are required")
+        selected = np.zeros(len(source_tags.values), dtype=bool)
+    else:
+        selected = selected_wall_cells(source_tags, imported.cell_tags, affected_source_rows)
     space = fem.functionspace(imported.domain, ("Lagrange", 1, (3,)))
     coefficients = materials(imported, structure)
     require_support_tags(imported, structure)
@@ -151,6 +165,8 @@ def solve_source_event(structure, affected_source_rows, *, maximum_volume_change
             source_cell_rows=source_tags.values,
             additional_nodal_forces=water_forces,
             selection_provenance=selection_provenance,
+            intact_only=intact_only,
+            cell_region_tags=imported.cell_tags.values if intact_only else None,
         )
     finally:
         if springs.matrix is not None:
@@ -161,7 +177,7 @@ def solve_event(space, *, young_pa, poisson, selected_cells, boundary_conditions
                 external_load, options: EventSolverOptions, output: Path | None = None,
                 interface_springs: InterfaceSprings | None = None, linear_support=None,
                 source_cell_rows=None, additional_nodal_forces=None,
-                selection_provenance=None) -> TensileLossEvent:
+                selection_provenance=None, intact_only=False, cell_region_tags=None) -> TensileLossEvent:
     """Solve both states using an external_load(test_function) UFL functional.
 
     Serial affine P1 tetrahedra, cellwise isotropic material, fixed load/BC
@@ -182,10 +198,19 @@ def solve_event(space, *, young_pa, poisson, selected_cells, boundary_conditions
         raise ValueError("Reduced tensile-loss event currently requires one MPI process")
     displacement = fem.Function(space, name="post_event_displacement_m")
     material = NoTensionMaterial(displacement, young_pa, poisson, selected_cells)
-    if not np.any(material.selected):
+    if type(intact_only) is not bool:
+        raise ValueError("intact_only must be an explicit boolean")
+    if intact_only and np.any(material.selected):
+        raise ValueError("Intact-only screening must not select altered cells")
+    if not intact_only and not np.any(material.selected):
         raise ValueError("At least one affected local cell is required")
     selection = material.selected.copy()
     provenance = {}
+    if cell_region_tags is not None:
+        regions = np.asarray(cell_region_tags)
+        if regions.shape != selection.shape or regions.dtype.kind not in "iu":
+            raise ValueError("Cell region tags must be integers in local cell order")
+        provenance["cell_region_tags"] = regions.copy()
     if source_cell_rows is not None:
         rows = np.asarray(source_cell_rows)
         if rows.shape != selection.shape or rows.dtype.kind not in "iu" or np.any(rows < 0):
@@ -309,7 +334,8 @@ def solve_event(space, *, young_pa, poisson, selected_cells, boundary_conditions
                 "applied_force_n": applied_force.tolist(),
                 "scaled_force_imbalance": force_imbalance / force_scale,
                 "maximum_displacement_m": float(np.max(np.linalg.norm(displacement.x.array.reshape(-1, 3), axis=1))),
-                "maximum_selected_principal_stress_pa": float(np.linalg.eigvalsh(stress[selection])[:, -1].max()),
+                "maximum_selected_principal_stress_pa": float(np.linalg.eigvalsh(stress[selection])[:, -1].max())
+                if selection.any() else None,
                 "elastic_energy_j": float(fem.assemble_scalar(fem.form(material.energy * ufl.dx))),
                 "interface_spring_energy_j": interface_springs.energy(displacement) if interface_springs is not None else 0.,
             }
@@ -349,6 +375,16 @@ def solve_event(space, *, young_pa, poisson, selected_cells, boundary_conditions
             np.savez_compressed(output / "intact_state.npz", displacement_m=intact.x.array,
                                 stress_pa=material.stress.x.array,
                                 energy_j_m3=material.energy.x.array)
+        if intact_only:
+            report["status"] = "passed_intact_loaded_only"
+            report["intact_only"] = True
+            if output is not None:
+                np.savez_compressed(
+                    output / "intact_cell_stress.npz",
+                    cell_stress_pa=material.stress.x.array.reshape(-1, 3, 3)[material.tensor_dofs],
+                    **provenance)
+            save_report()
+            return TensileLossEvent(intact, intact, material, report)
         material.selected[:] = selection
         material.update()
         post_residual = ufl.inner(material.stress, ufl.sym(ufl.grad(test))) * ufl.dx - load
@@ -442,6 +478,7 @@ def solve_contact_event(
     interface_springs=None, linear_support=None, additional_nodal_forces=None,
     face_pressures_pa=None, hydraulics=None, opening_limit_m=0.002, release_cut=True,
     released_face_mask=None, selected_tensile_strength_pa=0., equilibrium_seed=None,
+    selected_young_pa=None,
 ) -> TensileLossEvent:
     """Loaded bonded state -> selected tensile loss plus explicit cut release.
 
@@ -509,6 +546,7 @@ def solve_contact_event(
     displacement = fem.Function(space, name="post_event_displacement_m")
     material = NoTensionMaterial(
         displacement, young_pa, poisson, selected_cells, selected_tensile_strength_pa,
+        selected_young_pa=selected_young_pa,
     )
     selection = material.selected.copy()
     if not np.any(selection):
@@ -553,7 +591,12 @@ def solve_contact_event(
         "contact_options": asdict(contact_options),
         "selected_cells": int(selection.sum()), "iterations": [],
         "selected_tensile_strength_pa": material.tensile_strength_pa,
-        "selected_material_law": "reversible tensile cap; not irreversible strength-calibrated nucleation",
+        "selected_young_pa": material.selected_young_pa,
+        "selected_material_law": (
+            "reversible tensile cap; not irreversible strength-calibrated nucleation"
+            if material.selected_young_pa is None else
+            "damaged concrete: reduced Young's modulus and reversible tensile cap after the intact solve; "
+            "not irreversible strength-calibrated nucleation"),
         "relative_tolerance": options.relative_tolerance,
         "absolute_tolerance_n": options.absolute_tolerance_n,
         "maximum_iterations": options.maximum_iterations,
@@ -623,6 +666,8 @@ def solve_contact_event(
             released_face_mask=released,
             young_pa=material.young, poisson=material.poisson,
             selected_tensile_strength_pa=material.tensile_strength_pa,
+            **({"selected_young_pa": material.selected_young_pa}
+               if material.selected_young_pa is not None else {}),
             fixed_dofs=fixed, prescribed_m=imposed, assembled_exterior_force_n=exterior,
             pressure_pa=pressure, new_face_water_forces_n=water_source,
         )
@@ -648,6 +693,8 @@ def solve_contact_event(
         for array in (coordinates, cells, mapping, faces.minus, faces.plus, faces.normals,
                       material.young, material.poisson, selection,
                       np.asarray(material.tensile_strength_pa),
+                      *(() if material.selected_young_pa is None
+                        else (np.asarray(material.selected_young_pa),)),
                       fixed, imposed, exterior, intact_operator.indptr, intact_operator.indices,
                       intact_operator.data):
             contiguous = np.ascontiguousarray(array)

@@ -234,7 +234,7 @@ def prepare(
     configured_near_size_m = (config["geometry"]["bedrock"].get("mesh") or {}).get("near_size_m")
     mesh_config = config_for_wall_element_size(config, concrete.element_size_target_m)
     mesh_sizing = {
-        "scope": "wall body only; foundation and bedrock are excluded from the 150,000-element cap",
+        "scope": "wall body only; foundation and bedrock are excluded from the wall tetrahedral element target",
         "suggested_global_element_size_m": concrete.suggested_global_element_size_m,
         "effective_wall_element_size_m": concrete.element_size_target_m,
         "target_wall_tetrahedral_elements": concrete.target_wall_tetrahedral_elements,

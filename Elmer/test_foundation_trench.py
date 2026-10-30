@@ -344,7 +344,7 @@ class FoundationTopologyTests(unittest.TestCase):
             self.report["geometry"]["mesh_grading"]["near_size_m"], effective_size,
         )
         self.assertEqual(self.report["mesh_sizing"]["scope"],
-                         "wall body only; foundation and bedrock are excluded from the 150,000-element cap")
+                         "wall body only; foundation and bedrock are excluded from the wall tetrahedral element target")
         config = load_config(ROOT / "config.json")
         expected_width = max(
             step["radial_width_m"]

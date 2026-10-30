@@ -1,0 +1,5 @@
+property,undamaged concrete, damaged concrete
+Young's Modulus,35GPa,15GPa
+Tensile strength,2MPa,0.5MPa
+Compressive strength,30MPa,30MPa
+Fracture energy,100 J/m^2,100 J/m^2

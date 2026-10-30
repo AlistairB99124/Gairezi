@@ -195,8 +195,19 @@ def run_saved_event(
                 or not np.isfinite(selected_strength) or selected_strength < 0):
             raise ValueError("Selected tensile strength must be finite and nonnegative")
         manifest["selected_tensile_strength_pa"] = selected_strength
+        selected_young = concrete.get("selected_youngs_modulus")
+        if selected_young is not None:
+            intact_young = concrete.get("youngs_modulus")
+            if (isinstance(selected_young, bool) or not isinstance(selected_young, (int, float))
+                    or not np.isfinite(selected_young) or selected_young <= 0
+                    or not isinstance(intact_young, (int, float)) or selected_young > intact_young):
+                raise ValueError("Selected Young's modulus must be positive and not exceed the intact modulus")
+            selected_young = float(selected_young)
+        manifest["selected_youngs_modulus_pa"] = (
+            selected_young if selected_young is not None else concrete.get("youngs_modulus"))
         manifest["selected_material_law"] = (
-            "reversible tensile cap; elastic below strength, no irreversible strength-calibrated nucleation")
+            ("damaged concrete: reduced Young's modulus and " if selected_young is not None else "")
+            + "reversible tensile cap; elastic below strength, no irreversible strength-calibrated nucleation")
         phase(f"{water_mode} fracture growth solve")
         result = driver(
             structure, binding["affected_element_ids"], binding["marker_source_edges"],
@@ -204,7 +215,8 @@ def run_saved_event(
             opening_limit_m=binding["opening_limit_m"], selection_provenance={
                 **binding, "saved_selection_id": saved["selection_id"],
                 "saved_selection_sha256": saved["selection_sha256"], "source_job_id": job_id},
-            selected_tensile_strength_pa=selected_strength)
+            selected_tensile_strength_pa=selected_strength,
+            **({"selected_young_pa": selected_young} if selected_young is not None else {}))
         _record_bound_growth(result, output / "growth")
         phase("writing the accepted crack surface")
         accepted = output / "growth" / result["accepted_event_directory"]

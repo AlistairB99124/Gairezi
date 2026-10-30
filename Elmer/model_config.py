@@ -7,6 +7,8 @@ import json
 import math
 from pathlib import Path
 
+from .mesh_sizing import MINIMUM_WALL_TETRAHEDRAL_TARGET
+
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 
@@ -262,6 +264,7 @@ class _ConfigValidator:
                 material.get(name) if material is not None else None, path, MATERIAL_KEYS,
                 optional={"support"} if name == "bedrock" else {
                     "compressive_strength_pa", "selected_tensile_strength_pa",
+                    "selected_youngs_modulus", "cohesive_fracture_energy_j_m2",
                 },
             )
             if values is None:
@@ -279,6 +282,17 @@ class _ConfigValidator:
                 self.field_number(values, "compressive_strength_pa", path, positive=True)
             if name == "concrete" and "selected_tensile_strength_pa" in values:
                 self.field_number(values, "selected_tensile_strength_pa", path, nonnegative=True)
+            # Damaged-concrete stiffness for painted cells; never stiffer than intact concrete.
+            if name == "concrete" and "selected_youngs_modulus" in values:
+                damaged = self.field_number(values, "selected_youngs_modulus", path, positive=True)
+                intact = values.get("youngs_modulus")
+                if (damaged is not None and isinstance(intact, (int, float)) and not isinstance(intact, bool)
+                        and damaged > intact):
+                    self.issue(f"{path}.selected_youngs_modulus", "must not exceed youngs_modulus")
+            # Mode-I fracture energy for the experimental cohesive interface law;
+            # deliberately separate from the legacy phase-field Gc.
+            if name == "concrete" and "cohesive_fracture_energy_j_m2" in values:
+                self.field_number(values, "cohesive_fracture_energy_j_m2", path, positive=True)
             poisson = self.field_number(values, "poisson_ratio", path)
             if poisson is not None and not -1 < poisson < 0.5:
                 self.issue(f"{path}.poisson_ratio", "must lie between -1 and 0.5")
@@ -468,8 +482,12 @@ class _ConfigValidator:
         if root is None:
             return self.issues
 
-        geometry = self.object(root.get("geometry"), "geometry", CONFIG_KEYS["geometry"], {"foundation"})
+        geometry = self.object(root.get("geometry"), "geometry", CONFIG_KEYS["geometry"],
+                               {"foundation", "target_wall_tetrahedral_elements"})
         if geometry is not None:
+            if "target_wall_tetrahedral_elements" in geometry:
+                self.debug_integer(geometry["target_wall_tetrahedral_elements"],
+                                   "geometry.target_wall_tetrahedral_elements", MINIMUM_WALL_TETRAHEDRAL_TARGET)
             if "foundation" in geometry:
                 path = "geometry.foundation"
                 foundation = self.object(geometry["foundation"], path, {"depth_m", "side_margin_m", "support"})
