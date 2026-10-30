@@ -17,6 +17,7 @@ from .bedrock_preview import configured_rock_mesh, survey_coordinates
 from .model_config import foundation_support, load_config, rock_outer_support, validate_config, wall_joint_support
 from .regions.model_groups import joint_boundary_ids
 from .regions.combined_structure import build_combined_structure, write_combined_gmsh
+from .mesh_sizing import config_for_wall_element_size
 from .regions.tetrahedral import _CELL_FACES, tetrahedralize_structure
 from .structure_assembly import (
     convert_with_elmergrid, mpi_launcher, write_combined_solver_input,
@@ -228,6 +229,35 @@ def prepare(
     config = load_config(output / "config.json")
     # Thickness blocks are only split where springs join them; otherwise the wall stays monolithic.
     concrete = build_combined_structure(output, split_wall_joints=joints == "spring")
+    if concrete.element_size_target_m is None or concrete.wall_tetrahedral_element_count is None:
+        raise RuntimeError("Wall mesh did not report its effective element size and tetrahedron count")
+    configured_near_size_m = (config["geometry"]["bedrock"].get("mesh") or {}).get("near_size_m")
+    mesh_config = config_for_wall_element_size(config, concrete.element_size_target_m)
+    mesh_sizing = {
+        "scope": "wall body only; foundation and bedrock are excluded from the 150,000-element cap",
+        "suggested_global_element_size_m": concrete.suggested_global_element_size_m,
+        "effective_wall_element_size_m": concrete.element_size_target_m,
+        "target_wall_tetrahedral_elements": concrete.target_wall_tetrahedral_elements,
+        "wall_tetrahedral_element_count": concrete.wall_tetrahedral_element_count,
+        "foundation_element_size_m": (
+            concrete.element_size_target_m if "foundation" in config["geometry"] else None
+        ),
+        "configured_bedrock_near_size_m": configured_near_size_m,
+        "effective_bedrock_near_size_m": (
+            mesh_config["geometry"]["bedrock"]["mesh"]["near_size_m"]
+            if "mesh" in mesh_config["geometry"]["bedrock"] else None
+        ),
+        "effective_bedrock_far_size_m": (
+            mesh_config["geometry"]["bedrock"]["mesh"]["far_size_m"]
+            if "mesh" in mesh_config["geometry"]["bedrock"] else None
+        ),
+        "interface_policy": (
+            "Foundation and bedrock reuse the wall's exact boundary facets and node coordinates; "
+            "foundation spacing and near-seat bedrock target follow the effective wall size. "
+            "Bedrock far-field grading remains configured independently, but is never finer than "
+            "its effective near-seat size."
+        ),
+    }
     joint_list = wall_joints(config) if concrete.wall_joint_levels_m else []
     foundation_present = "foundation" in config["geometry"]
     bonded_foundation = foundation_present and foundation_support(config)["model"] == "bonded"
@@ -261,9 +291,9 @@ def prepare(
             raise ValueError("Foundation trench requires joints='spring' (configured interface workflow)")
         from .foundation_trench import build_foundation
         from .graded_bedrock import build_graded_rock
-        foundation = build_foundation(config, concrete)
+        foundation = build_foundation(mesh_config, concrete)
         rock = build_graded_rock(
-            config, foundation.points, [tuple(f) for f in foundation.terrain_faces],
+            mesh_config, foundation.points, [tuple(f) for f in foundation.terrain_faces],
             stream_margin_m, bank_margin_m, bottom_z_m, foundation=foundation,
         )
         offset = len(concrete.nodes)
@@ -284,7 +314,7 @@ def prepare(
         foundation.report["support"] = dict(foundation_support(config))
     else:
         rock = configured_rock_mesh(
-            config, np.asarray(concrete.nodes),
+            mesh_config, np.asarray(concrete.nodes),
             [tuple(seat_index[n] for n in face) for tag, face in concrete.boundaries if tag == 1],
             stream_margin_m, bank_margin_m, bottom_z_m,
         )
@@ -567,6 +597,7 @@ End
         "wall_joints": joint_list,
         "nodes": len(nodes),
         "cells_by_body": dict(Counter(regions)),
+        "mesh_sizing": mesh_sizing,
         "solver_body_ids": {"wall": WALL_BODY, "bedrock": BEDROCK_BODY, **({"foundation": 3} if foundation_present else {})},
         "boundary_id_map": boundary_map,
         "rock_outer_support": outer_support,

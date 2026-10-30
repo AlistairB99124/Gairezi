@@ -1,5 +1,506 @@
 # Dam Analysis Workbench - implementation plan
 
+## Current execution restriction
+
+Legacy seeded-crack app submission and cracking reruns are retired. New API jobs
+run the elastic baselines only; configured legacy cracking stages are blocked
+with explicit feedback rather than launching a fallback solver. The old
+single-point POST and stage-rerun POST return authenticated HTTP 410 responses.
+The desktop removes those launch controls and labels submission Run baselines.
+Painting saves a selection and can launch the separate experimental FEniCSx
+painted-event solver; it does not run Code_Aster fracture. New app submissions
+require common-head hydrostatic crack loading, with no dry fallback.
+Historical results and standalone numerical CLI defaults are preserved.
+The implementation sequence below must not be interpreted as permission to wire
+the preview into the legacy seed workflow.
+
+### Current painted-scenario progress
+
+- Configuration's Material tab exposes selected-element tensile strength from
+  zero to the configured concrete tensile strength in MPa, stored as optional
+  `material.concrete.selected_tensile_strength_pa`.
+  Absent values inherit the configured concrete tensile strength. Only painted
+  wall cells use this reversible tensile-cap law after the intact equilibrium;
+  zero reproduces the no-tension case. This is not irreversible softening or
+  strength-calibrated nucleation. The cap, energy and tangent are used together
+  in the growth equilibria and recorded in numerical inputs/results.
+- The painter and API require hydrostatic mode. Pressure on released faces is
+  derived from proven reservoir connectivity/head and retained exterior loads;
+  arbitrary pressure on every internal face is not assigned. Reservoir
+  discovery now retains upstream, tailwater, waterline-crossing and horizontal
+  constant-pressure crest edges; head/access checks apply to released cuts,
+  not the whole potential candidate inventory. Crest head is derived from
+  its actual elevation and configured pressure, with a horizontal-face check.
+  Partially submerged crack-face forces and pressure work use exact clipped
+  P1 integrals. Reservoir-disconnected cuts remain explicitly unpressurised.
+  Final wet acceptance checks open submerged access and nonpenetrating contact.
+  An actual released cut meeting different heads still fails explicitly; a
+  general different-head wet-growth model and trapped/filling history remain pending.
+  Historical dry events remain viewable but cannot be restarted as dry; reopen
+  the painter for explicit hydrostatic resubmission. Existing job configuration
+  snapshots stay frozen, so changing tensile strength requires a new baseline job.
+- The growth trial reuses its initial accepted intact/reduced equilibrium only
+  after verifying the full mechanical-problem identity and monotone cut release.
+  Every trial still re-equilibrates and audits residual/contact/force balance.
+  This avoids repeating the intact/strength-drop solve for each possible face.
+- Single-face releases can be kinematically ineffective when neighbouring
+  full-vector bonds still identify every crack-lip vertex. Native growth now
+  excludes patches that split no bonded identities and fails explicitly if
+  none of the proposed extensions can open; this must not be reported as
+  arrested growth. Initial candidate screening happens before the intact/
+  selected-material equilibrium solve, so a wholly locked initial front fails
+  during preparation without spending time on an unusable equilibrium.
+  The report records `initial_equilibrium_started=false` and the excluded
+  patches; previously saved job outputs are unchanged.
+  New painted app runs explicitly enable `resolve_locked_patches`. For each
+  locked front seed, a minimum-cardinality cut of the remaining bonds around
+  each seed vertex proposes a finite, edge-connected manifold surface disk.
+  This resolves the P1 node-star locking without changing the bulk mesh,
+  inserting a gap, removing cells or releasing faces for free. Up to three
+  completions per seed are generated, rather than enumerating all connected
+  subsets. Redundant supersets of another opening-capable completion of that
+  seed are excluded: resolution tests irreducible first-opening increments,
+  while larger finite jumps remain the explicit patch-bound search's scope.
+  Unlisted faces remain bonded. The full geometric area of each
+  proposed completion is charged at the configured fracture energy, and
+  acceptance still requires lower total potential and an audited equilibrium.
+  Native dry/wet callers retain the old default unless explicitly enabled;
+  reports distinguish node-star-patch-set arrest from single-face arrest.
+  Hydraulic adjacency uses both lip identities after remaining bonds are
+  condensed. Only inlet-connected released sheets receive pressure; other
+  sheets are explicitly dry. The clipped fixed-head loader is used for fully
+  and partially submerged cuts alike, allowing contact at individual vertices
+  only if a nonpenetrating, open submerged reservoir path is independently
+  established on the solved state.
+  A force/contact-audited pressure trial with closed hydraulic access is not
+  an accepted wet state. In the current convex material/contact problem,
+  fully applying nonnegative reservoir pressure bounds the potential from
+  below for every physically accessible drained subset. If even that bound
+  cannot pay the added geometric fracture area, the candidate can be rejected
+  with an explicit energy-bound certificate instead of aborting the search.
+  Favourable bounds with unresolved access and numerical failures still fail;
+  no dry fallback or invented aperture is used. This convex bound must not
+  be assumed valid for future nonconvex softening.
+  Historical completed single-face searches require that
+  caveat. This correction does not turn the reversible tensile cap into
+  irreversible softening or strength-calibrated nucleation. Native node-star
+  tests demonstrate positive opening, full-area energy costs, two accepted
+  wet extensions, irreversibility under increased surface resistance and
+  rejection of high-cost extensions. These are synthetic verification cases,
+  not dam-property calibration.
+- Native specimen tests at 0.5 MPa tensile capacity check elastic equilibrium
+  at 0.4 MPa tension, explicit nonacceptance at 1.2 MPa tension and unchanged
+  compressive compliance at 1.2 MPa compression. Surface pressure must not be
+  compared directly to tensile strength as a crushing criterion.
+
+- The painter can explicitly save append-only, job-bound selection snapshots
+  and restore the latest on reopening. Snapshots include source element/edge
+  IDs, face choices and numeric opening limit (default 0.002 m). Authenticated
+  GET/POST `/jobs/{id}/damage-selection/saved` routes revalidate configuration,
+  catalog identity and integrity. Corrupt/stale latest snapshots fail explicitly;
+  unsaved changes are still discarded. Saving starts no solver and changes no
+  baseline/job configuration.
+- Experimental FEniCSx checks now cover a relaxed no-tension local material
+  retaining original compressive compliance and native 3D post-event equilibrium
+  patches. This reversible local relaxation is not an irreversible propagating
+  crack or a calculated face opening.
+- A reduced native load-controlled event driver now solves the intact state,
+  imposes the selected-cell material change and re-equilibrates with the same
+  external load functional/BCs. Two-mesh tests check load redistribution and
+  reactions; complete loss of tensile load paths fails explicitly. New isolated
+  outputs preserve input mesh/selection/load and accepted intact state, stage
+  status and Newton trace even on event failure; accepted post-event material
+  and displacement exports appear only after equilibrium checks. Cellwise
+  properties now accept the existing concrete/rock DG0 material fields.
+  The existing mortar spring operator and canonical roller support form can
+  be retained in both solves and the independent reaction audit; reduced
+  analytical checks cover their compliance/forces/energy. Cellwise properties
+  and optional mortar CSR coefficients are archived. Serial constrained mortar
+  DOFs now use verified row/column elimination and imposed-displacement lifting,
+  retaining original coefficients for reactions/energy. Tests cover nonzero
+  prescribed displacements during nonlinear tensile release. A synthetic
+  patch verifies unchanged gravity/reservoir/tailwater forces during tensile
+  release. This original reduced driver is serial/direct; the later contact
+  driver also provides opt-in iterative solving. Production provenance/load/support
+  wiring, resource feasibility, hydraulic times and unrestricted propagation
+  remain unimplemented.
+- An experimental source-import event entry point now imports a canonical
+  structure itself, maps source rows through native reordering and rejects
+  bedrock/foundation selections. It reuses the baseline's shared gravity/
+  reservoir/tailwater/top-pressure helper, canonical materials, mortar springs
+  and outer supports. Native two/three-body checks verify force integrals,
+  both foundation interfaces and source-order intact displacement agreement
+  with the existing elastic solver (`rtol=1e-8`, `atol=1e-11 m`). Source rows
+  are preserved in native archives. This is not saved-request hash binding or
+  an API submission route. Coarse triangles crossing a waterline exposed
+  positive-part quadrature errors. Exact clipped-triangle P1 water loads now
+  support these cases, with independent analytical force/moment/virtual-work
+  and subdivision checks. Fixed nodal pressure forces enter both event states,
+  reaction checks and archives; source-event tests include partially submerged
+  reservoir and tailwater facets. This is not evolving crack-water pressure.
+  Baseline material parameters and loads remain unchanged. The later
+  source-growth fixture also corrects overlapping serial mortar/fixed-support
+  constraints and includes original mortar forces in fixed-support reactions
+  (see the source-growth validation below).
+- A baseline-bound experimental Python mechanics entry point now rebuilds the
+  canonical structure, requires existing elastic parity/equilibrium evidence,
+  rebuilds/validates the catalog and checks exact compacted source topology/
+  regions/coordinates. Mesh/configuration/baseline-field identities and source
+  diagnostic hashes must match before solving. The report retains binding
+  evidence, resolved faces, marker edges and numeric opening limit. Tests cover
+  actual Gmsh binding, stale/reordered/changed inputs and reduced native
+  provenance persistence with substituted baseline-loading orchestration.
+  This is not a full saved-dam integration test, API route or edge-growth law;
+  no submission capability has been enabled.
+- Serial native source-row tags and checked wall-selection masks preserve
+  source identity across subdivision, native reordering and two refinement
+  levels in reduced tests. Coincident split nodes are not merged; non-wall
+  selections fail. Production must still bind the source to the validated
+  catalog and preserve these tags through its own preparation/refinement.
+- Reduced hydraulic checks cover prescribed-open saturated 1-D flow, cubic-law
+  conductivity, gravity, transient linearised storage and aperture-rate effects.
+  Fluid properties and physical pressure/time histories are explicit test
+  inputs, not new production calibration. A further native reduced variant
+  couples local normal compliance to pressure-dependent opening, storage and
+  conductivity with a monolithic Newton solve. Independent contact tests apply
+  prescribed water tractions, release compression, calculate zero-initial-gap
+  face opening and reclose on unloading. These separate reduced models do not
+  implement the dam's evolving wetting/contact/crack system.
+- Optional scalar tangential loading in the native contact benchmark now checks
+  Coulomb stick/slip/reversal and nonnegative dissipation with explicit friction
+  coefficient/shear modulus. Friction uses solid contact force only, so pressure
+  reduces friction capacity and open faces carry no shear. 3-D contact search,
+  surface growth and production calibration are not supplied by this benchmark.
+- Explicit paired 3-D P1 face utilities measure normal opening from source-node
+  displacement jumps, retaining signed penetration/tangential slip separately,
+  and integrate consistent equal/opposite P1 water-pressure forces. A native
+  zero-gap two-block test verifies analytical opening, stress and equilibrium.
+  Scenario-neutral measured-opening assessment preserves the peak after
+  reclosure and warns at/above the limit. Neither the extractor nor that
+  assessment constructs a surface from a selected edge or implements growth.
+- An explicit-facet topology utility now cuts interior wall faces with node-star
+  connectivity, preserving tied crack-front nodes, cell rows/regions, parent
+  node IDs and exterior boundary tags. Accepted-state transfer imposes no jump.
+  Native integration verifies a bonded mesh through explicit cut and pressure
+  loading to measured 3-D opening/equilibrium. Boundary/non-wall/nonmanifold and
+  fully tied under-resolved cuts fail explicitly. This does not choose a
+  fracture surface from a selected edge or a constitutive propagation criterion.
+- Paired-surface water-access checks now use explicit hydraulic inlet source
+  edges and measured opening, not coordinate proximity or painted markers.
+  Closed connecting edges, tied fronts, point contacts and unrelated coincident
+  sheets do not transmit access. Reachable/isolated open faces and blocked
+  inlets remain explicit. Connectivity assigns no pressure or saturation and
+  must not silently erase trapped fluid after reclosure; transient filling
+  and pressure require a conserved-fluid state.
+- See [verification scope and commands](../FEniCSx/README.md#painted-tensile-loss-building-blocks).
+  Full-dam provenance wiring, edge-to-surface construction, growth,
+  friction, wetting/contact and pressure feedback, actual opening extraction,
+  Code_Aster parity and resource/engineering validation remain prerequisites
+  before exposing scenario submission.
+
+The working crack-growth scope is unrestricted turning/branching through the
+concrete, matching the painted-event intent; no horizontal-only constraint or
+initial opening is imposed. The physical growth/surface formulation is not yet
+implemented by the local no-tension law.
+
+### Target: eventual post-event equilibrium
+
+The requested result is eventual quasi-static equilibrium, not the response
+second by second. Preserve the loaded intact baseline, impose permanent tensile
+capacity loss in the selected wall elements, and seek an admissible post-event
+equilibrium under unchanged gravity and exterior hydraulic loads.
+
+Structural inertia, impact, filling duration and transient pressure histories
+are outside this first scenario. Numerical continuation steps are not physical
+seconds. Fluid viscosity/compressibility and an event duration are not mandatory
+inputs for an explicitly drained hydrostatic equilibrium model; they must not
+be demanded merely because transient benchmark components exist.
+
+The opening assessment now has an equilibrium-specific accepted-state contract:
+state IDs replace physical timestamps, peak and final opening are distinct,
+and reclosure cannot hide an accepted peak at/above the warning threshold.
+Incomplete runs remain unassessed. Shared threshold/warning logic preserves
+legacy transient reports. Three pure tests and the native measured hydrostatic
+opening check cover this contract; production result UI wiring remains gated.
+
+Hydraulic equilibrium assumptions remain explicit: an open, saturated path in
+communication with a reservoir uses its hydrostatic head, with pressure acting
+back on crack faces. Geometric connectivity alone does not establish saturation
+or drainage of closed/isolated pockets. Connected reservoirs at different heads
+can require steady flow rather than a single hydrostatic pressure field.
+Trapped fluid/air and disconnected or closed pockets require a stated treatment;
+do not silently discard their contents or assign reservoir pressure.
+
+Irreversible fracture/contact history is still relevant to the final state.
+Static nonconvergence is not proof of collapse, and convergence alone does not
+establish stability, uniqueness or dam safety. Fracture calibration, friction,
+appropriate hydraulic boundary assumptions and independent validation remain
+required; the scope reduction does not make the production solver ready.
+
+The eventual-equilibrium scope and stated hydraulic exclusions have been
+accepted. The first drained hydrostatic crack-loading component now assigns
+`rho*g*(head-z)` only to explicitly saturated, fully submerged, open faces
+reachable from named verified hydraulic inlet edges. It reuses paired-face
+consistent tractions. Explicit previously-wet masks prevent silent drainage on
+isolation/reclosure. Connected unequal heads fail pending steady flow, and
+partial saturation/free surfaces fail pending appropriate hydraulic topology.
+Independent components may use different heads. Seven pure checks and a native
+3-D pressure/opening/access-consistency check verify this limited component.
+It does not choose fracture resistance/friction values or implement
+irreversible propagation/contact; `solver_ready` remains false.
+
+A separate reduced steady surface-flow component now handles unequal heads
+on prescribed explicitly saturated, fully open paired surfaces. It solves
+`div(w^3 grad H)=0` and converts `rho*g*(H-z)` to consistent paired-face
+loads. Uniform viscosity cancels from source-free head; only scaled boundary
+reactions are reported, not physical leakage. Nine analytical/convergence/
+identity tests check head, cubic conductance, variable aperture, hydrostatic
+equivalence and conservation. Closed/tied vertices, isolated wet surfaces,
+point-only or nonmanifold junctions, conflicting heads and negative pressure
+remain explicit failures. Hydrostatic callers do not silently switch models.
+This is not coupled evolving contact/flow, an irreversible fracture model
+or a full-dam scenario; production submission stays disabled.
+
+The steady surface component now also has a reduced local-compliance feedback
+solve: pressure changes aperture via `w=w_ref+C*(p-p_ref)`, and that aperture
+changes the steady head through cubic conductance. Explicit options bound
+iterations and set aperture/flow tolerances and relaxation. Five checks verify
+analytical hydrostatic/stiff-wall limits, reference/owner invariance, explicit
+nonconvergence/closure and mesh convergence to an independently integrated
+nonlinear steady solution. Accepted states satisfy both compliance and audited
+flow on the same aperture. Synthetic already-open specimen data are not dam
+defaults; this does not implement bulk mechanics/contact/friction or growth.
+
+A reduced fixed-cut adapter now couples actual 3-D bulk elastic deformation
+to aperture-dependent steady surface head. Unchanged external-load dry
+equilibrium must already open all hydraulic vertices; no seed gap or artificial
+aperture is imposed. Accepted candidates recompute pressure on their own opening
+and pass independent bulk free residual/global force, surface flow balance and
+displacement-correction checks. Six native tests verify actual aperture/head
+feedback, hydrostatic limit, exterior-face/orientation provenance and
+closed-dry-cut/nonconvergence failure, retained mortar seats under nonzero
+prescribed support motion, and equivalent fixed nodal/form external loads.
+Mortar Dirichlet lifting uses the existing helper; independent audits retain
+the original spring operator. Original CSR coefficients, dry/wet spring energy,
+and fixed nodal external loads are retained in diagnostics/archives.
+Isolated outputs retain dry/input/failure evidence, and accepted-only NPZ/VTK
+fields use state IDs rather than physical time. This is not yet a painted
+tensile-loss/contact/propagation adapter or full-dam validation.
+
+A native serial 3-D fixed-cut frictionless-contact entry point now enforces
+vertex-normal nonpenetration with nodal-force multipliers, without a penalty
+stiffness or artificial aperture. Both tangential directions remain free.
+Existing mortar matrices, fixed nodal loads and imposed support motion enter
+the original bulk stiffness/load system. Exterior-lip/source identity checks
+are shared with the open-cut flow adapter. Eight tests cover analytical closure,
+pressure reopening/reclosure, oblique normals, free tangential motion,
+partial contact against independent constrained-energy minimisation, and
+accepted-only output/failure trace. Water is an explicitly prescribed traction
+in these checks, not inferred saturation or transported pressure. This does not
+yet couple contact to the selected no-tension event/flow/growth, supply Coulomb
+calibration, or establish dam-scale feasibility. Production submission remains
+disabled.
+
+The experimental `solve_contact_event` now integrates the selected-cell material
+change with native 3-D contact instead of merely testing them separately.
+It establishes a fully bonded loaded state (all jump components tied), then
+releases an explicitly supplied cut while selected cells lose tensile capacity.
+Compression and external loads/support motion are retained. The nonlinear
+material tangent/contact solve is independently audited using the actual
+material stress, reactions and global force balance.
+Explicit steady hydraulic data can now couple surface head/pressure to the
+same accepted material/contact displacement, after a dry post-event equilibrium
+opens the hydraulic inventory. Closed dry cuts and wet closure remain explicit
+failures, not residual-aperture regularisation or silent drainage. Inputs,
+bonded/dry states, iterations and failures persist; only accepted post-event
+states receive result exports. Native tests include actual tensile redistribution,
+analytical bonded fields, retained compression, same-state coupled pressure and
+failure persistence. **Edge-to-surface initiation, irreversible unrestricted
+growth, calibrated friction, trapped-fluid/free-surface states, canonical saved-
+dam integration/resource validation and production submission remain missing.**
+
+An experimental dry finite-candidate Griffith search now supplies an energy
+decision for explicit source triangle extensions: re-equilibrate the accumulated
+cut, compare mechanical potential release with `Gc * area`, and never heal an
+accepted surface. Actual interior wall/wall facets in all orientations can be
+extracted from source identities and marker incidence; point-only/coincident
+contacts are not edge adjacency. This remains a mesh-facet restriction, not an
+implementation of unrestricted physical paths. Arrest is labelled only within
+the tested single-triangle candidate set; multi-facet jumps are not excluded.
+Failed trials and a limit with favourable remaining extension fail explicitly.
+Native tests verify the analytical displacement-controlled energy threshold and
+selected-material bonded/released comparison. The event driver now reports
+dry stored material/support/mortar energy, dead-load work and a bound problem
+SHA256. Pressure-loaded/flow states cannot use that dry mechanical potential:
+reservoir work is not supplied. Wet growth, strength-controlled nucleation,
+candidate preparation/resolution, full-dam feasibility and
+production integration remain incomplete. This does not change submission gates.
+Prepared-candidate native orchestration is now implemented: each energy trial
+solves the selected material/contact problem with full bonds on unbroken faces
+and unilateral contact on released faces. Source-parent/marker identities and
+the exact final accepted trial directory persist. A native eight-candidate
+example verifies growth versus no growth under low/high surface resistance.
+This is explicitly dry and mesh-constrained, not an unrestricted wet path model.
+Canonical source preparation/orchestration is now experimental code rather
+than a caller-only responsibility: actual wall/wall source facets are split,
+exterior tags/materials/source rows retained, and the original gravity, exact
+exterior water loads, mortar seats and outer supports are reused. New surfaces
+remain explicitly dry. Original-parent multiplier identities are retained
+when wall nodes split; rebuilding independent per-triangle multiplier rows
+would otherwise change foundation stiffness even in the bonded state.
+Native displacement parity and projector/energy tests guard that invariant.
+Source mapping and trial failures persist without a success-shaped fallback.
+The source entry point is not bound to authenticated saved request/baseline
+evidence; all-facet preparation/trial performance is not validated on the dam.
+It remains dry and mesh-constrained, not unrestricted water-coupled production.
+An experimental bound dry-growth adapter now shares the existing event
+baseline/selection verifier: it rebuilds structure/catalog, verifies field,
+mesh and configuration identity, rechecks diagnostic hashes, and translates
+catalog marker endpoints through source-node compaction. Selection/baseline
+provenance and the opening warning limit persist with source/trial results.
+The direct source adapter still makes no binding claim. Tests cover actual
+Gmsh catalog mapping, rejection before preparation and native bound-adapter
+orchestration with substituted baseline loading, not a full saved-dam solve.
+No API/WPF solve route is enabled, and unrestricted wet propagation is unchanged.
+An opt-in saturated-flow extension now accepts exact tied crack-front nodes
+without a minimum hydraulic gap. Positive face conductance is integrated from
+the actual P1 aperture cubed; untied contact vertices, closed inlets and closed
+internal barriers remain explicit failures. Analytical wedge head/conductance/
+virtual-work tests and a native three-tet material/contact/water equilibrium
+check verify this bounded case. Default strict-open hydraulics is unchanged.
+This is not a closed/trapped-fluid state, wetting model or wet growth law.
+Explicit hydraulic face IDs can now select a released wet subset from the
+larger bonded/contact candidate inventory. Unbroken faces cannot receive water
+loads. The same transitive all-component mechanical bond identities establish
+hydraulic front connectivity, with checked source parents/displacement ties;
+coordinates alone never merge sheets. Hydraulic pressures integrate onto the
+original solid lip nodes. Native connected/subset tests verify unchanged bonds,
+same-state mechanics/flow and archived hydraulic row mappings. Omitted faces
+are explicitly dry; this cannot silently discard a previously wet fluid state
+and does not implement wet propagation, wetting or trapped-water conservation.
+An experimental common-head hydrostatic finite-candidate growth driver now
+includes reservoir work explicitly in `Pi=U-W_exterior-integral(p*w)dA`.
+This is conservative only for fixed reference geometry and common reservoir
+head; different-head dissipative flow is rejected as a growth potential.
+Every released surface is explicitly saturated and must open and connect to
+declared inlets at accepted equilibrium (optional tied tip). Mechanics/reservoir
+identities bind all trial comparisons. Native tests verify pressure virtual
+work, low/high resistance release/arrest, a reservoir-work-dependent decision,
+and irreversible extension of a seven-face wet surface to eight faces.
+Failed or hydraulically inadmissible trials fail explicitly, never claim arrest.
+The common-head specialization now permits pressure to open a closed trial
+without an initial gap or dry-open intermediate. Final aperture/access/flow are
+independently audited before acceptance; a native dry-closed compression-contact
+specimen opens under reservoir pressure and passes material/reaction/work checks.
+This explicitly saturated eventual-equilibrium branch does not predict filling
+history, and general steady through-flow retains the dry-opening prerequisite.
+This is still mesh-constrained, not unrestricted propagation; wetting/trapped-fluid conservation, general through-flow
+growth, full-dam validation and production integration remain unfinished.
+Dry/common-head native growth reports now retain accepted equilibrium evidence
+and aggregate opening-limit warnings over accepted states only. Reclosure does
+not erase an earlier peak; rejected trial openings do not enter the warning.
+Incomplete searches retain observed peaks without claiming the criterion
+passed. State IDs remain continuation labels, not physical time.
+Canonical source and verified-baseline adapters now reach the experimental
+common-head wet-growth driver through shared source/load/support preparation.
+Hydraulic inlets derive from inherited exterior reservoir tags and canonical
+heads, independently of painted markers. Different-head connections,
+waterline-crossing edges, ambiguous constant-pressure crest connections and
+absent reservoir access fail explicitly; no head or fluid data is invented.
+Native reduced source trials verify unchanged loads/materials/mortar and intact
+displacement parity. Bound-orchestration tests substitute baseline loading;
+the actual saved-dam workflow remains unverified and disabled.
+This fixture also verifies serial baseline spring/Dirichlet elimination where
+fixed rock nodes meet mortar seats, including original spring forces in support
+reactions; fixed displacements and global force balance are regression checked.
+Reduced source tests now cover accepted low-resistance wet fracture as well as
+high-resistance arrest. An actual Gmsh/catalog/selection-binding/native wet-growth
+test reopens accepted source/input/hydraulic archives and checks real mapped
+element/edge/face identities. Only structure rebuilding is substituted,
+not the catalog, binding, preparation or numerical solves. This is a reduced
+component test with synthetic baseline evidence, not a full saved-dam workflow
+or engineering validation.
+That integration now runs the actual saved-baseline gate against explicitly
+synthetic reduced-test evidence; only structure rebuilding is substituted.
+Changing completion status, force balance or source identities prevents growth
+before output creation. This does not constitute independent Elmer parity.
+
+Dry/common-head energy search now optionally tests every connected patch up to
+`GrowthOptions.maximum_patch_faces` (default 1). This addresses bounded
+multi-face jumps over single-face energy barriers without imposing free crack
+area or altering materials. All candidate patches touch the current edge front,
+retain earlier cuts and re-equilibrate the full problem. Reports record the
+patch bound and exact candidate surface IDs, and distinguish patch-set arrest
+from single-face arrest. Native six-to-eight-face wet release checks full
+reservoir work and irreversible cuts; exhaustive subset tests independently
+check candidate completeness within the bound. Larger jumps, mesh-independent
+paths, nucleation and full-dam cost remain unresolved. The extension cap counts
+accepted patch steps, not newly released faces; a favourable remaining trial or
+failed patch equilibrium is failure rather than arrest.
+The current native regression passes 266 distinct tests. A read-only binding
+check against the actual saved dam (194,316 nodes, 990,840 tetrahedra) also
+completed in 129.47 s: real structure rebuilding, source/configuration/diagnostic
+hashes, saved-baseline gate, catalog and exact element/edge mapping all passed,
+with no substituted loading. The existing independent elastic evidence reports
+relative displacement difference `1.767e-7`, nodal stress difference `5.991e-7`
+and force-balance error `7.989e-11`. These values were verified from the saved
+baseline, not recomputed in that check. The diagnostic selected one eligible
+element and actual edge only to exercise binding; it neither changed saved
+user selections nor launched full-dam fracture growth.
+An isolated experimental module runner now consumes the app's saved painting
+snapshot format and the same integrity reader as API restore. Explicit job,
+configuration, source model, baseline and field identities are revalidated;
+numerical controls and a source-cell resource ceiling are supplied separately.
+It preserves input snapshots, environment, verified binding, stage failure and
+accepted PVD/native-state/report paths in a new output directory only. Dry and
+common-head wet reduced native integration tests run through completion;
+unsupported water never silently switches to dry. This is a standalone
+experimental tool, not production API/WPF submission or dam-scale validation.
+Accepted output also includes a paired-lip ParaView surface with exact split/
+original-parent/face identities, released/wet masks, displacement, measured
+normal opening/signed gap/tangential jump and accepted water pressure. Both
+unit VTU round trips and native dry/wet runs reopen and verify these fields.
+The runner's `--prepare-only` mode now inventories actual unsplit native wall
+facets and checks canonical reservoir connections before any candidate-node
+splitting or solve. Native inventory is compared against the independent
+cell-owner implementation on reduced concrete/rock and jointed sources,
+including exact ordering, marker identity and orientation. Unsplit/split inlet
+sets agree. Multiple water-model incompatibilities are reported together and
+preserved with inventory counts even on failure.
+
+Actual saved-dam preparation found 1,177,580 candidate faces and an upper bound
+of 7,859,916 split displacement DOFs. Dry preparation succeeded without any
+fracture solve. The actual wet preflight explicitly rejects both positive
+constant-pressure crest connections and differing reservoir heads; 73.70 s
+total, of which 10.90 s was native inventory/hydraulic screening after binding.
+It created no split/growth mesh or accepted-result index and modified no user
+selection. Therefore the currently verified common-head growth component is
+not applicable to this saved dam's complete candidate inventory. General
+nonconservative hydraulic growth and scalable dam-level nonlinear mechanics
+remain concrete blockers, not solved by the standalone runner.
+Native contact now eliminates intact/unbroken identity bonds exactly through
+a displacement quotient, rather than enlarging every solve with bond
+multipliers. It recovers original forest forces and audits the original split
+space, preserving nonzero supports, forces, energy, irreversible releases and
+contact inequalities. The intact quotient recovers the original unsplit DOF
+count in the source regression. The previous multiplier path remains available
+for direct parity checks. This reduces solve size, not split-space assembly
+cost, and does not establish full-dam resource feasibility.
+
+An opt-in symmetric MINRES contact solve now avoids LU factorisation, with
+explicit tolerances/iteration cap and positive mechanical/approximate-Schur
+diagonal preconditioning. Direct remains the default. Tests compare direct/
+iterative native partial contact and wet multi-face growth, and verify
+iteration-limit/nonpositive-diagonal failures with no direct fallback.
+Actual full-dam nonlinear scalability remains unverified.
+
+The released frictionless source fixture also exposes a physical/numerical
+qualification: equilibrium and equal stress/energy/opening do not prove unique
+displacement. Direct and iterative methods can select different zero-energy
+displacement modes. Reports now explicitly mark uniqueness/stability unverified;
+a separate semidefinite counterexample checks this. No friction, extra support
+or residual stiffness is invented to remove the ambiguity.
+
 ## 1. Goal and scope
 
 Saved-job Code_Aster discrepancy investigation: see
@@ -291,6 +792,14 @@ a same-scope uncracked submodel reference exists. Full-dam (not submodel)
 Aster cracking and resource enforcement remain future work. See
 `Aster_Porting.md` for limitations.
 
+Painted-event results are a separate comparison from crack scenarios. The
+Comparison tab shows the initial intact and final accepted equilibria in their
+own group, including raw cellwise whole-model stress extrema and matched-node
+displacement-field change. It must not place a weakened-but-bonded state in
+the cracked-scenario column; that column remains empty when growth accepts no
+crack extension. The raw stress extrema are not directly comparable with the
+baseline's recovered wall peaks.
+
 Native Aster concrete damage versus FEniCSx AT2 was approved as a comparison
 of different formulations. The installed Aster 17.4 catalogue provides
 `ENDO_FISS_EXP` with `3D_GRAD_VARI`. Its material interface requires tensile
@@ -458,7 +967,7 @@ independent sensitivity verification. See the README for existing-run export.
 | Wall radii and radial width | Validate width and midpoint relationships; display units in metres |
 | Contour `height` | Label as signed elevation relative to crest z = 0 |
 | `geometry.wall.height_m` | Clearly identify current nominal metadata; contours control the actual height |
-| Global element size | Controls the shared combined mesh |
+| Global element size | Starting suggestion; the wall analysis mesh scales it to stay at or below 150,000 final tetrahedra, while the conforming foundation and near-seat bedrock adapt to the effective target size |
 | Local element size | Identify which generator uses it; do not imply it refines the current combined mesh |
 | `water_height` | Reservoir depth above the deepest wall seat; with `overflow_head` sets the water surface |
 | `overflow_head` | Depth above the crest when overflowing; adds the crest surcharge |
@@ -466,7 +975,7 @@ independent sensitivity verification. See the README for existing-run export.
 | Explicit directional springs | Without `geometry.foundation`, the wall/bedrock seat uses `geometry.bedrock.support.spring_n_per_m3`; with it, that setting controls foundation/bedrock and `geometry.foundation.support` controls wall/foundation. Springs act on relative displacement only (no grounded spring bypass); bonded interfaces share nodes and leave spring coefficients inactive. The legacy wall-only solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
 | Bedrock material | Active in the integrated three-body solver; the legacy wall-only solve represents the foundation with grounded springs instead |
 | `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall-only solve |
-| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: 0.5 m target within 2 m of the locked wall seat, grading to 15 m by 50 m; shared by preview and three-body preparation. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
+| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: near-seat size follows the effective wall size, grading toward the configured far size by the configured distance; shared by preview and three-body preparation. Only wall tetrahedra count toward the 150,000 cap. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
 | Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |
 
 No silent physical reinterpretation as part of the API work. If actual-height

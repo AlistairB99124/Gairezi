@@ -726,7 +726,7 @@ tetrahedral rock mesh**, controlled by `geometry.bedrock.mesh`:
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `near_size_m` | 0.5 | Nominal near-interface element length |
+| `near_size_m` | 0.5 | Starting near-interface size; the prepared bedrock mesh follows the effective wall size |
 | `far_size_m` | 15 | Nominal remote-rock element length |
 | `near_distance_m` | 2 | Fine buffer from the wall underside |
 | `far_distance_m` | 50 | Distance at which the far-field target is reached |
@@ -737,6 +737,11 @@ these distances in all three dimensions. Existing seat nodes and all seat
 triangles are locked, including their diagonals. The rock exterior retains the
 underlying faceted terrain/control profile instead of resampling it onto a
 tensor-product grid. No terrain-smoothing filter is applied.
+The wall's computed size is also applied to the concrete foundation spacing and
+the bedrock near-seat target in both the geometry preview and solver
+preparation; exact seat facets and node coordinates are shared. Bedrock remains
+independently graded toward its configured far-field size. Only wall tetrahedra
+count toward the 150,000-element cap.
 Fine surface nodes no longer force fine columns all the way down to the bottom.
 The volume is generated from a closed discrete shell to avoid artificial CAD
 seams trapping flat tetrahedra. Mesh generation verifies exact seat faces, positive
@@ -912,7 +917,7 @@ the deleted `Elmer/load_cases.json` is read by these workflows.
 
 | Section | Meaning |
 |---|---|
-| `geometry.global_element_size_m` | Shared mesh spacing in metres |
+| `geometry.global_element_size_m` | Starting size suggestion; the wall analysis mesh is adjusted to stay at or below 150,000 final tetrahedra, and attached foundation/near-seat bedrock adapt to the effective size |
 | `geometry.local_element_size_m` | Corner refinement for standalone geometry generators |
 | `geometry.wall` | Wall face radii, radial width and centreline (crest section); optional downstream `thickness_steps`, `joint_support`, `step_end_taper_ratio` |
 | `geometry.bedrock` | Signed bedrock contour elevations (the wall seat) and wall/rock seat support |
@@ -1059,7 +1064,7 @@ section are always global Cartesian coordinates, not chainage/radius values.
 
 | Field/capability | Combined Elmer workflow |
 |---|---|
-| `geometry.global_element_size_m` | Active; controls the shared mesh spacing |
+| `geometry.global_element_size_m` | Active as a starting suggestion; the wall body's effective target size is calculated from its 150,000-tetrahedron budget |
 | `geometry.local_element_size_m` | Validated, but does not refine the combined mesh |
 | Wall radii and bedrock contour elevations | Active; define the mesh geometry |
 | `geometry.wall.height_m` | Nominal metadata; contour elevations define actual geometry |
@@ -1275,28 +1280,28 @@ These simplifications are expected to affect compressive stress distribution and
 When `geometry.foundation` is present, every station top is now the minimum of
 its two incident former staircase column treads (one incident tread at a wall
 end). The wall/foundation split interpolates straight between these station
-tops. The 114 former 0.5 m risers become chamfers: actual wall-interface triangle
-angles are 45.000187--46.847796 degrees across the arch thickness. There are no
-vertical wall/foundation faces. Any nonzero riser other than exactly one course
-is rejected explicitly rather than silently chamfering across a joint or several
-stations. Because the seat can also sit on a thickness-step tread, the
-configuration validator (and the app's schema) rejects any
-`thickness_steps[].top_z_m` that is not a multiple of `global_element_size_m`
-when a foundation is present, naming the nearest valid levels; for example
-0.75 m courses with steps at -20 m and -25 m produced 0.25, 0.5 and 1.0 m
-risers. No wedge crosses a wall joint: each belongs to the block below its
-higher endpoint. Without foundation, the previous wall behavior is unchanged.
+tops. The 0.5 m global size is now a starting suggestion, not a fixed course
+spacing. With a foundation, the wall mesh selects a course spacing compatible
+with the thickness steps, estimates a coarser target from the generated
+tetrahedral count, and rebuilds until the wall body is at or below 150,000
+tetrahedra. Other bodies are not included in this limit. The current
+configuration produces a wall target spacing of 0.833333 m and 141,846 wall
+tetrahedra. The FEniCSx run manifest records the suggestion, effective target
+size and achieved count. No wedge crosses a wall joint: each belongs to the
+block below its higher endpoint. Without a foundation, the thickness steps
+remain independent of the global course grid.
 
 The cut wedges transfer **62.188918 m3** from foundation to wall, independently
 checked against the wall prism-cell volumes. The exposed margins follow the
-same profile. Trench radii remain 74.5--80.5 m; **3490/3490** wall seat nodes snap
+same profile. Trench radii are 74.0--80.5 m for the configured maximum 5.5 m
+wall thickness and 0.5 m side margin; **3490/3490** wall seat nodes snap
 exactly to duplicated foundation nodes. The lining uses two structured hex
 layers, deterministically split into tets. Its floor follows the same chamfered
-profile with a conservative common vertical offset **0.733675 m**, derived as
-`depth_m*sqrt(1+maximum_inner_radius_slope**2)`. Thus normal thickness is at least
-0.5 m, not exactly 0.5 m everywhere: flat treads have extra thickness. The floor
-is deeper than the old stepped trench; exterior terrain is only lowered, never
-filled. The lip follows the chamfered top and exterior triangles reconnect to
+profile with a conservative common vertical offset derived as
+`depth_m*sqrt(1+maximum_inner_radius_slope**2)`. Normal thickness is at least
+the configured 1.0 m, with extra thickness on flat treads. The floor is deeper
+than the old stepped trench; exterior terrain is only lowered, never filled.
+The lip follows the chamfered top and exterior triangles reconnect to
 unchanged survey anchors (maximum lowering 0.947427 m). Crest-end extensions
 retain the adjacent lowered wall-end top, not z=0.
 

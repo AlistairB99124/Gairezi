@@ -11,11 +11,22 @@ import struct
 from .bedrock_contours import load_contours
 from .uniform_wall import build_bedrock_seated_wall
 from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS, build_named_groups, is_wall_joint_boundary_id
-from ..model_config import load_config, wall_joint_support
+from ..mesh_sizing import (
+    TARGET_WALL_TETRAHEDRAL_ELEMENTS,
+    course_compatible_size,
+    size_for_element_target,
+    tetrahedral_element_count,
+)
+from ..model_config import load_config, wall_joint_support, wall_thickness_steps
 
 
-def build_wall(root: Path, extra_radial_fractions: tuple[float, ...] = (), split_joints: bool = False):
-    return build_bedrock_seated_wall(root, extra_radial_fractions, split_joints)
+def build_wall(
+    root: Path,
+    extra_radial_fractions: tuple[float, ...] = (),
+    split_joints: bool = False,
+    element_size_m: float | None = None,
+):
+    return build_bedrock_seated_wall(root, extra_radial_fractions, split_joints, element_size_m)
 
 
 REGION_BUILDERS = (
@@ -81,6 +92,10 @@ class CombinedStructure:
     region_cell_counts: dict[str, int]
     # Step elevations split into spring joints between wall blocks; empty for a monolithic wall.
     wall_joint_levels_m: tuple[float, ...] = ()
+    suggested_global_element_size_m: float | None = None
+    element_size_target_m: float | None = None
+    target_wall_tetrahedral_elements: int | None = None
+    wall_tetrahedral_element_count: int | None = None
 
 
 def load_material(path: Path) -> MaterialProperties:
@@ -135,9 +150,12 @@ def build_combined_structure(
     nodes, joint tags) when geometry.wall.joint_support is "spring"; the default keeps
     one monolithic wall for consumers that do not model the joint springs.
     """
-    split_joints = bool(split_wall_joints) and wall_joint_support(load_config(root / "config.json")["geometry"]["wall"]) is not None
-    material = load_material(root / "config.json")
     load_path = root / "config.json"
+    config = load_config(load_path)
+    geometry = config["geometry"]
+    wall = geometry["wall"]
+    split_joints = bool(split_wall_joints) and wall_joint_support(wall) is not None
+    material = load_material(load_path)
     loads = load_environment(load_path)
     foundation_support = load_foundation_support(load_path)
     nodes: list[tuple[float, float, float]] = []
@@ -147,7 +165,35 @@ def build_combined_structure(
     boundary_faces: dict[tuple[int, ...], list[tuple[int, int, tuple[int, ...]]]] = {}
     region_cell_counts: dict[str, int] = {}
 
-    wall_mesh = build_wall(root, extra_radial_fractions, split_joints)
+    suggested_size_m = float(geometry["global_element_size_m"])
+    step_levels_m = tuple(top_z_m for top_z_m, _ in wall_thickness_steps(wall)[1:])
+    constrained_steps = step_levels_m if "foundation" in geometry else ()
+    element_size_m = course_compatible_size(
+        suggested_size_m, constrained_steps, not_coarser_than=True,
+    )
+    wall_mesh = build_wall(root, extra_radial_fractions, split_joints, element_size_m)
+    tetra_count = tetrahedral_element_count(wall_mesh.cells)
+    for _ in range(12):
+        if tetra_count <= TARGET_WALL_TETRAHEDRAL_ELEMENTS:
+            break
+        requested_size_m = size_for_element_target(
+            wall_mesh.element_size_m, tetra_count, TARGET_WALL_TETRAHEDRAL_ELEMENTS,
+        )
+        next_size_m = course_compatible_size(
+            requested_size_m, constrained_steps, not_coarser_than=False,
+        )
+        if next_size_m <= wall_mesh.element_size_m * (1.0 + 1e-12):
+            raise ValueError(
+                f"Cannot reduce the wall mesh to {TARGET_WALL_TETRAHEDRAL_ELEMENTS:,} "
+                "tetrahedra without changing the configured wall geometry"
+            )
+        wall_mesh = build_wall(root, extra_radial_fractions, split_joints, next_size_m)
+        tetra_count = tetrahedral_element_count(wall_mesh.cells)
+    else:
+        raise RuntimeError(
+            f"Wall mesh sizing did not reach the {TARGET_WALL_TETRAHEDRAL_ELEMENTS:,}-tetrahedron target "
+            f"after 12 builds; the last mesh has {tetra_count:,} tetrahedra"
+        )
     regions = [(REGION_GROUP_IDS["WALL"], "wall", wall_mesh)]
 
     for region_id, region_name, mesh in regions:
@@ -193,6 +239,10 @@ def build_combined_structure(
         foundation_support=foundation_support,
         region_cell_counts=region_cell_counts,
         wall_joint_levels_m=tuple(wall_mesh.joint_levels_m),
+        suggested_global_element_size_m=suggested_size_m,
+        element_size_target_m=wall_mesh.element_size_m,
+        target_wall_tetrahedral_elements=TARGET_WALL_TETRAHEDRAL_ELEMENTS,
+        wall_tetrahedral_element_count=tetra_count,
     )
     return combined
 

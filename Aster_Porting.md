@@ -853,6 +853,271 @@ scheduling and the final cracking comparison are still not wired into app jobs.
 
 ### Native whole-model crack (app jobs)
 
+**New intact-start scenario (not yet a production solver):**
+`FEniCSx/horizontal_fracture_contract.py` separates a selected horizontal
+candidate section from an imposed seed. It records an intact initial condition,
+requires an explicit friction coefficient, and identifies transient
+fracture-only hydraulic coupling (impermeable surrounding concrete/rock).
+Its configurable opening limit defaults to 0.002 m; this is not initial gap,
+seed thickness, prescribed depth or length. An accepted opening history may
+show no fracture initiation. Assessment uses the peak over the history, not
+just the last state. Reaching or exceeding the limit produces an opening-limit
+warning, not a solver error, and does not change successful solver completion.
+The opening criterion is recorded separately from solver completion; it is not
+a structural-collapse verdict. Partial histories have no successful acceptance
+verdict, but retain warnings for limit exceedances already observed.
+The intended new UI label is **Opening Limit (m)**. The existing legacy control
+remains **Seed layer thickness (m)** until a solver actually calculates opening;
+renaming that legacy input would not change its physical effect.
+
+The subsequent painted-damage selection supersedes the intact-only selection
+intent: left-click selects affected elements; right-click toggles crack-start
+edges. `DamageSelection` in the same contract module requires at least one
+affected element **and** one crack-start edge, with field-specific validation
+errors for either missing selection. It rejects malformed and duplicate IDs.
+`FEniCSx/damage_selection.py` now builds a job-bound native wall catalog and
+validates mesh identity, wall membership, real edge IDs and conservative whole-
+tetrahedron containment within 75% of local thickness. The separate API
+`damage-selection/catalog` and `damage-selection/validate` routes expose this
+to the WPF **Paint damage (preview)** window. Left-drag paints overlapping
+projected elements; Shift-left-drag erases; right-click toggles the nearest edge.
+Opening Limit (m) uses numeric entry with a 0.002 m default. Both element and
+edge selection are mandatory. Validation returns `solver_ready: false`;
+it never launches a solver or changes a job. The app can now explicitly save
+append-only job-bound selection snapshots and restore the latest after catalog/
+configuration and snapshot-integrity checks. Saving is not solver submission.
+Legacy single-point submission and cracking reruns have now been removed from
+the app/API. Older clients receive authenticated HTTP 410 retirement feedback.
+New app jobs run elastic baselines only and mark requested legacy cracking
+stages blocked; neither solver is launched as a preview fallback. Archived
+outputs remain readable and standalone solver CLI defaults are unchanged.
+
+Reduced FEniCSx building blocks now verify a relaxed elastic no-tension local
+law, prescribed-open-fracture flow, local compliant pressure/opening feedback
+and prescribed water traction on native normal contact; see `FEniCSx/README.md`.
+These do not
+provide an equivalent Code_Aster implementation or a coupled dam scenario.
+This contract does not implement cohesive mechanics, coupled water flow, hydraulic
+pressure loading, or an opening extractor, and is not wired to app submission.
+External reservoir/tailwater loads must be preserved in the future scenario;
+internal fluid pressure must be coupled to flow and act on wetted fracture
+faces without automatically pressurising intact concrete.
+Native mechanical/hydraulic benchmarks, constitutive calibration, required
+hydraulic inputs/physical time histories, and production solver integration remain
+implementation gates. Neither scalar damage nor the legacy seed below can be
+reported as calculated crack opening. Historical app crack results use the
+legacy seeded-volume formulation described below; new app jobs do not run it.
+
+Initial capability checks for the new scenario:
+
+- The installed Code_Aster 17.4 reference case `ssnp164d` completed in 4.04 s
+  under an enforced 180 s wall-clock watchdog, in an isolated work directory.
+  Its `3D_JOINT_HYME` / `JOINT_MECA_ENDO` calculation passed 15 native
+  non-regression checks and three analytical checks. This establishes that the
+  installed runtime can execute that hydro-mechanical joint reference; it does
+  not establish material calibration, water-front propagation from intact
+  concrete, or the new production dam scenario.
+- The seven existing reduced FEniCSx frictionless contact tests pass on the
+  installed DOLFINx 0.11.0.post0 runtime. These are normal-contact regression
+  checks, not cohesive fracture, frictional sliding, or coupled flow validation.
+  Three added tests now verify externally prescribed face pressure, zero-initial-
+  gap opening, effective contact release, reclosure and input rejection. Six
+  separate compliant-flow tests check two-way local pressure/opening/storage/
+  conductivity coupling and explicit nonlinear failure; this does not establish
+  water access/wetting through closed contact or native Code_Aster parity.
+  Four further native contact tests verify scalar Coulomb stick/slip/reversal,
+  nonnegative dissipation and shear-field export, reduction of friction strength
+  by water pressure, explicit zero friction and required-input rejection. No
+  friction coefficient or shear modulus is inferred for a production dam job.
+  Six paired-face checks now verify source-identity-based 3-D opening extraction,
+  consistent P1 pressure virtual work, normal/tangential separation and an
+  analytical native two-block zero-gap pressure-opening solve with stress and
+  equilibrium checks. Surfaces are supplied explicitly: this is not edge-to-
+  surface construction or native Code_Aster opening/pressure integration.
+  An explicit-facet FEniCSx topology component now creates paired faces from
+  interior wall tetrahedra, retains shared fronts and parent provenance, and
+  transfers accepted states and exterior support/load labels without an imposed
+  opening. The native pressure-opening test now starts with a bonded mesh and
+  uses this cut. It is not a crack-path/growth law or an Aster remeshing adapter.
+  Eight water-access checks distinguish explicit inlet-connected open paths
+  from closed/isolated surfaces using paired identity and normal opening.
+  Topology-created tied fronts start blocked and do not become hydraulic
+  inlets merely because they were selected as crack-start markers. This is
+  geometric eligibility, not transient saturation or a pressure assignment.
+  The reduced FEniCSx event driver additionally solves an intact loaded baseline
+  and applies selected-cell tensile loss under unchanged external loads/BCs.
+  Tests check two-mesh force redistribution, retained compression and explicit
+  equilibrium failure when all tensile load paths are removed. Isolated output
+  retains intact state/failure diagnostics. Cellwise concrete/rock DG0 inputs,
+  the existing mortar spring operator and canonical roller forms now pass
+  reduced compliance/reaction tests, including unchanged mortar coefficients
+  through tensile loss and retained gravity/reservoir/tailwater loads.
+  Serial constrained mortar interface DOFs now support row/column elimination
+  and imposed-displacement lifting, retaining raw coefficients for force/
+  energy audits. Analytical zero/nonzero displacement and nonlinear release
+  checks pass; existing standalone solver defaults remain unchanged.
+  This is not a Code_Aster event adapter, a verified heterogeneous full-dam
+  calculation or a coupled evolving-crack hydraulic solve.
+  An experimental canonical-source import adapter now maps source-row wall
+  selections and reuses baseline material/support/interface and exterior-load
+  definitions. Its intact source-order displacement matches the existing
+  elastic solver in a reduced loaded test; two/three-body force checks retain
+  foundation properties and both interfaces. It is not authenticated saved-job
+  integration or an Aster adapter. The source-event adapter now clips
+  waterline-crossing exterior triangles and integrates consistent P1 pressure
+  loads, with analytical force/moment/virtual-work checks. Fixed nodal loads
+  enter both states and reactions, not a growing crack hydraulic law.
+  No standalone baseline numerical defaults were changed.
+  An additional experimental FEniCSx bound-event entry point checks the
+  existing verified-baseline gate, current catalog hashes and exact source
+  tetrahedron identity before reduced mechanics. Selected marker edges and
+  opening limits are persisted but do not imply propagation/opening assessment.
+  This is not an authenticated app route or Code_Aster implementation.
+  The eventual-equilibrium FEniCSx component now assigns hydrostatic head to
+  explicitly saturated, fully submerged, open boundary-connected faces and
+  returns consistent paired-face forces. Seven pure tests and a native 3-D
+  pressure/opening/access-consistency check pass. Wet isolated/reclosed pockets,
+  connected unequal heads and free-surface intersections fail explicitly;
+  no drained state, steady flow or crack propagation is silently inferred.
+  This reduced component has not been ported to Code_Aster.
+  A separate reduced FEniCSx-independent surface P1 steady-flow component now
+  handles unequal boundary heads on prescribed saturated fully open paired
+  meshes. Nine analytical/convergence/identity tests check cubic aperture
+  conductance, pressure and flow balance; uniform viscosity cancels from head,
+  and only scaled boundary reactions are reported. This is not evolving
+  contact/flow or an Aster adapter.
+  A reduced planar local-compliance/steady-surface iteration now checks two-way
+  pressure/aperture feedback against an independent integrated nonlinear
+  solution, with five limit/invariance/failure/convergence tests. This uses
+  synthetic already-open specimen inputs, not dam initial openings, and has
+  not been coupled to bulk contact/irreversible growth or ported to Aster.
+  A further fixed-cut FEniCSx adapter now couples actual 3-D bulk elasticity to
+  steady aperture-dependent surface flow. Six native tests verify feedback,
+  hydrostatic limit and explicit closed-dry-cut/nonconvergence failures, with
+  same-state mechanical/flow residual checks, actual exterior-lip/orientation
+  provenance and accepted-only exports. Existing mortar operators, nonzero
+  prescribed support motion and fixed nodal exterior loads are retained;
+  analytical spring-seat opening/energy and equivalent nodal/form loading
+  are checked. The independent audit uses original spring coefficients.
+  A separate native fixed-cut 3-D frictionless-contact entry point now uses
+  vertex-normal inequality constraints and exact nodal multipliers, retaining
+  both free tangential components without penalty stiffness/initial gap.
+  Eight tests include oblique contact, analytical pressure reopening/reclosure,
+  partial contact versus independent energy minimisation, and persistent
+  failure trace without accepted exports. Water remains explicitly prescribed
+  traction; contact/flow/tensile-loss/growth integration and Aster parity are
+  not claimed.
+  Selected no-tension material change, bonded-before-release 3-D contact and
+  aperture-dependent steady water are now integrated in one experimental
+  fixed-cut event entry point. The accepted state uses actual nonlinear stress
+  and its own aperture/head/pressure for residual/force audits. Analytic intact
+  fields, tensile redistribution, retained compression, hydraulic snapshots and
+  closed-cut failure are checked. The cut is still explicitly supplied; there
+  is no edge-driven irreversible surface-growth law or Aster parity claim.
+  An experimental dry single-triangle Griffith search now compares audited
+  re-equilibrated mechanical potential release with `Gc * new area`, preserving
+  accepted surfaces irreversibly. Source wall/wall facet candidates retain all
+  mesh orientations and exact marker/source identity. Native tests verify an
+  independent displacement-controlled fracture threshold and selected-material
+  bonded/released energy identity. This is finite-candidate mesh-constrained
+  energy descent, not unrestricted crack tracking, a strength nucleation law,
+  multi-face global minimisation, hydraulic growth or a production/Aster adapter.
+  A prepared-candidate native orchestration now automatically re-solves the
+  selected material/contact state for every trial, preserving full vector
+  bonds on unbroken candidates and nonpenetration on released surfaces.
+  Parent/marker identities and the exact chosen trial exports are retained.
+  Eight-candidate native checks verify low/high resistance growth/arrest;
+  unrestricted paths, wet growth and Aster parity remain missing.
+  Source preparation/orchestration now imports actual wall/wall facet candidates
+  and original selected volume rows, retaining exterior labels, concrete/rock
+  properties, gravity, exact exterior water loads and canonical supports.
+  Original mortar multiplier parents are preserved across split wall nodes:
+  rebuilding independent multiplier rows on every triangle changed the bonded
+  stiffness and is explicitly guarded by projector/energy and baseline parity
+  tests. Internal new surfaces remain dry. Full-dam all-facet resource cost,
+  authenticated saved-scenario binding, unrestricted/wet growth and Aster parity
+  are not verified; no production gate was changed.
+  An additional experimental bound dry-growth adapter now shares the verified
+  source-selection checks with the material event: baseline field/config/mesh
+  identity and diagnostic hashes must match before candidate preparation.
+  Catalog marker endpoints are translated through source-node compaction.
+  Bound-adapter provenance persists, but this remains dry mesh-constrained
+  FEniCSx work, not an authenticated app route or Code_Aster parity result.
+  Steady saturated FEniCSx flow also supports opt-in exact shared-node crack
+  fronts with zero aperture and no regularisation. Analytical wedge
+  conductance/head/virtual-work and native material/contact/water checks pass;
+  closed inlets/internal barriers and untied contact vertices remain rejected.
+  This does not add wet growth, trapped-fluid modelling or Aster parity.
+  Explicit hydraulic subset IDs now couple released wet faces to a partially
+  bonded mechanical inventory. Flow topology uses checked transitive mechanical
+  bonds rather than coordinate welding, while pressure loads retain original
+  solid lip nodes. Native connected/subset equilibrium and face-row archive
+  tests cover this case. Omitted faces are declared dry; this is not evolving
+  fluid conservation, wet crack growth or a Code_Aster implementation.
+  A separate common-head FEniCSx finite-candidate wet-growth component now
+  includes conservative reservoir work `-integral(p*w)dA` in each equilibrated
+  trial potential. It shares the existing dry search without treating wet
+  states as dry evidence. Native pressure-work/threshold and seven-to-eight-face
+  extension/arrest tests cover this bounded, explicitly saturated case.
+  Its explicitly saturated common-head equilibrium specialization permits
+  pressure opening from dry-closed contact, with no initial gap and final
+  aperture/access/flow checks required before acceptance. A native compression
+  specimen verifies pressure opening, material/reaction equilibrium and work.
+  Different-head growth, filling history, unrestricted growth,
+  trapped water, full-dam use and Code_Aster parity are not supplied.
+  Canonical source and verified-baseline wrappers now invoke that bounded
+  common-head driver. Inlets are derived from inherited reservoir tags and
+  canonical heads, never painted markers; differing heads, waterline crossings,
+  constant-pressure crest ambiguity and absent reservoir edges reject explicitly.
+  Native source checks retain materials/gravity/exterior water/mortar and strict
+  intact displacement parity. Fixed rock nodes on mortar seats now use checked
+  serial baseline spring/Dirichlet elimination, and support reactions include
+  original spring forces. The source fixture verifies exact fixed displacement
+  and global force balance. Full saved-dam execution and Code_Aster parity are
+  still unverified; no app solve route is enabled.
+  The shared dry/common-head FEniCSx search now optionally tests connected
+  multi-face patches up to an explicit size bound (default one). A native
+  six-to-eight-face wet jump verifies full reservoir work and irreversible
+  retention of previous surfaces. Exhaustive subset and energy-barrier tests
+  check bounded candidate completeness and demonstrate a two-face jump missed
+  by a single-face search. This remains a mesh-constrained greedy search, not
+  unrestricted growth or evidence against larger jumps. The actual saved
+  baseline gate is exercised by the reduced Gmsh/catalog integration with
+  clearly synthetic evidence; only structure rebuilding is substituted.
+  The experimental saved-painting runner now preserves isolated input/
+  provenance/failure manifests and accepted PVD/native-state/paired-surface VTU
+  paths for reduced native dry/common-head runs. It shares snapshot integrity
+  checks with API restore but does not enable production submission.
+  Preparation-only native inventory on the actual saved dam found 1,177,580
+  candidate faces. Wet preparation rejects its constant-pressure crest and
+  different reservoir heads before splitting/solving; this is verified
+  inapplicability, not an accepted fracture result or Code_Aster parity.
+  Exact unbroken-bond condensation now reduces FEniCSx contact systems while
+  recovering/auditing original split-space forces; native multiplier-oracle
+  comparisons and strict source intact parity pass. Optional symmetric MINRES
+  avoids LU and retains original equilibrium/contact audits without fallback.
+  These are numerical FEniCSx improvements, not Code_Aster parity or full-dam
+  performance evidence. Released frictionless equilibria may have nonunique
+  zero-energy displacements; reports explicitly leave uniqueness/stability
+  unverified rather than inventing friction/supports.
+  It does not implement the painted event, contact, growth or Aster parity.
+- Twenty Windows tests pass across the new scenario/opening contract and
+  existing shared-seed contracts. No native solver consumes the new request
+  yet; legacy requests keep their existing numerical meaning.
+- Painted selection verification used the actual saved dam: 606,414 native
+  wall tetrahedra and 654,491 nondegenerate projected edges. Catalog preparation
+  with verified-baseline provenance checks took 38.80 s; WPF parsing/indexing/
+  picking took 3.49 s; first offscreen render completed within 10.16 s including
+  setup, with an 882 MiB working set.
+  Cached selection-only repaint took 0.02 s. Fifteen WPF-picked native element
+  IDs plus a selected edge passed Python validation on the same catalog.
+  These measurements verify selection/preview plumbing, not fracture physics.
+- The final focused verification passes 34 Python geometry/contract regressions,
+  19 API tests, and the desktop regression runner including native selection
+  tests. Full-mesh cached repaint is explicitly checked to remain below one
+  second. The existing nullable-return warning in `ScreenConverters.cs`
+  remains unchanged.
+
 The client's crack runs horizontally at the selected elevation along the
 wall, stopping `cracking[0].buffer_m` (default 1 m) short of the wall/foundation contour at each
 end (measured as true distance at the seed's inner radius), or for a centred `length_m` when

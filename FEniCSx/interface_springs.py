@@ -63,21 +63,25 @@ def intersection_mass(first, second):
     return matrix, area
 
 
-def mortar_projector(blocks, node_count):
+def mortar_projector(blocks, node_count, *, multiplier_map=None):
     """Slave-weighted jump and positive slave mass row sums."""
-    rows = np.concatenate([np.repeat(nodes[:3], 6) for nodes, mass in blocks])
+    mapping = np.arange(node_count) if multiplier_map is None else np.asarray(multiplier_map)
+    if (mapping.dtype.kind not in "iu" or mapping.shape != (node_count,)
+            or np.any(mapping < 0) or np.any(mapping >= node_count)):
+        raise ValueError("Mortar multiplier map must contain valid row identities for every displacement node")
+    rows = np.concatenate([np.repeat(mapping[nodes[:3]], 6) for nodes, mass in blocks])
     columns = np.concatenate([np.tile(nodes, 3) for nodes, mass in blocks])
     values = np.concatenate([mass[:3, :].ravel() for nodes, mass in blocks])
     jump = sparse.coo_matrix((values, (rows, columns)), shape=(node_count, node_count)).tocsr()
     weights = np.zeros(node_count)
     for nodes, mass in blocks:
-        np.add.at(weights, nodes[:3], mass[:3, :3].sum(axis=1))
+        np.add.at(weights, mapping[nodes[:3]], mass[:3, :3].sum(axis=1))
     return jump, weights
 
 
-def projected_spring_matrix(blocks, node_count):
+def projected_spring_matrix(blocks, node_count, *, multiplier_map=None):
     """Symmetric conservative scalar mortar operator; stiffness is applied later."""
-    jump, weights = mortar_projector(blocks, node_count)
+    jump, weights = mortar_projector(blocks, node_count, multiplier_map=multiplier_map)
     inverse = np.zeros(node_count)
     active = weights > 0
     inverse[active] = 1 / weights[active]
@@ -151,9 +155,29 @@ def spring_pairs(structure):
 
 
 class InterfaceSprings:
-    def __init__(self, imported, structure, space):
+    def __init__(self, imported, structure, space, *, multiplier_parent_node_ids=None):
         self.space = space
         domain = imported.domain
+        multiplier_map = None
+        if multiplier_parent_node_ids is not None:
+            if domain.comm.size != 1:
+                raise ValueError("Source-preserved mortar multipliers currently require a serial mesh")
+            source = domain.geometry.input_global_indices[domain.geometry.dofmaps[0]]
+            count = space.dofmap.index_map.size_local
+            parents = np.asarray(multiplier_parent_node_ids)
+            if (space.mesh is not domain or parents.dtype.kind not in "iu"
+                    or parents.shape != (count,) or np.any(parents < 0)
+                    or source.shape != space.dofmap.list.shape
+                    or not np.array_equal(np.unique(source), np.arange(count))):
+                raise ValueError("Mortar parent IDs must match complete serial source-node identities")
+            _, first, groups = np.unique(parents, return_index=True, return_inverse=True)
+            source_points = np.empty((count, 3))
+            source_points[source] = space.tabulate_dof_coordinates()[space.dofmap.list]
+            if not np.allclose(source_points, source_points[first][groups], rtol=0., atol=1e-12):
+                raise ValueError("Mortar multiplier parents cannot merge different source coordinates")
+            multiplier_map = np.empty(count, dtype=np.int64)
+            multiplier_map[space.dofmap.list] = groups[source]
+        self.multiplier_map = multiplier_map
         xyz = space.tabulate_dof_coordinates()
         local = {}
         facet_count = domain.topology.index_map(2).size_local
@@ -223,7 +247,9 @@ class InterfaceSprings:
             self.report[name] = {"area_m2": total_area, "spring_n_per_m3": coefficients,
                                  "faces": [len(first), len(second)],
                                  "discretisation": "Galerkin mortar; lumped multiplier compliance"}
-            scalar = projected_spring_matrix(blocks, node_count)
+            if multiplier_map is not None:
+                self.report[name]["multiplier_identity"] = "original source parents retained across candidate node splits"
+            scalar = projected_spring_matrix(blocks, node_count, multiplier_map=multiplier_map)
             self._operator += sparse.kron(
                 scalar, sparse.diags([coefficients[axis] for axis in ("x", "y", "z")]),
                 format="csr",
@@ -249,11 +275,12 @@ class InterfaceSprings:
             group["faces"][part] = detail
         self.matrix = None
 
-    def add_to(self, matrix):
+    def add_to(self, matrix, *, operator=None):
         if self.matrix is None:
             raise RuntimeError("Spring matrix has not been assembled")
         matrix.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
-        matrix.axpy(1., self.matrix, structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
+        matrix.axpy(1., self.matrix if operator is None else operator,
+                    structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
         matrix.assemble()
 
     def build_matrix(self, template):
@@ -281,26 +308,67 @@ class InterfaceSprings:
 
 class SpringLinearProblem(LinearProblem):
     """DOLFINx 0.11 linear assembly with an additional nonlocal spring matrix."""
-    def __init__(self, *args, interface_springs=None, **kwargs):
+    def __init__(self, *args, interface_springs=None, additional_nodal_forces=None,
+                 eliminate_interface_bcs=False, **kwargs):
+        self._constrained_springs = None
         super().__init__(*args, **kwargs)
         self.interface_springs = interface_springs
+        self.additional_nodal_forces = None
+        if additional_nodal_forces is not None:
+            forces = np.asarray(additional_nodal_forces)
+            if (self.u.function_space.mesh.comm.size != 1 or forces.shape != self.b.array.shape
+                    or forces.dtype.kind not in "fiu" or not np.isfinite(forces).all()):
+                raise ValueError("Additional nodal forces require a finite serial vector matching the load")
+            self.additional_nodal_forces = forces.astype(float).copy()
         if interface_springs is not None:
             self.A.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
             if interface_springs.matrix is None:
                 interface_springs.build_matrix(self.A)
+            if eliminate_interface_bcs and self.bcs:
+                if self.u.function_space.mesh.comm.size != 1:
+                    raise ValueError("Mortar/Dirichlet elimination currently requires a serial mesh")
+                fixed = np.unique(np.concatenate([bc.dof_indices()[0] for bc in self.bcs])).astype(PETSc.IntType)
+                self._constrained_springs = interface_springs.matrix.copy()
+                self._constrained_springs.zeroRowsColumns(fixed, diag=0.)
+                self._constrained_springs.assemble()
+
+    @property
+    def spring_jacobian(self):
+        """Borrowed operator; original springs are retained for forces/reactions."""
+        return (self._constrained_springs if self._constrained_springs is not None
+                else self.interface_springs.matrix if self.interface_springs is not None else None)
+
+    def __del__(self):
+        if self._constrained_springs is not None:
+            self._constrained_springs.destroy()
+        super().__del__()
 
     def solve(self):
-        if self.interface_springs is None:
+        if self.interface_springs is None and self.additional_nodal_forces is None:
             return super().solve()
         self.A.zeroEntries()
         fem.petsc.assemble_matrix(self.A, self.a, bcs=self.bcs)
         self.A.assemble()
-        self.interface_springs.add_to(self.A)
+        if self.interface_springs is not None:
+            self.interface_springs.add_to(self.A, operator=self.spring_jacobian)
         with self.b.localForm() as local:
             local.set(0)
         fem.petsc.assemble_vector(self.b, self.L)
         fem.petsc.apply_lifting(self.b, [self.a], bcs=[self.bcs])
         self.b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        if self.additional_nodal_forces is not None:
+            self.b.array[:] += self.additional_nodal_forces
+        if self._constrained_springs is not None:
+            imposed = self.b.duplicate()
+            work = self.b.duplicate()
+            try:
+                imposed.set(0.)
+                fem.petsc.set_bc(imposed, self.bcs)
+                self.interface_springs.matrix.mult(imposed, work)
+                self.b.axpy(-1., work)
+            finally:
+                imposed.destroy()
+                work.destroy()
         fem.petsc.set_bc(self.b, self.bcs)
         self.solver.solve(self.b, self.x)
         self.x.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)

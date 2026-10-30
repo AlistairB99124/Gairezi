@@ -7,7 +7,10 @@ from mpi4py import MPI
 import numpy as np
 import ufl
 from petsc4py import PETSc
-from three_body_model import is_three_body
+if __package__:
+    from .three_body_model import is_three_body
+else:
+    from three_body_model import is_three_body
 
 
 def ground_supports(imported, structure):
@@ -18,10 +21,45 @@ def ground_supports(imported, structure):
     )
 
 
+def water_load_parameters(imported, structure):
+    """Existing hydrostatic heads/constant top pressure, without reinterpretation."""
+    domain = imported.domain
+    loads = structure.loads
+    water_gradient = loads.water_density_kg_m3 * abs(loads.gravity_z_m_s2)
+    tailwater_elevation = (
+        structure.concrete_minimum_z if is_three_body(structure)
+        else float(domain.comm.allreduce(domain.geometry.x[:, 2].min(), op=MPI.MIN))
+    ) + loads.tailwater_head_m
+    return water_gradient, {2: loads.upstream_surface_z_m, 3: tailwater_elevation}, {
+        4: water_gradient * max(loads.upstream_surface_z_m, 0.0),
+    }
+
+
+def external_load(imported, structure, density, test, ds, *, include_water=True):
+    """Canonical unchanged gravity and exterior water loads, with audit terms."""
+    domain = imported.domain
+    gravity = ufl.as_vector((0.0, 0.0, density * structure.loads.gravity_z_m_s2))
+    z = ufl.SpatialCoordinate(domain)[2]
+    normal = ufl.FacetNormal(domain)
+    water_gradient, elevations, constants = water_load_parameters(imported, structure)
+    pressures = {
+        tag: water_gradient * ufl.max_value(elevation - z, 0)
+        for tag, elevation in elevations.items()
+    }
+    pressures.update(constants)
+    load = ufl.inner(gravity, test) * ufl.dx(domain=domain)
+    if include_water:
+        for tag, pressure in pressures.items():
+            load += ufl.inner(-pressure * normal, test) * ds(tag)
+    return load, gravity, pressures
+
+
 def solve(imported, structure, options: dict, output: Path, *, save_source_displacement: bool = True,
           reference_stress=None):
     domain = imported.domain
     three_body = is_three_body(structure)
+    if three_body and domain.comm.rank == 0:
+        print("Three-body elastic assembling system", flush=True)
     space = fem.functionspace(domain, ("Lagrange", 1, (3,)))
     trial, test = ufl.TrialFunction(space), ufl.TestFunction(space)
     young = structure.material.youngs_modulus_pa
@@ -61,24 +99,9 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         rock_rollers = support_form(trial, test, ds, structure)
         if rock_rollers is not None:
             a += rock_rollers
-    loads = structure.loads
     density = coefficients["density"] if three_body else structure.material.density_kg_m3
-    gravity = ufl.as_vector((0.0, 0.0, density * loads.gravity_z_m_s2))
-    z = ufl.SpatialCoordinate(domain)[2]
     normal = ufl.FacetNormal(domain)
-    pressure_gradient = loads.water_density_kg_m3 * abs(loads.gravity_z_m_s2)
-    water_gradient = loads.water_density_kg_m3 * abs(loads.gravity_z_m_s2)
-    tailwater_elevation = (structure.concrete_minimum_z if three_body else float(domain.comm.allreduce(
-        domain.geometry.x[:, 2].min(), op=MPI.MIN,
-    ))) + loads.tailwater_head_m
-    pressures = {
-        2: pressure_gradient * ufl.max_value(loads.upstream_surface_z_m - z, 0),
-        3: water_gradient * ufl.max_value(tailwater_elevation - z, 0),
-        4: water_gradient * max(loads.upstream_surface_z_m, 0.0),
-    }
-    L = ufl.inner(gravity, test) * dx
-    for tag, pressure in pressures.items():
-        L += ufl.inner(-pressure * normal, test) * ds(tag)
+    L, gravity, pressures = external_load(imported, structure, density, test, ds)
     from interface_springs import SpringLinearProblem
     solver_options = {
         "ksp_type": "cg", "pc_type": "gamg", "ksp_rtol": 0.1 * options["relative_tolerance"],
@@ -90,7 +113,7 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         solver_options.update(ksp_type="gmres", ksp_gmres_restart=100, ksp_pc_side="right")
     problem = SpringLinearProblem(
         a, L, bcs=bcs, interface_springs=interfaces, petsc_options_prefix="dam_elastic_",
-        petsc_options=solver_options,
+        petsc_options=solver_options, eliminate_interface_bcs=domain.comm.size == 1,
     )
     from elasticity_solver import rigid_body_near_nullspace
 
@@ -104,6 +127,7 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         if domain.comm.rank == 0:
             # Lets progress monitors normalise the residuals above by this solve's own tolerance.
             print(f"Three-body elastic GMRES tolerance: rtol={solver_options['ksp_rtol']:.6g}", flush=True)
+            print("Three-body elastic solving displacements", flush=True)
     try:
         displacement = problem.solve()
     except PETSc.Error as error:
@@ -161,7 +185,9 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
     }
     if three_body:
         from three_body_model import support_reactions
-        reactions = support_reactions(imported, space, structure, displacement, ufl.action(a, displacement) - L, ds)
+        reactions = support_reactions(
+            imported, space, structure, displacement, ufl.action(a, displacement) - L, ds,
+            interface_springs=interfaces)
     imbalance = applied + np.asarray(list(reactions.values())).sum(axis=0)
     relative_balance = float(np.linalg.norm(imbalance) / np.linalg.norm(applied))
     if three_body and domain.comm.rank == 0:

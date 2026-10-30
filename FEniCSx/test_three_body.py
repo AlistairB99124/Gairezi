@@ -623,6 +623,34 @@ class ThreeBodyTests(unittest.TestCase):
         self.assertAlmostEqual(np.asarray((1.0, 1.0, 1.0, 0.0, 0.0, 0.0)) @ matrix
                                @ np.asarray((1.0, 1.0, 1.0, 0.0, 0.0, 0.0)), area)
 
+    def test_candidate_split_retains_original_multiplier_space_and_spring_energy(self):
+        points = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [1., 1., 0.]])
+        triangles = np.array([[0, 1, 2], [1, 3, 2]])
+        original, split = [], []
+        parents = []
+        for index, triangle in enumerate(triangles):
+            mass, _ = intersection_mass(points[triangle], points[triangle])
+            nodes = np.r_[triangle, triangle + 4]
+            original.append((nodes, mass))
+            split.append((np.arange(6) + index * 6, mass))
+            parents.extend(nodes)
+        parents = np.array(parents)
+        prolongation = np.eye(8)[parents]
+        expected = projected_spring_matrix(original, 8).toarray()
+        preserved = projected_spring_matrix(split, 12, multiplier_map=parents).toarray()
+        np.testing.assert_allclose(prolongation.T @ preserved @ prolongation, expected, atol=1e-16)
+        changed = projected_spring_matrix(split, 12).toarray()
+        self.assertGreater(np.max(np.abs(prolongation.T @ changed @ prolongation - expected)), 1e-3)
+        displacement = np.arange(8) * .001
+        self.assertAlmostEqual(float(displacement @ expected @ displacement),
+                               float((prolongation @ displacement) @ preserved @ (prolongation @ displacement)),
+                               places=15)
+        np.testing.assert_allclose(preserved @ np.ones(12), 0., atol=1e-16)
+        self.assertGreaterEqual(np.linalg.eigvalsh(preserved).min(), -1e-15)
+        for invalid in (np.arange(11), np.full(12, -1), np.arange(12, dtype=float)):
+            with self.assertRaises(ValueError):
+                projected_spring_matrix(split, 12, multiplier_map=invalid)
+
 
 if __name__ == "__main__":
     unittest.main()

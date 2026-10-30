@@ -397,7 +397,10 @@ def load_structure(config_path: Path, model: Path, structure):
                 diagnostic["wall_rock_seat_triangles"], "foundation/bedrock",
             )
         validate_foundation_faces(source.points, boundaries, body_nodes, pairs)
-    from dam_mesh import compact_unused_nodes
+    if __package__:
+        from .dam_mesh import compact_unused_nodes
+    else:
+        from dam_mesh import compact_unused_nodes
     result = compact_unused_nodes(replace(
         structure, nodes=[tuple(p) for p in source.points], cells=cells,
         region_ids=regions, boundaries=boundaries,
@@ -511,12 +514,21 @@ def bottom_bcs(imported, space):
     return [fem.dirichletbc(np.zeros(3, dtype=space.mesh.geometry.x.dtype), dofs, space)]
 
 
-def bottom_reactions(imported, space, residual_form):
+def bottom_reactions(imported, space, residual_form, *, interface_springs=None, displacement=None):
     from petsc4py import PETSc
 
     vector = fem.petsc.assemble_vector(fem.form(residual_form))
     try:
         vector.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        if interface_springs is not None:
+            if displacement is None or interface_springs.matrix is None:
+                raise ValueError("Spring support reactions require an assembled operator and displacement")
+            work = interface_springs.matrix.createVecLeft()
+            try:
+                interface_springs.matrix.mult(displacement.x.petsc_vec, work)
+                vector.array[:len(work.array)] += work.array
+            finally:
+                work.destroy()
         dofs = fem.locate_dofs_topological(space, 2, imported.facet_tags.find(10))
         dofs = dofs[dofs < space.dofmap.index_map.size_local]
         values = vector.array.reshape(-1, 3)[dofs].sum(axis=0)
@@ -566,10 +578,11 @@ def require_support_tags(imported, structure):
             raise ValueError(f"Canonical mesh has no rock roller facets for boundary tag {tag}")
 
 
-def support_reactions(imported, space, structure, displacement, residual_form, ds):
+def support_reactions(imported, space, structure, displacement, residual_form, ds, *, interface_springs=None):
     """Rock support reactions (N) on the structure, per support face."""
     if rock_support(structure)["model"] == "fixed_bottom":
-        return {"rock_bottom": bottom_reactions(imported, space, residual_form)}
+        return {"rock_bottom": bottom_reactions(
+            imported, space, residual_form, interface_springs=interface_springs, displacement=displacement)}
     import ufl
 
     comm = imported.domain.comm

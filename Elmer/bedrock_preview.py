@@ -14,6 +14,7 @@ from matplotlib.path import Path as PlotPath
 from matplotlib.tri import LinearTriInterpolator, Triangulation
 
 from .model_config import load_config
+from .mesh_sizing import config_for_wall_element_size
 from .regions.combined_structure import build_combined_structure
 from .regions.tetrahedral import split_face
 
@@ -643,12 +644,15 @@ def export_preview(
 ) -> Path:
     config = load_config(root / "config.json")
     structure = build_combined_structure(root)
+    if structure.element_size_target_m is None:
+        raise RuntimeError("Wall mesh did not report its effective element size")
+    mesh_config = config_for_wall_element_size(config, structure.element_size_target_m)
     concrete_points = survey_coordinates(
         np.asarray(structure.nodes),
         float(config["geometry"]["wall"]["centerline_radius_m"]), 80.,
     )
     rock = configured_rock_mesh(
-        config, concrete_points,
+        mesh_config, concrete_points,
         [face for tag, face in structure.boundaries if tag == 1],
         stream_margin_m, bank_margin_m, bottom_z_m,
     )
@@ -709,6 +713,19 @@ def export_preview(
         "purpose": "Wall and bedrock geometry preview only; NOT an Elmer solution",
         "body_ids": BODY_IDS,
         "cell_counts": counts,
+        "mesh_sizing": {
+            "scope": "wall body only; bedrock is excluded from the 150,000-element cap",
+            "suggested_global_element_size_m": structure.suggested_global_element_size_m,
+            "effective_wall_element_size_m": structure.element_size_target_m,
+            "target_wall_tetrahedral_elements": structure.target_wall_tetrahedral_elements,
+            "wall_tetrahedral_element_count": structure.wall_tetrahedral_element_count,
+            "configured_bedrock_near_size_m": (config["geometry"]["bedrock"].get("mesh") or {}).get(
+                "near_size_m"
+            ),
+            "effective_bedrock_near_size_m": mesh_config["geometry"]["bedrock"].get("mesh", {}).get(
+                "near_size_m"
+            ),
+        },
         "concrete_chainage_reference_radius_m": 80.,
         "legacy_concrete_chainage_reference_radius_m":
             config["geometry"]["wall"]["centerline_radius_m"],

@@ -1,6 +1,7 @@
 """Checks for the standalone, explicitly unsolved three-body export."""
 import math
 from collections import Counter
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -71,33 +72,42 @@ class BedrockPreviewTests(unittest.TestCase):
 
     def test_manifest_has_readable_attributed_wall_and_bedrock(self):
         self.config["geometry"]["global_element_size_m"] = .25
-        del self.config["geometry"]["bedrock"]["mesh"]
         structure = SimpleNamespace(
             nodes=[(0., 0., -29.), (1., 0., -29.), (0., 1., -29.), (0., 0., 0.)],
             cells=[(4, (0, 1, 2, 3))],
             region_ids=[1],
             boundaries=[],
+            suggested_global_element_size_m=.25,
+            element_size_target_m=.75,
+            target_wall_tetrahedral_elements=150000,
+            wall_tetrahedral_element_count=1,
         )
         rock = np.array([
             [0., 0., -31.], [1., 0., -31.], [0., 1., -31.],
             [0., 0., -29.], [1., 0., -29.], [0., 1., -29.],
         ])
+        graded_rock = SimpleNamespace(
+            points=rock,
+            blocks={6: np.tile(np.array([[0, 1, 2, 3, 4, 5]]), (8, 1))},
+            report={},
+        )
         with tempfile.TemporaryDirectory() as directory, patch(
             "Elmer.bedrock_preview.load_config", return_value=self.config,
         ), patch(
             "Elmer.bedrock_preview.build_combined_structure", return_value=structure,
         ), patch(
-            "Elmer.bedrock_preview.seated_bedrock_geometry",
-            return_value=(rock, np.array([[0, 1, 2, 3, 4, 5]]), {}),
-        ) as geometry:
+            "Elmer.bedrock_preview.configured_rock_mesh", return_value=graded_rock,
+        ) as rock_mesh:
             path = export_preview(ROOT, Path(directory))
-            self.assertEqual(
-                geometry.call_args.kwargs["element_size_m"],
-                self.config["geometry"]["global_element_size_m"],
-            )
-            self.assertEqual(geometry.call_args.kwargs["bottom_z_m"], -87.)
-            self.assertEqual(geometry.call_args.args[3:5], (58., 58.))
-            self.assertTrue(geometry.call_args.kwargs["grade_mesh"])
+            effective_config = rock_mesh.call_args.args[0]
+            self.assertEqual(effective_config["geometry"]["global_element_size_m"], .75)
+            self.assertEqual(effective_config["geometry"]["bedrock"]["mesh"]["near_size_m"], .75)
+            self.assertEqual(effective_config["geometry"]["bedrock"]["mesh"]["far_size_m"], 15.)
+            sizing = json.loads((path.parent / "geometry_review.json").read_text())["mesh_sizing"]
+            self.assertEqual(sizing["suggested_global_element_size_m"], .25)
+            self.assertEqual(sizing["effective_wall_element_size_m"], .75)
+            self.assertEqual(sizing["configured_bedrock_near_size_m"], .5)
+            self.assertEqual(sizing["effective_bedrock_near_size_m"], .75)
             pieces = ET.parse(path).findall(".//Piece")
             self.assertEqual(len(pieces), 2)
             ids = set()

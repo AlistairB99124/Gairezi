@@ -237,29 +237,6 @@ class _ConfigValidator:
                     self.issue(f"{row_path}.radial_width_m", "must be less than upstream_radius_m")
                 previous_width = width
 
-    def validate_steps_on_course_grid(self, value: object, element_size: float) -> None:
-        """With a foundation, every step elevation must lie on a wall course.
-
-        The wall is seated on courses spaced global_element_size_m apart and on
-        step treads, and the chamfered foundation needs every seat riser to be
-        exactly one course; an off-grid step creates partial risers.
-        """
-        if not isinstance(value, list):
-            return
-        for index, row in enumerate(value):
-            top_z = row.get("top_z_m") if isinstance(row, Mapping) else None
-            if not isinstance(top_z, (int, float)) or isinstance(top_z, bool) or not math.isfinite(top_z):
-                continue
-            courses = top_z / element_size
-            if abs(courses - round(courses)) * element_size > 1e-6:
-                below = math.floor(courses) * element_size
-                self.issue(
-                    f"geometry.wall.thickness_steps[{index}].top_z_m",
-                    f"must be a multiple of geometry.global_element_size_m ({element_size:g} m) "
-                    f"when geometry.foundation is present; nearest valid levels are "
-                    f"{below + element_size:g} m and {below:g} m",
-                )
-
     def validate_wall_joint_support(self, value: object) -> None:
         """Joints between thickness bands: bonded, or linear springs in global x/y/z (N/m^3)."""
         path = "geometry.wall.joint_support"
@@ -283,7 +260,9 @@ class _ConfigValidator:
             path = f"material.{name}"
             values = self.object(
                 material.get(name) if material is not None else None, path, MATERIAL_KEYS,
-                optional={"support"} if name == "bedrock" else {"compressive_strength_pa"},
+                optional={"support"} if name == "bedrock" else {
+                    "compressive_strength_pa", "selected_tensile_strength_pa",
+                },
             )
             if values is None:
                 continue
@@ -298,6 +277,8 @@ class _ConfigValidator:
                 self.field_number(values, key, path, positive=True)
             if name == "concrete" and "compressive_strength_pa" in values:
                 self.field_number(values, "compressive_strength_pa", path, positive=True)
+            if name == "concrete" and "selected_tensile_strength_pa" in values:
+                self.field_number(values, "selected_tensile_strength_pa", path, nonnegative=True)
             poisson = self.field_number(values, "poisson_ratio", path)
             if poisson is not None and not -1 < poisson < 0.5:
                 self.issue(f"{path}.poisson_ratio", "must lie between -1 and 0.5")
@@ -573,8 +554,6 @@ class _ConfigValidator:
                 self.validate_thickness_steps(
                     wall["thickness_steps"], wall_upstream, wall_downstream,
                 )
-                if "foundation" in geometry and global_size is not None:
-                    self.validate_steps_on_course_grid(wall["thickness_steps"], global_size)
             if wall is not None and "joint_support" in wall:
                 self.validate_wall_joint_support(wall["joint_support"])
             if wall is not None and "step_end_taper_ratio" in wall:

@@ -193,8 +193,14 @@ def build_uniform_wall(
     anchor_chainages_m: list[float],
     extra_radial_fractions: tuple[float, ...] = (),
     split_joints: bool = False,
+    element_size_m: float | None = None,
 ) -> UniformWallMesh:
-    element_size_m = load_global_element_size(root / "config.json")
+    element_size_m = (
+        load_global_element_size(root / "config.json")
+        if element_size_m is None else float(element_size_m)
+    )
+    if not math.isfinite(element_size_m) or element_size_m <= 0:
+        raise ValueError("Element size must be finite and positive")
     geometry = load_config(root / "config.json")["geometry"]
     bedrock_rows = geometry["bedrock"]["contours"]
     wall = geometry["wall"]
@@ -366,7 +372,10 @@ def build_uniform_wall(
 
 
 def build_bedrock_seated_wall(
-    root: Path, extra_radial_fractions: tuple[float, ...] = (), split_joints: bool = False,
+    root: Path,
+    extra_radial_fractions: tuple[float, ...] = (),
+    split_joints: bool = False,
+    element_size_m: float | None = None,
 ) -> UniformWallMesh:
     contours = load_model_contours(root)
     return build_uniform_wall(
@@ -376,4 +385,5 @@ def build_bedrock_seated_wall(
         [point.chainage_m for point in contours],
         extra_radial_fractions,
         split_joints,
+        element_size_m,
     )

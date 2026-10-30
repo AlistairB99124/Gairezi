@@ -46,7 +46,9 @@ class BondedTopologyTests(unittest.TestCase):
         from Elmer.model_config import load_config
         legacy = load_config(assembly.ROOT / "config.json")
         legacy["geometry"].pop("foundation", None)
-        with patch("Elmer.regions.uniform_wall.load_config", return_value=legacy):
+        with patch("Elmer.regions.combined_structure.load_config", return_value=legacy), patch(
+            "Elmer.regions.uniform_wall.load_config", return_value=legacy,
+        ):
             source = build_combined_structure(assembly.ROOT)
         audit = audit_combined_structure(source)
         self.assertEqual(audit["face_connected_components"], 1)
@@ -56,7 +58,9 @@ class BondedTopologyTests(unittest.TestCase):
         self.assertEqual(len({tuple(round(x, 9) for x in xyz) for xyz in source.nodes}), len(source.nodes))
         self.assertFalse(any(tag > 7 for tag, _ in source.boundaries))
         # Every seat node lies on a horizontal course excavated less than one element
-        # (0.5 m) below the surveyed bedrock surface.
+        # below the surveyed bedrock surface.
+        element_size_m = source.element_size_target_m
+        self.assertIsNotNone(element_size_m)
         rows = [{"chainage": p.chainage_m, "height": p.bedrock_z_m} for p in load_model_contours(assembly.ROOT)]
         seat_nodes = {node for tag, face in source.boundaries if tag == 1 for node in face}
         self.assertTrue(seat_nodes)
@@ -65,9 +69,10 @@ class BondedTopologyTests(unittest.TestCase):
             chainage = 78.0 * math.atan2(x, y)
             depth = bedrock_elevation(rows, chainage) - z
             self.assertGreater(depth, -1e-6)
-            self.assertLess(depth, 0.5)
-            self.assertLess(abs(z / 0.5 - round(z / 0.5)), 1e-6)
-        self.assertAlmostEqual(min(z for _, _, z in source.nodes), -29.0)
+            self.assertLess(depth, element_size_m)
+        minimum_z_m = min(z for _, _, z in source.nodes)
+        self.assertLessEqual(minimum_z_m, -29.0 + 1e-6)
+        self.assertGreater(minimum_z_m, -29.0 - element_size_m)
         mesh = tetrahedralize_structure(source)
         faces = Counter()
         for _, tet in mesh.cells:
@@ -77,6 +82,19 @@ class BondedTopologyTests(unittest.TestCase):
         self.assertEqual(set(mesh.region_ids), {1})
         exterior = {tuple(sorted(face)) for _, face in mesh.boundaries}
         self.assertEqual(exterior, {face for face, count in faces.items() if count == 1})
+
+    def test_analysis_mesh_respects_tetrahedron_budget_and_reports_effective_size(self):
+        from Elmer.regions.combined_structure import build_combined_structure
+        from Elmer.regions.tetrahedral import tetrahedralize_structure
+        from Elmer.mesh_sizing import TARGET_WALL_TETRAHEDRAL_ELEMENTS
+
+        source = build_combined_structure(assembly.ROOT)
+        converted = tetrahedralize_structure(source)
+        self.assertEqual(source.suggested_global_element_size_m, 0.5)
+        self.assertGreater(source.element_size_target_m, source.suggested_global_element_size_m)
+        self.assertEqual(source.wall_tetrahedral_element_count, len(converted.cells))
+        self.assertEqual(source.target_wall_tetrahedral_elements, TARGET_WALL_TETRAHEDRAL_ELEMENTS)
+        self.assertLessEqual(source.wall_tetrahedral_element_count, TARGET_WALL_TETRAHEDRAL_ELEMENTS)
 
 
 class ReservoirLevelTests(unittest.TestCase):

@@ -30,22 +30,9 @@ class ModelConfigTests(unittest.TestCase):
         from_object = load_config(copy.deepcopy(self.payload))
         self.assertEqual(from_file, from_object)
 
-    def test_foundation_step_levels_must_lie_on_the_global_course_grid(self):
-        # The submitted job: 0.75 m courses with steps at -20 m and -25 m failed meshing.
+    def test_global_element_size_is_a_suggestion_not_a_step_grid_constraint(self):
         self.payload["geometry"]["global_element_size_m"] = 0.75
         self.payload["geometry"]["local_element_size_m"] = 0.25
-        with self.assertRaises(ConfigurationValidationError) as context:
-            validate_config(self.payload)
-        messages = {issue.path: issue.message for issue in context.exception.issues}
-        self.assertIn("-19.5 m and -20.25 m", messages["geometry.wall.thickness_steps[0].top_z_m"])
-        self.assertIn("geometry.wall.thickness_steps[1].top_z_m", messages)
-        steps = self.payload["geometry"]["wall"]["thickness_steps"]
-        steps[0]["top_z_m"], steps[1]["top_z_m"] = -19.5, -24.75
-        validate_config(self.payload)
-        # Without a chamfered foundation the wall has no riser rule.
-        steps[0]["top_z_m"], steps[1]["top_z_m"] = -20.0, -25.0
-        del self.payload["geometry"]["foundation"]
-        self.payload["geometry"]["wall"].pop("step_end_taper_ratio", None)
         validate_config(self.payload)
 
     def test_concrete_compressive_strength_is_positive_and_optional_for_historical_jobs(self):
@@ -191,10 +178,19 @@ class ModelConfigTests(unittest.TestCase):
 
     def test_bedrock_allows_explicit_bond(self):
         self.payload["geometry"].pop("foundation", None)
+        self.payload["geometry"]["wall"].pop("step_end_taper_ratio", None)
         self.payload["geometry"]["bedrock"]["support"]["model"] = "bonded"
         validate_config(self.payload)
         self.payload["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         validate_config(self.payload)
+
+    def test_painted_tensile_strength_is_optional_finite_and_nonnegative(self):
+        for value in (0., 1e6, 2e6):
+            self.payload["material"]["concrete"]["selected_tensile_strength_pa"] = value
+            validate_config(self.payload)
+        for value in (-1., True, float("nan"), float("inf")):
+            self.payload["material"]["concrete"]["selected_tensile_strength_pa"] = value
+            self.assert_invalid_at(self.payload, "material.concrete.selected_tensile_strength_pa")
 
     def test_obsolete_interface_overrides_are_rejected(self):
         self.assertNotIn("interfaces", self.payload)

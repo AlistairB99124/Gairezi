@@ -14,8 +14,12 @@ import sys
 import tempfile
 import traceback
 
-from configuration import load_scenarios
-from engineering_report import write_engineering_results
+if __package__:
+    from .configuration import load_scenarios
+    from .engineering_report import write_engineering_results
+else:
+    from configuration import load_scenarios
+    from engineering_report import write_engineering_results
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -61,6 +65,12 @@ def inventory() -> dict:
         "nodes": len(structure.nodes),
         "volume_cells": len(structure.cells),
         "gmsh_volume_element_counts": dict(Counter(kind for kind, _ in structure.cells)),
+        "mesh_sizing": {
+            "suggested_global_element_size_m": structure.suggested_global_element_size_m,
+            "element_size_target_m": structure.element_size_target_m,
+            "target_wall_tetrahedral_elements": structure.target_wall_tetrahedral_elements,
+            "wall_tetrahedral_element_count": structure.wall_tetrahedral_element_count,
+        },
         "group_counts": {name: len(indices) for name, indices in groups.items()},
         "material": asdict(structure.material),
         "loads": asdict(structure.loads),
@@ -99,7 +109,10 @@ def submitted_structure(config: Path, model_directory: Path | None = None):
         structure = build_combined_structure(root)
     apply_load_case(structure, config)
     if model_directory is not None:
-        from three_body_model import load_structure
+        if __package__:
+            from .three_body_model import load_structure
+        else:
+            from three_body_model import load_structure
         result = load_structure(config, model_directory, structure)
         if saved_source is not None and saved_source.get("sha256") != result.three_body_source["sha256"]:
             raise ValueError("Saved three-body source hashes no longer match the model")
@@ -143,6 +156,14 @@ def run_baseline(dam_config: Path, output_root: Path, versions: dict, *, phase: 
     write_json(directory / "manifest.json", manifest)
     try:
         structure = submitted_structure(snapshot, model_directory)
+        if structure.wall_tetrahedral_element_count is not None:
+            manifest["mesh_sizing"] = {
+                "suggested_global_element_size_m": structure.suggested_global_element_size_m,
+                "element_size_target_m": structure.element_size_target_m,
+                "target_wall_tetrahedral_elements": structure.target_wall_tetrahedral_elements,
+                "wall_tetrahedral_element_count": structure.wall_tetrahedral_element_count,
+            }
+            write_json(directory / "manifest.json", manifest)
         if model_directory is not None:
             write_json(directory / "three_body_source.json", structure.three_body_source)
         if phase:

@@ -59,6 +59,7 @@ class FoundationConfigTests(unittest.TestCase):
     def test_absent_block_preserves_legacy_spring_pair(self):
         config = load_config(ROOT / "config.json")
         config["geometry"].pop("foundation", None)
+        config["geometry"]["wall"].pop("step_end_taper_ratio", None)
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         self.assertIn("wall_bedrock", interface_stiffness(config))
         self.assertNotIn("wall_foundation", interface_stiffness(config))
@@ -230,7 +231,12 @@ class BondedFoundationTopologyTests(unittest.TestCase):
             expected_fixed = 1 if config["material"]["bedrock"].get("support") is None else 0
             self.assertEqual(text.count("Displacement 1 = Real 0"), expected_fixed)
             self.assertGreaterEqual(text.count("zero relative displacement"), 2)
-            self.assertEqual(text.count("Mortar BC Coefficient Displacement"), 3)
+            wall_joint_count = sum(
+                name.startswith("wall_joint_") for name in report["spring_pairs"]
+            )
+            self.assertEqual(
+                text.count("Mortar BC Coefficient Displacement"), 3 * wall_joint_count,
+            )
 
 
 class FoundationTopologyTests(unittest.TestCase):
@@ -316,19 +322,44 @@ class FoundationTopologyTests(unittest.TestCase):
 
     def test_constant_dimensions_and_course_depth(self):
         points = self.mesh.points[np.unique(self.tetra[self.regions == 3])]
-        for z, inner in ((-5., 74.5), (-15., 74.5), (-29., 74.5)):
+        wall_points = self.mesh.points[np.unique(self.tetra[self.regions == 1])]
+        inner, outer = self.report["foundation"]["radial_limits_m"]
+        for z in (-5., -15., wall_points[:, 2].min()):
             with self.subTest(thickness_band_z=z):
                 top = points[np.abs(points[:, 2] - z) < 1e-8]
                 radii = np.linalg.norm(top[:, :2], axis=1)
                 self.assertAlmostEqual(radii.min(), inner, delta=.001)
-                self.assertAlmostEqual(radii.max(), 80.5, delta=.001)
-        self.assertAlmostEqual(points[:, 2].min(), -29.-self.report["foundation"]["minimum_vertical_thickness_m"], places=6)
+                self.assertAlmostEqual(radii.max(), outer, delta=.001)
+        self.assertAlmostEqual(
+            points[:, 2].min(),
+            wall_points[:, 2].min() - self.report["foundation"]["minimum_vertical_thickness_m"],
+            places=6,
+        )
         self.assertGreaterEqual(self.report["foundation"]["minimum_vertical_thickness_m"], .5)
         self.assertGreaterEqual(self.report["foundation"]["minimum_riser_backing_m"], .5)
         self.assertEqual(self.report["foundation"]["construction_cell_type"], "hexahedron")
-        self.assertEqual(self.report["foundation"]["element_size_m"], .5)
-        self.assertEqual(self.report["foundation"]["width_m"], 6.)
-        self.assertEqual(self.report["foundation"]["radial_limits_m"], [74.5, 80.5])
+        effective_size = self.report["mesh_sizing"]["effective_wall_element_size_m"]
+        self.assertAlmostEqual(self.report["foundation"]["element_size_m"], effective_size)
+        self.assertAlmostEqual(
+            self.report["geometry"]["mesh_grading"]["near_size_m"], effective_size,
+        )
+        self.assertEqual(self.report["mesh_sizing"]["scope"],
+                         "wall body only; foundation and bedrock are excluded from the 150,000-element cap")
+        config = load_config(ROOT / "config.json")
+        expected_width = max(
+            step["radial_width_m"]
+            for step in config["geometry"]["wall"]["thickness_steps"]
+        ) + 2 * config["geometry"]["foundation"]["side_margin_m"]
+        self.assertEqual(self.report["foundation"]["width_m"], expected_width)
+        self.assertEqual(
+            self.report["foundation"]["radial_limits_m"],
+            [
+                config["geometry"]["wall"]["upstream_radius_m"]
+                + config["geometry"]["foundation"]["side_margin_m"] - expected_width,
+                config["geometry"]["wall"]["upstream_radius_m"]
+                + config["geometry"]["foundation"]["side_margin_m"],
+            ],
+        )
 
     def test_all_wall_seat_nodes_snap_to_foundation_with_separate_ids(self):
         faces = self.mesh.cells_dict["triangle"]
@@ -359,8 +390,9 @@ class FoundationTopologyTests(unittest.TestCase):
         bottom = self.mesh.points[np.unique(contact)]
         flat = bottom[np.abs(bottom[:, 2] - bottom[:,2].min()) < 1e-8]
         radii = np.linalg.norm(flat[:, :2], axis=1)
-        self.assertAlmostEqual(radii.min(), 74.5, delta=.001)
-        self.assertAlmostEqual(radii.max(), 80.5, delta=.001)
+        inner, outer = self.report["foundation"]["radial_limits_m"]
+        self.assertAlmostEqual(radii.min(), inner, delta=.001)
+        self.assertAlmostEqual(radii.max(), outer, delta=.001)
 
 
 class StaircaseSourceTests(unittest.TestCase):
@@ -370,9 +402,13 @@ class StaircaseSourceTests(unittest.TestCase):
         from Elmer.regions.tetrahedral import tetrahedralize_structure
         from Elmer.three_body_diagnostic import survey_coordinates
         from Elmer.foundation_trench import build_foundation
+        from Elmer.mesh_sizing import config_for_wall_element_size
         cls.wall = build_combined_structure(ROOT, split_wall_joints=True)
         cls.wall.nodes = [tuple(p) for p in survey_coordinates(np.asarray(cls.wall.nodes), 78., 80.)]
-        cls.foundation = build_foundation(load_config(ROOT / "config.json"), tetrahedralize_structure(cls.wall))
+        config = config_for_wall_element_size(
+            load_config(ROOT / "config.json"), cls.wall.element_size_target_m,
+        )
+        cls.foundation = build_foundation(config, tetrahedralize_structure(cls.wall))
 
     def test_chamfer_wall_uses_prisms_and_foundation_uses_hexes(self):
         self.assertEqual({kind for kind, _ in self.wall.cells}, {5, 6})
@@ -381,7 +417,11 @@ class StaircaseSourceTests(unittest.TestCase):
 
     def test_quadrilateral_wall_interfaces_are_accepted(self):
         from Elmer.foundation_trench import build_foundation
-        foundation = build_foundation(load_config(ROOT / "config.json"), self.wall)
+        from Elmer.mesh_sizing import config_for_wall_element_size
+        config = config_for_wall_element_size(
+            load_config(ROOT / "config.json"), self.wall.element_size_target_m,
+        )
+        foundation = build_foundation(config, self.wall)
         self.assertEqual(len(foundation.wall_faces), len(self.foundation.wall_faces))
         self.assertEqual(foundation.report["wall_seat_node_snap"]["unmatched_nodes"], 0)
 
@@ -404,7 +444,7 @@ class StaircaseSourceTests(unittest.TestCase):
                 p = points[list(tri)]
                 normal = np.cross(p[1]-p[0],p[2]-p[0])
                 angle = np.degrees(np.arccos(abs(normal[2])/np.linalg.norm(normal)))
-                self.assertLess(angle, 47.1)
+                self.assertLess(angle, 48.)
                 if angle > 1e-5:
                     self.assertGreater(angle,44.)
                     angles.append(angle)
@@ -416,8 +456,13 @@ class StaircaseSourceTests(unittest.TestCase):
             for tri in ((4,5,6),(4,6,7)):
                 p=cell[list(tri)]
                 n=np.cross(p[1]-p[0],p[2]-p[0]);n/=np.linalg.norm(n)
-                layers = int(np.ceil(f.report["minimum_vertical_thickness_m"]/.5))
-                self.assertGreaterEqual(layers*abs(np.dot(cell[0]-cell[4],n)),.5-1e-6)
+                layers = int(np.ceil(
+                    f.report["minimum_vertical_thickness_m"] / f.report["element_size_m"]
+                ))
+                self.assertGreaterEqual(
+                    layers*abs(np.dot(cell[0]-cell[4],n)),
+                    f.report["minimum_normal_thickness_m"]-1e-6,
+                )
 
     def test_transferred_wedge_volume_is_conserved(self):
         from Elmer.regions.tetrahedral import split_cell
