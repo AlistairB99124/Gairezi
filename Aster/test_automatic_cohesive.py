@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -123,20 +124,26 @@ def fixture_manifest(arrays: dict) -> dict:
                 "tributary_area_m2": float(area), "stiffness_n_per_m": stiffness.tolist()}
                for i, (area, stiffness) in enumerate(zip(arrays["wall_foundation_tributary_area_m2"],
                                                          arrays["interface_stiffness_n_per_m"]))]
-    return {"wall_foundation_springs": springs,
+    return {"compact_spring_groups": bool(arrays.get("compact_spring_groups", False)),
+            "wall_foundation_springs": springs,
             "support_springs": [{"group": f"SPR_OUT_{i:05d}", "matrix_n_per_m": matrix.tolist()}
                                 for i, matrix in enumerate(arrays["support_matrices_n_per_m"])]}
 
 
 def fixture_base_comm(manifest: dict, gradient_pa_per_m: float) -> str:
     """The same section layout as Aster.generate_three_body_case.render_comm."""
+    from Aster.generate_three_body_case import grouped_spring_entries
+    compact = manifest.get("compact_spring_groups", False)
     springs = ",\n        ".join(
-        f"_F(GROUP_MA='{s['group']}', REPERE='GLOBAL', CARA='K_T_D_L', VALE={tuple(s['stiffness_n_per_m'])!r})"
-        for s in manifest["wall_foundation_springs"])
+        f"_F(GROUP_MA={s['group']!r}, REPERE='GLOBAL', CARA='K_T_D_L', VALE={s['vale']!r})"
+        for s in grouped_spring_entries([
+            {"group": s["group"], "vale": tuple(s["stiffness_n_per_m"])}
+            for s in manifest["wall_foundation_springs"]], "K_IF_" if compact else None))
     outer = ",\n        ".join(
-        f"_F(GROUP_MA='{s['group']}', REPERE='GLOBAL', CARA='K_T_N', SYME='NON', "
-        f"VALE={tuple(v for row in s['matrix_n_per_m'] for v in row)!r})"
-        for s in manifest["support_springs"])
+        f"_F(GROUP_MA={s['group']!r}, REPERE='GLOBAL', CARA='K_T_N', SYME='NON', VALE={s['vale']!r})"
+        for s in grouped_spring_entries([
+            {"group": s["group"], "vale": tuple(v for row in s["matrix_n_per_m"] for v in row)}
+            for s in manifest["support_springs"]], "K_OUT_" if compact else None))
     return f'''DEBUT(LANG='EN')
 
 MAIL = LIRE_MAILLAGE(FORMAT='MED', UNITE=20, NOM_MED='THREE_BODY', VERI_MAIL=_F(VERIF='NON'))
@@ -443,6 +450,32 @@ def fake_fenicsx(directory: Path, faces_count: int, *, initiated=None, opened=No
 
 
 class PostprocessTests(unittest.TestCase):
+    def test_wsl_launcher_failure_overrides_completed_status(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "run").mkdir()
+            (root / ac.CASE_NAME).write_text("SOLVEUR=_F(METHODE='MULT_FRONT')")
+            calls = []
+
+            def execute(distribution, installation, directory, program, timeout, log):
+                calls.append(program)
+                if "convert_three_body_to_med.py" in " ".join(program):
+                    (root / "mesh.med").write_text("mesh")
+                    return subprocess.CompletedProcess(program, 0, "converted", "")
+                (root / "run" / ac.STATUS_NAME).write_text('{"status":"completed"}')
+                return subprocess.CompletedProcess(program, 1, "launcher failed", "")
+
+            with patch("Aster.whole_model_crack.find_linux_installation", return_value="/opt/aster"), \
+                    patch("Aster.whole_model_crack.wsl_path", side_effect=str), \
+                    patch("Aster.run_case.run_wsl_solver", side_effect=execute), \
+                    patch("Aster.automatic_cohesive.os.name", "nt"):
+                status = ac.solve(root, 60)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["returncode"], 1)
+            self.assertEqual(status["runtime"], "wsl")
+
     def test_aster_only_preparation_has_no_fabricated_supporting_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -549,10 +582,23 @@ class AsterFixtureRun(unittest.TestCase):
                                           (root / "run" / ac.STATUS_NAME).resolve(),
                                           interpolation=split["arrays"])
             (root / ac.CASE_NAME).write_text(comm, encoding="utf-8")
+            (root / "case_inputs.json").write_text(json.dumps({
+                "joint": joint, "load_factors": [.5, 1.], "candidate_faces": 0,
+                "native_joint_cells": 0, "split_nodes": 0, "added_nodes": 0,
+                "joint_integration": "three_HEXA8_FPG4_patches_exact_P1_trace"}))
+            candidate = root / "candidate"
+            candidate.mkdir()
+            (candidate / "summary.json").write_text(json.dumps({"status": "prepared_aster_candidates"}))
+            np.savez(candidate / "cohesive_state.npz", areas_m2=np.empty(0))
             status = ac.solve(root, time_limit_s=120, memory_limit_mb=2048)
             self.assertEqual(status["status"], "completed", status)
             with np.load(root / "run" / ac.STEPS_NAME) as fields:
                 self.assertEqual(fields["damage_state"].shape, (2, 0))
+            report = ac.postprocess(root, candidate, status)
+            self.assertEqual(report["status"], "completed")
+            self.assertEqual(report["design_load"]["opened_faces"], 0)
+            self.assertEqual(report["corroboration"]["verdict"], "not_available")
+            self.assertTrue(np.isfinite(report["maximum_wall_displacement_m"]))
             with np.load(root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as fields:
                 self.assertTrue(np.isfinite(fields["final"]).all())
                 self.assertGreater(np.linalg.norm(fields["final"]), 0.)
@@ -639,6 +685,7 @@ class AsterFixtureRun(unittest.TestCase):
     def test_consistent_support_trace_survives_native_joint_run(self):
         from Aster.support_trace import add_consistent_support, render_constraints
         arrays = column_fixture()
+        arrays["compact_spring_groups"] = np.array(True)
         faces = crack_faces(arrays)
         seat = arrays["tri3_rock_bottom"]
         add_consistent_support(arrays, seat, np.repeat((np.eye(3) * 1e13)[None], len(seat), axis=0))

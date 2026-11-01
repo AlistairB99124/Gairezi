@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +32,11 @@ def baseline_inventory(baseline: Path, configuration: Path, model: Path):
     run = json.loads((baseline / "run_manifest.json").read_text(encoding="utf-8"))
     if run.get("status") != "completed":
         raise ValueError("Authoritative Aster baseline is not completed")
-    if Path(manifest["source_mesh"]).resolve() != (model / "three_body.msh").resolve():
+    source_mesh = Path(manifest["source_mesh"])
+    if os.name != "nt":
+        from Aster.whole_model_crack import wsl_path
+        source_mesh = Path(wsl_path(source_mesh))
+    if source_mesh.resolve() != (model / "three_body.msh").resolve():
         raise ValueError("Aster baseline belongs to another source mesh")
     for name, digest in manifest["source_hashes"].items():
         if file_hash(model / name) != digest:

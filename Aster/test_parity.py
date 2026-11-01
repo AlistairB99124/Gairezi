@@ -18,6 +18,135 @@ from Aster.source_contract import native_projector_audit, nodal_areas, real_valu
 
 
 class SourceContractTests(unittest.TestCase):
+    def test_windows_source_paths_are_mapped_to_wsl_on_either_host(self):
+        from Aster.whole_model_crack import wsl_path
+        self.assertEqual(wsl_path(Path(r"C:\Users\model\three_body.msh")),
+                         "/mnt/c/Users/model/three_body.msh")
+
+    @unittest.skipIf(sys.platform == "win32", "Linux process-group supervisor")
+    def test_wsl_guard_exits_cleanly_after_normal_completion(self):
+        from Aster.run_case import WSL_PROCESS_GUARD
+        with subprocess.Popen([sys.executable, "-c", WSL_PROCESS_GUARD,
+                               sys.executable, "-c", "print('done')"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as process:
+            process.wait(timeout=5)
+            stdout, stderr = process.communicate()
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(stdout.strip(), "done")
+
+    @unittest.skipIf(sys.platform == "win32", "Linux process-group supervisor")
+    def test_wsl_guard_kills_descendants_when_host_pipe_closes(self):
+        from Aster.run_case import WSL_PROCESS_GUARD
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "orphan"
+            child = f"import time; from pathlib import Path; time.sleep(3); Path({str(marker)!r}).touch()"
+            parent = (f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); "
+                      "print('ready',flush=True); time.sleep(30)")
+            with subprocess.Popen([sys.executable, "-c", WSL_PROCESS_GUARD, sys.executable, "-c", parent],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True) as process:
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                process.communicate(timeout=5)
+                self.assertNotEqual(process.returncode, 0)
+            self.assertFalse(marker.exists())
+
+    def test_wsl_baseline_preserves_host_artifacts_and_bounds_every_linux_stage(self):
+        from Aster.run_case import run_wsl_case
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            case = output / "case.comm"
+            case.write_text("FIN()")
+            (output / "mesh_manifest.json").write_text("{}")
+            calls = []
+
+            def execute(command, run_dir, timeout, **kwargs):
+                calls.append(command)
+                if "convert_three_body_to_med.py" in " ".join(command):
+                    (output / "mesh.med").write_text("converted")
+                elif "extract_result_fields.py" in " ".join(command):
+                    (run_dir / "aster_result_fields.npz").write_text("fields")
+                    (run_dir / "result_stress.vtu").write_text("stress")
+                else:
+                    (run_dir / "result.med").write_text("result")
+                return subprocess.CompletedProcess(command, 0, "OK", "")
+
+            with patch("Aster.whole_model_crack.find_linux_installation", return_value="/opt/aster"), \
+                    patch("Aster.run_case.run_solver", side_effect=execute):
+                result = run_wsl_case(case, output, output, "three_body_mesh_arrays.npz",
+                                      "convert_three_body_to_med.py", "baseline", 60)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["result_fields_path"], str((output / "run" / "aster_result_fields.npz").resolve()))
+            self.assertEqual(len(calls), 3)
+            self.assertTrue(all("timeout" in command and "--kill-after=10" in command for command in calls))
+            export = (output / "run" / "baseline.export").read_text()
+            self.assertNotIn("\\", export)
+            if sys.platform == "win32":
+                self.assertIn("/mnt/", export)
+
+    def test_wsl_baseline_conversion_failure_rejects_stale_mesh_and_never_solves(self):
+        from Aster.run_case import run_wsl_case
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            case = output / "case.comm"
+            case.write_text("FIN()")
+            (output / "mesh_manifest.json").write_text("{}")
+            (output / "mesh.med").write_text("stale")
+            with patch("Aster.whole_model_crack.find_linux_installation", return_value="/opt/aster"), \
+                    patch("Aster.run_case.run_solver", return_value=subprocess.CompletedProcess([], 1, "", "failed")) as run:
+                result = run_wsl_case(case, output, output, "three_body_mesh_arrays.npz",
+                                      "convert_three_body_to_med.py", "baseline", 60)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse((output / "mesh.med").exists())
+
+    def test_wsl_baseline_linux_timeout_is_not_success(self):
+        from Aster.run_case import run_wsl_case
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            case = output / "case.comm"
+            case.write_text("FIN()")
+            (output / "mesh_manifest.json").write_text("{}")
+            with patch("Aster.whole_model_crack.find_linux_installation", return_value="/opt/aster"), \
+                    patch("Aster.run_case.run_solver", return_value=subprocess.CompletedProcess([], 124, "", "timeout")):
+                result = run_wsl_case(case, output, output, "three_body_mesh_arrays.npz",
+                                      "convert_three_body_to_med.py", "baseline", 60)
+            self.assertEqual(result["status"], "timed_out")
+
+    def test_wsl_baseline_missing_installation_does_not_fall_back(self):
+        from Aster.run_case import run_wsl_case
+        with patch("Aster.whole_model_crack.find_linux_installation", side_effect=RuntimeError("not installed")), \
+                patch("Aster.run_case.run_solver") as run:
+            with self.assertRaisesRegex(RuntimeError, "not installed"):
+                run_wsl_case(Path("case"), Path("output"), Path("mesh"), "arrays", "converter", "baseline", 60)
+            run.assert_not_called()
+
+    def test_native_discrete_grouping_preserves_every_exact_tensor(self):
+        from Aster.generate_three_body_case import grouped_spring_entries
+        entries = [{"group": "a", "vale": (1., 2., 3.)}, {"group": "b", "vale": (1., 2., 3.)},
+                   {"group": "c", "vale": (1. + 1e-12, 2., 3.)}]
+        grouped = grouped_spring_entries(entries)
+        self.assertEqual(grouped[0]["group"], ("a", "b"))
+        self.assertEqual(grouped[1]["group"], "c")
+        restored = {name: item["vale"] for item in grouped
+                    for name in (item["group"] if isinstance(item["group"], tuple) else (item["group"],))}
+        self.assertEqual(restored, {item["group"]: item["vale"] for item in entries})
+
+    def test_real_timeout_kills_solver_child_holding_output_pipes(self):
+        from Aster.run_case import run_solver
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            marker = output / "surviving-child"
+            child = f"import time; from pathlib import Path; time.sleep(2); Path({str(marker)!r}).write_text('alive')"
+            parent = (
+                f"import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', {child!r}]); "
+                "print('child started', flush=True); time.sleep(10)"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_solver([sys.executable, "-c", parent], output, 1)
+            self.assertFalse(marker.exists(), "The child must not outlive the solver timeout or hold its pipes open")
+            self.assertIn("child started", (output / "stdout.log").read_text())
+
     def test_reduced_material_audit_uses_contiguous_foundation_body(self):
         import json
         from Aster.source_contract import audit_source_materials

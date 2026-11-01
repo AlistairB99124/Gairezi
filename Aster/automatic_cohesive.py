@@ -786,19 +786,25 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
 def solve(output_dir: Path, time_limit_s: int, memory_limit_mb: int = MEMORY_LIMIT_MB,
           runtime: str = "wsl") -> dict:
     """Run the prepared case with the local Code_Aster; returns the case's own status."""
-    from Aster.run_case import build_med_mesh, detect_installation, MESH_UNIT, run_solver
+    from Aster.run_case import build_med_mesh, detect_installation, MESH_UNIT, run_solver, run_wsl_solver
 
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
     if runtime == "wsl" and os.name == "nt":
-        from Aster.whole_model_crack import find_linux_installation, linux_command, wsl_path
-        distribution = os.environ.get("LAMB_FENICSX_WSL_DISTRIBUTION", "Ubuntu")
+        from Aster.whole_model_crack import (
+            DEFAULT_WSL_DISTRIBUTION, DISTRIBUTION_ENVIRONMENT,
+            find_linux_installation, wsl_path,
+        )
+        distribution = os.environ.get(DISTRIBUTION_ENVIRONMENT, DEFAULT_WSL_DISTRIBUTION)
         root = find_linux_installation(distribution)
         med_path = output_dir / "mesh.med"
+        med_path.unlink(missing_ok=True)
         converter = ROOT / "Aster" / "convert_three_body_to_med.py"
-        converted = subprocess.run(linux_command(distribution, root, output_dir, [
+        converted = run_wsl_solver(distribution, root, output_dir, [
             f"{root}/bin/python3", wsl_path(converter), wsl_path(output_dir / SPLIT_ARRAYS_NAME),
-            wsl_path(med_path)]), capture_output=True, text=True, timeout=min(time_limit_s, 120), check=False)
+            wsl_path(med_path)], min(time_limit_s, 120), run_dir / "conversion.log")
+        if converted.returncode in (124, 137):
+            raise subprocess.TimeoutExpired(converted.args, min(time_limit_s, 120))
         if converted.returncode != 0 or not med_path.is_file():
             raise CorroborationError(f"WSL Aster mesh conversion failed: {converted.stdout}\n{converted.stderr}")
         case = output_dir / CASE_NAME
@@ -829,11 +835,13 @@ def solve(output_dir: Path, time_limit_s: int, memory_limit_mb: int = MEMORY_LIM
         f"F libr {mesh_path} D {MESH_UNIT}",
         "",
     ]), encoding="utf-8")
-    command = (linux_command(distribution, root, run_dir, [f"{root}/bin/run_aster", wsl_path(export_path)])
-               if runtime == "wsl" and os.name == "nt"
-               else [installation["launcher_path"], str(export_path.resolve())])
-    completed = run_solver(command, run_dir,
-                           int(time_limit_s), live_log=run_dir / "solver.live.log")
+    if runtime == "wsl" and os.name == "nt":
+        completed = run_wsl_solver(distribution, root, run_dir,
+                                   [f"{root}/bin/run_aster", wsl_path(export_path)],
+                                   int(time_limit_s), run_dir / "solver.live.log")
+    else:
+        completed = run_solver([installation["launcher_path"], str(export_path.resolve())],
+                               run_dir, int(time_limit_s), live_log=run_dir / "solver.live.log")
     (run_dir / "stdout.log").write_text(completed.stdout, encoding="utf-8")
     (run_dir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
     try:
@@ -844,7 +852,8 @@ def solve(output_dir: Path, time_limit_s: int, memory_limit_mb: int = MEMORY_LIM
                                  f"solve started:\n{tail}") from None
     status["returncode"] = completed.returncode
     status["runtime"] = "wsl" if runtime == "wsl" and os.name == "nt" else "native"
-    if status.get("status") == "running":
+    if (completed.returncode != 0 or "<EXCEPTION>" in completed.stdout + completed.stderr
+            or status.get("status") == "running"):
         status["status"] = "failed"
         status["message"] = f"Code_Aster stopped unexpectedly (exit code {completed.returncode})"
     return status
@@ -928,9 +937,10 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         if len(factors) == 0:
             report.update(status="failed", steps=[])
             return report
-        damage = np.asarray(steps["damage_state"], dtype=float).reshape(len(factors), -1)
-        jump = np.asarray(steps["normal_jump_m"], dtype=float).reshape(len(factors), -1)
-        traction = np.asarray(steps["normal_traction_pa"], dtype=float).reshape(len(factors), -1)
+        native_faces = report["native_joint_cells"]
+        damage = np.asarray(steps["damage_state"], dtype=float).reshape(len(factors), native_faces)
+        jump = np.asarray(steps["normal_jump_m"], dtype=float).reshape(len(factors), native_faces)
+        traction = np.asarray(steps["normal_traction_pa"], dtype=float).reshape(len(factors), native_faces)
     if (jump.shape != damage.shape or traction.shape != damage.shape
             or not all(np.isfinite(values).all() for values in (factors, damage, jump, traction))
             or np.any(np.diff(factors) <= 0)):

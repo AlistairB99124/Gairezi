@@ -44,10 +44,36 @@ SIF must activate both; converted mesh bodies are checked before solving.
 Historical inputs targeting foundation body 3 produced an inactive foundation
 and require a new isolated source run, not a supporting-stage restart alone.
 
-On Windows 11 the cracking runner uses the installed Linux Code_Aster in WSL
+Current repair verification remains incomplete for the corrected Elmer reference
+and live restart. Three isolated corrected Elmer trials stopped on a 450-second
+assembly budget, including exactly grouped seat conditions and single-threaded
+BLAS. These outputs are not accepted and no live job/source restart was performed.
+Exact Aster coefficient grouping reduced the saved source's support definitions
+from 17,376 to 4,689. Compact MED coefficient groups retain every spring and tensor
+but omit redundant per-element group metadata. The full Linux Aster baseline then
+completed with extraction in 206 seconds on 166,326 tetrahedra. Wall/foundation
+maximum displacements were 9.342 mm / 0.114 mm; these are numerical results, not
+engineering acceptance or a passed wall-displacement gauge.
+
+The same-source FEniCSx solve balances its assembled forces to 7.3e-12, but its
+displacement differs from this Aster baseline by 1.29%. Aster's existing lumped
+interface springs and FEniCSx's Galerkin mortar operator remain distinct; this is
+not a passed parity gate and no tolerance was relaxed. Native small trace,
+crack-growth and zero-candidate equilibrium/postprocessing fixtures pass.
+Linux verification timeouts terminate the launched process group rather than
+leaving solver children alive.
+
+On Windows 11 the baseline and cracking runners use the installed Linux Code_Aster in WSL
 and MUMPS, rather than the older bundled Windows solver. Missing Linux Aster
 is an error, never a silent fallback. Solvers run sequentially to leave memory
 for Aster; user jobs have no agent-verification time cap.
+The supervised Windows-to-WSL full baseline completed in 191 seconds with finite
+fields and matching source identities. Its conversion, solve and extraction
+supervisors kill their own Linux process groups when the host stdin pipe closes.
+Saved Windows source paths are mapped into WSL for provenance checks; hashes
+are neither rewritten nor bypassed. Full Aster-only screening, candidate
+preparation and native mesh hand-off pass for 7,401 candidate facets / 22,203
+HEXA8 joint patches. This does not establish completed full-network growth.
 
 Aster uses native `3D_JOINT` / `CZM_LIN_REG` cohesive facets. Each original
 triangular interface has three HEXA8 quadrilateral patches with FPG4 integration;

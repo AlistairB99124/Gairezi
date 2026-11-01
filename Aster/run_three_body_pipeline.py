@@ -17,7 +17,7 @@ from Aster.run_case import run_case
 
 
 def run_pipeline(source_mesh: Path | None = None, output_dir: Path = DEFAULT_OUTPUT_DIR,
-                 time_limit_s: int = 1800) -> dict:
+                 time_limit_s: int = 1800, runtime: str = "native") -> dict:
     output_dir = output_dir.resolve()
     source_mesh = source_mesh or find_latest_source_mesh()
     if source_mesh is None:
@@ -34,7 +34,8 @@ def run_pipeline(source_mesh: Path | None = None, output_dir: Path = DEFAULT_OUT
     print("[2/6] Generating Code_Aster case from saved source inputs ...", file=sys.stderr)
     case_path = output_dir / "case.comm"
     generate(case_path=case_path, inputs_path=output_dir / "case_inputs.json",
-             mesh_manifest_path=output_dir / "mesh_manifest.json")
+             mesh_manifest_path=output_dir / "mesh_manifest.json",
+             linear_solver="MUMPS" if runtime == "wsl" else "MULT_FRONT")
 
     print("[3/6] Solving (this is the slow step, several minutes) ...", file=sys.stderr)
     run_manifest = run_case(
@@ -45,6 +46,7 @@ def run_pipeline(source_mesh: Path | None = None, output_dir: Path = DEFAULT_OUT
         converter_filename="convert_three_body_to_med.py",
         export_name="01_three_body_baseline",
         time_limit_s=time_limit_s,
+        runtime=runtime,
     )
     if run_manifest.get("status") != "completed":
         return {
@@ -79,8 +81,9 @@ def main() -> None:
     parser.add_argument("--source-mesh", type=Path)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--time-limit-s", type=int, default=1800)
+    parser.add_argument("--runtime", choices=("native", "wsl"), default="native")
     args = parser.parse_args()
-    report = run_pipeline(args.source_mesh, args.output_dir, args.time_limit_s)
+    report = run_pipeline(args.source_mesh, args.output_dir, args.time_limit_s, args.runtime)
     print(json.dumps(report, indent=2))
     if report.get("status") != "verified":
         sys.exit(2)

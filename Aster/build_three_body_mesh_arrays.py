@@ -406,6 +406,7 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
         source_cell_rows=np.concatenate((np.flatnonzero(is_wall | is_foundation),
                                          np.flatnonzero(is_bedrock))),
         source_node_ids=kept_ids,
+        compact_spring_groups=np.array(True),
     )
     if contract["bedrock_analysis_mode"] == "elastic_layer":
         from Aster.support_trace import add_consistent_support

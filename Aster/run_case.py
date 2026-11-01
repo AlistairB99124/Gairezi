@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,8 @@ MED_CONVERT_TIMEOUT_S = 120
 
 
 def run_solver(command: list[str], run_dir: Path, timeout: int,
-               live_log: Path | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
+               live_log: Path | None = None, env: dict | None = None,
+               keep_stdin_open: bool = False) -> subprocess.CompletedProcess:
     """Keep a timeout from leaving a solver child running behind its launcher.
 
     With ``live_log``, output is also appended to that file line by line while
@@ -54,9 +56,12 @@ def run_solver(command: list[str], run_dir: Path, timeout: int,
     and process-tree kill are unchanged. ``env`` replaces the inherited
     environment (for example a relocated Linux Code_Aster runtime)."""
     if live_log is not None:
-        return _run_solver_streaming(command, run_dir, timeout, live_log, env)
+        return _run_solver_streaming(command, run_dir, timeout, live_log, env, keep_stdin_open)
+    if keep_stdin_open:
+        raise ValueError("A persistent stdin pipe requires streaming solver output")
     with subprocess.Popen(command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, encoding="utf-8", errors="replace", env=env) as process:
+                          text=True, encoding="utf-8", errors="replace", env=env,
+                          start_new_session=os.name != "nt") as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -73,11 +78,12 @@ def _terminate_tree(process: subprocess.Popen) -> None:
         subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True,
                        capture_output=True, timeout=30)
     else:
-        process.kill()
+        os.killpg(process.pid, signal.SIGKILL)
 
 
 def _run_solver_streaming(command: list[str], run_dir: Path, timeout: int,
-                          live_log: Path, env: dict | None = None) -> subprocess.CompletedProcess:
+                          live_log: Path, env: dict | None = None,
+                          keep_stdin_open: bool = False) -> subprocess.CompletedProcess:
     # Solver children write to a pipe, which Python and gfortran block-buffer
     # by default; ask them to flush per line so the live log is actually live.
     environment = {**(os.environ if env is None else env), "PYTHONUNBUFFERED": "1",
@@ -87,7 +93,9 @@ def _run_solver_streaming(command: list[str], run_dir: Path, timeout: int,
     finished = threading.Event()
     tails: list[threading.Thread] = []
     with subprocess.Popen(command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, encoding="utf-8", errors="replace", env=environment) as process, \
+                          stdin=subprocess.PIPE if keep_stdin_open else None,
+                          text=True, encoding="utf-8", errors="replace", env=environment,
+                          start_new_session=os.name != "nt") as process, \
             live_log.open("a", encoding="utf-8") as live:
         def write(line: str) -> None:
             with write_lock:
@@ -286,7 +294,13 @@ def run_case(
     converter_filename: str = "convert_arrays_to_med.py",
     export_name: str = "00_elastic_baseline",
     time_limit_s: int = 480,
+    runtime: str = "native",
 ) -> dict:
+    if runtime not in ("native", "wsl"):
+        raise ValueError("Code_Aster runtime must be native or wsl")
+    if runtime == "wsl" and os.name == "nt":
+        return run_wsl_case(case_path, output_dir, mesh_dir, arrays_filename,
+                            converter_filename, export_name, time_limit_s)
     output_dir.mkdir(parents=True, exist_ok=True)
     installation = detect_installation()
     manifest = {
@@ -402,6 +416,107 @@ def run_case(
         manifest["message"] = str(error)
     manifest["elapsed_s"] = time.monotonic() - started
     manifest["run_dir"] = str(run_dir.resolve())
+    _write(manifest, output_dir)
+    return manifest
+
+
+# Killing a Windows wsl.exe tree does not necessarily kill its Linux descendants.
+# The host holds stdin open; cancellation/host exit closes it and kills only this
+# Linux supervisor's isolated process group.
+WSL_PROCESS_GUARD = """
+import os, signal, subprocess, sys, threading
+child = subprocess.Popen(sys.argv[1:], start_new_session=True)
+def watch_host():
+    while os.read(0, 4096):
+        pass
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+threading.Thread(target=watch_host, daemon=True).start()
+sys.exit(child.wait())
+"""
+
+
+def run_wsl_solver(distribution: str, root: str, directory: Path, program: list[str],
+                   timeout: int, live_log: Path) -> subprocess.CompletedProcess:
+    from Aster.whole_model_crack import linux_command
+    command = linux_command(distribution, root, directory, [
+        f"{root}/bin/python3", "-c", WSL_PROCESS_GUARD,
+        "timeout", "--kill-after=10", str(timeout), *program])
+    return run_solver(command, directory, timeout + 30,
+                      live_log=live_log, keep_stdin_open=True)
+
+
+def run_wsl_case(case_path: Path, output_dir: Path, mesh_dir: Path, arrays_filename: str,
+                 converter_filename: str, export_name: str, time_limit_s: int) -> dict:
+    from Aster.whole_model_crack import (
+        DEFAULT_WSL_DISTRIBUTION, DISTRIBUTION_ENVIRONMENT,
+        find_linux_installation, wsl_path,
+    )
+    distribution = os.environ.get(DISTRIBUTION_ENVIRONMENT, DEFAULT_WSL_DISTRIBUTION)
+    root = find_linux_installation(distribution)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = output_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": 1, "case_path": str(case_path.resolve()), "case_sha256": file_hash(case_path),
+        "mesh_manifest_sha256": file_hash(mesh_dir / "mesh_manifest.json"),
+        "installation": {"available": True, "launcher_path": f"{root}/bin/run_aster",
+                         "runtime": "wsl", "distribution": distribution},
+        "run_dir": str(run_dir.resolve()),
+    }
+    result_med = run_dir / "result.med"
+    fields_path = run_dir / "aster_result_fields.npz"
+    for path in (result_med, fields_path, run_dir / "result_stress.vtu",
+                 run_dir / "_diagnostic_displacement.npz", output_dir / "aster_full_displacement.npz"):
+        path.unlink(missing_ok=True)
+    started = time.monotonic()
+    def execute(program: list[str], directory: Path, timeout: int, log_name: str):
+        return run_wsl_solver(distribution, root, directory, program, timeout, run_dir / log_name)
+
+    try:
+        med_path = mesh_dir / "mesh.med"
+        med_path.unlink(missing_ok=True)
+        conversion = execute([
+            f"{root}/bin/python3", wsl_path(Path(__file__).with_name(converter_filename)),
+            wsl_path(mesh_dir / arrays_filename), wsl_path(med_path)],
+            output_dir, MED_CONVERT_TIMEOUT_S, "conversion.log")
+        (run_dir / "conversion.log").write_text(conversion.stdout + conversion.stderr, encoding="utf-8")
+        if conversion.returncode in (124, 137):
+            raise subprocess.TimeoutExpired(conversion.args, MED_CONVERT_TIMEOUT_S)
+        if conversion.returncode != 0 or not med_path.is_file():
+            raise RuntimeError("WSL MED conversion failed; see run/conversion.log")
+        export_path = run_dir / f"{export_name}.export"
+        export_path.write_text("\n".join((
+            f"P time_limit {time_limit_s}", "P memory_limit 8192", "P mpi_nbcpu 1",
+            f"F comm {wsl_path(case_path)} D 1", f"F libr {wsl_path(med_path)} D {MESH_UNIT}",
+            f"F rmed {wsl_path(result_med)} R {RESULT_UNIT}", "")), encoding="utf-8")
+        manifest["export_path"] = str(export_path.resolve())
+        completed = execute([f"{root}/bin/run_aster", wsl_path(export_path)],
+                            run_dir, time_limit_s, "solver.live.log")
+        (run_dir / "stdout.log").write_text(completed.stdout, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
+        if completed.returncode in (124, 137):
+            raise subprocess.TimeoutExpired(completed.args, time_limit_s)
+        if completed.returncode != 0 or "<EXCEPTION>" in completed.stdout + completed.stderr or not result_med.is_file():
+            raise RuntimeError(f"WSL Aster solve failed (exit {completed.returncode}); see run/solver.live.log")
+        extracted = execute([
+            f"{root}/bin/python3", wsl_path(Path(__file__).with_name("extract_result_fields.py")),
+            wsl_path(result_med), wsl_path(fields_path)], run_dir, MED_CONVERT_TIMEOUT_S, "extraction.log")
+        (run_dir / "extraction.log").write_text(extracted.stdout + extracted.stderr, encoding="utf-8")
+        if extracted.returncode in (124, 137):
+            raise subprocess.TimeoutExpired(extracted.args, MED_CONVERT_TIMEOUT_S)
+        if extracted.returncode != 0 or not fields_path.is_file() or not (run_dir / "result_stress.vtu").is_file():
+            raise RuntimeError("WSL Aster field extraction failed; see run/extraction.log")
+        manifest.update(status="completed", result_med_path=str(result_med.resolve()),
+                        result_fields_path=str(fields_path.resolve()),
+                        result_vtu_path=str((run_dir / "result_stress.vtu").resolve()))
+    except subprocess.TimeoutExpired as error:
+        manifest.update(status="timed_out", message=str(error))
+    except RuntimeError as error:
+        manifest.update(status="failed", message=str(error))
+    manifest["elapsed_s"] = time.monotonic() - started
     _write(manifest, output_dir)
     return manifest
 

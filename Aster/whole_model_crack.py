@@ -17,7 +17,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import time
@@ -57,9 +57,13 @@ INTERFACE_OPERATOR = "consistent_two_sided_TRI3_TRI6"
 def wsl_path(path: Path) -> str:
     """Windows path to its /mnt/<drive>/... form; POSIX paths pass through."""
     text = str(Path(path).resolve()) if os.name == "nt" else str(path)
-    drive, rest = os.path.splitdrive(text)
+    windows = PureWindowsPath(text)
+    drive = windows.drive
     if not drive:
         return text.replace("\\", "/")
+    if len(drive) != 2 or drive[1] != ":":
+        raise ValueError("WSL paths require a local drive, not a UNC share")
+    rest = windows.as_posix()[2:]
     return f"/mnt/{drive.rstrip(':').lower()}{rest.replace(chr(92), '/')}"
 
 

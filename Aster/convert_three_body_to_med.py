@@ -140,13 +140,36 @@ def convert(npz_path: Path, med_path: Path) -> None:
     poi1_nodes = data["support_nodes"]
     point_blocks = [(mc.NORM_POINT1, poi1_nodes.reshape(-1, 1), "OUTER_SPRINGS")]
     point_mesh, point_group_arrays = _build_level(MESH_NAME, 0, coords, point_blocks)
-    for i in range(len(poi1_nodes)):
-        group = mc.DataArrayInt.New([i])
-        group.setName(f"SPR_OUT_{i:05d}")
-        point_group_arrays.append(group)
+    compact = bool(data.get("compact_spring_groups", False))
+    if compact:
+        tensors = data["support_matrices_n_per_m"]
+        groups = {}
+        for row, tensor in enumerate(tensors):
+            key = tuple(tensor[i, j] for j in range(3) for i in range(3))
+            groups.setdefault(key, []).append(row)
+        for index, rows in enumerate(groups.values()):
+            group = mc.DataArrayInt.New(rows)
+            group.setName(f"K_OUT_{index:05d}")
+            point_group_arrays.append(group)
+    else:
+        for i in range(len(poi1_nodes)):
+            group = mc.DataArrayInt.New([i])
+            group.setName(f"SPR_OUT_{i:05d}")
+            point_group_arrays.append(group)
 
     spring_pairs = data["seg2_wall_foundation_springs"]
     spring_mesh, spring_group_arrays = _build_seg2_spring_level(MESH_NAME, coords, spring_pairs)
+    if compact:
+        # The per-element groups already preserve the MED sort permutation.
+        sorted_ids = [int(group[0]) for group in spring_group_arrays[1:]]
+        groups = {}
+        for row, stiffness in enumerate(data["interface_stiffness_n_per_m"]):
+            groups.setdefault(tuple(stiffness), []).append(sorted_ids[row])
+        spring_group_arrays = spring_group_arrays[:1]
+        for index, rows in enumerate(groups.values()):
+            group = mc.DataArrayInt.New(rows)
+            group.setName(f"K_IF_{index:05d}")
+            spring_group_arrays.append(group)
 
     mfu = mc.MEDFileUMesh.New()
     mfu.setName(MESH_NAME)
