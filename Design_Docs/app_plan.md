@@ -24,6 +24,20 @@ Elmer/FEniCSx badges as supporting and places Aster badges first.
 
 ## Current automatic solver sequence
 
+The isolated displacement campaign can enable native `hydraulic_loads` in its
+mesh manifest: undrained heel-to-toe uplift at the wall-side foundation boundary
+and hydrostatic pressure on reservoir-connected opened crack facets. Its new
+intact uplift baseline must solve and pass an equilibrium diagnostic before
+re-screening. Historical/default application configurations and saved results
+retain their original no-uplift/no-crack-water loads. This is a campaign-only
+hydraulic study, not a silent change to production numerical behavior.
+
+Hydraulic active-set trials start from the last accepted mechanical history.
+Only stable pressure connectivity is accepted; rejected trials cannot commit
+irreversible damage. Hydraulic runs use explicit accepted load instants without
+unverified internal mechanical subdivisions. Reference-geometry facet pressure
+is a small-strain approximation, not transient flow or follower loading.
+
 Elmer supplies the source mesh and elastic reference. FEniCSx and Code_Aster
 then run independent elastic baselines. A successful Elmer stage alone does
 not mean that all baselines or cracking have succeeded.

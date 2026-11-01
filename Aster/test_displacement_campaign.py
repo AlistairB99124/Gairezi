@@ -1,6 +1,8 @@
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +14,90 @@ from Aster import run_case
 
 
 class CampaignTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Linux path and child environment contract")
+    def test_linux_task_paths_and_backend_environment_are_isolated(self):
+        before = dict(os.environ)
+        with patch.object(run_case, "bundled_python_for", return_value=Path("/aster/bin/python3")):
+            command = run_case.native_command("/aster/bin/run_aster", ["/aster/bin/python3", "-V"])
+        self.assertEqual(command[0], "env")
+        self.assertIn("LD_LIBRARY_PATH=/aster/lib:/aster/lib64", command)
+        self.assertEqual(dict(os.environ), before)
+        arguments = ["sweep", "--job", r"C:\jobs\reference", "--output", r"C:\sweeps",
+                     "--constitutive-gate", r"C:\gate\gate.json", "--execute",
+                     "--accept-native-cpu-guard", "--new-output"]
+        with patch.object(sys, "argv", arguments), patch.object(campaign, "run_campaign") as execute:
+            campaign.main()
+        self.assertEqual(str(execute.call_args.args[0]), "/mnt/c/jobs/reference")
+        self.assertEqual(str(execute.call_args.args[1].parent), "/mnt/c/sweeps")
+        self.assertEqual(str(execute.call_args.kwargs["constitutive_gate"]), "/mnt/c/gate/gate.json")
+
+    def test_constitutive_gate_checks_same_point_traction_and_irreversibility(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            steps = root / campaign.native.STEPS_NAME
+            points = root / campaign.native.STEPS_NAME.replace(".npz", "_pointwise.npz")
+            state = np.array([[0.], [1.], [2.], [2.]])
+            jump = np.array([[1e-10], [1e-6], [.001], [.0005]])
+            np.savez(steps, damage_state=state, normal_jump_m=jump)
+            gate = root / "gate.json"
+
+            def write_gate(traction):
+                np.savez(points, state=state, normal_jump_m=jump, normal_traction_pa=traction)
+                campaign.write_json(gate, {"status": "passed", "unloading_retains_separation": True,
+                    "native_status": {"returncode": 0},
+                    "evidence": {str(p): campaign.native.file_hash(p) for p in (steps, points)}})
+
+            write_gate(np.array([[1.], [8e5], [0.], [0.]]))
+            self.assertEqual(campaign.validate_constitutive_gate(gate)["sha256"], campaign.native.file_hash(gate))
+            snapshot = campaign.materialize_constitutive_gate(gate, root / "snapshot")
+            self.assertTrue(snapshot.is_file())
+            campaign.validate_constitutive_gate(snapshot)
+            points.write_bytes(b"Changed original evidence")
+            campaign.validate_constitutive_gate(snapshot)
+            with self.assertRaisesRegex(ValueError, "reference changed"):
+                campaign.validate_constitutive_gate(gate)
+            write_gate(np.array([[1.], [8e5], [500.], [0.]]))
+            with self.assertRaisesRegex(ValueError, "zero traction"):
+                campaign.validate_constitutive_gate(gate)
+            state[-1] = 1.
+            write_gate(np.array([[1.], [8e5], [0.], [0.]]))
+            with self.assertRaisesRegex(ValueError, "irreversibility"):
+                campaign.validate_constitutive_gate(gate)
+
+    def test_progress_log_appends_timestamped_case_and_failure_events(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "sweep.log"
+            path.write_text("Existing investigation\n")
+            campaign.log_progress("CASE_START", path=path, case="test", cap=3000)
+            campaign.log_progress("BLOCKED", path=path, error="No uplift\nNo crack water")
+            lines = path.read_text().splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(lines[0], "Existing investigation")
+            self.assertRegex(lines[1], r"^\d{4}-\d{2}-\d{2}T.*\+00:00 CASE_START ")
+            self.assertEqual(json.loads(lines[1].split(" ", 2)[2])["cap"], 3000)
+            self.assertEqual(json.loads(lines[2].split(" ", 2)[2])["error"], "No uplift\nNo crack water")
+
+    def test_missing_historical_reference_is_logged_before_solver_launch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "output"
+            with patch.object(campaign, "log_progress") as progress, \
+                    patch.object(campaign, "validate_reference", side_effect=ValueError("Missing reference")) as reference, \
+                    patch.object(campaign.native, "solve") as solve:
+                with self.assertRaisesRegex(ValueError, "Missing reference"):
+                    campaign.run_campaign(Path(temp) / "jobs" / "job", root,
+                        preflight_only=False, execute=True, case_time_limit=30,
+                        minimum_free_gb=1, constitutive_gate=Path(temp) / "gate.json")
+                reference.assert_called_once()
+                solve.assert_not_called()
+                self.assertEqual(json.loads((root / "campaign.json").read_text())["status"], "blocked")
+                self.assertIn("BLOCKED", [call.args[0] for call in progress.call_args_list])
+                self.assertFalse((root / "campaign.lock").exists())
+
+    def test_hydraulic_controls_compare_against_new_intact_not_saved_cracking_result(self):
+        controls = campaign.initial_cases(hydraulic=True)
+        self.assertEqual(controls[0], campaign.Case("A1-reproduction"))
+        self.assertIn(campaign.Case("A4-historical-material-full-load", e_gpa=10, nu=.15, gf=150), controls)
+
     def test_bounded_initial_matrix_and_restoration_controls(self):
         cases = campaign.initial_cases()
         self.assertLess(len(cases), campaign.MAX_LAUNCHES - campaign.RESERVED)
@@ -94,6 +180,23 @@ class CampaignTests(unittest.TestCase):
             path.write_text("changed")
             with self.assertRaisesRegex(ValueError, "reference changed"):
                 campaign.verify_hashes(hashes)
+
+    def test_full_sweep_cannot_bypass_native_constitutive_gate(self):
+        with self.assertRaisesRegex(ValueError, "constitutive separation"):
+            campaign.run_campaign(Path("job"), Path("output"), preflight_only=False, execute=True,
+                              case_time_limit=30, minimum_free_gb=1)
+
+    def test_parameter_refinement_keeps_other_axes_fixed_and_reserve_bounded(self):
+        case = campaign.Case("hit", e_gpa=1, ft_mpa=.02, gf=1)
+        below = campaign.Case("below", e_gpa=5, ft_mpa=.02, gf=1)
+        controls = campaign.confirmations(case, [{"case": campaign.asdict(below),
+                                            "status": "converged_below_100mm"}])
+        self.assertEqual(len(controls), campaign.RESERVED)
+        for refinement in controls[-3:]:
+            self.assertGreater(refinement.e_gpa, 1)
+            self.assertLess(refinement.e_gpa, 5)
+            self.assertEqual(refinement.ft_mpa, .02)
+            self.assertEqual(refinement.gf, 1)
 
 
 if __name__ == "__main__":

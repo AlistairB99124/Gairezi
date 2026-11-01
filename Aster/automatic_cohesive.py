@@ -20,8 +20,10 @@ Known modelling differences are reported, not hidden: ``CZM_LIN_REG`` uses a
 mixed-mode jump norm (FEniCSx is mode I with tied tangential response), it is
 an intrinsic law with a stiff initial penalty (FEniCSx is rigid until
 initiation), Aster evaluates joint traction at integration points (FEniCSx
-initiates on the larger one-cell facet stress), and no crack-face water pressure
-is applied.
+initiates on the larger one-cell facet stress). Historical/default cases have
+no crack-face water pressure. Isolated hydraulic campaigns opt in through the
+mesh manifest, adding undrained base uplift and reservoir-connected crack water
+with a converged active set at each explicit accepted load instant.
 """
 from __future__ import annotations
 
@@ -485,6 +487,8 @@ def joint_parameters(arrays: dict, faces: np.ndarray, summary: dict, concrete_e_
                      concrete_nu: float) -> dict:
     f_t = float(summary["tensile_strength_pa"])
     g_f = float(summary["fracture_energy_j_m2"])
+    if not all(np.isfinite(value) and value > 0 for value in (f_t, g_f, concrete_e_pa)):
+        raise CorroborationError("Cohesive strength, fracture energy and elastic modulus must be finite and positive")
     nodes = np.asarray(arrays["nodes"], dtype=float)
     edge_faces = faces if len(faces) else np.asarray(arrays["tetra4_concrete"])[:, :3]
     edges = np.concatenate([np.linalg.norm(nodes[edge_faces[:, i]] - nodes[edge_faces[:, (i + 1) % 3]], axis=1)
@@ -494,7 +498,12 @@ def joint_parameters(arrays: dict, faces: np.ndarray, summary: dict, concrete_e_
     critical = 2.0 * g_f / f_t
     # CZM_LIN_REG leaves its elastic branch at the jump PENA_ADHERENCE * critical opening
     # (checked on a Code_Aster run), so its initial stiffness is f_t / (PENA_ADHERENCE * critical).
-    adherence = float(np.clip(f_t / (stiffness * critical), 1e-12, 1.0))
+    adherence = float(f_t / (stiffness * critical))
+    if not 1e-12 <= adherence < 1.0:
+        raise CorroborationError(
+            f"CZM_LIN_REG elastic/softening branches require 1e-12 <= PENA_ADHERENCE < 1; "
+            f"computed {adherence:.6g}. Material inputs and the mesh-derived joint penalty are incompatible; "
+            "refusing to clip the value to a degenerate cohesive law.")
     return {
         "law": "CZM_LIN_REG",
         "tensile_strength_pa": f_t,
@@ -598,6 +607,8 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
     comm += tie_load
     if "SUPPORT_TRACE = AFFE_CHAR_MECA" in comm:
         tie_excit += "    _F(CHARGE=SUPPORT_TRACE),\n"
+    if "UPLIFT = AFFE_CHAR_MECA" in comm:
+        tie_excit += "    _F(CHARGE=UPLIFT, FONC_MULT=RAMP),\n"
     if interpolation is not None and len(interpolation["interpolation_nodes"]):
         parents = interpolation["interpolation_parents"].tolist()
         weights = interpolation["interpolation_weights"].tolist()
@@ -726,6 +737,32 @@ save()
 
 FIN()
 '''
+    if "hydraulic_loads" in joint:
+        from Aster import hydraulic_loads
+        settings = hydraulic_loads.validate_settings(joint["hydraulic_loads"]["settings"])
+        metadata = joint["hydraulic_loads"]
+        runtime_source = Path(hydraulic_loads.__file__).read_text(encoding="utf-8")
+        archive = steps_path.parent.parent / SPLIT_ARRAYS_NAME
+        comm = comm.replace("RESU = None\n", (
+            f"exec(compile({runtime_source!r}, 'hydraulic_loads.py', 'exec'))\n"
+            f"hydraulic_settings = {settings!r}\n"
+            f"with np.load({_comm_string(archive.resolve())}, allow_pickle=False) as stored:\n"
+            "    hydraulic_arrays = {key: stored[key] for key in stored.files}\n"
+            f"crack_water = CrackWater(hydraulic_arrays, {metadata['upstream_z_m']!r}, "
+            f"{metadata['gradient_pa_per_m']!r}, hydraulic_settings['opening_tolerance_m'])\n"
+            f"hydraulic_uplift_resultant = np.asarray({metadata['uplift']['resultant_n']!r})\n"
+            "hydraulic_history = []\nhydraulic_masks = []\nRESU = None\n"))
+        start = comm.index("    try:\n        if RESU is None:")
+        end = comm.index("    reached = target\n", start)
+        comm = comm[:start] + hydraulic_loads.COUPLED_SOLVE + comm[end:]
+        start = comm.index("    times = DEFI_LIST_INST(")
+        end = comm.index("    options = dict(", start)
+        comm = comm[:start] + (
+            "    times = DEFI_LIST_REEL(DEBUT=reached, INTERVALLE=_F(JUSQU_A=target, NOMBRE=1))\n"
+        ) + comm[end:]
+        comm = comm.replace('    status["converged_load_factors"].append(target)',
+                            '    status["hydraulic_steps"] = hydraulic_history\n'
+                            '    status["converged_load_factors"].append(target)')
     return comm
 
 
@@ -797,6 +834,12 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     joint["has_joints"] = bool(len(faces))
     joint["stop_overload_on_opening"] = summary.get("status") == "prepared_aster_candidates"
     joint["material_assignment"] = assignment
+    if "hydraulic_loads" in base_inputs:
+        joint["hydraulic_loads"] = {
+            **base_inputs["hydraulic_loads"],
+            "upstream_z_m": base_inputs["upstream_water_surface_z_m"],
+            "gradient_pa_per_m": base_inputs["water_pressure_gradient_pa_per_m"],
+        }
     if assignment is not None:
         config = json.loads(Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))
         original = config["material"]["concrete"]
@@ -845,7 +888,7 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
 def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEMORY_LIMIT_MB,
           runtime: str = "wsl") -> dict:
     """Run the prepared case with the local Code_Aster; returns the case's own status."""
-    from Aster.run_case import build_med_mesh, detect_installation, MESH_UNIT, run_solver, run_wsl_solver
+    from Aster.run_case import build_med_mesh, detect_installation, MESH_UNIT, run_solver, run_wsl_solver, native_command
 
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
@@ -871,6 +914,8 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
         for name in (STEPS_NAME, STATUS_NAME):
             path = (run_dir / name).resolve()
             text = text.replace(_comm_string(path), repr(wsl_path(path)))
+        arrays_path = (output_dir / SPLIT_ARRAYS_NAME).resolve()
+        text = text.replace(_comm_string(arrays_path), repr(wsl_path(arrays_path)))
         text = text.replace("SOLVEUR=_F(METHODE='MULT_FRONT')", "SOLVEUR=_F(METHODE='MUMPS')")
         case.write_text(text, encoding="utf-8")
         case_path, mesh_path = wsl_path(case), wsl_path(med_path)
@@ -883,7 +928,8 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
         if med_path is None:
             raise CorroborationError("Code_Aster's bundled Python was not found; the mesh could not be converted")
         case_path, mesh_path = str((output_dir / CASE_NAME).resolve()), str(med_path.resolve())
-    for name in (STEPS_NAME, STATUS_NAME, STEPS_NAME.replace(".npz", "_displacement.npz")):
+    for name in (STEPS_NAME, STATUS_NAME, STEPS_NAME.replace(".npz", "_displacement.npz"),
+                 STEPS_NAME.replace(".npz", "_hydraulic.npz")):
         (run_dir / name).unlink(missing_ok=True)
     export_path = run_dir / "aster_cohesive.export"
     export_path.write_text("\n".join([
@@ -899,7 +945,8 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
                                    [f"{root}/bin/run_aster", wsl_path(export_path)],
                                    time_limit_s, run_dir / "solver.live.log")
     else:
-        completed = run_solver([installation["launcher_path"], str(export_path.resolve())],
+        completed = run_solver(native_command(installation["launcher_path"],
+                                              [installation["launcher_path"], str(export_path.resolve())]),
                                run_dir, time_limit_s, live_log=run_dir / "solver.live.log")
     (run_dir / "stdout.log").write_text(completed.stdout, encoding="utf-8")
     (run_dir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
@@ -988,6 +1035,16 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         "native_joint_cells": inputs.get("native_joint_cells", inputs["candidate_faces"]),
         "tangent_update_interval": inputs.get("tangent_update_interval", 1),
     }
+    if "hydraulic_loads" in joint:
+        report["hydraulic_loads"] = joint["hydraulic_loads"]
+        report["hydraulic_steps"] = status.get("hydraulic_steps", [])
+        report["differences_from_fenicsx"] = [
+            note for note in report["differences_from_fenicsx"]
+            if "water" not in note.lower() and "uplift" not in note.lower()]
+        report["differences_from_fenicsx"].append(
+            "Isolated hydraulic study: undrained heel-to-toe uplift and reservoir-connected opened "
+            "crack-face pressure are active in Aster; historical supporting baselines have neither. "
+            "Small-strain facet active-set pressure is not a coupled flow/permeability model.")
     if not steps_path.is_file():
         report.update(status="failed", steps=[])
         return report

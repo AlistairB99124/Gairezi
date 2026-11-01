@@ -5,9 +5,52 @@
 Reference job: `d7052bc6d4a34315a6daacdb77a72b42`, native run
 `20261101T151043Z-30b55786`. Preserve its frozen geometry, mesh, intact
 concrete, foundation, springs, density, gravity, reservoir/tailwater and crest
-loads. Change only selected-wall properties and automatic connected selection
-extent. Keep CZM_LIN_REG; no MAZARS, crushing, new crack-water pressure,
-load amplification or relaxed convergence tolerances.
+loads, except for the hydraulic scope amendment below. Change only selected-wall
+properties and automatic connected selection extent once the new full-load
+reference is established. Keep CZM_LIN_REG; no MAZARS, crushing, load
+amplification or relaxed convergence tolerances.
+
+### Required hydraulic scope amendment
+
+The user requires full exterior hydrostatic pressure, undrained base uplift
+varying from upstream reservoir head at the heel to tailwater head at the toe
+without drainage reduction, and full reservoir pressure on hydraulically
+connected opened crack faces. Do not pressurise dry/disconnected cracks.
+
+The saved native baseline has **zero uplift**. The isolated campaign now enables
+`hydraulic_loads` in its native mesh manifest. Historical/default app workflows
+are unchanged; old results are not retrospectively re-labelled as full-load.
+
+`Aster.hydraulic_loads` applies undrained pressure into the wall-side foundation
+boundary only. Measured heel/toe radii along the source arch define the transverse
+head fraction; crest thickness is not used. Source node identities preserve
+the physical boundary through cohesive/relief copies. Linear triangular pressure
+uses consistent P1 nodal forces with exact clipped-waterline integration.
+
+Open crack triangles receive paired equal/opposite hydrostatic forces only when
+reachable from a submerged upstream exterior edge through open shared edges.
+Opening is the signed normal jump, with an explicit 1e-9 m numerical tolerance.
+Face/edge-average activation is a discrete facet approximation: partial wetting,
+permeability, transient flow and trapped-water pressure are not modelled.
+Pressure acts on reference-geometry normals (small strain, not follower loads).
+Closure/disconnection deactivates pressure; mechanical separation remains
+irreversible. A dry isolated crack is never automatically filled.
+
+Each load instant iterates its hydraulic active set, at most20 trials. Every
+trial starts from the last accepted mechanical state; rejected trial damage is
+discarded. Only a stable wet mask is accepted. Mechanical/hydraulic failures
+stop explicitly, with previous accepted evidence retained. Hydraulic runs use
+explicit outer load instants without automatic internal subdivisions: internally
+converged mechanical instants with an unverified wet mask are not valid hydraulic
+evidence. This intentionally differs from historical dry adaptive subdivision;
+solver tolerances remain unchanged.
+
+Execution first solves a new isolated intact uplift baseline, checks force and
+moment equilibrium (1% diagnostic gate), and re-screens its stresses. This solve
+counts against the64-launch budget. A1/A2 use original concrete and compare
+against that new baseline. A4 reproduces historical selected material under the
+new hydraulic loads, without comparing it to old no-uplift maxima. Historical
+preflight caps cannot be reused in a hydraulic execution directory.
 
 Target: first **converged physical wall-node displacement magnitude >=0.100 m**,
 not display deformation, auxiliary nodes or displacement difference.
@@ -37,11 +80,11 @@ displacement did not mean increased stiffness.
 - Authenticate original baseline/config/mesh hashes. Screen/prepare with the
   original configuration, then record only authorised selected-property
   differences. No rewritten original hashes or fictitious modified baseline.
-- Freeze exact selected rows/candidate topology per cap; original ft0.8 MPa
+- Freeze newly screened selected rows/candidate topology per cap; original ft0.8 MPa
   still controls automatic screening.
 - LF<=1 only. Disable the campaign stop-at-first-opening overload search, not
-  production defaults. Start low-strength cases at LF0.01; retain adaptive
-  subdivisions and damage irreversibility.
+  production defaults. Start low-strength cases at LF0.01; retain damage
+  irreversibility and accept only hydraulically converged explicit instants.
 - Save actual accepted native instants, physical wall maxima/components/locations,
   matched gauges and fields before advancing; preserve last valid state on failure.
 - No outer wall-clock timeout. Keep native iteration/CPU safeguards and explicit
@@ -59,12 +102,15 @@ Small native specimen: elastic response, initiation, softening, full separation,
 irreversible unloading/reloading, reactions and traction/opening/state1/state2
 checks. Stop if constitutive response or extraction disagrees.
 At cap3000:
-- A1 isolated saved-run reproduction E10/nu0.15/ft0.8/Gf150.
-- A2 selected properties equal original concrete, identical candidate topology.
+- A1/A2 original material on the new full-load candidate topology, compared
+  against the new uplift baseline.
 - A3 E10/nu0.2/ft0.8/Gf100: separate stiffness from Poisson/toughness.
+- A4 saved E10/nu0.15/ft0.8/Gf150 material, now under full hydraulic loads.
 - Same-topology bonded/elastic-joint control for decisive cases, labelled
   diagnostic rather than an accepted fracture result.
 Investigate unexplained reproduction/topology discrepancies before continuing.
+The runner stops if either native A1/A2 maximum differs from its reference by
+more than1% (a diagnostic gate, not a safety acceptance threshold).
 
 ### B: strength-only initiation
 
@@ -137,5 +183,82 @@ unresolved cases and constitutive limitations.
 First implement and verify the isolated runner with focused unit/native smoke
 tests. Full overnight execution requires explicit approval and has not started.
 Use `python -m Aster.displacement_campaign --help` from the Gairezi environment.
-`--preflight-only` authenticates/prepares caps without native solves.
+`--preflight-only` authenticates/prepares historical caps without native solves;
+this remains a no-uplift preview, not the new hydraulic screening.
 Never use an application-job directory as campaign output.
+Full campaign preparation/execution uses Ubuntu's SciPy-capable Python with the
+native Aster environment activated, not the application Windows virtualenv.
+Omitting `--case-time-limit` removes outer wall-clock enforcement; execute then
+requires `--accept-native-cpu-guard` to acknowledge the installed CPU safeguard.
+Execution also requires `--constitutive-gate` pointing to hash-authenticated
+native specimen step evidence demonstrating initiation, state2 separation and
+retained separation on unloading. The runner rejects missing/stale gate evidence.
+No full-matrix execution is authorised merely by passing unit/smoke tests.
+
+### Current verification state
+
+Four full-dam cap preflights are feasible: cap1500 ->1499 cells/2621 facets;
+3000 ->2998/5313; 6000 ->6000/10737; 9000 ->8999/16184.
+Small native fine-step displacement/joint capture and same-topology bonding
+controls passed. No full-dam sweep has started.
+
+The separation anomaly was traced to an inherited elastic-only specimen with
+ft=1e12 Pa and Gf=1e10 J/m2: its material/penalty ratio was clipped to
+PENA_ADHERENCE=1, collapsing the elastic/softening branch distinction. Production
+now rejects incompatible ratios rather than silently clipping them.
+
+A corrected native specimen with ft0.8 MPa, Gf100 J/m2 and
+PENA_ADHERENCE=9.308565293e-5 passes elastic/initiation/softening/separation,
+complete closure and reopening. Initial state0 has peak opening2.865e-14 m.
+Pointwise separated open joints carry zero tensile traction; separation remains
+irreversible on closure/reload. Facet maxima may combine different integration
+points, so a facet touched by separation can still carry traction elsewhere.
+This corrects the specimen, not a demonstration that the full dam separates.
+Hydraulic implementation and the isolated native reference verification now pass.
+Full-matrix execution has not been started.
+
+Hydraulic implementation checks now pass for small native uplift and wet/dry
+crack-water specimens: uplift has correct sign and force/moment balance;
+wet pressure activates with2 active-set iterations, while dry cracks stay
+unpressurised. Full mesh uplift preparation identifies2472 base triangles,
+845.51 m2, upward resultant85.82 MN (plus inclined-base horizontal components).
+This is load preparation, not a full-dam failure result.
+
+The new intact uplift reference solved in154.4 seconds. Maximum physical wall
+displacement is9.370 mm; relative force/moment residuals are6.02e-6/3.09e-6.
+Re-screening cap3000 now selects2999 cells and5311 candidate faces, rather than
+reusing old2998/5313 topology. Full native hydraulic crack preparation/campaign
+handoff compiles and retains authenticated original source hashes.
+The bounded100 mm fracture matrix itself remains unexecuted.
+
+### VS Code launch task
+
+Run **Aster: Run full hydraulic displacement sweep** from the root workspace's
+`.vscode/tasks.json`. It uses the existing Ubuntu Aster17.4 installation and
+saved reference job, creates a timestamped directory under
+`Aster/results/hydraulic_sweeps`, and uses the locally preserved, authenticated
+constitutive gate at `Aster/results/hydraulic_gate/gate.json`. Gate/result data
+are ignored by Git. Missing/stale gate data cause an explicit refusal.
+The task discloses and acknowledges the installed native CPU safeguard; there
+is no outer wall-clock cap. It is not run automatically after editing.
+
+## Visible progress log
+
+[sweep.log](./sweep.log) records the investigation and current execution blockers.
+It is generated and ignored by Git. The campaign runner appends UTC-timestamped
+start/finish events, cap preparation, case parameters, displacement/threshold
+outcomes, errors and cancellation. During a run it appends a heartbeat every
+30 seconds with active case, launch count, available memory and native solver
+log timestamp/path. Native iteration details remain in each case's
+`native/run/solver.live.log`; detailed accepted-step fields remain in the case
+output. A heartbeat indicates runner activity, not solver convergence.
+Existing log entries are preserved across campaign invocations.
+
+### Additional Google model suggestion
+
+Installed Code_Aster17.4 contains neither `ENDO_FISS_URG_DIAG` nor `RT_DIAG`,
+`GF_DIAG`, `ALPH_DIAG`, `BET_DIAG` in its material catalog. Do not add those
+unverified keywords. The installed `ENDO_FISS_EXP` is a different gradient-damage
+formulation with different parameters and modelisation; it is not a drop-in
+replacement for CZM_LIN_REG. A calibrated continuum/gradient-damage comparison
+would be a separate study, outside this fixed-model campaign.

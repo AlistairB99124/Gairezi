@@ -449,6 +449,22 @@ class IntegratedJointTests(unittest.TestCase):
         self.assertNotIn("DDL_IMPO", comm)
         np.testing.assert_array_equal(split["arrays"]["support_nodes"], arrays["support_nodes"])
 
+    def test_joint_parameters_refuse_degenerate_branches_instead_of_clipping(self):
+        arrays = column_fixture()
+        faces = crack_faces(arrays)
+        with self.assertRaisesRegex(ac.CorroborationError, "refusing to clip"):
+            ac.joint_parameters(arrays, faces,
+                                {"tensile_strength_pa": 1e12, "fracture_energy_j_m2": 1e10}, 30e9, .2)
+        joint = ac.joint_parameters(arrays, faces,
+                                   {"tensile_strength_pa": 8e5, "fracture_energy_j_m2": 100.}, 30e9, .2)
+        self.assertGreater(joint["pena_adherence"], 0.)
+        self.assertLess(joint["pena_adherence"], 1.)
+        self.assertAlmostEqual(joint["critical_opening_m"], .00025)
+        for strength in (0., -1., float("nan"), float("inf")):
+            with self.assertRaisesRegex(ac.CorroborationError, "finite and positive"):
+                ac.joint_parameters(arrays, faces,
+                                    {"tensile_strength_pa": strength, "fracture_energy_j_m2": 100.}, 30e9, .2)
+
 
 def fake_fenicsx(directory: Path, faces_count: int, *, initiated=None, opened=None, factor=1.0,
                  first=0.75) -> Path:

@@ -180,7 +180,7 @@ def bundled_python_for(launcher_path: str) -> Path | None:
     -> ``<install>/external/Python3.10/python.exe``). Returns None if it
     doesn't exist at the expected location (e.g. a different distribution
     layout). Linux standalone distributions may provide ``<install>/bin/python3``;
-    their relocated runtime environment must already be initialized."""
+    their relocated runtime environment is scoped to child commands."""
     install_root = Path(launcher_path).resolve().parent.parent
     candidates = [install_root / "external" / "Python3.10" / "python.exe"]
     if os.name != "nt":
@@ -215,7 +215,7 @@ def build_med_mesh(
         return med_path
     converter = Path(__file__).resolve().parent / converter_filename
     completed = subprocess.run(
-        [str(python_exe), str(converter), str(arrays_path), str(med_path)],
+        native_command(launcher_path, [str(python_exe), str(converter), str(arrays_path), str(med_path)]),
         capture_output=True,
         text=True,
         timeout=MED_CONVERT_TIMEOUT_S,
@@ -241,7 +241,7 @@ def extract_result_fields(launcher_path: str, result_med_path: Path, run_dir: Pa
     out_path = run_dir / "aster_result_fields.npz"
     extractor = Path(__file__).resolve().parent / "extract_result_fields.py"
     completed = subprocess.run(
-        [str(python_exe), str(extractor), str(result_med_path), str(out_path)],
+        native_command(launcher_path, [str(python_exe), str(extractor), str(result_med_path), str(out_path)]),
         capture_output=True,
         text=True,
         timeout=MED_CONVERT_TIMEOUT_S,
@@ -254,6 +254,14 @@ def extract_result_fields(launcher_path: str, result_med_path: Path, run_dir: Pa
             f"stdout: {completed.stdout}\nstderr: {completed.stderr}"
         )
     return out_path
+
+
+def native_command(launcher_path: str, program: list[str]) -> list[str]:
+    if os.name != "nt" and bundled_python_for(launcher_path) is not None:
+        from Aster.whole_model_crack import linux_environment
+        root = str(Path(launcher_path).resolve().parent.parent)
+        return ["env", *linux_environment(root, 1), *program]
+    return program
 
 
 def file_hash(path: Path) -> str:
@@ -293,7 +301,7 @@ def run_case(
     arrays_filename: str = "mesh_arrays.npz",
     converter_filename: str = "convert_arrays_to_med.py",
     export_name: str = "00_elastic_baseline",
-    time_limit_s: int = 480,
+    time_limit_s: int | None = 480,
     runtime: str = "native",
 ) -> dict:
     if runtime not in ("native", "wsl"):
@@ -358,7 +366,7 @@ def run_case(
     export_path = run_dir / f"{export_name}.export"
     export_path.write_text(
         "\n".join([
-            f"P time_limit {time_limit_s}",
+            *([f"P time_limit {time_limit_s}"] if time_limit_s is not None else []),
             "P memory_limit 4096",
             "P mpi_nbcpu 1",
             f"F comm {case_path.resolve()} D 1",
@@ -376,8 +384,9 @@ def run_case(
     started = time.monotonic()
     try:
         completed = run_solver(
-            [installation["launcher_path"], str(export_path.resolve())],
+            native_command(installation["launcher_path"], [installation["launcher_path"], str(export_path.resolve())]),
             run_dir, time_limit_s,
+            live_log=run_dir / "solver.live.log",
         )
         # Code_Aster's run_aster wrapper can report returncode 0 / "DIAGNOSTIC
         # JOB : OK" even when an internal command raised an uncaught Python
@@ -450,7 +459,7 @@ def run_wsl_solver(distribution: str, root: str, directory: Path, program: list[
 
 
 def run_wsl_case(case_path: Path, output_dir: Path, mesh_dir: Path, arrays_filename: str,
-                 converter_filename: str, export_name: str, time_limit_s: int) -> dict:
+                 converter_filename: str, export_name: str, time_limit_s: int | None) -> dict:
     from Aster.whole_model_crack import (
         DEFAULT_WSL_DISTRIBUTION, DISTRIBUTION_ENVIRONMENT,
         find_linux_installation, wsl_path,
@@ -490,7 +499,8 @@ def run_wsl_case(case_path: Path, output_dir: Path, mesh_dir: Path, arrays_filen
             raise RuntimeError("WSL MED conversion failed; see run/conversion.log")
         export_path = run_dir / f"{export_name}.export"
         export_path.write_text("\n".join((
-            f"P time_limit {time_limit_s}", "P memory_limit 8192", "P mpi_nbcpu 1",
+            *([f"P time_limit {time_limit_s}"] if time_limit_s is not None else []),
+            "P memory_limit 8192", "P mpi_nbcpu 1",
             f"F comm {wsl_path(case_path)} D 1", f"F libr {wsl_path(med_path)} D {MESH_UNIT}",
             f"F rmed {wsl_path(result_med)} R {RESULT_UNIT}", "")), encoding="utf-8")
         manifest["export_path"] = str(export_path.resolve())

@@ -165,6 +165,16 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
     elif mesh_manifest.get("support_integration") == "consistent_P1_face":
         raise ValueError("Consistent support trace arrays are missing")
     support_excitation = "_F(CHARGE=SUPPORT_TRACE)," if trace else ""
+    uplift_code, uplift_excitation = "", ""
+    if "hydraulic_loads" in mesh_manifest:
+        from Aster.hydraulic_loads import validate_settings, render_uplift
+        settings = validate_settings(mesh_manifest["hydraulic_loads"])
+        with np.load(arrays_path, allow_pickle=False) as stored:
+            uplift_code, uplift_report = render_uplift(
+                {key: stored[key] for key in stored.files}, upstream_surface_z, tailwater_elevation_m, water_gradient)
+        inputs["hydraulic_loads"] = dict(settings=settings, uplift=uplift_report,
+                                        crack_water="inactive in intact elastic baseline")
+        uplift_excitation = "_F(CHARGE=UPLIFT),"
 
     comm = f'''# 01_three_body_baseline.comm - Code_Aster linear-elastic cross-check of the
 # CANONICAL Elmer wall+foundation+bedrock model (Elmer.three_body_solver;
@@ -281,6 +291,7 @@ CARA_ROCK = AFFE_CARA_ELEM(
 
 {fixed_seat}
 {trace}
+{uplift_code}
 RESU = MECA_STATIQUE(
     MODELE=MODELE,
     CHAM_MATER=CHMAT,
@@ -291,6 +302,7 @@ RESU = MECA_STATIQUE(
         _F(CHARGE=CREST_SURCHARGE),
         {fixed_excitation}
         {support_excitation}
+        {uplift_excitation}
     ),
     SOLVEUR=_F(METHODE='MULT_FRONT'),
 )

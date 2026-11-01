@@ -117,6 +117,15 @@ def diagnostics(mesh_dir: Path, full_displacement: np.ndarray) -> dict:
                                       None if name else manifest["source_crest_pressure_pa"])
             force += f
             moment += m
+        if "hydraulic_loads" in manifest:
+            from Aster.hydraulic_loads import uplift_forces, validate_settings
+            validate_settings(manifest["hydraulic_loads"])
+            upstream = manifest["source_pressures"]["UpstreamHydrostaticPressure"]
+            downstream = manifest["source_pressures"]["DownstreamTailwater"]
+            uplift, _ = uplift_forces({key: data[key] for key in data.files}, upstream["surface_z_m"],
+                                       downstream["surface_z_m"], upstream["gradient_pa_per_m"])
+            force += uplift.sum(axis=0)
+            moment += np.cross(points, uplift).sum(axis=0)
         pairs = data["seg2_wall_foundation_springs"]
         relative = full_displacement[pairs[:, 0]] - full_displacement[pairs[:, 1]]
         energy += .5 * float((data["interface_stiffness_n_per_m"] * relative ** 2).sum())
