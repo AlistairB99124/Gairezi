@@ -2,7 +2,8 @@ import unittest
 
 import numpy as np
 
-from automatic_screening import screen_cells
+from automatic_screening import (interior_wall_facet_normal_stress, max_damage_count, screen_cells,
+                                 select_damage_cells)
 
 UNIT_TET = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
 
@@ -64,7 +65,120 @@ class AutomaticScreeningTest(unittest.TestCase):
         self.assertTrue(check["initiates"])
         self.assertAlmostEqual(check["peak_facet_normal_stress_pa"], 3e6)
         self.assertAlmostEqual(check["peak_two_cell_average_facet_normal_stress_pa"], 1.5e6)
+        selection = result["selection"]
+        self.assertEqual((selection["eligible_cells"], selection["selected_cells"]), (2, 2))
+        self.assertEqual(selection["selected_source_rows"], [7, 8])
+        self.assertIsNone(selection["max_damage_count"])
+        capped = screen_cells(tensors, np.array([1, 1], dtype=np.int32), np.array([7, 8]), coordinates, cells,
+                              2e6, relative_tolerance=1e-3, max_damage_count=2)["selection"]
+        self.assertEqual((capped["max_damage_count"], capped["selected_facets"], capped["capped"]), (2, 1, False))
 
+
+# Five critical facets over cells 0..6 (facet stress, owners); facet 5 is below strength.
+PAIRS = np.array([[0, 1], [1, 2], [3, 4], [5, 6], [2, 3], [0, 6]])
+STRESS = np.array([3.0e6, 2.5e6, 2.5e6, 2.2e6, 2.1e6, 1.0e6])
+CRITICAL = STRESS >= 2e6
+ROWS = np.arange(100, 107)
+
+
+def octahedron():
+    """Eight wall tetrahedra around an interior centre node: its star is 8 cells, each axis node's is 4."""
+    axes = np.array([[1., 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]])
+    coordinates = np.vstack(([0., 0, 0], axes))
+    cells = np.array([[0, x, y, z] for x in (1, 2) for y in (3, 4) for z in (5, 6)])
+    return coordinates, cells, np.ones(8, dtype=np.int32)
+
+
+def uniform(count, value=3e6):
+    return np.repeat(np.diag([value, value, value])[None], count, axis=0)
+
+
+def capped(count, regions=None, stress=None):
+    coordinates, cells, wall = octahedron()
+    regions = wall if regions is None else regions
+    pairs, facet = interior_wall_facet_normal_stress(coordinates, cells, regions,
+                                                     uniform(8) if stress is None else stress)
+    return select_damage_cells(pairs, facet, facet >= 2e6, np.arange(200, 208), count,
+                               coordinates_m=coordinates, tetrahedra=cells, regions=regions)
+
+
+class CappedPatchSelectionTest(unittest.TestCase):
+    def test_whole_node_star_is_selected_and_openable(self):
+        result = capped(8)
+        self.assertEqual(result["selected_source_rows"], list(range(200, 208)))
+        self.assertEqual((result["selected_cells"], result["selected_facets"]), (8, 12))
+        self.assertEqual((result["candidate_facets"], result["openable_facets"]), (12, 12))
+        self.assertTrue(result["openable"])
+        self.assertIsNone(result["message"])
+        self.assertEqual(result["patch_nodes"], 1)
+        self.assertFalse(result["capped"])
+
+    def test_cap_takes_the_most_tensioned_star_that_fits(self):
+        # The centre star (8) does not fit 4; the +x star (4 cells) carries the highest tension.
+        stress = uniform(8)
+        stress[:4] = np.diag([4e6, 4e6, 4e6])
+        result = capped(4, stress=stress)
+        self.assertEqual(result["selected_source_rows"], [200, 201, 202, 203])
+        self.assertEqual((result["selected_facets"], result["openable_facets"]), (4, 4))
+        self.assertTrue(result["openable"])
+        self.assertTrue(result["capped"])
+        self.assertEqual(result["max_damage_count"], 4)
+        # Facets shared with a -x cell keep the +x cell's 4 MPa (one-sided) but lie outside the patch.
+        self.assertEqual(result["peak_unselected_facet_stress_pa"], 4e6)
+
+    def test_count_too_small_for_any_star_is_not_openable(self):
+        result = capped(3)
+        self.assertEqual(result["selected_cells"], 0)
+        self.assertFalse(result["openable"])
+        self.assertIn("Increase Max Damage Count", result["message"])
+
+    def test_nodes_touching_other_regions_are_skipped(self):
+        regions = np.ones(8, dtype=np.int32)
+        regions[7] = 3
+        result = capped(8, regions=regions)
+        self.assertNotIn(207, result["selected_source_rows"])
+        self.assertLessEqual(result["selected_cells"], 8)
+        self.assertTrue(result["openable"])
+
+
+class DamageSelectionTest(unittest.TestCase):
+    def test_blank_count_selects_every_cell_owning_a_critical_facet(self):
+        result = select_damage_cells(PAIRS, STRESS, CRITICAL, ROWS, None)
+        self.assertEqual(result["selected_source_rows"], list(range(100, 107)))
+        self.assertEqual((result["eligible_cells"], result["eligible_facets"]), (7, 5))
+        self.assertEqual((result["selected_cells"], result["selected_facets"]), (7, 5))
+        self.assertFalse(result["capped"])
+        self.assertEqual(result["lowest_selected_facet_stress_pa"], 2.1e6)
+        self.assertIsNone(result["peak_unselected_facet_stress_pa"])
+
+    def test_capped_selection_needs_the_mesh(self):
+        with self.assertRaisesRegex(ValueError, "needs the mesh"):
+            select_damage_cells(PAIRS, STRESS, CRITICAL, ROWS, 5)
+
+    def test_no_critical_facet_selects_nothing(self):
+        coordinates, cells, regions = octahedron()
+        pairs, stress = interior_wall_facet_normal_stress(coordinates, cells, regions, uniform(8))
+        result = select_damage_cells(pairs, stress, np.zeros(len(pairs), dtype=bool), np.arange(8), 10,
+                                     coordinates_m=coordinates, tetrahedra=cells, regions=regions)
+        self.assertEqual((result["eligible_cells"], result["selected_cells"]), (0, 0))
+        self.assertEqual(result["selected_source_rows"], [])
+        self.assertIsNone(result["lowest_selected_facet_stress_pa"])
+        self.assertIsNone(result["openable"])
+        self.assertIsNone(result["message"])
+        self.assertEqual(select_damage_cells(np.empty((0, 2), int), [], [], ROWS, None)["selected_cells"], 0)
+
+    def test_invalid_count_is_rejected(self):
+        for count in (0, 1, 2.5, True):
+            with self.assertRaises(ValueError):
+                select_damage_cells(PAIRS, STRESS, CRITICAL, ROWS, count)
+
+    def test_count_is_read_from_the_damage_selection_block(self):
+        self.assertIsNone(max_damage_count({}))
+        self.assertIsNone(max_damage_count({"damage_selection": {"max_damage_count": None}}))
+        self.assertEqual(max_damage_count({"damage_selection": {"max_damage_count": 40}}), 40)
+
+
+class AutomaticScreeningInputTest(unittest.TestCase):
     def test_rejects_invalid_inputs(self):
         tensors, regions, rows, coordinates, cells = fixture([1e6, 1e6], [1, 1])
         asymmetric = tensors.copy()

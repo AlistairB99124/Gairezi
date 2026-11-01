@@ -44,15 +44,88 @@ intact one-sided facet-normal stress (larger of the two owner cells'
 also reported as `facet_check` by screening) from the screening archives; below `f_t*(1-tol)` it returns
 `no_damage_initiated`, otherwise cells beside critical facets seed the region,
 which drops neighbour rings to fit `--maximum-candidate-faces`. Outputs: `manifest.json`, `summary.json` and
-`cohesive_surface.vtu` when cracks exist. Growth on structured tetrahedral
-meshes currently stops with `unsupported_geometry` after initial softening, and
-an overstressed real-dam run is unverified. The API submits it only after a
-confirmed screening (`/jobs/{id}/automatic-cracking/submit`, `/run`,
-`/run/cancel`).
+`cohesive_surface.vtu` when cracks exist. After an accepted network solve the runner
+also solves the fully bonded (intact) state on the same split mesh, loads and load factor,
+and `summary.json` records `stress_comparison` (raw P1 wall cell peaks, intact vs cracked,
+with the cracked stress at the intact peak cells) and `opening_assessment` (initiated,
+opened and separated facets, peak interface traction, and whether cracked equals intact).
+`cohesive_state.npz` saves the split cells, body tags, source cell rows, candidate cells,
+both cell stress fields and the intact displacement; the app's Comparison
+(`Automatic_Cohesive`) and Investigation views read these. Facets initiate on the larger
+owner-cell facet stress, so a facet can initiate yet stay closed when the shared interface
+traction stays below `f_t`; the assessment reports this rather than an opened crack.
+Runs written before runner version 4 lack these arrays; rerun Crack growth to inspect them.
+`summary.json` also records `design_load` (initiated and opened facets at load factor 1,
+peak interface traction over `f_t`, and a linear estimate of the first-opening factor)
+and a plain-language `verdict`. When nothing opens at the design load and
+`damage_selection.maximum_overload_factor` (1-10; absent or null = design load only) is
+above 1, the runner continues proportional loading of every load in 0.1 steps up to that
+factor from the committed state (`continue_overload`). `overload` then records the first
+opening load factor and its bracket, the crack state at the highest factor reached, and
+any stop (the last accepted step is kept); the steps carry `phase` `design`/`overload`,
+and the intact reference and stress comparison are at that final factor. This is a
+strength-margin search, not a physical load case (runner version 5).
+A critical facet that cannot open
+alone in P1 is completed by node-star patches; besides the fewest-facet cut,
+`NodeStarPatchResolver` offers a cut weighted by normal deviation from the
+seed (`PLANARITY_WEIGHT`), because on structured meshes the fewest-facet cut
+often closes with a facet perpendicular to the existing crack and fails the
+`maximum_normal_deviation_rad` kink check. Growth can still stop with
+`unsupported_geometry` when no patch passes that check (the API error then
+quotes the network message), and an overstressed real-dam run is unverified.
+
+Screening (version 3) also writes an automatic element `selection` from
+`damage_selection.max_damage_count` in the job configuration
+(`select_damage_cells`): eligible cells own an interior wall facet at or above
+`f_t*(1-tol)` under the same one-sided measure. With `null` every eligible cell
+is selected and the runner seeds from them, growing through neighbour rings as
+above. With an integer N >= 2 a connected patch of whole wall node stars (all
+wall cells around a node) is grown from the most tensioned critical-facet node to
+the next most tensioned neighbouring node whose star still fits N (nodes touching
+other regions are skipped; isolated owner pairs stay fully tied and never open).
+`openable_facets` pre-checks the patch with `split_interior_wall_faces`; when no
+facet can open the selection records `openable: false` and a `message`, and the
+API fails element selection without launching cracking. Otherwise the run is
+confined to the facets between selected cells (no rings),
+and outside facets that still reach `f_t` are reported in the outcome basis
+rather than rejecting it. The app runs selection and cracking automatically
+after the FEniCSx baseline (no manual selection); the API exposes only the
+read routes `/jobs/{id}/automatic-cracking/screening` and `/run`, plus
+`/run/cancel`.
+
+Every network solve covers the whole dam (Max Damage Count limits the
+candidate facets, not the system size). `sparse_direct.py` solves systems of
+at least `MUMPS_MINIMUM_UNKNOWNS` (20,000) unknowns with PETSc/MUMPS LU and
+keeps the last two factorisations, so bisection solves at an unchanged
+topology only scale the load and reuse the factor; smaller systems keep SciPy
+SuperLU (reproducing earlier results, since the cohesive Newton path branches
+on the roundoff sign of near-zero openings). Null pivots are rejected as
+singular on both paths. On the 384-cell reference selection (about 173k
+unknowns) a bonded solve fell from about 175 s to 0.5 s after the first
+factorisation, and a solve with 12 initiated faces from about 390 s to 1.3 s,
+with the same load factors and ratios as SuperLU through 14 solves (peak RSS
+about 5.6 GB instead of 10.8 GB). Symmetric systems (including the indefinite
+cohesive saddle-point operators) use MUMPS LDL^T instead of LU. MUMPS speed
+depends on the BLAS: install OpenBLAS in WSL (`apt install
+libopenblas0-pthread`; the reference BLAS is several times slower), and the
+runner sets `OPENBLAS_NUM_THREADS` to at most 4 unless already set, because one
+thread per core oversubscribed. On the 959-cell selection (118k-unknown Newton
+operator) one factorisation fell from about 16 s (reference BLAS, LU) to 2.5 s,
+and initiation rounds 1-3 from 47/129/201 s to 10/25/39 s with identical load
+factors and stress ratios.
+
+Each progress line reports the accepted load factor against the target (for
+example `accepted load factor 0.8398 of 1.0000 (84.0%)`), the solve time and the
+elapsed time. The run ends when the accepted factor reaches the target; the
+solve limit (5000) is only a safety cap, and the number of solves does not
+shrink with a smaller selection because every solve covers the whole dam. The
+API turns the recent rise in accepted load factor (from the first initiation
+round, over roughly the last half of the run) into a rough time-left estimate
+for the Crack growth stage; no estimate is shown until the load has risen.
 
 Tests: `FEniCSx.test_cohesive_mode_i`, `FEniCSx.test_cohesive_contact`,
-`FEniCSx.test_cohesive_network` and `FEniCSx.test_fracture_topology` (run from
-`Gairezi`); `test_automatic_cracking`, `test_automatic_screening` and
+`FEniCSx.test_cohesive_network`, `FEniCSx.test_sparse_direct` and
+`FEniCSx.test_fracture_topology` (run from `Gairezi`); `test_automatic_cracking`, `test_automatic_screening` and
 `test_tensile_loss_event.TensileLossEventTests.test_source_intact_only_persists_native_cell_tensors_for_automatic_screening`
 (run from `FEniCSx`).
 
@@ -592,8 +665,10 @@ evidence remain substituted. General different-head/trapped-water behaviour,
 strength-consistent unrestricted paths and dam-scale solve validation remain
 unsupported.
 
-The WPF painter's **Submit** saves the selection and then calls the
-experimental `POST /jobs/{id}/painted-event` API stage. That stage launches this
+**Retired from the app:** manual painting and `POST /jobs/{id}/painted-event`
+are removed; historical painted events remain readable. The description below
+is kept for the standalone runner and saved results. The former WPF painter's
+**Submit** saved the selection and then called that API stage, which launched this
 runner through WSL in `painted_events/<run>/` in the job directory. The runner
 and the shared growth drivers print flushed `Progress: <phase>` lines to
 `runner.log` (selection check, binding, preflight, candidate preparation,
@@ -712,8 +787,10 @@ at 1.2 MPa compression. Failure of an overloaded capped specimen is not a
 simulation of crushing or proof of irreversible damage. The existing
 reversible tensile cap still does not implement that damage law.
 
-The Configuration / Material slider (zero to concrete tensile strength) sets
-`material.concrete.selected_tensile_strength_pa` (MPa in the UI, Pa in JSON).
+Historical only: the app no longer offers these painted-cell fields and
+configurations containing them are rejected; saved painted-event manifests
+still record them. The former Configuration / Material slider (zero to concrete
+tensile strength) set `material.concrete.selected_tensile_strength_pa` (MPa in the UI, Pa in JSON).
 When omitted it inherits `material.concrete.tensile_strength_pa`. Only the
 painted wall cells use the chosen value after the intact solve. The local law
 minimises `0.5*(eps-eta):C:(eps-eta) + ft*tr(eta)` over positive-semidefinite

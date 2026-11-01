@@ -18,6 +18,40 @@ from Aster.source_contract import native_projector_audit, nodal_areas, real_valu
 
 
 class SourceContractTests(unittest.TestCase):
+    def test_reduced_material_audit_uses_contiguous_foundation_body(self):
+        import json
+        from Aster.source_contract import audit_source_materials
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = {"bedrock_analysis": {"mode": "elastic_layer"}, "loads": {"gravity": -10.},
+                      "material": {"concrete": {"youngs_modulus": 3e10, "poisson_ratio": .2, "density": 2400.}}}
+            (root / "config.json").write_text(json.dumps(config))
+            (root / "diagnostic.json").write_text(json.dumps({"solver_body_ids": {"wall": 1, "foundation": 2}}))
+            sif = ("Body 1\n Material = 1\n Body Force = 1\n Equation = 1\nEnd\n"
+                   "Body 2\n Target Bodies(1) = 2\n Material = 1\n Body Force = 1\n Equation = 1\nEnd\n"
+                   "Material 1\n Youngs Modulus = Real 3e10\n Poisson Ratio = Real .2\n Density = Real 2400\nEnd\n"
+                   "Body Force 1\n Stress Bodyforce 3 = Real -24000\nEnd\n")
+            path = root / "dam_model.sif"
+            path.write_text(sif)
+            self.assertTrue(audit_source_materials(root / "three_body.msh")["body_material_assignments"])
+            path.write_text(sif.replace("Target Bodies(1) = 2", "Target Bodies(1) = 3"))
+            with self.assertRaisesRegex(ValueError, "region 2"):
+                audit_source_materials(root / "three_body.msh")
+
+    def test_displacement_peaks_are_separate_per_body(self):
+        from Aster.parity_checks import concrete_checks
+        fields = {
+            "points_m": np.array([[0., 0., 1.], [0., 0., 0.]]),
+            "displacement_m": np.array([[.025, 0., 0.], [9., 0., 0.]]),
+            "stress_pa": np.ones((2, 6)),
+            "source_node_ids": np.array([0, 1]),
+            "body_1_mask": np.array([True, False]),
+            "body_3_mask": np.array([False, True]),
+        }
+        report = concrete_checks(fields, fields, np.array([0, 1]))
+        self.assertEqual(report["regions"]["wall"]["aster_maximum_displacement_m"], .025)
+        self.assertEqual(report["regions"]["foundation"]["aster_maximum_displacement_m"], 9.)
+
     def test_sif_values_are_parsed_not_executed(self):
         blocks = sif_boundaries('Boundary Condition 1\n Name = "test"\n Spring 12 = Real -3e9\nEnd\n')
         self.assertEqual(real_value(blocks[1], "Spring 12"), -3e9)

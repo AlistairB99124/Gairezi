@@ -36,6 +36,7 @@ Usage::
 from __future__ import annotations
 
 import os
+import json
 import sys
 from pathlib import Path
 
@@ -129,15 +130,30 @@ def extract(result_med_path: Path, out_path: Path) -> dict:
             if "source_node_ids" in arrays:
                 full_points = np.asarray(depl.getMesh().getCoords().toNumPyArray())
                 np.testing.assert_allclose(full_points, arrays["nodes"], rtol=0., atol=1e-9)
-                np.savez_compressed(out_path.parent / "_diagnostic_displacement.npz",
-                                    displacement_m=depl.getArray().toNumPyArray())
+                np.savez_compressed(
+                    mesh_arrays_path.parent / "aster_full_displacement.npz",
+                    coordinates_m=full_points,
+                    displacement_m=depl.getArray().toNumPyArray(),
+                    source_node_ids=arrays["source_node_ids"],
+                )
+                np.savez_compressed(
+                    result_med_path.parent / "_diagnostic_displacement.npz",
+                    displacement_m=depl.getArray().toNumPyArray(),
+                )
 
     med_mesh = ml.MEDFileUMesh(str(result_med_path))
     groups = med_mesh.getGroupsOnSpecifiedLev(0)
-    group = "CONCRETE" if "CONCRETE" in groups else "WALL"
+    mode = "full_volume"
+    if mesh_arrays_path.is_file():
+        manifest_path = mesh_arrays_path.parent / "mesh_manifest.json"
+        if manifest_path.is_file():
+            mode = json.loads(manifest_path.read_text(encoding="utf-8")).get(
+                "bedrock_analysis_mode", "full_volume",
+            )
+    group = "WALL" if mode == "elastic_layer" else "CONCRETE" if "CONCRETE" in groups else "WALL"
     if group not in groups:
         raise RuntimeError("Result MED has no concrete volume group (CONCRETE or WALL)")
-    scope = "concrete" if group == "CONCRETE" else "legacy_wall"
+    scope = "wall" if mode == "elastic_layer" else "concrete" if group == "CONCRETE" else "legacy_wall"
     cell_ids = med_mesh.getGroupArr(0, group)
     # Subset by cell identity, not coordinates: opposite interface sides
     # have coincident nodes with different stresses.
@@ -166,6 +182,10 @@ def extract(result_med_path: Path, out_path: Path) -> dict:
             if "source_node_ids" in arrays:
                 cells = np.asarray(sigm.getMesh().getNodalConnectivity().toNumPyArray()).reshape(-1, 5)[:, 1:]
                 source_cells = arrays["tetra4_concrete"]
+                cell_bodies = arrays["concrete_body_ids"]
+                if mode == "elastic_layer":
+                    source_cells = source_cells[cell_bodies == 1]
+                    cell_bodies = cell_bodies[cell_bodies == 1]
                 if cells.shape != source_cells.shape:
                     raise RuntimeError("Concrete result topology differs from exported source")
                 mapped = np.full(len(points), -1, dtype=np.int64)
@@ -174,9 +194,9 @@ def extract(result_med_path: Path, out_path: Path) -> dict:
                     raise RuntimeError("Result node identity is inconsistent")
                 np.testing.assert_allclose(points[cells], arrays["nodes"][source_cells], rtol=0., atol=1e-9)
                 extra["source_node_ids"] = mapped
-                for body in (1, 3):
+                for body in ((1,) if mode == "elastic_layer" else (1, 3)):
                     mask = np.zeros(len(points), dtype=bool)
-                    mask[np.unique(cells[arrays["concrete_body_ids"] == body])] = True
+                    mask[np.unique(cells[cell_bodies == body])] = True
                     extra[f"body_{body}_mask"] = mask
     np.savez_compressed(
         out_path,

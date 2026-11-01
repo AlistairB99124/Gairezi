@@ -356,10 +356,12 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
     rock_side_faces = np.concatenate([face_group(tag) for tag in ROCK_SIDE_FACE_TAGS], axis=0) \
         if any((tri_tags == tag).any() for tag in ROCK_SIDE_FACE_TAGS) else np.empty((0, 3), dtype=np.int64)
 
-    for name, faces in (
+    required_faces = [
         ("UPSTREAM", upstream_faces), ("DOWNSTREAM", downstream_faces), ("CREST", crest_faces),
-        ("ROCK_BOTTOM", rock_bottom_faces), ("ROCK_SIDES", rock_side_faces),
-    ):
+    ]
+    if contract["bedrock_analysis_mode"] != "elastic_layer":
+        required_faces.extend((("ROCK_BOTTOM", rock_bottom_faces), ("ROCK_SIDES", rock_side_faces)))
+    for name, faces in required_faces:
         if faces.size == 0:
             raise MeshExportError(f"Required face group {name} is empty after export")
 
@@ -381,8 +383,7 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
         return float(0.5 * np.linalg.norm(cross, axis=1).sum())
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_dir / "three_body_mesh_arrays.npz",
+    arrays = dict(
         nodes=dense_coords,
         tetra4_concrete=concrete_cells,
         tetra4_bedrock=bedrock_cells,
@@ -402,11 +403,22 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
         support_nodes=support_nodes,
         support_matrices_n_per_m=contract["support_matrices"],
         concrete_body_ids=tet_tags[is_wall | is_foundation],
+        source_cell_rows=np.concatenate((np.flatnonzero(is_wall | is_foundation),
+                                         np.flatnonzero(is_bedrock))),
         source_node_ids=kept_ids,
     )
+    if contract["bedrock_analysis_mode"] == "elastic_layer":
+        from Aster.support_trace import add_consistent_support
+        add_consistent_support(arrays, dense_of[contract["support_faces"]],
+                               contract["support_face_tensors_n_per_m3"])
+        support_nodes = arrays["support_nodes"]
+    np.savez_compressed(output_dir / "three_body_mesh_arrays.npz", **arrays)
 
     manifest = {
         "schema_version": 1,
+        "bedrock_analysis_mode": contract["bedrock_analysis_mode"],
+        **({"elastic_layer_support": contract["elastic_layer_support"]}
+           if contract["bedrock_analysis_mode"] == "elastic_layer" else {}),
         "source_mesh": str(source_mesh.resolve()),
         "source_config": contract["source_config"],
         "source_hashes": contract["source_hashes"],
@@ -414,13 +426,18 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
         "source_crest_pressure_pa": contract["crest_pressure_pa"],
         "support_springs": [
             {"group": f"SPR_OUT_{i:05d}", "matrix_n_per_m": matrix.tolist()}
-            for i, matrix in enumerate(contract["support_matrices"])
+            for i, matrix in enumerate(arrays["support_matrices_n_per_m"])
         ],
         "simplifications_vs_elmer": [
-            "Surface spring laws use nodal area lumping rather than Elmer's consistent Galerkin projector; "
+            "Surface interface springs use nodal area lumping rather than Elmer's consistent Galerkin projector; "
             "all source volume cells and interface node identities are preserved.",
+            *(["Elastic-layer supports use exact P1 face integration in all three solvers; "
+               "Aster point springs use degree-two quadrature with exact displacement trace constraints."]
+              if contract["bedrock_analysis_mode"] == "elastic_layer" else []),
         ],
-        "node_count": int(dense_coords.shape[0]),
+        "node_count": int(len(arrays["nodes"])),
+        "support_integration": ("consistent_P1_face" if contract["bedrock_analysis_mode"] == "elastic_layer"
+                                else "lumped_outer_support"),
         "concrete_cells": int(concrete_cells.shape[0]),
         "bedrock_cells": int(bedrock_cells.shape[0]),
         "bedrock_slivers_dropped": n_slivers_dropped,
@@ -435,15 +452,29 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
         ],
         "groups": {
             "CONCRETE": {"cells": int(concrete_cells.shape[0]), **bounds(np.unique(concrete_cells.ravel()))},
-            "BEDROCK": {"cells": int(bedrock_cells.shape[0]), **bounds(np.unique(bedrock_cells.ravel()))},
             "UPSTREAM": {"faces": int(upstream_faces.shape[0]), "area_m2": tri_area_m2(upstream_faces), **bounds(np.unique(upstream_faces.ravel()))},
             "DOWNSTREAM": {"faces": int(downstream_faces.shape[0]), "area_m2": tri_area_m2(downstream_faces), **bounds(np.unique(downstream_faces.ravel()))},
             "CREST": {"faces": int(crest_faces.shape[0]), "area_m2": tri_area_m2(crest_faces), **bounds(np.unique(crest_faces.ravel()))},
-            "ROCK_BOTTOM": {"faces": int(rock_bottom_faces.shape[0]), "area_m2": tri_area_m2(rock_bottom_faces), **bounds(rock_bottom_nodes)},
-            "ROCK_SIDES": {"faces": int(rock_side_faces.shape[0]), "area_m2": tri_area_m2(rock_side_faces), **bounds(rock_side_nodes)},
         },
         "coordinate_bounds": bounds(np.arange(dense_coords.shape[0])),
     }
+    groups = manifest["groups"]
+    if len(bedrock_cells):
+        groups["BEDROCK"] = {
+            "cells": int(bedrock_cells.shape[0]), **bounds(np.unique(bedrock_cells.ravel())),
+        }
+    if contract["bedrock_analysis_mode"] == "elastic_layer":
+        groups.update({
+            "ROCK_BOTTOM": {"faces": 0, "area_m2": 0.},
+            "ROCK_SIDES": {"faces": 0, "area_m2": 0.},
+        })
+    else:
+        groups.update({
+            "ROCK_BOTTOM": {"faces": int(rock_bottom_faces.shape[0]),
+                            "area_m2": tri_area_m2(rock_bottom_faces), **bounds(rock_bottom_nodes)},
+            "ROCK_SIDES": {"faces": int(rock_side_faces.shape[0]),
+                           "area_m2": tri_area_m2(rock_side_faces), **bounds(rock_side_nodes)},
+        })
     (output_dir / "mesh_manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return manifest
 

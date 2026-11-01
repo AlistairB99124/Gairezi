@@ -611,6 +611,21 @@ class ThreeBodyTests(unittest.TestCase):
         self.assertEqual(peak["node_id"], 8)
         self.assertEqual(peak["value_pa"], 8.0)
 
+    def test_elastic_layer_support_report_is_json_serializable(self):
+        from three_body_model import rock_support_report
+        from types import SimpleNamespace
+        support = {
+            "model": "elastic_layer",
+            "support_nodes": np.array([2, 5], dtype=np.int64),
+            "support_matrices_n_per_m": np.array([np.eye(3) * 2e10, np.eye(3) * 5e10]),
+            "effective_depth_min_m": 1.,
+            "effective_depth_max_m": 2.,
+        }
+        report = rock_support_report(SimpleNamespace(rock_support=support))
+        self.assertEqual(json.loads(json.dumps(report, allow_nan=False))["support_nodes"], [2, 5])
+        np.testing.assert_array_equal(report["support_matrices_n_per_m"], support["support_matrices_n_per_m"])
+        self.assertIsInstance(support["support_nodes"], np.ndarray)
+
     def test_projected_mortar_matches_multiplier_elimination(self):
         xyz = np.asarray(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)))
         mass, area = intersection_mass(xyz, xyz)

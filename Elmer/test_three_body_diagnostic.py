@@ -8,9 +8,75 @@ from unittest.mock import patch
 
 from Elmer.three_body_diagnostic import (
     SPRING_PAIRS, check_spring_gaps, check_spring_partitions, interface_stiffness, prepare,
-    spring_conditions,
+    spring_conditions, check_active_bodies, elastic_layer_groups,
 )
 from Elmer.model_config import load_config
+
+
+class ActiveBodyTests(unittest.TestCase):
+    def test_only_exactly_identical_support_tensors_share_a_condition(self):
+        import numpy as np
+        tensors = np.repeat(np.eye(3)[None], 4, axis=0)
+        tensors[2, 0, 0] += 1e-12
+        tags, groups = elastic_layer_groups(tensors)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(tags[0], tags[1])
+        self.assertEqual(tags[0], tags[3])
+        self.assertNotEqual(tags[0], tags[2])
+        np.testing.assert_array_equal(groups[tags - tags.min()], tensors)
+
+    def test_renumbered_foundation_must_be_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mesh = Path(directory)
+            (mesh / "mesh.elements").write_text("1 1 504 1 2 3 4\n2 2 504 5 6 7 8\n")
+            sif = mesh / "case.sif"
+            for target in (3, 2):
+                sif.write_text(
+                    f"Body 1\n Equation = 1\nEnd\nBody 2\n Target Bodies(1) = {target}\n Equation = 1\nEnd\n"
+                )
+                if target == 3:
+                    with self.assertRaisesRegex(RuntimeError, "body renumbering"):
+                        check_active_bodies(mesh, sif)
+                else:
+                    check_active_bodies(mesh, sif)
+
+
+class ElasticLayerParallelTests(unittest.TestCase):
+    def test_reduced_mesh_selects_serial_before_conversion_and_records_reason(self):
+        from Elmer.three_body_diagnostic import solve
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            report = {"rock_outer_support": {"model": "elastic_layer"},
+                      "joints": "bonded", "boundary_id_map": {}}
+            (output / "diagnostic.json").write_text(json.dumps(report))
+            with patch("Elmer.three_body_diagnostic.os.name", "nt"), \
+                 patch("Elmer.three_body_diagnostic.shutil.which", return_value="ElmerSolver_mpi.exe"), \
+                 patch("Elmer.three_body_diagnostic.mpi_launcher", return_value=("mpiexec", "-n")), \
+                 patch("Elmer.three_body_diagnostic.pvpython_executable", return_value="pvpython"), \
+                 patch("Elmer.three_body_diagnostic.convert_with_elmergrid",
+                       side_effect=RuntimeError("conversion probe")) as convert:
+                with self.assertRaisesRegex(RuntimeError, "conversion probe"):
+                    solve(output, partitions=4)
+            self.assertIsNone(convert.call_args.args[2])
+            saved = json.loads((output / "diagnostic.json").read_text())
+            self.assertEqual(saved["parallel_compatibility"]["effective_partitions"], 1)
+            self.assertEqual(saved["parallel_compatibility"]["requested_partitions"], 4)
+
+    def test_explicit_rock_keeps_requested_parallelism(self):
+        from Elmer.three_body_diagnostic import solve
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "diagnostic.json").write_text(json.dumps({
+                "rock_outer_support": {"model": "rollers"}, "joints": "bonded", "boundary_id_map": {},
+            }))
+            with patch("Elmer.three_body_diagnostic.shutil.which", return_value="ElmerSolver_mpi.exe"), \
+                 patch("Elmer.three_body_diagnostic.mpi_launcher", return_value=("mpiexec", "-n")), \
+                 patch("Elmer.three_body_diagnostic.pvpython_executable", return_value="pvpython"), \
+                 patch("Elmer.three_body_diagnostic.convert_with_elmergrid",
+                       side_effect=RuntimeError("conversion probe")) as convert:
+                with self.assertRaisesRegex(RuntimeError, "conversion probe"):
+                    solve(output, partitions=4)
+            self.assertEqual(convert.call_args.args[2], 4)
 
 
 class SpringProjectorTests(unittest.TestCase):

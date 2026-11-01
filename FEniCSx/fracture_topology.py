@@ -136,9 +136,15 @@ class NodeStarPatchResolver:
 
     At each seed vertex, an integer minimum bond cut separates its two lip
     identities in the remaining node-star graph. Unit capacities minimise the
-    number of additional facets, not physical energy. Every resulting facet's
-    actual area is charged by the subsequent Griffith equilibrium comparison.
+    number of additional facets, not physical energy. A second cut weights each
+    facet by its normal deviation from the seed facet, so a flatter patch is
+    also offered when the fewest-facet cut kinks (structured meshes often close
+    a fan with one steep facet). Every resulting facet's actual area is charged
+    by the subsequent Griffith equilibrium comparison.
     """
+
+    # Integer capacity added per unit of (1 - |cos|) between a facet and the seed normal.
+    PLANARITY_WEIGHT = 100
 
     def __init__(self, faces: PairedCrackFaces, parent_node_ids):
         parents = np.asarray(parent_node_ids)
@@ -172,22 +178,25 @@ class NodeStarPatchResolver:
                 if start == end:
                     continue
                 a, b = np.searchsorted(nodes, left), np.searchsorted(nodes, right)
-                capacity = coo_matrix(
-                    (np.ones(2 * len(a), dtype=np.int64),
-                     (np.concatenate((a, b)), np.concatenate((b, a)))),
-                    shape=(len(nodes), len(nodes))).tocsr()
-                flow = maximum_flow(capacity, start, end)
-                residual = capacity - flow.flow
-                residual.data = (residual.data > 0).astype(np.int64)
-                residual.eliminate_zeros()
-                reachable = np.zeros(len(nodes), dtype=bool)
-                reachable[breadth_first_order(residual, start, directed=True,
-                                              return_predecessors=False)] = True
-                cut = set(map(int, face_ids[reachable[a] != reachable[b]]))
-                patch = tuple(sorted(seeds | cut))
-                if seed not in cut or not self._connected_disk(patch):
-                    continue
-                patches.add(patch)
+                alignment = np.abs(self.faces.normals[face_ids] @ self.faces.normals[seed])
+                planar = 1 + np.rint(self.PLANARITY_WEIGHT * (1 - np.clip(alignment, 0, 1))).astype(np.int64)
+                for weights in (np.ones(len(a), dtype=np.int64), planar):
+                    capacity = coo_matrix(
+                        (np.concatenate((weights, weights)),
+                         (np.concatenate((a, b)), np.concatenate((b, a)))),
+                        shape=(len(nodes), len(nodes))).tocsr()
+                    flow = maximum_flow(capacity, start, end)
+                    residual = capacity - flow.flow
+                    residual.data = (residual.data > 0).astype(np.int64)
+                    residual.eliminate_zeros()
+                    reachable = np.zeros(len(nodes), dtype=bool)
+                    reachable[breadth_first_order(residual, start, directed=True,
+                                                  return_predecessors=False)] = True
+                    cut = set(map(int, face_ids[reachable[a] != reachable[b]]))
+                    patch = tuple(sorted(seeds | cut))
+                    if seed not in cut or not self._connected_disk(patch):
+                        continue
+                    patches.add(patch)
         ordered = sorted(patches, key=lambda ids: (len(ids), ids))
         return [patch for patch in ordered
                 if not any(set(other) < set(patch) for other in ordered)]

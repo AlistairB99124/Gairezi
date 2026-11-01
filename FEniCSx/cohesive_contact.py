@@ -23,15 +23,15 @@ import numbers
 
 import numpy as np
 from scipy import sparse
-from scipy.sparse.linalg import MatrixRankWarning, spsolve
-import warnings
 
 if __package__:
+    from . import sparse_direct
     from .cohesive_mode_i import LinearModeICohesiveLaw, ModeIHistory
     from .fracture_faces import PairedCrackFaces
     from .fracture_water_access import water_access
     from .hydrostatic_load import triangle_pressure_weights
 else:
+    import sparse_direct
     from cohesive_mode_i import LinearModeICohesiveLaw, ModeIHistory
     from fracture_faces import PairedCrackFaces
     from fracture_water_access import water_access
@@ -436,10 +436,8 @@ def solve_cohesive_equilibrium(stiffness, load_n, fixed_dofs, prescribed_m,
             operator = sparse.bmat([[reduced, free_constraint.T], [free_constraint, None]], format="csc")
             force = np.concatenate((-residual[free] / scale, -np.asarray(row_full @ displacement).ravel()))
             try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", MatrixRankWarning)
-                    solution = spsolve(operator, force)
-            except MatrixRankWarning as error:
+                solution = sparse_direct.solve(operator, force)
+            except sparse_direct.SingularMatrixError as error:
                 raise RuntimeError(
                     "Cohesive tangent system is singular (e.g. a frictionless separated mechanism); "
                     "no equilibrium accepted") from error

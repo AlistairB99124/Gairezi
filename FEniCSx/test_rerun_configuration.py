@@ -53,6 +53,12 @@ class RerunConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match this fracture job"):
             require_verified_baseline(self.structure(changed), self.directory)
 
+    def test_bedrock_mode_change_rejects_baseline_reuse(self):
+        changed = copy.deepcopy(self.submitted)
+        changed["bedrock_analysis"] = {"mode": "elastic_layer"}
+        with self.assertRaisesRegex(ValueError, "does not match this fracture job"):
+            require_verified_baseline(self.structure(changed), self.directory)
+
     def test_tampered_snapshot_rejects_baseline(self):
         (self.directory / "config.json").write_text(json.dumps(self.submitted))
         with self.assertRaisesRegex(ValueError, "does not match this fracture job"):

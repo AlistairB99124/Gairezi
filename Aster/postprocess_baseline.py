@@ -289,7 +289,10 @@ def compare(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict:
     if "source_node_ids" in aster_fields and "body_1_mask" in aster_fields:
         from Aster.parity_checks import concrete_checks
         report.update(concrete_checks(elmer_fields, aster_fields, elmer_index_for_aster))
-        report["stress_reporting"] = "Separate wall and optional concrete foundation; no combined stress peak."
+        report["stress_reporting"] = (
+            "Wall only; concrete foundation is retained mechanically but excluded from stress reporting."
+            if scope == "wall" else "Separate wall and optional concrete foundation; no combined stress peak."
+        )
         report["tensile_peak_comparison_by_region"] = {
             name: region["tensile_peak_comparison"] for name, region in report["regions"].items()
         }

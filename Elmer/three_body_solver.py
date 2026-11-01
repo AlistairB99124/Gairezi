@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tempfile
 
-from .model_config import load_config
+from .model_config import bedrock_analysis_mode, load_config
 from .structure_assembly import mpi_launcher
 from .three_body_diagnostic import interface_stiffness, prepare, pvpython_executable, solve
 
@@ -20,11 +20,14 @@ def default_output_root() -> Path:
     return base / "Lamb" / "three-body-solver"
 
 
-def export_reporting_region(result: Path, *, timeout: int | None = None) -> Path:
+def export_reporting_region(result: Path, *, timeout: int | None = None, wall_only: bool = False) -> Path:
     output = result.parent.parent / "reporting"
+    command = [pvpython_executable(), str(Path(__file__).with_name("stress_reporting_region.py")),
+               "--result", str(result), "--output", str(output)]
+    if wall_only:
+        command.append("--wall-only")
     subprocess.run(
-        [pvpython_executable(), str(Path(__file__).with_name("stress_reporting_region.py")),
-         "--result", str(result), "--output", str(output)],
+        command,
         check=True, timeout=timeout,
     )
     path = output / "structure.vtu"
@@ -46,7 +49,8 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
     print("Stage: solving", flush=True)
     result = solve(output / "model", timeout=timeout, partitions=partitions)
     print("Stage: postprocessing", flush=True)
-    reporting_result = export_reporting_region(result, timeout=timeout)
+    wall_only = bedrock_analysis_mode(config) == "elastic_layer"
+    reporting_result = export_reporting_region(result, timeout=timeout, wall_only=wall_only)
     summary_path = reporting_result.parent / "stress_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     concrete = [summary["bodies"]["wall"]]
@@ -54,7 +58,16 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
     compression = -max(entry["peak_compression_mpa"] for entry in concrete) * 1e6
     strength = config["material"]["concrete"]["tensile_strength_pa"]
     diagnostic = json.loads((output / "model" / "diagnostic.json").read_text())
-    if diagnostic.get("foundation", {}).get("present"):
+    if wall_only:
+        connection_assumption = (
+            ("Bonded" if diagnostic.get("wall_foundation_connection") == "bonded" else "Spring-connected")
+            + " wall/foundation interface; preliminary local elastic-layer support under the foundation"
+        )
+        active_support = (
+            "compliant local tensor springs under the concrete foundation; "
+            "rock volume and rock self-weight settlement omitted"
+        )
+    elif diagnostic.get("foundation", {}).get("present"):
         wall_foundation = diagnostic.get("wall_foundation_connection")
         foundation_bedrock = diagnostic.get("foundation_bedrock_connection")
         connection_assumption = (
@@ -123,7 +136,7 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         "nodes": diagnostic["nodes"],
         "cells": sum(diagnostic["cells_by_body"].values()),
         "stress_analysis": {
-            "scope": "wall only; concrete foundation separately when present",
+            "scope": "wall only" if wall_only else "wall; concrete foundation separately when present",
             "max_tensile_principal_stress_pa": {"value_pa": tension},
             "max_compressive_principal_stress_pa": {"value_pa": compression},
             "tensile_strength_pa": strength,
@@ -131,6 +144,9 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
             "element_count": sum(entry["reporting_cells"] for entry in concrete),
         },
     }
+    if wall_only:
+        report["bedrock_analysis"] = diagnostic["elastic_layer_support"]
+        report["engineering_validated"] = False
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Reporting result: {reporting_result}", flush=True)
     return report

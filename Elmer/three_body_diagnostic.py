@@ -14,7 +14,10 @@ import time
 import numpy as np
 
 from .bedrock_preview import configured_rock_mesh, survey_coordinates
-from .model_config import foundation_support, load_config, rock_outer_support, validate_config, wall_joint_support
+from .model_config import (
+    bedrock_analysis_mode, foundation_support, load_config, rock_outer_support, validate_config,
+    wall_joint_support,
+)
 from .regions.model_groups import joint_boundary_ids
 from .regions.combined_structure import build_combined_structure, write_combined_gmsh
 from .mesh_sizing import config_for_wall_element_size
@@ -28,6 +31,7 @@ JOINT_MODELS = ("bonded", "spring")
 # Boundary tags for the two sides of the wall/bedrock spring seat.
 WALL_SEAT, ROCK_SEAT = 11, 12
 ROCK_BOTTOM = 10
+ELASTIC_LAYER_TAG_BASE = 100000
 # Outer rock-box sides: local axis (x = across valley/banks, y = stream depth) and
 # outward sign along that rock-local unit vector.
 ROCK_SIDES = {13: ("x", -1.), 14: ("x", 1.), 15: ("y", -1.), 16: ("y", 1.)}
@@ -271,6 +275,7 @@ def prepare(
     if bonded_bedrock:
         seat_pairs.pop("foundation_bedrock" if foundation_present else "wall_bedrock")
     pairs = {**seat_pairs, **{joint["name"]: tuple(joint["tags"]) for joint in joint_list}}
+    stiffness = interface_stiffness(config) if joints == "spring" else {}
     joint_levels_text = ", ".join(f"{joint['z_m']:g}" for joint in joint_list)
     concrete.nodes = [tuple(p) for p in survey_coordinates(
         np.asarray(concrete.nodes),
@@ -292,10 +297,11 @@ def prepare(
         from .foundation_trench import build_foundation
         from .graded_bedrock import build_graded_rock
         foundation = build_foundation(mesh_config, concrete)
-        rock = build_graded_rock(
-            mesh_config, foundation.points, [tuple(f) for f in foundation.terrain_faces],
-            stream_margin_m, bank_margin_m, bottom_z_m, foundation=foundation,
-        )
+        if bedrock_analysis_mode(config) == "full_volume":
+            rock = build_graded_rock(
+                mesh_config, foundation.points, [tuple(f) for f in foundation.terrain_faces],
+                stream_margin_m, bank_margin_m, bottom_z_m, foundation=foundation,
+            )
         offset = len(concrete.nodes)
         convert = lambda face: tuple(offset + int(n) for n in face)
         concrete = replace(
@@ -312,15 +318,19 @@ def prepare(
                 (tag, face) for tag, face in concrete.boundaries if tag not in (17, 18)
             ])
         foundation.report["support"] = dict(foundation_support(config))
-    else:
+    elif bedrock_analysis_mode(config) == "full_volume":
         rock = configured_rock_mesh(
             mesh_config, np.asarray(concrete.nodes),
             [tuple(seat_index[n] for n in face) for tag, face in concrete.boundaries if tag == 1],
             stream_margin_m, bank_margin_m, bottom_z_m,
         )
+    if bedrock_analysis_mode(config) == "elastic_layer":
+        return _prepare_elastic_layer(
+            output, config, concrete, solver_concrete, foundation, bonded_foundation,
+            joint_list, joint_levels_text, mesh_sizing, pairs, stiffness,
+        )
     rock_points, rock_blocks, geometry = rock.points, rock.blocks, rock.report
     bonded_seat = joints == "spring" and bonded_bedrock
-    stiffness = interface_stiffness(config) if joints == "spring" else {}
     stiffness = {name: value for name, value in stiffness.items() if name in pairs}
     seat_faces = [face for tag, face in concrete.boundaries if tag == 1]
     nodes, concrete_cells, concrete_boundaries = (
@@ -624,6 +634,226 @@ End
     return report
 
 
+def elastic_layer_groups(tensors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Share one boundary condition for exactly identical face tensors."""
+    tensors = np.asarray(tensors, dtype=float)
+    if tensors.ndim != 3 or tensors.shape[1:] != (3, 3) or not np.isfinite(tensors).all():
+        raise ValueError("Elastic-layer faces require finite 3x3 tensors")
+    groups = {}
+    tags = []
+    for tensor in tensors:
+        key = tuple(tensor.ravel())
+        if key not in groups:
+            groups[key] = ELASTIC_LAYER_TAG_BASE + len(groups)
+        tags.append(groups[key])
+    return np.asarray(tags, dtype=np.int64), np.asarray(list(groups)).reshape(-1, 3, 3)
+
+
+def _prepare_elastic_layer(
+    output: Path, config: dict, concrete, solver_concrete, foundation, bonded_foundation: bool,
+    joint_list: list[dict], joint_levels_text: str, mesh_sizing: dict, pairs: dict,
+    stiffness: dict,
+) -> dict:
+    """Write a concrete-only Elmer source with face-wise elastic-layer springs.
+
+    All three solvers integrate the same triangular P1 surface support tensor.
+    """
+    from bedrock_support import lumped_layer_support
+    from .mortar_interfaces import split_planar_interfaces, expand_spring_pairs
+
+    if foundation is None:
+        raise ValueError("The elastic-layer support requires the concrete foundation")
+    bedrock = config["material"]["bedrock"]
+    bottom_z = config["geometry"]["bedrock"]["domain"]["bottom_z_m"]
+    nodes = np.asarray(concrete.nodes, dtype=float)
+    seat_faces = np.asarray([face for tag, face in concrete.boundaries if tag == 1], dtype=np.int64)
+    layer = lumped_layer_support(
+        nodes, seat_faces, youngs_modulus=bedrock["youngs_modulus"],
+        poisson_ratio=bedrock["poisson_ratio"], bottom_z_m=bottom_z,
+        spring_n_per_m3=config.get("bedrock_analysis", {}).get("spring_n_per_m3"),
+    )
+    support_tags, support_tensors = elastic_layer_groups(layer["stiffness_n_per_m3"])
+    unique_support_tags = np.unique(support_tags)
+    boundaries = [(tag, face) for tag, face in concrete.boundaries if tag != 1]
+    boundaries.extend((int(tag), tuple(int(node) for node in face))
+                      for tag, face in zip(support_tags, seat_faces, strict=True))
+    pair_contract = pairs
+    boundaries, pair_contract = split_planar_interfaces(nodes.tolist(), boundaries, pairs)
+    solver_pairs = expand_spring_pairs(pair_contract)
+    solver_stiffness = {
+        name: stiffness[name.split("/")[0]]
+        for name in solver_pairs if name.split("/")[0] in stiffness
+    }
+    boundary_map = {
+        tag: index + 1 for index, tag in enumerate(sorted({tag for tag, _ in boundaries}))
+    }
+    mesh = replace(
+        concrete,
+        boundaries=[(boundary_map[tag], face) for tag, face in boundaries],
+    )
+    write_combined_gmsh(mesh, output / "three_body.msh")
+
+    path = output / "dam_model.sif"
+    write_combined_solver_input(solver_concrete, path)
+    text = path.read_text(encoding="utf-8")
+    text = re.sub(r"(?ms)^Boundary Condition 1\n.*?^End\n\n?", "", text, count=1)
+    text = re.sub(
+        r"Target Boundaries\(1\) = (\d+)",
+        lambda match: f"Target Boundaries(1) = {boundary_map[int(match.group(1))]}",
+        text,
+    )
+    text += (
+        '\nBody 2\n    Target Bodies(1) = 2\n    Name = "FoundationBody"\n    Equation = 1\n'
+        '    Material = 1\n    Body Force = 1\nEnd\n'
+    )
+    if solver_stiffness:
+        text = text.replace(
+            "    Variable DOFs = 3\n",
+            "    Variable DOFs = 3\n    Apply Mortar BCs = Logical True\n", 1,
+        )
+        text += spring_conditions(text, boundary_map, solver_stiffness, solver_pairs)
+    next_bc = max(int(value) for value in re.findall(r"^Boundary Condition (\d+)$", text, re.M)) + 1
+    for index, (tag, matrix) in enumerate(zip(unique_support_tags, support_tensors, strict=True)):
+        entries = "".join(
+            f"    Spring {i + 1}{j + 1} = Real {matrix[i, j]:.12g}\n"
+            for i in range(3) for j in range(3) if matrix[i, j] != 0
+        )
+        text += (
+            f"\nBoundary Condition {next_bc + index}\n"
+            f'    Name = "ElasticLayerSeat_{index:05d}"\n'
+            f"    Target Boundaries(1) = {boundary_map[int(tag)]}\n"
+            f"{entries}End\n"
+        )
+    path.write_text(text.replace("combined_results_mpi", "three_body_results"), encoding="utf-8")
+
+    mesh_sizing = dict(mesh_sizing)
+    mesh_sizing.update({
+        "bedrock_volume": "omitted",
+        "interface_policy": (
+            "Concrete wall and foundation retained; foundation-seat support triangles use "
+            "the configured elastic-layer tensor at each face centroid."
+        ),
+    })
+    foundation.report["support"] = dict(foundation_support(config))
+    foundation_report = dict(foundation.report)
+    foundation_report["bedrock_connection"] = "elastic_layer"
+    support_report = {
+        "model": "elastic_layer",
+        "depth_rule": "face-centroid vertical distance to geometry.bedrock.domain.bottom_z_m",
+        "normal_stiffness_rule": "E*(1-nu)/((1+nu)*(1-2*nu)*h)",
+        "tangential_stiffness_rule": "E/(2*(1+nu)*h)",
+        "discretisation": {
+            "FEniCSx_and_Code_Aster": "consistent triangular P1 face tensor springs",
+            "Elmer": "face-wise consistent surface Spring integration",
+        },
+        "effective_depth_min_m": float(layer["effective_depth_m"].min()),
+        "effective_depth_max_m": float(layer["effective_depth_m"].max()),
+        "seat_area_m2": float(layer["face_area_m2"].sum()),
+        "support_node_count": int(len(layer["support_nodes"])),
+        "face_count": int(len(seat_faces)),
+        "support_nodes": layer["support_nodes"].tolist(),
+        "support_matrices_n_per_m": layer["support_matrices_n_per_m"].tolist(),
+        "face_groups": [
+            {"source_tag": int(tag), "matrix_n_per_m3": matrix.tolist()}
+            for tag, matrix in zip(unique_support_tags, support_tensors, strict=True)
+        ],
+        "limitations": [
+            "Independent local springs omit cross-seat bedrock coupling",
+            "Rock self-weight settlement is omitted",
+            "Effective depth is a geometric preliminary-assessment assumption",
+            "Linear springs transmit tension and shear; no rock separation or yielding",
+        ],
+    }
+    if "spring_n_per_m3" in config.get("bedrock_analysis", {}):
+        support_report.update({
+            "depth_rule": "not used for supplied distributed coefficients",
+            "normal_stiffness_rule": "supplied global z stiffness per area",
+            "tangential_stiffness_rule": "supplied global x/y stiffness per area",
+            "spring_n_per_m3": dict(config["bedrock_analysis"]["spring_n_per_m3"]),
+        })
+        support_report["limitations"] = [
+            entry for entry in support_report["limitations"]
+            if not entry.startswith("Effective depth")
+        ]
+    wall_foundation_note = (
+        "perfectly bonded wall/foundation (shared nodes; zero relative displacement)"
+        if bonded_foundation else
+        "wall/foundation directional springs from geometry.foundation.support.spring_n_per_m3"
+    )
+    joint_note = wall_foundation_note + "; preliminary compliant local elastic-layer foundation support"
+    if joint_list:
+        joint_note += (
+            f"; wall blocks joined at z={joint_levels_text} m by directional springs "
+            f"from {WALL_JOINT_SOURCE}"
+        )
+    report = {
+        "foundation": foundation_report,
+        "foundation_bedrock_connection": "elastic_layer",
+        "wall_foundation_connection": "bonded" if bonded_foundation else "spring",
+        "assumptions": [
+            wall_foundation_note,
+            "concrete foundation retained; no bedrock volume or rock self-weight settlement",
+            *support_report["limitations"],
+            "wall-only stress reporting and damage region",
+            "zero uplift",
+            "simultaneous gravity and existing concrete water loads",
+        ],
+        "purpose": "Preliminary wall-on-compliant-bedrock elastic-layer analysis",
+        "joints": "spring",
+        "interface_stiffness_n_per_m3": stiffness,
+        "interface_stiffness_sources": {
+            **{joint["name"]: WALL_JOINT_SOURCE for joint in joint_list},
+            **({} if bonded_foundation else {
+                "wall_foundation": "geometry.foundation.support.spring_n_per_m3",
+            }),
+        },
+        "spring_pairs": {
+            name: value if isinstance(value, dict) else list(value)
+            for name, value in pair_contract.items() if name in stiffness
+        },
+        "wall_connection": "spring_jointed_blocks" if joint_list else "single_monolithic_body",
+        "wall_joints": joint_list,
+        "nodes": len(nodes),
+        "cells_by_body": dict(Counter(concrete.region_ids)),
+        "mesh_sizing": mesh_sizing,
+        "solver_body_ids": {"wall": WALL_BODY, "foundation": 2},
+        "source_body_ids": {"wall": WALL_BODY, "foundation": 3},
+        "boundary_id_map": boundary_map,
+        "rock_outer_support": {"model": "elastic_layer"},
+        "elastic_layer_support": support_report,
+        "wall_rock_seat_triangles": int(len(seat_faces)),
+        "wall_underside": {
+            "profile": "stepped_45deg_chamfer",
+            "elevation_quantization": True,
+            "radial_extent": "full_wall_thickness",
+        },
+        "geometry": {
+            "mesh_method": "concrete_only_elastic_layer",
+            "bottom_z_m": float(bottom_z),
+            "seat_triangles": int(len(seat_faces)),
+            "seat_area_m2": support_report["seat_area_m2"],
+        },
+        "concrete_element_types": sorted({kind for kind, _ in concrete.cells}),
+        "linear_solver": {
+            "method": "BiCGStabl", "preconditioner": "ILU2",
+            "ilu_factor": 0.01, "convergence_tolerance": 1e-10,
+        },
+        "solver_input": path.name,
+        "result_name": "three_body_results",
+        "result": None,
+        "wall_bedrock_connection": "not_in_contact",
+        "connection_assumption": joint_note,
+        "active_support": (
+            "local elastic-layer tensor springs under concrete foundation; "
+            "wall-only stress reporting/cracking"
+        ),
+        "stress_reporting_scope": "wall",
+        "engineering_validated": False,
+    }
+    (output / "diagnostic.json").write_text(json.dumps(report, indent=2, allow_nan=False))
+    return report
+
+
 def spring_conditions(
     text: str, boundary_map: dict[int, int], stiffness: dict[str, dict[str, float]],
     pairs: dict[str, tuple[int, int]] | None = None,
@@ -694,6 +924,21 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
     report = json.loads(report_path.read_text())
     if (output / "results").exists():
         raise ValueError("Results directory already exists; prepare a fresh run to exclude stale results")
+    requested_partitions = partitions
+    if (os.name == "nt" and report.get("rock_outer_support", {}).get("model") == "elastic_layer"
+            and partitions > 1):
+        partitions = 1
+        reason = (
+            "Elastic-layer spring/mortar meshes use one Elmer rank: the installed Windows "
+            "MPI solver crashes during ParallelInitMatrix with multiple ranks."
+        )
+        print(f"Elmer compatibility: {reason} Requested ranks: {requested_partitions}.", flush=True)
+        report["parallel_compatibility"] = {
+            "requested_partitions": requested_partitions,
+            "effective_partitions": partitions,
+            "reason": reason,
+        }
+        report_path.write_text(json.dumps(report, indent=2))
     executable = shutil.which("ElmerSolver_mpi")
     if executable is None:
         raise RuntimeError("ElmerSolver_mpi unavailable")
@@ -727,6 +972,7 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
         report_path.write_text(json.dumps(report, indent=2))
     if spring and partitions > 1:
         check_spring_partitions(output / "mesh", partitions, boundary_map, pairs)
+    check_active_bodies(output / "mesh", output / report.get("solver_input", "diagnostic.sif"))
     (output / "results").mkdir()
     environment = os.environ.copy()
     environment.setdefault("ELMER_HOME", str(Path(executable).resolve().parent.parent))
@@ -774,6 +1020,27 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
     report["joint_gaps"] = gaps
     report_path.write_text(json.dumps(report, indent=2))
     return result
+
+
+def check_active_bodies(mesh: Path, solver_input: Path) -> None:
+    """Reject ElmerGrid body renumbering that leaves volume elements inactive."""
+    with (mesh / "mesh.elements").open() as stream:
+        actual = {int(line.split()[1]) for line in stream if line.strip()}
+    declared = set()
+    for body, block in re.findall(r"(?ms)^Body (\d+)\n(.*?)^End\s*$",
+                                  solver_input.read_text(encoding="utf-8")):
+        if not re.search(r"(?m)^\s*Equation\s*=\s*[1-9]\d*\s*$", block):
+            continue
+        target = re.search(r"(?m)^\s*Target Bodies\(\d+\)\s*=\s*(?:Integer\s+)?([\d ]+)\s*$", block)
+        if target:
+            declared.update(int(value) for value in target.group(1).split())
+        else:
+            declared.add(int(body))
+    if actual != declared:
+        raise RuntimeError(
+            f"Elmer mesh bodies {sorted(actual)} differ from active solver bodies {sorted(declared)}; "
+            "check ElmerGrid body renumbering before solving"
+        )
 
 
 def wait_for_solver(

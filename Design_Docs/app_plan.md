@@ -1,5 +1,200 @@
 # Dam Analysis Workbench - implementation plan
 
+## Solver authority and required completion
+
+Code_Aster is the primary source of truth for the assessment, including wall
+cracking and displacement. Elmer and FEniCSx provide supporting comparisons;
+neither may replace a failed, missing or unaccepted Aster result.
+
+Aster baseline failure means the baseline assessment has failed. Missing or
+unaccepted Aster wall-cracking results mean the cracking assessment is incomplete
+or failed, not successful because a supporting solver passed. Keep valid
+supporting outputs available for investigation, clearly labelled as supporting
+evidence. Solver execution failure is not a physical displacement failure.
+
+The required production workflow must obtain accepted Aster baseline and
+whole-wall cracking results before claiming a completed cracking assessment.
+The pipeline requires an accepted Aster result; it does not equate a successful
+supporting solve with that result.
+The API completion gate now fails jobs without an accepted Aster baseline or
+required Aster cracking result. On API restart, historical successful jobs
+without that evidence are reclassified as failed. Completed Elmer reference
+outputs remain readable as explicitly supporting evidence. The desktop labels
+Elmer/FEniCSx badges as supporting and places Aster badges first.
+
+## Current automatic solver sequence
+
+Elmer supplies the source mesh and elastic reference. FEniCSx and Code_Aster
+then run independent elastic baselines. A successful Elmer stage alone does
+not mean that all baselines or cracking have succeeded.
+
+`Aster.automatic_preparation` screens accepted Aster displacement and saves
+wall candidates without invoking the supporting FEniCSx solver. The API then
+launches `Aster.automatic_cohesive`. Preparation is a distinct prepared state,
+not nonlinear success. Baseline/source/candidate hashes and physical node/cell
+identities protect this hand-off. Failed FEniCSx verification does not block
+selection or its restart; Aster baseline failure explicitly blocks cracking.
+
+All three elastic-layer implementations use consistent triangular P1 face
+support. Aster uses degree-two point springs with exact trace constraints.
+FEniCSx force accounting sums the actual assembled load, avoiding independently
+compiled scalar-pressure quadrature differences at clipped waterlines.
+ElmerGrid compacts the concrete-only body tags to wall 1 / foundation 2. The
+SIF must activate both; converted mesh bodies are checked before solving.
+Historical inputs targeting foundation body 3 produced an inactive foundation
+and require a new isolated source run, not a supporting-stage restart alone.
+
+On Windows 11 the cracking runner uses the installed Linux Code_Aster in WSL
+and MUMPS, rather than the older bundled Windows solver. Missing Linux Aster
+is an error, never a silent fallback. Solvers run sequentially to leave memory
+for Aster; user jobs have no agent-verification time cap.
+
+Aster uses native `3D_JOINT` / `CZM_LIN_REG` cohesive facets. Each original
+triangular interface has three HEXA8 quadrilateral patches with FPG4 integration;
+edge and centroid displacements are exactly constrained to the original P1
+trace. This integrates intact affine jump energy without the centroid PENTA6
+zero-energy rotational mechanism, extra supports or changed material stiffness.
+Reports retain original candidate-facet counts and peak damage/opening over the
+patches. Initiated/opened areas are candidate-facet areas touched, not fully
+separated surface areas. Final whole-wall
+displacement, joint damage/opening, solver completion and input hashes determine
+report availability. The Comparison table and ParaView expose that current
+Aster result, not a historical run or the retired seeded submodel. Failed
+Aster stages can be restarted without rerunning Elmer or candidate preparation.
+
+The native small partial-section cracking fixture converges, initiates and opens.
+A saved reduced 26,778-tetrahedron model with one candidate facet also reaches
+design load in Linux Aster, with finite maximum wall displacement 9.37 mm
+(below the client's 25 mm lower boundary; not a success badge). This checks
+support integration/output, not a full selected-region crack-growth run. An isolated
+tetrahedron held only by centroid PENTA6 joints reproduced a singular initial
+system, including with Linux MUMPS. The integrated HEXA8 version now passes the
+native intact isolated-tetrahedron regression in about 9 seconds. The native
+crack-growth fixture also passes; a saved reduced 26,778-tetrahedron model with
+four candidate faces around an internal wall tetrahedron reaches design load in
+35 seconds, with 9.37 mm wall displacement. This does not establish full
+candidate-network runtime or convergence. Numerical failures remain explicit.
+The saved 275,161-tetrahedron, 1,906-candidate-facet network now reaches intact
+equilibrium in 78.5 seconds total (1.2 seconds preparation). A bounded design-load
+trial converged through load factor 0.8 and stopped on its verification CPU budget
+after 423 seconds while advancing to 0.9; it is partial, not accepted. Matrix
+factorisation is a major cost. Single Lagrange multipliers triggered an internal
+error in installed Aster, and tangent reuse every second iteration was slower
+on this network; both optimisations were rejected. Keep double multipliers and
+update the tangent every iteration. App-job limits remain unchanged.
+No pivot relaxation, artificial restraints or baseline substitution is applied.
+The current Aster model has mixed-mode joints and no crack-face water pressure;
+the report and desktop disclose this difference from FEniCSx. Full-dam
+cracking acceptance remains to be demonstrated.
+
+## Client-specified baseline and cracking displacement gauge
+
+For preliminary assessment, evaluate the **maximum wall displacement vector
+magnitude in each completed baseline and the final accepted cracking
+equilibrium**, assessed separately in millimetres.
+Use true physical displacement, not display deformation exaggeration,
+crack opening, an individual component, foundation/rock displacement, or
+another scenario's displacement. This is the primary client success/failure
+gauge; peak stresses are supporting diagnostics, not a replacement gauge.
+The authoritative gauge uses Aster wall displacement. Each supporting solver's
+badge describes only its own result and cannot establish overall success.
+These client-specified criteria are:
+
+| Maximum wall displacement in the assessed state | Assessment |
+| --- | --- |
+| Below 25 mm (`u_max < 0.025 m`) | Confused face: modelling-error flag; investigate the model |
+| 25 to 100 mm inclusive (`0.025 <= u_max <= 0.100 m`) | Happy face: success under the client's displacement criterion |
+| Above 100 mm (`u_max > 0.100 m`) | Angry face: failure under the client's displacement criterion |
+
+A low-displacement flag records the client's expected-response criterion;
+it does not independently prove which modelling assumption is wrong.
+Exactly 25 mm and exactly 100 mm are success. Evaluate unrounded values.
+An absent, nonfinite, unaccepted, canceled or nonconverged baseline/cracking
+state is **not assessable**, never success or a below-25-mm modelling failure.
+Label every baseline solver and final cracking scenario separately; do not
+combine their statuses or substitute baseline values for missing cracking results.
+Do not use this gauge to tune coefficients
+until results fall in the success range. Numerical convergence and other
+checks remain separate; this gauge is not a safety-certification claim.
+The desktop Results and Comparison views lead with authoritative Aster baseline
+and final cracking badges, followed by explicitly supporting solver badges.
+Aster comparison values remain available without Elmer/FEniCSx reports.
+Report-loading failures are shown explicitly, not disguised as missing data.
+Reopening failed, cancelled or interrupted jobs also loads available accepted
+baseline evidence independently of supporting result availability.
+Each badge shows a face, text outcome and millimetres.
+Historical reports without explicit wall-only displacement are not assessable;
+rerun to obtain this evidence. Aster cracking submodel peaks cannot stand in for
+the maximum displacement of the whole wall.
+
+## Preliminary compliant-bedrock reduction: approved assumption
+
+The supplied 2026-10-31 reference springs supersede the depth-derived default:
+x/y = 200000 N/mm and z = 533333.33 N/mm for 10000 mm2 tributary area.
+`bedrock_analysis.spring_n_per_m3` stores the equivalent global-axis distributed
+coefficients x/y = 2e10 and z = 5.3333333e10 N/m3 in the authoritative config.
+Nodal tensors scale by the actual tributary area, never a constant per node.
+These coefficients use the supplied 1 m influence-depth example and
+`E/(H*(1-nu^2))` axial rule, not the earlier constrained-modulus/depth rule.
+The latter remains available only for snapshots without explicit coefficients.
+`bedrock_analysis.mode=elastic_layer` excludes rock volume; `full_volume`
+restores it. The Debug Include explicit bedrock volume control is independent
+of fracture solver overrides. Foundation stiffness and concrete gravity remain;
+wall-only reporting/cracking do not remove foundation mechanics.
+
+The production replacement being developed is **not** the fixed-seat diagnostic.
+Keep the concrete foundation mechanically and target wall cracking/reporting.
+The approved preliminary elastic-layer approximation uses each foundation-seat
+triangle's centroid-to-configured-bedrock-bottom vertical depth `h`. With rock
+properties `E, nu`, local tangential stiffness is `G/h`, where
+`G=E/(2*(1+nu))`; normal stiffness is `M/h`, where
+`M=E*(1-nu)/((1+nu)*(1-2*nu))`. Both are distributed stiffnesses in N/m3.
+The global tensor is `kt*I+(kn-kt)*n*n^T`; reversing the face normal does not
+change it. Reject nonpositive depth and degenerate/duplicate support faces.
+
+`bedrock_support.py` implements these coefficients, area/3 nodal tensor lumping,
+and concrete-only source-array reduction that clears all rigid-seat constraints.
+This preliminary approximation omits cross-seat rock coupling and rock
+self-weight settlement; springs remain linear and transmit tension/shear.
+It is not a safety-certification workflow or an exact full-rock equivalent.
+The reduced source writes concrete-only Elmer meshes with face Spring tensors.
+FEniCSx and Aster read area/3 lumped nodal tensors from the source contract.
+Elmer uses consistent surface integration, so uniform-translation resultants
+match but nonuniform seat deformation can differ. Fresh reduced-source
+preparation and Aster source auditing are tested; the user will run app
+baselines. Native full baseline/cracking corroboration of the supplied values
+has not been run by the agent.
+
+## Debug: no-bedrock baseline comparison
+
+`fracture_debug.compare_with_no_bedrock` defaults to false/absent. When enabled,
+the job runs baselines only: automatic element selection and all cracking
+submission/restart paths are disabled. A concrete foundation bonded to the
+rock is required. The diagnostic retains identical concrete tetrahedra, wall
+joints, wall/foundation springs and concrete loads, removes rock volume and its
+self-weight, and fixes all displacement components on the exposed
+foundation/rock seat. This is a **rigid-support sensitivity test**, not an
+equivalent bedrock model or engineering validation.
+
+After both full-rock baselines succeed, an isolated `bedrock_comparison` stage
+runs native FEniCSx full/rigid baselines and an Aster rigid baseline, reusing the
+job's completed Aster full baseline. All four concrete-only VTUs use identical
+constant-P1 cell principal-stress field names and include displacement vectors.
+These cell stresses are intentionally distinct from the normal Comparison
+table's recovered-nodal peaks. The diagnostic manifest records wall/foundation
+stress, displacement and elastic energy, absolute rigid-minus-full differences,
+FEniCSx equilibrium evidence and source/configuration/topology hashes.
+Full-rock support reactions include rock self-weight and must not be compared
+as though both variants have identical total external gravity.
+
+`GET /jobs/{id}/bedrock-comparison` exposes the complete four-file comparison
+only after validated completion. WPF's **Open bedrock comparison in ParaView**
+button loads all four sources into one session; users should select matching
+fields, colour ranges and viewpoints. Cancellation/restart interruption and
+failed/missing/foreign outputs are explicit; no partial result is success.
+Historical and ordinary jobs keep existing behaviour. No user-job development
+timeout is added.
+
 ## Automatic whole-wall cracking: formulation gate
 
 The planned replacement for manual painting is a read-only whole-wall assessment
@@ -50,14 +245,38 @@ workflow. It solves the job's intact native equilibrium
 cell's maximum principal stress and lists cells above
 `f_t*(1+relative_tolerance)` with their volume, peak, location and direction,
 plus the near-critical count. It is an initial-state screening, not a crack
-prediction: redistribution after cracking can extend or arrest damage. The API
-exposes it at `/jobs/{id}/automatic-cracking/screening` (start/read/cancel) and
-`/confirmation` (immutable record of the exact run, its configuration digest,
-baseline and Gf). The desktop crack-definition window defaults to this
-automatic mode, highlighting overstressed cells in magenta; manual painting
-remains available as the experimental alternative. For the saved reference job
-the intact wall peak is 1.051 MPa (0.53 `f_t`), so screening reports no
-overstressed cells.
+prediction: redistribution after cracking can extend or arrest damage. For the
+saved reference job the intact wall peak is 1.051 MPa (0.53 `f_t`), so
+screening reports no overstressed cells.
+
+**Automatic element selection.** Screening also selects the elements cracking
+starts from, using the network's initiation measure (the one-sided facet-normal
+stress below). Eligible elements own an interior wall facet at or above
+`f_t*(1-tol)`. `damage_selection.max_damage_count` in `config.json` (Configuration
+> Cracking > Max Damage Count) controls the selection:
+
+- blank/`null` (default; also when the block is absent): every eligible element
+  is selected and cracking may grow beyond them through neighbour rings, as before;
+- an integer >= 2: a connected patch of whole wall node stars (every wall cell
+  around one mesh node) is grown from the node of the highest-tension critical
+  facet, then to the next most tensioned neighbouring node whose star still fits
+  (so fewer than N may be selected; nodes touching other regions are skipped).
+  Isolated owner pairs are never used: a cut facet only opens where it separates
+  the cells around a node, so lone facets stay fully tied. Selection pre-checks
+  the facets between selected cells with the runner's own tie rule and **fails
+  element selection** with a message (no cracking launched) when none can open,
+  e.g. a count below the smallest star (about 12 cells on the reference mesh).
+  Cracking is then **confined** to those facets: no rings and no growth outside
+  the selection. Outside facets that still reach `f_t` are reported, not used to
+  reject the result. The app offers a snapping 12-10000 slider (step 12), a
+  select-all check box and a number box for any exact count >= 2.
+
+The screening `selection` block records the rule, count, whether it capped,
+eligible/selected cells and facets, source rows, and the lowest selected and
+highest unselected facet stress. There is no pop-up and no manual selection:
+painting, the crack-definition window, the damage catalogue and the
+`selected_tensile_strength_pa` / `selected_youngs_modulus` concrete fields are
+removed (configurations containing them are rejected on load).
 
 `FEniCSx/automatic_cracking.py` is the experimental real-dam runner. It takes a
 completed screening, rebuilds the native wall candidates and runs the cohesive
@@ -84,34 +303,38 @@ shared facet. It
 writes `summary.json` (load factor, steps, dissipation, wet faces, bonded peak)
 and, when cracks exist, `cohesive_surface.vtu`.
 
-Submission is gated: `POST /jobs/{id}/automatic-cracking/submit` returns 202
-only when the latest screening succeeded, has a verified confirmation
-(matching run id, configuration digest, screening digest and Gf) and nothing
-else runs for the job; otherwise 409. A newer unconfirmed screening supersedes
-an older confirmation. `GET /jobs/{id}/automatic-cracking/run` returns the
-latest run (`summary` without per-step data, `accepted`,
-`engineering_validated: false`) and `POST .../run/cancel` stops it. The API
-verifies the runner manifest, summary digest and provenance before reporting
-success. The desktop Submit button follows `submission_allowed`, shows the run
-description and limitations, and opens the crack surface in ParaView.
+**The chain runs automatically.** For a three-body job with a crack defined,
+once the FEniCSx baseline succeeds the job stays `running` through the
+"Element selection (automatic)" stage (screening plus selection) and then
+automatic cracking; no user action is needed. A successful selection is confirmed
+automatically (`confirmation.json`,
+`confirmed_by: "automatic_selection"`, binding run id, configuration digest,
+screening digest and Gf) and cracking starts; with nothing selected cracking
+reports `no_damage_initiated` without mesh work. A failed screening, or one
+without a selection or Gf, fails the Element selection stage and starts no
+cracking. Selection and cracking failures do not fail the
+job; it finishes after the Code_Aster baseline. The API keeps read-only routes:
+`GET /jobs/{id}/automatic-cracking/screening`, `GET .../run`, and
+`POST .../run/cancel`. The former start/cancel screening, confirmation, submit,
+damage-catalogue, saved-selection and painted-event start routes are removed.
+The API verifies the runner manifest, summary digest and provenance before
+reporting success.
 
-A submitted run is the job's fracture stage, exactly as a painted event is:
-the job becomes `running` with stage `automatic_cracking`, `fracture_source`
-becomes `automatic` (a later painted event sets it back to `painted`), Crack
-definition shows succeeded and the three fracture stages (group "Fracture
-analysis (automatic cohesive)") follow the runner manifest phase: screening
-checks, mesh import and candidate preparation are Preparing; assembling the
-native system is Initial equilibrium; the cohesive network solve is Growth.
-When the runner ends the job returns to its previous status and
-`automatic_cracking_status` records the outcome: `succeeded` only for an
-accepted outcome; a completed but unaccepted outcome is `failed` with its
-`outcome_basis` (at Preparing when refused before any load step, otherwise at
-Growth). Cancel Job stops only this run (`cancelled`); an API restart marks a
-running run `interrupted`; restarting a fracture stage resubmits the latest
-confirmed screening. The desktop window closes on submit and the Run/Results
-pipeline, activity monitor and job log (the runner log, via
-`/painted-event/logs`) take over. The network solve reports no per-step
-progress, so Growth has no ETA.
+The three fracture stages (group "Fracture analysis (automatic cohesive)")
+follow the runner manifest phase: screening checks, mesh import and candidate
+preparation are Preparing; assembling the native system is Initial
+equilibrium; the cohesive network solve is Growth. `automatic_cracking_status`
+records the outcome: `succeeded` only for an accepted outcome; a completed but
+unaccepted outcome is `failed` with its `outcome_basis` (at Preparing when
+refused before any load step, otherwise at Growth). Cancel Job stops the
+running selection or cracking (`cancelled`); an API restart marks it
+`interrupted`. **Rerun element selection** in the pipeline repeats screening,
+selection and cracking (also the way to run historical jobs that finished
+before this chain existed); restarting a fracture stage reruns cracking from
+the latest verified selection. Historical painted jobs stay readable, but their
+fracture stages cannot be rerun as painted events. The activity monitor and
+job log (the runner log, via `/painted-event/logs`) show progress. The network
+solve reports no per-step progress, so Growth has no ETA.
 
 Known limits: on structured hex-derived tetrahedral meshes, growth beyond
 initial softening stops with `unsupported_geometry` (a detaching wedge needs
@@ -128,14 +351,19 @@ run the elastic baselines only; configured legacy cracking stages are blocked
 with explicit feedback rather than launching a fallback solver. The old
 single-point POST and stage-rerun POST return authenticated HTTP 410 responses.
 The desktop removes those launch controls and labels submission Run baselines.
-Painting saves a selection and can launch the separate experimental FEniCSx
-painted-event solver; it does not run Code_Aster fracture. New app submissions
-require common-head hydrostatic crack loading, with no dry fallback.
+Manual painting and the painted-event solver launch are retired; new jobs use
+automatic element selection and automatic cohesive cracking (FEniCSx only, no
+Code_Aster fracture).
 Historical results and standalone numerical CLI defaults are preserved.
 The implementation sequence below must not be interpreted as permission to wire
 the preview into the legacy seed workflow.
 
-### Current painted-scenario progress
+### Painted-scenario history (retired)
+
+Manual painting is removed from the app and API. The notes below describe the
+historical painted-event solver, whose saved results remain viewable; the
+`selected_*` concrete fields they mention are no longer accepted in
+configurations.
 
 - Configuration's Material tab exposes selected-element tensile strength from
   zero to the configured concrete tensile strength in MPa, stored as optional
@@ -1105,6 +1333,7 @@ independent sensitivity verification. See the README for existing-run export.
 | Bedrock material | Active in the integrated three-body solver; the legacy wall-only solve represents the foundation with grounded springs instead |
 | `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall-only solve |
 | `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: near-seat size follows the effective wall size, grading toward the configured far size by the configured distance; shared by preview and three-body preparation. Only wall tetrahedra count toward the 150,000 cap. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
+| `damage_selection.max_damage_count` | Optional automatic element selection limit on the Cracking tab: blank/`null` (default) selects every element owning a facet whose one-sided normal stress reaches `f_t`; an integer >= 2 grows a connected patch of whole node stars from the highest-tension facet up to that count, fails selection if no facet can open, and confines cracking to it |
 | Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |
 
 No silent physical reinterpretation as part of the API work. If actual-height

@@ -23,15 +23,16 @@ import time
 
 import numpy as np
 from scipy import sparse
-from scipy.sparse.linalg import spsolve
 
 if __package__:
+    from . import sparse_direct
     from .cohesive_contact import (CohesiveInterface, CohesiveOptions, InterfaceState, ReservoirCrackWater,
                                    solve_cohesive_equilibrium, solve_wet_cohesive_equilibrium)
     from .cohesive_mode_i import LinearModeICohesiveLaw
     from .fracture_faces import PairedCrackFaces, bonded_node_representatives
     from .fracture_topology import NodeStarPatchResolver, SplitTetrahedra, split_interior_wall_faces
 else:
+    import sparse_direct
     from cohesive_contact import (CohesiveInterface, CohesiveOptions, InterfaceState, ReservoirCrackWater,
                                   solve_cohesive_equilibrium, solve_wet_cohesive_equilibrium)
     from cohesive_mode_i import LinearModeICohesiveLaw
@@ -90,6 +91,8 @@ class NetworkResult:
     wet_faces: np.ndarray
     steps: list = field(default_factory=list)
     report: dict = field(default_factory=dict)
+    # Fully bonded equilibrium at the same load factor on the same operator (optional reference).
+    intact_displacement_m: np.ndarray = None
 
 
 class _Stop(Exception):
@@ -175,6 +178,8 @@ class CohesiveNetwork:
         self.progress = progress
         self._stage = "full load"
         self._accepted_factor = 0.
+        self._target_factor = 1.
+        self._run_started = None
         self._reduction_cache = {}
 
     @classmethod
@@ -256,7 +261,10 @@ class CohesiveNetwork:
         displacement = np.zeros(size)
         displacement[fixed] = prescribed
         rhs = load[free] - stiffness[free][:, fixed] @ prescribed
-        displacement[free] = spsolve(stiffness[free][:, free].tocsc(), rhs)
+        try:
+            displacement[free] = sparse_direct.solve(stiffness[free][:, free], rhs)
+        except sparse_direct.SingularMatrixError as error:
+            raise _Stop("nonconvergence", "Intact elastic solve is singular or non-finite") from error
         if not np.isfinite(displacement).all():
             raise _Stop("nonconvergence", "Intact elastic solve is singular or non-finite")
         residual = stiffness @ displacement - load
@@ -275,15 +283,27 @@ class CohesiveNetwork:
         self._emit_progress(trial, time.monotonic() - started)
         return trial
 
+    def bonded_displacement(self, factor):
+        """Fully bonded (intact) split-node displacement at ``factor``; not counted as a network solve."""
+        trial = self._solve(float(factor), np.zeros(self.count, dtype=bool), np.zeros((self.count, 3)))
+        return trial["displacement"]
+
     def _emit_progress(self, trial, seconds):
         if self.progress is None:
             return
         ratio = "n/a" if trial["ratio"] is None else f"{trial['ratio']:.3f}"
         opened = int(np.isin(trial["status"], ("softening", "separated")).sum())
-        self.progress(f"cohesive solve {self.solves}/{self.options.maximum_solves} ({self._stage}): "
-                      f"trial load factor {trial['factor']:.4f}, accepted {self._accepted_factor:.4f}, "
+        # The run ends when the accepted load factor reaches the target; maximum_solves is only a
+        # safety limit, so progress is reported against the load, not the solve count.
+        target = self._target_factor
+        percent = 100. * self._accepted_factor / target if target > 0 else 0.
+        elapsed = 0. if self._run_started is None else time.monotonic() - self._run_started
+        self.progress(f"cohesive solve {self.solves} ({self._stage}): "
+                      f"accepted load factor {self._accepted_factor:.4f} of {target:.4f} ({percent:.1f}%), "
+                      f"trial {trial['factor']:.4f}, "
                       f"max bonded stress/f_t {ratio}, initiated faces {int(trial['initiated'].sum())}, "
-                      f"opened {opened}, wet {int(trial['wet'].sum())}; {seconds:.1f} s")
+                      f"opened {opened}, wet {int(trial['wet'].sum())}; solve {seconds:.1f} s, "
+                      f"elapsed {elapsed:.0f} s")
 
     def _solve(self, factor, initiated, history):
         topology = self._topology(initiated)
@@ -399,11 +419,13 @@ class CohesiveNetwork:
                         f"{len(unresolved)} critical facet(s) cannot open in P1 and have no node-star patch: {source[:5]}")
         return updated, added
 
-    def run(self, start_factor=0., end_factor=1., *, initiated=None, history=None):
+    def run(self, start_factor=0., end_factor=1., *, initiated=None, history=None, progress_target=None):
         """Proportional loading with bisection to each strength crossing.
 
         ``initiated``/``history`` continue from a previously committed result
         (irreversible: unloading never resets initiation or opening history).
+        ``progress_target`` reports progress against a later overall target and keeps
+        the elapsed clock of the earlier run, for a continuation split into increments.
         """
         tolerance = self.options.cohesive.initiation_relative_tolerance
         initiated = np.zeros(self.count, dtype=bool) if initiated is None else np.array(initiated, dtype=bool)
@@ -412,6 +434,10 @@ class CohesiveNetwork:
             raise ValueError("Committed network state must match the candidate inventory")
         steps, last = [], None
         low, target = float(start_factor), float(end_factor)
+        self._target_factor = target if progress_target is None else float(progress_target)
+        self._accepted_factor = low
+        if progress_target is None or self._run_started is None:
+            self._run_started = time.monotonic()
         rounds = 0
         patch_faces = 0
 
@@ -422,7 +448,10 @@ class CohesiveNetwork:
             steps.append({"load_factor": trial["factor"], "event": note,
                           "maximum_bonded_tensile_ratio": trial["ratio"],
                           "initiated_faces": int(initiated.sum()),
+                          "initiated_area_m2": float(self.faces.areas[initiated].sum()),
                           "opened_faces": int(np.isin(trial["status"], ("softening", "separated")).sum()),
+                          "opened_area_m2": float(self.faces.areas[
+                              np.isin(trial["status"], ("softening", "separated"))].sum()),
                           "separated_faces": int((trial["status"] == "separated").sum()),
                           "wet_faces": int(trial["wet"].sum()),
                           "redundant_junction_constraint_rows": trial["report"].get("redundant_junction_constraint_rows", 0),

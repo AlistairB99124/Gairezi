@@ -147,6 +147,31 @@ class FractureTopologyTests(unittest.TestCase):
             resolver((), (0,)),
             NodeStarPatchResolver(copies.faces, copies.parent_node_ids)((), (0,)))
 
+    def test_node_star_offers_coplanar_completion_when_fewest_facet_cut_is_perpendicular(self):
+        if __package__:
+            from .fracture_topology import NodeStarPatchResolver
+        else:
+            from fracture_topology import NodeStarPatchResolver
+        # Octahedral star around node 6: equator facets are horizontal, meridians vertical.
+        points = np.array([(1., 0., 0.), (0., 1., 0.), (-1., 0., 0.), (0., -1., 0.),
+                           (0., 0., 1.), (0., 0., -1.), (0., 0., 0.)])
+        cells = np.array([row for i in range(4)
+                          for row in ([i, (i + 1) % 4, 4, 6], [i, (i + 1) % 4, 5, 6])])
+        candidates = interior_wall_candidates(points, cells, [1] * 8, [[0, 6]])
+        split = split_interior_wall_faces(points, cells, [1] * 8, candidates)
+        seed = next(i for i, face in enumerate(split.source_faces.tolist()) if sorted(face) == [0, 1, 6])
+        normals = split.faces.normals
+
+        def flattest(resolver):
+            return max(np.min(np.abs(normals[list(patch)] @ normals[seed]))
+                       for patch in resolver((), (seed,)))
+
+        resolver = NodeStarPatchResolver(split.faces, split.parent_node_ids)
+        self.assertAlmostEqual(flattest(resolver), 1.)
+        uniform = NodeStarPatchResolver(split.faces, split.parent_node_ids)
+        uniform.PLANARITY_WEIGHT = 0
+        self.assertAlmostEqual(flattest(uniform), 0.)
+
     def test_unknown_boundary_nonwall_nonmanifold_and_duplicate_cuts_fail(self):
         points, cells = self.fixture()
         for tetrahedra, regions, cuts in (

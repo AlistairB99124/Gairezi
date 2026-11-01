@@ -2,6 +2,17 @@
 
 ## Current objective amendment
 
+Current production authority supersedes the historical sequence below:
+Code_Aster is the primary assessment source. Accepted Aster displacement feeds
+`Aster.automatic_preparation`, then native whole-wall cohesive cracking; failed
+supporting FEniCSx verification is not a preparation prerequisite. Candidate
+preparation is not a nonlinear result. Elastic-layer support now uses exact
+triangular P1 integration in all three solvers, including Aster quadrature trace
+constraints. ElmerGrid's concrete-only body renumbering requires foundation
+body 2 in the SIF; sources targeting body 3 must be regenerated. The source
+producer groups only exactly identical support tensors, preserving face
+integration while avoiding thousands of redundant boundary conditions.
+
 The user has accepted the current elastic discrepancies for proceeding with
 the multi-solver cracking comparison. The historical baseline-only scope below
 is not a prohibition on developing that next stage. The primary goal is
@@ -875,6 +886,9 @@ intent: left-click selects affected elements; right-click toggles crack-start
 edges. `DamageSelection` in the same contract module requires at least one
 affected element **and** one crack-start edge, with field-specific validation
 errors for either missing selection. It rejects malformed and duplicate IDs.
+(Since retired: the app and API no longer offer painting, the catalog/validate/
+saved-selection routes or the painted-event launch; automatic element selection
+via `damage_selection.max_damage_count` replaces it. The history below is kept.)
 `FEniCSx/damage_selection.py` now builds a job-bound native wall catalog and
 validates mesh identity, wall membership, real edge IDs and conservative whole-
 tetrahedron containment within 75% of local thickness. The separate API

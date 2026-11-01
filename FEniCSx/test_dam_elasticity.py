@@ -12,6 +12,25 @@ import test_dam_mesh
 
 
 class DamElasticityTests(unittest.TestCase):
+    def test_clipped_waterline_balances_the_assembled_pressure_load(self):
+        structure = test_dam_mesh.DamMeshTests().cube()
+        structure.boundaries = [(1 if i == 0 else 2 if i == 2 else 7, face)
+                                for i, (_, face) in enumerate(structure.boundaries)]
+        structure.material = SimpleNamespace(youngs_modulus_pa=1e7, poissons_ratio=0.0, density_kg_m3=1000.0)
+        structure.loads = SimpleNamespace(
+            gravity_z_m_s2=-10.0, peak_water_pressure_pa=5000.0, maximum_water_height_m=.37,
+            water_density_kg_m3=1000.0, tailwater_head_m=0.0, overflow_head_m=0.0,
+            upstream_surface_z_m=.37
+        )
+        structure.foundation_support = SimpleNamespace(
+            spring_x_n_per_m3=1e6, spring_y_n_per_m3=1e6, spring_z_n_per_m3=1e6)
+        imported = import_structure(structure, 1e-12)
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, report = solve(imported, structure, {"relative_tolerance": 1e-12,
+                                "maximum_iterations": 500}, Path(directory))
+        self.assertGreater(np.linalg.norm(np.asarray(report["applied_force_n"])[:2]), 0.0)
+        self.assertLess(report["relative_force_balance_error"], 1e-10)
+
     def test_gravity_balanced_by_grounded_foundation_springs(self):
         structure = test_dam_mesh.DamMeshTests().cube()
         structure.boundaries = [(1 if i == 0 else 7, face) for i, (_, face) in enumerate(structure.boundaries)]

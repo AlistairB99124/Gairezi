@@ -1,4 +1,12 @@
 {
+  "bedrock_analysis": {
+    "mode": "elastic_layer",
+    "spring_n_per_m3": {
+      "x": 20000000000.0,
+      "y": 20000000000.0,
+      "z": 53333333000.0
+    }
+  },
   "geometry": {
     "foundation": {
       "depth_m": 1.0,
@@ -111,9 +119,7 @@
       "poisson_ratio": 0.2,
       "tensile_strength_pa": 2000000.0,
       "compressive_strength_pa": 30000000.0,
-      "cohesive_fracture_energy_j_m2": 100.0,
-      "selected_youngs_modulus": 15000000000.0,
-      "selected_tensile_strength_pa": 500000.0
+      "cohesive_fracture_energy_j_m2": 100.0
     },
     "bedrock": {
       "density": 2700,
@@ -154,6 +160,10 @@
       "length_m": null
     }
   ],
+  "damage_selection": {
+    "max_damage_count": null,
+    "maximum_overload_factor": 2.0
+  },
   "fracture_debug": {
     "model": "AT2",
     "critical_energy_release_rate_j_m2": 2700.0,

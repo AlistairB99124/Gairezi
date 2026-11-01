@@ -273,6 +273,55 @@ class InterfaceSprings:
                 detail["tags"] = list(declaration["tags"])
             group["area_m2"] += detail["area_m2"]
             group["faces"][part] = detail
+        layer_support = getattr(structure, "rock_support", {})
+        if layer_support.get("model") == "elastic_layer":
+            support_nodes = np.asarray(layer_support["support_nodes"], dtype=np.int64)
+            support_matrices = np.asarray(layer_support["support_matrices_n_per_m"], dtype=float)
+            if (support_nodes.ndim != 1 or support_matrices.shape != (len(support_nodes), 3, 3)
+                    or not np.isfinite(support_matrices).all()):
+                raise ValueError("Invalid saved elastic-layer nodal support matrices")
+            source_cells = domain.geometry.input_global_indices[domain.geometry.dofmaps[0]]
+            field_cells = np.asarray(space.dofmap.list).reshape(source_cells.shape)
+            local_map = {}
+            for source_row, field_row in zip(source_cells, field_cells, strict=True):
+                global_row = space.dofmap.index_map.local_to_global(field_row)
+                for source_node, global_dof in zip(source_row, global_row, strict=True):
+                    source_node, global_dof = int(source_node), int(global_dof)
+                    prior = local_map.setdefault(source_node, global_dof)
+                    if prior != global_dof:
+                        raise ValueError("A source support node maps to multiple FEniCSx displacement DOFs")
+            dof_maps = {}
+            for rank_map in domain.comm.allgather(local_map):
+                for source_node, global_dof in rank_map.items():
+                    prior = dof_maps.setdefault(source_node, global_dof)
+                    if prior != global_dof:
+                        raise ValueError("Distributed source support node mapping is inconsistent")
+            rows, columns, values = [], [], []
+            from bedrock_support import consistent_face_mass
+            faces = np.asarray(layer_support["support_faces"], dtype=np.int64)
+            tensors = np.asarray(layer_support["support_face_tensors_n_per_m3"], dtype=float)
+            if tensors.shape != (len(faces), 3, 3) or not np.isfinite(tensors).all():
+                raise ValueError("Invalid consistent elastic-layer face tensors")
+            for face, mass, tensor in zip(faces, consistent_face_mass(structure.nodes, faces),
+                                          tensors, strict=True):
+                try:
+                    dofs = (3 * np.array([dof_maps[int(node)] for node in face])[:, None]
+                            + np.arange(3)).ravel()
+                except KeyError as error:
+                    raise ValueError("Elastic-layer face is absent from the source mesh") from error
+                block = np.kron(mass, tensor)
+                rows.extend(np.repeat(dofs, 9))
+                columns.extend(np.tile(dofs, 9))
+                values.extend(block.ravel())
+            self._operator += sparse.coo_matrix(
+                (values, (rows, columns)), shape=self._operator.shape,
+            ).tocsr()
+            self.report["elastic_layer"] = {
+                "support_nodes": int(len(support_nodes)),
+                "discretisation": "consistent P1 triangular face tensor springs",
+                "effective_depth_min_m": layer_support["effective_depth_min_m"],
+                "effective_depth_max_m": layer_support["effective_depth_max_m"],
+            }
         self.matrix = None
 
     def add_to(self, matrix, *, operator=None):

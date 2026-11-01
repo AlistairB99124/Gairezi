@@ -58,12 +58,30 @@ def audit_source_materials(source_mesh: Path) -> dict:
             raise ValueError(f"Missing source {kind} {number}")
         return match[1]
 
-    for body, material in ((1, 1), (2, 2), (3, 1)):
+    from Elmer.model_config import bedrock_analysis_mode
+    reduced = bedrock_analysis_mode(config) == "elastic_layer"
+    if reduced:
+        diagnostic = json.loads((model / "diagnostic.json").read_text(encoding="utf-8"))
+        solver_ids = diagnostic["solver_body_ids"]
+        if solver_ids.get("wall") != 1 or set(solver_ids) - {"wall", "foundation"}:
+            raise ValueError("Invalid reduced concrete solver body mapping")
+        assignments = [(1, 1)]
+        if "foundation" in solver_ids:
+            if solver_ids["foundation"] != 2:
+                raise ValueError("Reduced foundation must use contiguous Elmer Body 2")
+            assignments.append((2, 1))
+            if not re.search(r"Target Bodies\(1\)\s*=\s*2", block("Body", 2)):
+                raise ValueError("Reduced foundation solver body must target converted Elmer region 2")
+    else:
+        assignments = [(1, 1), (2, 2), (3, 1)]
+    for body, material in assignments:
         value = block("Body", body)
         for key, number in (("Material", material), ("Body Force", material), ("Equation", 1)):
             if not re.search(rf"(?m)^\s*{key}\s*=\s*{number}\s*$", value):
                 raise ValueError(f"Unexpected saved {key} assignment on body {body}")
     for number, name in ((1, "concrete"), (2, "bedrock")):
+        if reduced and name == "bedrock":
+            continue
         values = config["material"][name]
         for key, expected in (("Youngs Modulus", values["youngs_modulus"]),
                               ("Poisson Ratio", values["poisson_ratio"]), ("Density", values["density"])):
@@ -191,6 +209,8 @@ def native_projector_audit(source_mesh: Path, coords, faces, tags) -> dict:
 
 
 def source_springs(source_mesh: Path, coords: np.ndarray, faces: np.ndarray, tags: np.ndarray) -> dict:
+    from Elmer.model_config import bedrock_analysis_mode
+
     model = source_mesh.parent
     config = model / "config.json"
     sif = model / "dam_model.sif"
@@ -199,6 +219,8 @@ def source_springs(source_mesh: Path, coords: np.ndarray, faces: np.ndarray, tag
         if not path.is_file():
             raise ValueError(f"Missing saved source-case artifact: {path}")
     blocks = sif_boundaries(sif.read_text(encoding="utf-8"))
+    configuration = json.loads(config.read_text(encoding="utf-8"))
+    support_mode = bedrock_analysis_mode(configuration)
     diag = json.loads(diagnostic.read_text(encoding="utf-8"))
     pairs, stiffness, names, areas, interface_names = [], [], [], [], []
     joint_slave, joint_master, joint_coefficients = [], [], []
@@ -245,43 +267,90 @@ def source_springs(source_mesh: Path, coords: np.ndarray, faces: np.ndarray, tag
             names.append(f"SPR_IF_{len(names):05d}")
             areas.append(area)
             interface_names.append(name)
-    if not pairs:
+    if not pairs and support_mode != "elastic_layer":
         raise ValueError("Saved case contains no supported spring interfaces")
 
     support_by_node: dict[int, np.ndarray] = {}
-    for face in diag["rock_outer_support"]["faces"].values():
-        name = face["name"]
-        semantic = next(key for key, value in diag["rock_outer_support"]["faces"].items() if value["name"] == name)
-        saved_tag = diag["boundary_id_map"][semantic]
-        matches = [block for block in blocks.values() if target(block) == saved_tag]
-        if len(matches) != 1:
-            raise ValueError(f"Missing/ambiguous outer spring boundary {saved_tag}")
-        block = matches[0]
-        matrix = np.zeros((3, 3))
-        for i in range(3):
-            for j in range(3):
-                key = f"Spring {i + 1}{j + 1}"
-                if re.search(rf"(?mi)^\s*{key}\s*=", block):
-                    matrix[i, j] = real_value(block, key)
-        normal = np.asarray(face["outward_normal"])
-        expected = face["normal_stiffness_n_per_m3"] * np.outer(normal, normal)
-        if not np.allclose(matrix, expected, rtol=1e-10, atol=1e-3):
-            raise ValueError(f"Saved support matrix differs from diagnostic on {name}")
-        for node, area in nodal_areas(coords, faces[tags == saved_tag]).items():
-            support_by_node[node] = support_by_node.get(node, np.zeros((3, 3))) + area * matrix
+    if support_mode == "elastic_layer":
+        from bedrock_support import lumped_layer_support
+
+        layer = diag.get("elastic_layer_support")
+        if not isinstance(layer, dict) or not layer.get("face_groups"):
+            raise ValueError("Elastic-layer diagnostic lacks saved seat face groups")
+        support_faces, saved_support_tensors = [], []
+        for index, item in enumerate(layer["face_groups"]):
+            source_tag = int(item["source_tag"])
+            saved_tag = int(diag["boundary_id_map"][str(source_tag)])
+            selected = faces[tags == saved_tag]
+            if not len(selected):
+                raise ValueError(f"Elastic-layer support tag {saved_tag} has no triangles")
+            named = [
+                block for block in blocks.values()
+                if re.search(rf'(?mi)^\s*Name\s*=\s*"ElasticLayerSeat_{index:05d}"\s*$', block)
+            ]
+            if len(named) != 1 or target(named[0]) != saved_tag:
+                raise ValueError(f"Missing or mismatched Elmer elastic-layer boundary {index}")
+            matrix = np.zeros((3, 3))
+            for i in range(3):
+                for j in range(3):
+                    key = f"Spring {i + 1}{j + 1}"
+                    if re.search(rf"(?mi)^\s*{re.escape(key)}\s*=", named[0]):
+                        matrix[i, j] = real_value(named[0], key)
+            expected = np.asarray(item["matrix_n_per_m3"], dtype=float)
+            if not np.allclose(matrix, expected, rtol=1e-10, atol=1e-3):
+                raise ValueError(f"Elmer elastic-layer tensor differs from the saved support on face {index}")
+            support_faces.extend(selected)
+            saved_support_tensors.extend([matrix] * len(selected))
+        support = lumped_layer_support(
+            coords, np.asarray(support_faces, dtype=np.int64),
+            youngs_modulus=configuration["material"]["bedrock"]["youngs_modulus"],
+            poisson_ratio=configuration["material"]["bedrock"]["poisson_ratio"],
+            bottom_z_m=configuration["geometry"]["bedrock"]["domain"]["bottom_z_m"],
+            spring_n_per_m3=configuration.get("bedrock_analysis", {}).get("spring_n_per_m3"),
+        )
+        if not np.allclose(support["stiffness_n_per_m3"], saved_support_tensors, rtol=1e-10, atol=1e-3):
+            raise ValueError("Grouped Elmer support tensors differ from the configured face supports")
+        support_by_node = {
+            int(node): matrix
+            for node, matrix in zip(support["support_nodes"], support["support_matrices_n_per_m"], strict=True)
+        }
+    else:
+        for semantic, face in diag["rock_outer_support"]["faces"].items():
+            saved_tag = diag["boundary_id_map"][semantic]
+            matches = [block for block in blocks.values() if target(block) == saved_tag]
+            if len(matches) != 1:
+                raise ValueError(f"Missing/ambiguous outer spring boundary {saved_tag}")
+            block = matches[0]
+            matrix = np.zeros((3, 3))
+            for i in range(3):
+                for j in range(3):
+                    key = f"Spring {i + 1}{j + 1}"
+                    if re.search(rf"(?mi)^\s*{key}\s*=", block):
+                        matrix[i, j] = real_value(block, key)
+            normal = np.asarray(face["outward_normal"])
+            expected = face["normal_stiffness_n_per_m3"] * np.outer(normal, normal)
+            if not np.allclose(matrix, expected, rtol=1e-10, atol=1e-3):
+                raise ValueError(f"Saved support matrix differs from diagnostic on {face['name']}")
+            for node, area in nodal_areas(coords, faces[tags == saved_tag]).items():
+                support_by_node[node] = support_by_node.get(node, np.zeros((3, 3))) + area * matrix
     nodes = np.array(sorted(support_by_node), dtype=np.int64)
     pressures, crest_pressure = saved_pressures(blocks)
     return {
-        "pairs": np.asarray(pairs, dtype=np.int64),
-        "stiffness": np.asarray(stiffness),
+        "pairs": np.asarray(pairs, dtype=np.int64).reshape(-1, 2),
+        "stiffness": np.asarray(stiffness).reshape(-1, 3),
         "names": names,
         "areas": np.asarray(areas),
         "interfaces": interface_names,
-        "joint_slave_tri3": np.asarray(joint_slave, dtype=np.int64),
-        "joint_master_tri3": np.asarray(joint_master, dtype=np.int64),
-        "joint_coefficients_n_per_m3": np.asarray(joint_coefficients),
+        "joint_slave_tri3": np.asarray(joint_slave, dtype=np.int64).reshape(-1, 3),
+        "joint_master_tri3": np.asarray(joint_master, dtype=np.int64).reshape(-1, 3),
+        "joint_coefficients_n_per_m3": np.asarray(joint_coefficients).reshape(-1, 3),
         "support_nodes": nodes,
         "support_matrices": np.asarray([support_by_node[node] for node in nodes]),
+        **({"support_faces": np.asarray(support_faces, dtype=np.int64),
+            "support_face_tensors_n_per_m3": support["stiffness_n_per_m3"]}
+           if support_mode == "elastic_layer" else {}),
+        "bedrock_analysis_mode": support_mode,
+        "elastic_layer_support": diag.get("elastic_layer_support") if support_mode == "elastic_layer" else None,
         "source_hashes": {path.name: sha256(path) for path in (source_mesh, config, sif, diagnostic)},
         "source_config": str(config.resolve()),
         "pressures": pressures,

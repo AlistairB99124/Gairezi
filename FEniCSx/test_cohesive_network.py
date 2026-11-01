@@ -4,6 +4,7 @@ Candidate facets are supplied as planes (no seeds); initiation, P1 patch
 expansion, junctions, irreversibility, dissipation and reservoir water are
 checked against closed-form uniaxial results where they exist.
 """
+import re
 import unittest
 
 import numpy as np
@@ -172,12 +173,17 @@ class CohesiveNetworkTests(unittest.TestCase):
         result = network(block, block.plane(2, .5), Loading(block, 2 * DELTA0), progress=lines.append).run()
         self.assertEqual(result.status, "accepted_equilibrium", result.report["message"])
         self.assertEqual(len(lines), result.report["solves"])
-        self.assertTrue(all(line.startswith(f"cohesive solve {i}/5000 (")
+        self.assertTrue(all(line.startswith(f"cohesive solve {i} (")
                             for i, line in enumerate(lines, 1)))
+        self.assertIn("accepted load factor 0.0000 of 1.0000 (0.0%)", lines[0])
+        percents = [float(re.search(r"of 1\.0000 \(([\d.]+)%\)", line).group(1)) for line in lines]
+        self.assertEqual(percents, sorted(percents))
+        self.assertGreater(percents[-1], 0.)
+        self.assertNotIn("/5000", "".join(lines))
         self.assertIn("(target load)", lines[0])
         self.assertTrue(any("strength-crossing bisection" in line for line in lines))
         self.assertTrue(any("initiation round 1," in line for line in lines))
-        self.assertRegex(lines[-1], r"initiated faces [1-9]\d*, opened \d+, wet 0; \d+\.\d s$")
+        self.assertRegex(lines[-1], r"initiated faces [1-9]\d*, opened \d+, wet 0; solve \d+\.\d s, elapsed \d+ s$")
 
     def test_candidate_and_cell_order_do_not_change_the_result(self):
         block = Block((4, 1, 2), (1., .25, 1.))

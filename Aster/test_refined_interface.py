@@ -32,6 +32,49 @@ def trace(corners, triangles, quadratic):
 
 
 class RefinedInterfaceTests(unittest.TestCase):
+    def test_elastic_layer_source_contract_builds_unconstrained_nodal_tensors(self):
+        from bedrock_support import elastic_layer_tensors
+
+        with tempfile.TemporaryDirectory() as folder:
+            model = Path(folder)
+            source_mesh = model / "three_body.msh"
+            source_mesh.write_text("source")
+            points = np.array(((0., 0., 0.), (2., 0., 0.), (0., 3., 0.)))
+            faces = np.array(((0, 1, 2),), dtype=np.int64)
+            expected = elastic_layer_tensors(
+                points, faces, youngs_modulus=50e9, poisson_ratio=.25, bottom_z_m=-10.,
+            )["stiffness_n_per_m3"][0]
+            config = {
+                "bedrock_analysis": {"mode": "elastic_layer"},
+                "material": {"bedrock": {"youngs_modulus": 50e9, "poisson_ratio": .25}},
+                "geometry": {"bedrock": {"domain": {"bottom_z_m": -10.}}},
+            }
+            (model / "config.json").write_text(json.dumps(config))
+            diagnostic = {
+                "boundary_id_map": {"100000": 5},
+                "elastic_layer_support": {
+                    "model": "elastic_layer",
+                    "face_groups": [{"source_tag": 100000, "matrix_n_per_m3": expected.tolist()}],
+                },
+            }
+            (model / "diagnostic.json").write_text(json.dumps(diagnostic))
+            entries = "".join(
+                f" Spring {i + 1}{j + 1} = Real {expected[i, j]:.12g}\n"
+                for i in range(3) for j in range(3) if expected[i, j] != 0
+            )
+            (model / "dam_model.sif").write_text(
+                'Boundary Condition 1\n Name = "ElasticLayerSeat_00000"\n'
+                f" Target Boundaries(1) = 5\n{entries}End\n"
+            )
+            with patch("Aster.source_contract.saved_pressures", return_value=({}, 0.)):
+                contract = source_springs(source_mesh, points, faces, np.array((5,)))
+
+        self.assertEqual(contract["bedrock_analysis_mode"], "elastic_layer")
+        self.assertEqual(contract["pairs"].shape, (0, 2))
+        self.assertEqual(contract["support_nodes"].tolist(), [0, 1, 2])
+        self.assertEqual(contract["support_matrices"].shape, (3, 3, 3))
+        self.assertEqual(contract["elastic_layer_support"]["model"], "elastic_layer")
+
     def test_both_wall_sides_retain_parent_faces_through_two_cuts_and_enrichment(self):
         tetra = np.array([[0., 0, -1.], [1., 0, 1.], [0., 1., 1.], [0., 0, 1.]])
         nodes = np.vstack([tetra, tetra[[2, 1, 0, 3]]])

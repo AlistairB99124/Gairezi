@@ -175,10 +175,16 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
     def integral(expression):
         return float(domain.comm.allreduce(fem.assemble_scalar(fem.form(expression)), op=MPI.SUM))
 
-    applied = np.asarray([
-        integral(gravity[i] * dx) + sum(integral(-p * normal[i] * ds(tag)) for tag, p in pressures.items())
-        for i in range(3)
-    ])
+    # Sum the actual assembled load. Independently compiling scalar pressure
+    # integrals can choose different quadrature across a clamped waterline.
+    load_vector = fem.petsc.assemble_vector(fem.form(L))
+    try:
+        load_vector.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        owned = space.dofmap.index_map.size_local
+        applied = np.asarray(domain.comm.allreduce(
+            load_vector.array[:3 * owned].reshape(-1, 3).sum(axis=0), op=MPI.SUM))
+    finally:
+        load_vector.destroy()
     reactions = {
         str(tag): [integral(-coefficients[i] * displacement[i] * ds(tag)) for i in range(3)]
         for tag, coefficients in springs.items()
@@ -225,17 +231,21 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
         "wall_connection": connection,
     }
     if three_body:
-        from three_body_model import rock_support, connection_report
+        from three_body_model import rock_support_report, connection_report
+        from Elmer.model_config import bedrock_analysis_mode
 
-        support = rock_support(structure)
         report.update(
             model_kind="three_body", interface_springs=interfaces.report,
             wall_connection=connection,
             wall_joints=[{"name": joint["name"], "z_m": joint["z_m"]} for joint in getattr(structure, "wall_joints", [])],
             **connection_report(structure),
-            rock_outer_support=support,
+            rock_outer_support=rock_support_report(structure),
             source_mesh=structure.three_body_source,
-            stress_scope="wall; rock and optional foundation reported separately",
+            stress_scope=(
+                "wall only; concrete foundation retained mechanically; bedrock volume omitted"
+                if bedrock_analysis_mode(structure.three_body_config) == "elastic_layer"
+                else "wall; rock and optional foundation reported separately"
+            ),
         )
     from stress_recovery import recover_stress
 
@@ -245,6 +255,8 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
     )
     if three_body:
         concrete = imported.cell_tags.find(1)
+        from three_body_model import maximum_wall_displacement
+        report["maximum_wall_displacement_m"] = maximum_wall_displacement(imported, displacement)
         raw_principal = raw_principal[concrete[concrete < owned_cells]]
     report["raw_element_stress"] = {
         "maximum_principal_tensile_stress_pa": float(domain.comm.allreduce(
@@ -254,7 +266,11 @@ def solve(imported, structure, options: dict, output: Path, *, save_source_displ
     }
     if three_body and domain.comm.rank == 0:
         print("Three-body elastic recovering nodal stress", flush=True)
-    report.update(recover_stress(domain, stress(displacement), output,
-                                 cell_tags=imported.cell_tags if three_body else None,
-                                 reference_stress=reference_stress))
+    from Elmer.model_config import bedrock_analysis_mode
+    report.update(recover_stress(
+        domain, stress(displacement), output,
+        cell_tags=imported.cell_tags if three_body else None,
+        reference_stress=reference_stress,
+        wall_only=three_body and bedrock_analysis_mode(structure.three_body_config) == "elastic_layer",
+    ))
     return source_displacement, sigma, report

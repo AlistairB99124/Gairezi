@@ -114,6 +114,11 @@ def convert(npz_path: Path, med_path: Path) -> None:
         (mc.NORM_TETRA4, data["tetra4_concrete"], "CONCRETE"),
         (mc.NORM_TETRA4, data["tetra4_bedrock"], "BEDROCK"),
     ]
+    # Both native joint types sort after TETRA4 in MED order, preserving body indices.
+    if "hexa8_joints" in data and len(data["hexa8_joints"]):
+        volume_blocks.append((mc.NORM_HEXA8, data["hexa8_joints"], "JOINTS"))
+    elif "penta6_joints" in data and len(data["penta6_joints"]):
+        volume_blocks.append((mc.NORM_PENTA6, data["penta6_joints"], "JOINTS"))
     volume_mesh, volume_group_arrays = _build_level(MESH_NAME, 3, coords, volume_blocks)
     if "concrete_body_ids" in data:
         for body, name in ((1, "WALL"), (3, "FOUNDATION")):
@@ -148,13 +153,30 @@ def convert(npz_path: Path, med_path: Path) -> None:
     mfu.setMeshAtLevel(0, volume_mesh)
     mfu.setMeshAtLevel(-1, face_mesh)
     mfu.setMeshAtLevel(-2, spring_mesh)
-    mfu.setMeshAtLevel(-3, point_mesh)
+    if len(poi1_nodes):
+        mfu.setMeshAtLevel(-3, point_mesh)
     mfu.setGroupsAtLevel(0, volume_group_arrays)
     mfu.setGroupsAtLevel(-1, face_group_arrays)
     mfu.setGroupsAtLevel(-2, spring_group_arrays)
-    mfu.setGroupsAtLevel(-3, point_group_arrays)
+    if len(poi1_nodes):
+        mfu.setGroupsAtLevel(-3, point_group_arrays)
 
     med_path.parent.mkdir(parents=True, exist_ok=True)
+    node_groups = []
+    if "fixed_support_nodes" in data and len(data["fixed_support_nodes"]):
+        group = mc.DataArrayInt.New(data["fixed_support_nodes"].tolist())
+        group.setName("FIXED_SEAT")
+        node_groups.append(group)
+    if "tie_node_pairs" in data and len(data["tie_node_pairs"]):
+        # One single-node group per side of each tie, so the case pairs nodes explicitly
+        # (coincident split copies make geometric pairing ambiguous).
+        for index, (node, copy) in enumerate(data["tie_node_pairs"].tolist()):
+            for name, value in ((f"TIEA{index:05d}", node), (f"TIEB{index:05d}", copy)):
+                group = mc.DataArrayInt.New([int(value)])
+                group.setName(name)
+                node_groups.append(group)
+    if node_groups:
+        mfu.setGroupsAtLevel(1, node_groups)
     mfu.write(str(med_path), 2)
     print(f"WROTE {med_path} ({med_path.stat().st_size} bytes)")
     print("volume groups:", sorted(a.getName() for a in volume_group_arrays))

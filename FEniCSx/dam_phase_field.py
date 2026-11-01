@@ -287,7 +287,10 @@ def solve(
             "crack_placement": placement,
             "damage_region_ids": list(damage_regions),
             "non_wall_damage": (
-                "bedrock and optional foundation fixed at zero" if three_body else "fixed at zero, including shared interface DOFs"
+                "concrete foundation fixed at zero; bedrock volume omitted"
+                if three_body and rock_support(structure)["model"] == "elastic_layer"
+                else "bedrock and optional foundation fixed at zero"
+                if three_body else "fixed at zero, including shared interface DOFs"
             ),
             "applied_force_n": applied.tolist(),
             "ground_spring_reactions_n": reactions,
@@ -318,10 +321,15 @@ def solve(
                 ),
                 "No unilateral crack-face contact or friction is enforced.",
                 "Diffuse pressure is an energy-consistent regularised traction, not an explicit face load.",
-                "Convergence and successful execution do not constitute engineering validation.",
+                "",
                 (
-                    "Damage is restricted to wall region 1; bedrock and foundation damage DOFs are fixed at zero. "
-                    "Wall and bedrock damage do not couple across the seat, and the seat springs do not soften."
+                    (
+                        "Damage is restricted to wall region 1; the concrete foundation is fixed at zero damage "
+                        "and the elastic-layer support does not soften."
+                        if rock_support(structure)["model"] == "elastic_layer" else
+                        "Damage is restricted to wall region 1; bedrock and foundation damage DOFs are fixed at zero. "
+                        "Wall and bedrock damage do not couple across the seat, and the seat springs do not soften."
+                    )
                     if three_body else
                     "Damage is restricted to wall region 2; non-wall and shared interface damage DOFs are fixed at zero."
                 ),
@@ -334,6 +342,9 @@ def solve(
         "maximum_principal_tensile_stress_pa": maximum_tensile_stress,
         "maximum_principal_compressive_stress_pa": maximum_compressive_stress,
     }
+    if three_body:
+        from three_body_model import maximum_wall_displacement
+        result.report["maximum_wall_displacement_m"] = maximum_wall_displacement(imported, result.displacement)
     result.report.update(recover_stress(
         domain,
         stress_expression,
@@ -346,6 +357,7 @@ def solve(
             for kind in ("tensile", "compressive")
         } if baseline_report is not None else None,
         cell_tags=imported.cell_tags if three_body else None,
+        wall_only=three_body and rock_support(structure)["model"] == "elastic_layer",
     ))
     if three_body:
         from three_body_model import connection_report
@@ -356,7 +368,11 @@ def solve(
             wall_joints=[{"name": joint["name"], "z_m": joint["z_m"]}
                          for joint in getattr(structure, "wall_joints", [])],
             **connection_report(structure),
-            stress_scope="wall; full-domain rock and optional foundation reported separately",
+            stress_scope=(
+                "wall only; concrete foundation retained mechanically; bedrock volume omitted"
+                if rock_support(structure)["model"] == "elastic_layer"
+                else "wall; full-domain rock and optional foundation reported separately"
+            ),
             fracture_verification="implementation verification only; full-dam validation required",
         )
     result.report["mesh_nodes"] = int(result.damage.function_space.dofmap.index_map.size_global)

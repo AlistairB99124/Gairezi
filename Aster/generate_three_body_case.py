@@ -2,7 +2,7 @@
 
 Material/body-force assignments are checked against the saved SIF. Pressure
 datums and spring coefficients come from that SIF, not reconstructed geometry.
-Surface-spring integration remains lumped; see Aster_Porting.md.
+Elastic-layer supports use exact triangular P1 surface integration.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -48,6 +49,9 @@ def load_rock_outer_spring(path: Path) -> dict:
 
 def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIFEST_PATH) -> tuple[str, dict]:
     mesh_manifest = json.loads(mesh_manifest_path.read_text(encoding="utf-8"))
+    no_bedrock = mesh_manifest.get("rigid_seat_sensitivity") is True
+    layer_mode = mesh_manifest.get("bedrock_analysis_mode") == "elastic_layer"
+    has_bedrock_volume = not no_bedrock and not layer_mode
     config_path = Path(mesh_manifest["source_config"])
     if file_hash(config_path) != mesh_manifest["source_hashes"]["config.json"]:
         raise ValueError("Saved source configuration changed since mesh export")
@@ -123,6 +127,25 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
         f"VALE={tuple(spring['matrix_n_per_m'][i][j] for j in range(3) for i in range(3))!r})"
         for spring in mesh_manifest["support_springs"]
     )
+    volume_groups = "('CONCRETE',)" if not has_bedrock_volume else "('CONCRETE', 'BEDROCK')"
+    model_groups = ("'CONCRETE', 'UPSTREAM', 'DOWNSTREAM', 'CREST'," if not has_bedrock_volume else
+                    "'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST', 'ROCK_BOTTOM', 'ROCK_SIDES',")
+    outer_model = "" if no_bedrock else "_F(GROUP_MA='OUTER_SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),"
+    rock_assignment = "" if not has_bedrock_volume else "_F(GROUP_MA='BEDROCK', MATER=BEDROCK_MAT),"
+    fixed_seat = ("FIXED_SEAT = AFFE_CHAR_MECA(MODELE=MODELE, DDL_IMPO="
+                  "_F(GROUP_NO='FIXED_SEAT', DX=0.0, DY=0.0, DZ=0.0))\n" if no_bedrock else "")
+    fixed_excitation = "_F(CHARGE=FIXED_SEAT)," if no_bedrock else ""
+    inputs["rigid_seat_sensitivity"] = no_bedrock
+    inputs["bedrock_analysis_mode"] = mesh_manifest.get("bedrock_analysis_mode", "full_volume")
+    from Aster.support_trace import render_constraints
+    arrays_path = mesh_manifest_path.parent / "three_body_mesh_arrays.npz"
+    trace = ""
+    if arrays_path.is_file():
+        with np.load(arrays_path, allow_pickle=False) as stored:
+            trace = render_constraints({key: stored[key] for key in stored.files})
+    elif mesh_manifest.get("support_integration") == "consistent_P1_face":
+        raise ValueError("Consistent support trace arrays are missing")
+    support_excitation = "_F(CHARGE=SUPPORT_TRACE)," if trace else ""
 
     comm = f'''# 01_three_body_baseline.comm - Code_Aster linear-elastic cross-check of the
 # CANONICAL Elmer wall+foundation+bedrock model (Elmer.three_body_solver;
@@ -155,13 +178,12 @@ MODELE = AFFE_MODELE(
     AFFE=(
         _F(
             GROUP_MA=(
-                'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST',
-                'ROCK_BOTTOM', 'ROCK_SIDES',
+                {model_groups}
             ),
             PHENOMENE='MECANIQUE',
             MODELISATION='3D',
         ),
-        _F(GROUP_MA='OUTER_SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),
+        {outer_model}
         _F(GROUP_MA='{wall_foundation_spring_group_all}', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),
     ),
 )
@@ -190,7 +212,7 @@ CHMAT = AFFE_MATERIAU(
     MAILLAGE=MAIL,
     AFFE=(
         _F(GROUP_MA='CONCRETE', MATER=CONCRETE_MAT),
-        _F(GROUP_MA='BEDROCK', MATER=BEDROCK_MAT),
+        {rock_assignment}
     ),
 )
 # Doc u4.43.03 AFFE_MATERIAU.
@@ -238,6 +260,8 @@ CARA_ROCK = AFFE_CARA_ELEM(
 # K_T_N: global k*n*n.T matrices, preserving free tangential directions.
 # Nine-entry SYME='NON' encoding is column-major (installed zzzz274f test).
 
+{fixed_seat}
+{trace}
 RESU = MECA_STATIQUE(
     MODELE=MODELE,
     CHAM_MATER=CHMAT,
@@ -246,6 +270,8 @@ RESU = MECA_STATIQUE(
         _F(CHARGE=GRAVITE),
         _F(CHARGE=PRESSIONS),
         _F(CHARGE=CREST_SURCHARGE),
+        {fixed_excitation}
+        {support_excitation}
     ),
     SOLVEUR=_F(METHODE='MULT_FRONT'),
 )
@@ -269,7 +295,7 @@ RESU = MECA_STATIQUE(
 RESU = CALC_CHAMP(
     reuse=RESU,
     RESULTAT=RESU,
-    GROUP_MA=('CONCRETE', 'BEDROCK'),
+    GROUP_MA={volume_groups},
     CONTRAINTE=('SIEF_ELGA', 'SIGM_NOEU'),
 )
 # GROUP_MA restricts CALC_CHAMP to the two 3-D volume groups, excluding the

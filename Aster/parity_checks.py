@@ -195,6 +195,8 @@ def concrete_checks(elmer, aster, index):
             peak["node_id"] = int(rows[peak["node_id"]])
             peak["source_node_id"] = int(aster["source_node_ids"][peak["node_id"]])
         regions[name] = {
+            "aster_maximum_displacement_m": float(np.linalg.norm(a_disp[mask], axis=1).max()),
+            "elmer_maximum_displacement_m": float(np.linalg.norm(e_disp[mask], axis=1).max()),
             "elmer_tension_pa": e_t, "aster_tension_pa": a_t,
             "elmer_compression_pa": e_c, "aster_compression_pa": a_c,
             "tensile_peak_comparison": {

@@ -56,7 +56,7 @@ def run_solver(command: list[str], run_dir: Path, timeout: int,
     if live_log is not None:
         return _run_solver_streaming(command, run_dir, timeout, live_log, env)
     with subprocess.Popen(command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=env) as process:
+                          text=True, encoding="utf-8", errors="replace", env=env) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -87,7 +87,7 @@ def _run_solver_streaming(command: list[str], run_dir: Path, timeout: int,
     finished = threading.Event()
     tails: list[threading.Thread] = []
     with subprocess.Popen(command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=environment) as process, \
+                          text=True, encoding="utf-8", errors="replace", env=environment) as process, \
             live_log.open("a", encoding="utf-8") as live:
         def write(line: str) -> None:
             with write_lock:
@@ -357,7 +357,7 @@ def run_case(
     manifest["export_path"] = str(export_path.resolve())
 
     for old_output in (result_med_path, run_dir / "aster_result_fields.npz", run_dir / "result_stress.vtu",
-                       run_dir / "_diagnostic_displacement.npz"):
+                       run_dir / "_diagnostic_displacement.npz", output_dir / "aster_full_displacement.npz"):
         old_output.unlink(missing_ok=True)
     started = time.monotonic()
     try:

@@ -101,6 +101,19 @@ def fixture():
 
 
 class StressReportingRegionTests(unittest.TestCase):
+    def test_wall_displacement_does_not_use_foundation_or_rock_peak(self):
+        mesh = fixture()
+        displacement = vtk_to_numpy(mesh.GetPointData().GetArray("displacement"))
+        displacement[:16, 0] = .025
+        displacement[16:, 0] = 9.
+        summary = stress_summary(mesh)
+        self.assertEqual(summary["wall"]["maximum_displacement_m"], .025)
+        labels = vtk_to_numpy(mesh.GetCellData().GetArray("GeometryIds"))
+        labels[labels == 2] = 3
+        summary = stress_summary(mesh)
+        self.assertEqual(summary["wall"]["maximum_displacement_m"], .025)
+        self.assertEqual(summary["foundation"]["maximum_displacement_m"], 9.)
+
     def test_only_concrete_is_retained_with_original_fields(self):
         mesh = fixture()
         result = reporting_region(mesh)

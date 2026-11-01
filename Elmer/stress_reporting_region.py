@@ -55,7 +55,7 @@ def reference_coordinates(mesh) -> np.ndarray:
     return points - values
 
 
-def reporting_region(mesh, distance_m: float = 5.):
+def reporting_region(mesh, distance_m: float = 5., *, wall_only: bool = False):
     # Retain the legacy distance argument for CLI compatibility; it no longer
     # expands the reported material selection.
     if not math.isfinite(distance_m) or distance_m <= 0:
@@ -66,6 +66,9 @@ def reporting_region(mesh, distance_m: float = 5.):
     concrete = select_body(mesh, 1, 1)
     if not concrete.GetNumberOfCells():
         raise ValueError("Missing reporting body: wall")
+    if wall_only:
+        concrete.GetPointData().RemoveArray(DISTANCE_ARRAY)
+        return concrete
     foundation = select_body(mesh, 3, 3)
     if foundation.GetNumberOfCells():
         joined = vtkAppendFilter()
@@ -79,7 +82,7 @@ def reporting_region(mesh, distance_m: float = 5.):
     return concrete
 
 
-def sharp_concrete_edges(mesh, angle_deg: float = SHARP_EDGE_ANGLE_DEG):
+def sharp_concrete_edges(mesh, angle_deg: float = SHARP_EDGE_ANGLE_DEG, *, wall_only: bool = False):
     """Feature edges of wall/foundation surfaces in undeformed coordinates.
 
     Bodies and wall blocks are joined by springs with duplicated nodes, so
@@ -90,7 +93,8 @@ def sharp_concrete_edges(mesh, angle_deg: float = SHARP_EDGE_ANGLE_DEG):
     concrete_parts = vtkAppendFilter()
     concrete_parts.MergePointsOff()
     concrete_parts.AddInputData(select_body(mesh, 1, 1))
-    concrete_parts.AddInputData(select_body(mesh, 3, 3))
+    if not wall_only:
+        concrete_parts.AddInputData(select_body(mesh, 3, 3))
     concrete_parts.Update()
     concrete = vtkUnstructuredGrid()
     concrete.DeepCopy(concrete_parts.GetOutput())
@@ -118,9 +122,9 @@ def sharp_concrete_edges(mesh, angle_deg: float = SHARP_EDGE_ANGLE_DEG):
     return result
 
 
-def add_edge_distance(region, angle_deg: float = SHARP_EDGE_ANGLE_DEG):
+def add_edge_distance(region, angle_deg: float = SHARP_EDGE_ANGLE_DEG, *, wall_only: bool = False):
     """Add each point's undeformed distance to the nearest sharp concrete edge."""
-    edges = sharp_concrete_edges(region, angle_deg)
+    edges = sharp_concrete_edges(region, angle_deg, wall_only=wall_only)
     locator = vtkStaticCellLocator()
     locator.SetDataSet(edges)
     locator.BuildLocator()
@@ -179,6 +183,8 @@ def stress_summary(mesh, edge_exclusion_m: float | None = None) -> dict:
         coordinates = reference_coordinates(selected)
         report[name] = {
             "reporting_cells": selected.GetNumberOfCells(),
+            "maximum_displacement_m": float(np.linalg.norm(
+                vtk_to_numpy(data.GetArray("displacement")), axis=1).max()),
             **_principal_peaks(principal, coordinates, np.ones(len(principal), dtype=bool)),
         }
         if edge_exclusion_m is not None:
@@ -196,6 +202,7 @@ def stress_summary(mesh, edge_exclusion_m: float | None = None) -> dict:
 
 def export_region(
     result: Path, output: Path, distance_m: float = 5., edge_exclusion_m: float = EDGE_EXCLUSION_M,
+    *, wall_only: bool = False,
 ) -> dict:
     if not result.is_file():
         raise FileNotFoundError(result)
@@ -205,7 +212,8 @@ def export_region(
     reader.SetFileName(str(result))
     reader.Update()
     source = reader.GetOutput()
-    region = add_edge_distance(reporting_region(source, distance_m))
+    region = add_edge_distance(reporting_region(source, distance_m, wall_only=wall_only),
+                               wall_only=wall_only)
     summary = stress_summary(region, edge_exclusion_m)
     output.mkdir(parents=True, exist_ok=True)
     path = output / "structure.vtu"
@@ -234,16 +242,20 @@ def export_region(
             np.testing.assert_array_equal(vtk_to_numpy(array), vtk_to_numpy(saved_array))
     report = {
         "source_full_domain_result": str(result.resolve()),
-        "result": str(path.resolve()), "reporting_scope": "concrete",
-        "selection": "Wall and optional concrete foundation only",
+        "result": str(path.resolve()), "reporting_scope": "wall" if wall_only else "concrete",
+        "selection": "Wall only" if wall_only else "Wall and optional concrete foundation",
         "stress_method": "Principal eigenvalues of recovered nodal stress tensor",
         "reporting_cells": region.GetNumberOfCells(),
         "bodies": summary,
         "sharp_edge_exclusion": {
             "distance_m": edge_exclusion_m,
             "feature_angle_deg": SHARP_EDGE_ANGLE_DEG,
-            "edges": "Wall/foundation surface edges (undeformed) where faces meet at or beyond the feature angle, "
-                     "including step corners, joint/interface perimeters and rims; 45-degree seat chamfers are not edges",
+            "edges": (
+                "Wall surface edges only (undeformed)"
+                if wall_only else
+                "Wall/foundation surface edges (undeformed) where faces meet at or beyond the feature angle, "
+                "including step corners, joint/interface perimeters and rims; 45-degree seat chamfers are not edges"
+            ),
             "purpose": "Raw peaks at sharp re-entrant edges are mesh-dependent singularities in linear elasticity; "
                        "'away_from_sharp_edges' peaks are an additional view, not a replacement",
         },
@@ -262,5 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--distance-m", type=float, default=5.)
     parser.add_argument("--edge-exclusion-m", type=float, default=EDGE_EXCLUSION_M)
+    parser.add_argument("--wall-only", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(export_region(args.result, args.output, args.distance_m, args.edge_exclusion_m), indent=2))
+    print(json.dumps(export_region(args.result, args.output, args.distance_m, args.edge_exclusion_m,
+                                   wall_only=args.wall_only), indent=2))

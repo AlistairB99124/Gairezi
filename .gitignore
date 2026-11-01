@@ -3,6 +3,9 @@
 /Aster/results/
 /case_study_00/
 __pycache__/
+/.pytest_cache
+/.agent-work
+/.venv
 *.pyc
 *.bak
 *.bak_*

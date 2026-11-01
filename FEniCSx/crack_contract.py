@@ -138,7 +138,7 @@ class PhaseFieldSolverOptions:
 # ``fracture_debug`` block, so each job freezes its own values (process of elimination).
 FRACTURE_DEBUG_KEYS = (
     "model", "critical_energy_release_rate_j_m2", "length_scale_m", "residual_stiffness",
-    "crack_water_pressure_factor", "load_steps", "solver", "aster",
+    "crack_water_pressure_factor", "load_steps", "solver", "aster", "compare_with_no_bedrock",
 )
 FRACTURE_DEBUG_ASTER_KEYS = ("band_width_m", "softening_p")
 DEFAULT_RESIDUAL_STIFFNESS = 1e-8
@@ -180,6 +180,8 @@ def apply_fracture_debug(defaults: dict, config: dict) -> tuple[dict, float]:
     unknown = set(debug) - set(FRACTURE_DEBUG_KEYS)
     if unknown:
         raise ValueError(f"Unsupported fracture_debug fields: {sorted(unknown)}")
+    if "compare_with_no_bedrock" in debug and type(debug["compare_with_no_bedrock"]) is not bool:
+        raise ValueError("fracture_debug.compare_with_no_bedrock must be a boolean")
     if "model" in debug:
         if debug["model"] not in PHASE_FIELD_MODELS:
             raise ValueError(f"fracture_debug.model must be one of {PHASE_FIELD_MODELS}")

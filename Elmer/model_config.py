@@ -25,13 +25,22 @@ CONFIG_KEYS = {
     },
     "outputs": {"max_displacement", "max_tensile_stress", "cracking_risk"},
 }
-OPTIONAL_CONFIG_KEYS = {"crack_simulations", "cracking", "fracture_debug"}
+OPTIONAL_CONFIG_KEYS = {
+    "crack_simulations", "cracking", "fracture_debug", "damage_selection", "bedrock_analysis",
+}
+BEDROCK_ANALYSIS_MODES = {"full_volume", "elastic_layer"}
+# Automatic element selection (see FEniCSx/automatic_screening.select_damage_cells).
+DAMAGE_SELECTION_KEYS = {"max_damage_count", "maximum_overload_factor"}
+# Proportional overload search beyond the design load (FEniCSx/automatic_cracking.maximum_overload_factor).
+MAXIMUM_OVERLOAD_FACTOR = 10.0
+# One cohesive facet needs both owner cells, so fewer than two cells can never crack.
+MINIMUM_DAMAGE_COUNT = 2
 # Optional UI crack-seed settings (see FEniCSx/automatic_crack.cracking_settings).
 CRACKING_KEYS = {"face", "depth_m", "opening_m", "full_width", "buffer_m", "length_m"}
 # Optional fracture debug overrides (see FEniCSx/crack_contract.apply_fracture_debug).
 FRACTURE_DEBUG_KEYS = {
     "model", "critical_energy_release_rate_j_m2", "length_scale_m", "residual_stiffness",
-    "crack_water_pressure_factor", "load_steps", "solver", "aster",
+    "crack_water_pressure_factor", "load_steps", "solver", "aster", "compare_with_no_bedrock",
 }
 FRACTURE_DEBUG_SOLVER_INTEGERS = {
     "maximum_staggered_iterations": 1, "mechanics_maximum_iterations": 1,
@@ -263,8 +272,7 @@ class _ConfigValidator:
             values = self.object(
                 material.get(name) if material is not None else None, path, MATERIAL_KEYS,
                 optional={"support"} if name == "bedrock" else {
-                    "compressive_strength_pa", "selected_tensile_strength_pa",
-                    "selected_youngs_modulus", "cohesive_fracture_energy_j_m2",
+                    "compressive_strength_pa", "cohesive_fracture_energy_j_m2",
                 },
             )
             if values is None:
@@ -280,15 +288,6 @@ class _ConfigValidator:
                 self.field_number(values, key, path, positive=True)
             if name == "concrete" and "compressive_strength_pa" in values:
                 self.field_number(values, "compressive_strength_pa", path, positive=True)
-            if name == "concrete" and "selected_tensile_strength_pa" in values:
-                self.field_number(values, "selected_tensile_strength_pa", path, nonnegative=True)
-            # Damaged-concrete stiffness for painted cells; never stiffer than intact concrete.
-            if name == "concrete" and "selected_youngs_modulus" in values:
-                damaged = self.field_number(values, "selected_youngs_modulus", path, positive=True)
-                intact = values.get("youngs_modulus")
-                if (damaged is not None and isinstance(intact, (int, float)) and not isinstance(intact, bool)
-                        and damaged > intact):
-                    self.issue(f"{path}.selected_youngs_modulus", "must not exceed youngs_modulus")
             # Mode-I fracture energy for the experimental cohesive interface law;
             # deliberately separate from the legacy phase-field Gc.
             if name == "concrete" and "cohesive_fracture_energy_j_m2" in values:
@@ -653,7 +652,64 @@ class _ConfigValidator:
             self.validate_cracking(root["cracking"], width)
         if root.get("fracture_debug") is not None:
             self.validate_fracture_debug(root["fracture_debug"])
+            debug = root["fracture_debug"]
+            if isinstance(debug, dict) and debug.get("compare_with_no_bedrock") is True:
+                geometry = root.get("geometry", {})
+                if not isinstance(geometry, dict) or geometry.get("foundation") is None:
+                    self.issue("fracture_debug.compare_with_no_bedrock", "requires a concrete foundation")
+                else:
+                    rock = geometry.get("bedrock")
+                    support = rock.get("support") if isinstance(rock, dict) else None
+                    if not isinstance(support, dict) or support.get("model") != "bonded":
+                        self.issue("fracture_debug.compare_with_no_bedrock", "requires a bonded foundation/bedrock interface")
+        if "damage_selection" in root:
+            self.validate_damage_selection(root["damage_selection"])
+        if "bedrock_analysis" in root:
+            self.validate_bedrock_analysis(root["bedrock_analysis"], root)
         return self.issues
+
+    def validate_bedrock_analysis(self, value: object, root: Mapping[str, object]) -> None:
+        path = "bedrock_analysis"
+        analysis = self.object(value, path, {"mode"}, optional={"spring_n_per_m3"})
+        if analysis is None or "mode" not in analysis:
+            return
+        mode = analysis["mode"]
+        if "spring_n_per_m3" in analysis:
+            springs = self.object(analysis["spring_n_per_m3"], f"{path}.spring_n_per_m3", VECTOR_KEYS)
+            if springs is not None:
+                for axis in VECTOR_KEYS:
+                    if axis in springs:
+                        self.number(springs[axis], f"{path}.spring_n_per_m3.{axis}", positive=True)
+        if not isinstance(mode, str) or mode not in BEDROCK_ANALYSIS_MODES:
+            self.issue(f"{path}.mode", f"must be one of {sorted(BEDROCK_ANALYSIS_MODES)}")
+            return
+        if mode == "elastic_layer":
+            geometry = root.get("geometry")
+            foundation = geometry.get("foundation") if isinstance(geometry, Mapping) else None
+            bedrock = geometry.get("bedrock") if isinstance(geometry, Mapping) else None
+            support = bedrock.get("support") if isinstance(bedrock, Mapping) else None
+            if not isinstance(foundation, Mapping):
+                self.issue(f"{path}.mode", "elastic_layer requires a concrete foundation")
+            if not isinstance(support, Mapping) or support.get("model") != "bonded":
+                self.issue(f"{path}.mode", "elastic_layer requires the configured foundation/bedrock seat to be bonded")
+            domain = bedrock.get("domain") if isinstance(bedrock, Mapping) else None
+            bottom = domain.get("bottom_z_m") if isinstance(domain, Mapping) else None
+            if (isinstance(bottom, bool) or not isinstance(bottom, (int, float))
+                    or not math.isfinite(bottom)):
+                self.issue(f"{path}.mode", "elastic_layer requires a finite configured bedrock domain bottom")
+
+    def validate_damage_selection(self, value: object) -> None:
+        """Automatic element selection: ``max_damage_count`` null (all qualifying cells) or an integer >= 2;
+        ``maximum_overload_factor`` null (design load only) or a number in [1, 10]."""
+        selection = self.object(value, "damage_selection", set(), optional=DAMAGE_SELECTION_KEYS)
+        if selection is not None and selection.get("max_damage_count") is not None:
+            self.debug_integer(selection["max_damage_count"], "damage_selection.max_damage_count",
+                               MINIMUM_DAMAGE_COUNT)
+        if selection is not None and selection.get("maximum_overload_factor") is not None:
+            path = "damage_selection.maximum_overload_factor"
+            factor = self.number(selection["maximum_overload_factor"], path)
+            if factor is not None and not 1 <= factor <= MAXIMUM_OVERLOAD_FACTOR:
+                self.issue(path, f"must be between 1 and {MAXIMUM_OVERLOAD_FACTOR:g}")
 
     def validate_fracture_debug(self, value: object) -> None:
         """Optional per-job overrides of FEniCSx/fracture_defaults.json (and Aster softening).
@@ -664,6 +720,8 @@ class _ConfigValidator:
         debug = self.object(value, path, set(), optional=FRACTURE_DEBUG_KEYS)
         if debug is None:
             return
+        if "compare_with_no_bedrock" in debug and type(debug["compare_with_no_bedrock"]) is not bool:
+            self.issue(f"{path}.compare_with_no_bedrock", "must be a boolean")
         if "model" in debug and debug["model"] not in ("AT1", "AT2"):
             self.issue(f"{path}.model", "must be 'AT1' or 'AT2'")
         self.field_number(debug, "critical_energy_release_rate_j_m2", path, positive=True)
@@ -853,3 +911,9 @@ def load_config(source: Path | dict[str, object] = CONFIG_PATH) -> dict[str, obj
     else:
         payload = json.loads(Path(source).read_text(encoding="utf-8"))
     return validate_config(payload)
+
+
+def bedrock_analysis_mode(config: Mapping[str, object]) -> str:
+    """Missing mode retains historical full-volume behavior for CLI/jobs."""
+    analysis = config.get("bedrock_analysis")
+    return str(analysis["mode"]) if isinstance(analysis, Mapping) else "full_volume"

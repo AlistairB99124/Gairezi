@@ -11,11 +11,13 @@ from pathlib import Path
 import numpy as np
 
 from automatic_cracking import (
-    ACCEPTED_OUTCOMES, NativeNetworkProblem, candidate_region, cell_max_principal_stress,
-    interior_wall_facet_normal_stress, isotropic_elasticity, prepare_and_run, region_candidate_faces,
-    run_network_on_structure, screening_bound, screening_facet_bound,
+    ACCEPTED_OUTCOMES, NativeNetworkProblem, candidate_region, cell_max_principal_stress, crack_verdict,
+    maximum_overload_factor,
+    interior_wall_facet_normal_stress, isotropic_elasticity, opening_assessment, prepare_and_run,
+    region_candidate_faces, region_cell_stresses, run_network_on_structure, screening_bound,
+    screening_facet_bound, stress_comparison,
 )
-from automatic_screening import config_digest, facet_check
+from automatic_screening import _wall_faces, config_digest, facet_check
 from cohesive_contact import CohesiveOptions
 from cohesive_mode_i import LinearModeICohesiveLaw
 from cohesive_network import CohesiveNetwork, NetworkOptions
@@ -96,6 +98,22 @@ def write_archives(directory, stress):
 
 
 class RegionTests(unittest.TestCase):
+    def test_displacement_gauge_excludes_non_wall_nodes(self):
+        from types import SimpleNamespace
+        points = np.array([[0., 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                           [2, 0, 0], [3, 0, 0], [2, 1, 0], [2, 0, 1]])
+        split = SimpleNamespace(coordinates_m=points, cells=np.array([[0, 1, 2, 3], [4, 5, 6, 7]]),
+                                region_ids=np.array([1, 3]))
+        material = {"concrete": {"youngs_modulus": 1e7, "poisson_ratio": 0.},
+                    "bedrock": {"youngs_modulus": 3e7, "poisson_ratio": 0.}}
+        displacement = np.zeros((8, 3))
+        displacement[:4, 0] = .025
+        displacement[4:, 0] = 9.
+        report, _, _ = stress_comparison(split, material, displacement, displacement)
+        for name in ("intact", "cracked"):
+            self.assertEqual(report[name]["maximum_wall_displacement_m"], .025)
+            self.assertEqual(report[name]["maximum_displacement_m"], 9.)
+
     def test_rings_grow_through_shared_vertices_and_stay_in_the_wall(self):
         tetrahedra = np.array([[0, 1, 2, 3], [1, 2, 3, 4], [4, 5, 6, 7], [7, 8, 9, 10]])
         regions = np.array([1, 1, 1, 2])
@@ -112,6 +130,18 @@ class RegionTests(unittest.TestCase):
         stress = cell_max_principal_stress(coordinates, np.array([[0, 1, 2, 3]]), displacement,
                                            isotropic_elasticity(1e7, 0.))
         np.testing.assert_allclose(stress, [1e4])
+
+    def test_region_cell_stress_uses_each_body_material(self):
+        coordinates = np.array([[0., 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        displacement = np.zeros((4, 3))
+        displacement[:, 2] = 1e-3 * coordinates[:, 2]
+        material = {"concrete": {"youngs_modulus": 1e7, "poisson_ratio": 0.},
+                    "bedrock": {"youngs_modulus": 3e7, "poisson_ratio": 0.}}
+        cells = np.array([[0, 1, 2, 3]] * 3)
+        stress = region_cell_stresses(coordinates, cells, np.array([1, 2, 3]), displacement, material)
+        np.testing.assert_allclose(stress[:, 2, 2], [1e4, 3e4, 1e4])
+        with self.assertRaises(ValueError):
+            region_cell_stresses(coordinates, cells[:1], np.array([9]), displacement, material)
 
     def test_screening_bound_uses_the_tolerance_conservatively(self):
         self.assertTrue(screening_bound({"peak_principal_stress_pa": 1.0e6}, 2e6, 1e-3))
@@ -212,6 +242,8 @@ class RunnerTests(unittest.TestCase):
                       result.report.get("message"))
         self.assertTrue(result.initiated.any())
         self.assertLess(result.steps[0]["load_factor"], 1.)
+        self.assertGreater(result.steps[-1]["initiated_area_m2"], 0.)
+        self.assertLessEqual(result.steps[-1]["opened_area_m2"], result.steps[-1]["initiated_area_m2"] + 1e-12)
         self.assertLess(result.load_factor, 1.)
         self.assertLessEqual(np.max(result.face_normal_stress_pa[~result.initiated]), strength * (1 + 1e-3))
         if result.status == "accepted_equilibrium":
@@ -220,6 +252,95 @@ class RunnerTests(unittest.TestCase):
         else:
             self.assertNotIn(result.status, ACCEPTED_OUTCOMES)
             self.assertTrue(any(step["event"] == "initiation" for step in result.steps))
+
+    def test_confined_run_opens_only_facets_between_selected_cells(self):
+        structure, original = bending_column()
+        strength = 1e3
+        faces, owners = _wall_faces(np.asarray(original.tetrahedra), np.asarray(original.regions))
+        pair = owners[6]  # a seed pair whose confined solve reaches an accepted equilibrium
+        rows = sorted(int(original.parent_ids[cell]) for cell in pair)
+        result, prepared, region = run_network_on_structure(
+            structure, self.screening(original, 1e5, strength), gf_j_m2=1., tensile_strength_pa=strength,
+            relative_tolerance=1e-3, maximum_volume_change=1e-12, rings=2, progress=lambda _: None,
+            seed_rows=rows, confined=True)
+        seeds = np.isin(original.parent_ids, rows) & (np.asarray(original.regions) == 1)
+        self.assertEqual(len(region["attempts"]), 1)
+        self.assertEqual(region["attempts"][0]["rings"], 0)
+        self.assertEqual(region["attempts"][0]["region_cells"], int(seeds.sum()))
+        expected = region_candidate_faces(original.tetrahedra, original.regions, seeds)
+        self.assertEqual(region["attempts"][0]["candidate_faces"], len(expected))
+        self.assertEqual(len(result.initiated), len(expected))
+        self.assertEqual(result.status, "accepted_equilibrium")
+        # Outside facets in this low-strength wall reach f_t: reported, not grown into.
+        self.assertEqual(region["status"], "region_confined")
+        self.assertGreater(region["outside_region_critical_facets"], 0)
+        # The bonded reference is the same split mesh with every candidate tied at the same load.
+        split = prepared.split
+        self.assertEqual(result.intact_displacement_m.shape, result.displacement_m.shape)
+        report, intact, cracked = stress_comparison(split, structure.three_body_config["material"],
+                                                    result.intact_displacement_m, result.displacement_m)
+        self.assertEqual(intact.shape, (len(split.cells), 3, 3))
+        self.assertEqual(report["mesh_cells"], len(split.cells))
+        self.assertGreater(report["intact"]["maximum_principal_tensile_stress_pa"], strength)
+        self.assertLess(report["intact"]["maximum_principal_compressive_stress_pa"], 0.)
+        same_cell = report["cracked"]["cracked_at_intact_tensile_peak"]
+        self.assertEqual(same_cell["cell"], report["intact"]["tensile_peak_cell"])
+        np.testing.assert_allclose(same_cell["principal_stresses_pa"], np.linalg.eigvalsh(cracked[same_cell["cell"]]))
+        assessment = opening_assessment(result, LinearModeICohesiveLaw(strength, 1.), report)
+        self.assertEqual(assessment["initiated_faces"], int(result.initiated.sum()))
+        opened = int(np.isin(result.face_status, ("softening", "separated")).sum())
+        self.assertEqual(assessment["opened_faces"], opened)
+        self.assertEqual(assessment["cracked_equals_intact"], report["relative_displacement_change"] <= 1e-6)
+        if opened:
+            self.assertGreater(report["maximum_displacement_change_m"], 0.)
+
+    def test_overload_search_finds_the_first_opening_beyond_the_design_load(self):
+        # At f_t 20 kPa one facet releases at ~0.79 but stays closed at the design load.
+        structure, original = bending_column()
+        strength = 2e4
+        faces, owners = _wall_faces(np.asarray(original.tetrahedra), np.asarray(original.regions))
+        rows = sorted(int(original.parent_ids[cell]) for cell in owners[6])
+        result, _, region = run_network_on_structure(
+            structure, self.screening(original, 1e5, strength), gf_j_m2=1., tensile_strength_pa=strength,
+            relative_tolerance=1e-3, maximum_volume_change=1e-12, rings=2, progress=lambda _: None,
+            seed_rows=rows, confined=True, overload_factor=1.5)
+        design, overload = region["design_load"], region["overload"]
+        self.assertEqual(design["load_factor"], 1.)
+        self.assertGreater(design["initiated_faces"], 0)
+        self.assertEqual(design["opened_faces"], 0)
+        self.assertLess(design["peak_stress_to_strength_ratio"], 1.)
+        self.assertGreater(design["linear_first_opening_load_factor_estimate"], 1.)
+        self.assertEqual(result.status, "accepted_equilibrium")
+        self.assertGreater(result.load_factor, 1.)
+        self.assertEqual(overload["reached_load_factor"], result.load_factor)
+        low, high = overload["first_opening_bracket"]
+        self.assertTrue(1. <= low < high == overload["first_opening_load_factor"] <= result.load_factor)
+        self.assertGreater(overload["opened_area_m2"], 0.)
+        if overload["stopped"] is None:
+            self.assertEqual(result.load_factor, 1.5)
+        phases = [step["phase"] for step in result.steps]
+        self.assertEqual(phases, sorted(phases))  # "design" steps precede "overload" steps
+        self.assertEqual(max(step["load_factor"] for step in result.steps if step["phase"] == "design"), 1.)
+        self.assertEqual(result.intact_displacement_m.shape, result.displacement_m.shape)
+        verdict = crack_verdict(design, overload, strength)
+        self.assertIn("No crack opens at the design load", verdict)
+        self.assertIn("first open between", verdict)
+        # Without the overload search the design state is returned with a linear estimate.
+        design_only, _, plain = run_network_on_structure(
+            structure, self.screening(original, 1e5, strength), gf_j_m2=1., tensile_strength_pa=strength,
+            relative_tolerance=1e-3, maximum_volume_change=1e-12, rings=2, progress=lambda _: None,
+            seed_rows=rows, confined=True)
+        self.assertEqual(design_only.load_factor, 1.)
+        self.assertNotIn("overload", plain)
+        self.assertIn("Linear estimate", crack_verdict(plain["design_load"], None, strength))
+
+    def test_maximum_overload_factor_defaults_to_the_design_load(self):
+        self.assertEqual(maximum_overload_factor({}), 1.)
+        self.assertEqual(maximum_overload_factor({"damage_selection": {"max_damage_count": 4}}), 1.)
+        self.assertEqual(maximum_overload_factor({"damage_selection": {"maximum_overload_factor": 2}}), 2.)
+        for value in (0.5, 11, True):
+            with self.assertRaises(ValueError):
+                maximum_overload_factor({"damage_selection": {"maximum_overload_factor": value}})
 
     def test_runner_writes_bound_outcome_without_mesh_work(self):
         config = {"material": {"concrete": {"tensile_strength_pa": 2e6, "cohesive_fracture_energy_j_m2": 400.}}}

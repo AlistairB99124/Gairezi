@@ -9,7 +9,7 @@ import ufl
 
 
 def recover_stress(domain, expression, output: Path, *, sample_points: dict | None = None,
-                   cell_tags=None, reference_stress=None) -> dict:
+                   cell_tags=None, reference_stress=None, wall_only: bool = False) -> dict:
     """Match the Elmer reporting sequence without altering the mechanics solve."""
     space = fem.functionspace(domain, ("Lagrange", 1, (3, 3)))
     trial, test = ufl.TrialFunction(space), ufl.TestFunction(space)
@@ -43,8 +43,8 @@ def recover_stress(domain, expression, output: Path, *, sample_points: dict | No
             raise ValueError("Recovered stress contains nonfinite values")
         principal[start:end] = np.linalg.eigvalsh(tensors)
     body_peaks = {}
-    bodies = [(1, "wall"), (2, "bedrock")]
-    if cell_tags is not None and domain.comm.allreduce(len(cell_tags.find(3))) > 0:
+    bodies = [(1, "wall")] if wall_only else [(1, "wall"), (2, "bedrock")]
+    if not wall_only and cell_tags is not None and domain.comm.allreduce(len(cell_tags.find(3))) > 0:
         bodies.append((3, "foundation"))
     if cell_tags is not None:
         tags = np.zeros(count, dtype=np.int32)

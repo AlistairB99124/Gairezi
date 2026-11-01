@@ -30,6 +30,15 @@ class ModelConfigTests(unittest.TestCase):
         from_object = load_config(copy.deepcopy(self.payload))
         self.assertEqual(from_file, from_object)
 
+    def test_supplied_bedrock_boundary_stiffness_is_validated(self):
+        self.assertEqual(self.payload["bedrock_analysis"]["spring_n_per_m3"],
+                         {"x": 2e10, "y": 2e10, "z": 53333333000.})
+        for bad in (0, -1, True, "20000000000", float("inf")):
+            with self.subTest(value=bad):
+                changed = copy.deepcopy(self.payload)
+                changed["bedrock_analysis"]["spring_n_per_m3"]["x"] = bad
+                self.assert_invalid_at(changed, "bedrock_analysis.spring_n_per_m3.x")
+
     def test_global_element_size_is_a_suggestion_not_a_step_grid_constraint(self):
         self.payload["geometry"]["global_element_size_m"] = 0.75
         self.payload["geometry"]["local_element_size_m"] = 0.25
@@ -73,6 +82,7 @@ class ModelConfigTests(unittest.TestCase):
         self.assertIs(validate_config(self.payload), self.payload)
 
     def test_bedrock_domain_is_optional_and_validated(self):
+        self.payload.pop("bedrock_analysis", None)
         domain = self.payload["geometry"]["bedrock"]["domain"]
         self.assertEqual(domain, {"stream_margin_m": 58., "bank_margin_m": 58., "bottom_z_m": -87.})
         domain["stream_margin_m"] = -1.
@@ -88,6 +98,33 @@ class ModelConfigTests(unittest.TestCase):
         } <= paths)
         del self.payload["geometry"]["bedrock"]["domain"]
         self.assertIs(validate_config(self.payload), self.payload)
+
+    def test_explicit_bedrock_analysis_mode_is_validated_without_changing_cli_default(self):
+        self.payload.pop("bedrock_analysis", None)
+        from Elmer.model_config import bedrock_analysis_mode
+
+        self.assertEqual(bedrock_analysis_mode(self.payload), "full_volume")
+        for mode in ("full_volume", "elastic_layer"):
+            candidate = copy.deepcopy(self.payload)
+            candidate["bedrock_analysis"] = {"mode": mode}
+            self.assertIs(validate_config(candidate), candidate)
+            self.assertEqual(bedrock_analysis_mode(candidate), mode)
+        for value in (None, {}, {"mode": "rigid_seat"}, {"mode": "elastic_layer", "other": 1}):
+            candidate = copy.deepcopy(self.payload)
+            candidate["bedrock_analysis"] = value
+            with self.subTest(value=value), self.assertRaises(ConfigurationValidationError):
+                validate_config(candidate)
+
+    def test_elastic_layer_requires_a_bonded_concrete_foundation_and_bottom(self):
+        for mutate in (
+            lambda candidate: candidate["geometry"].pop("foundation"),
+            lambda candidate: candidate["geometry"]["bedrock"]["support"].update(model="spring"),
+            lambda candidate: candidate["geometry"]["bedrock"].pop("domain"),
+        ):
+            candidate = copy.deepcopy(self.payload)
+            mutate(candidate)
+            candidate["bedrock_analysis"] = {"mode": "elastic_layer"}
+            self.assert_invalid_at(candidate, "bedrock_analysis.mode")
     def test_validation_does_not_rewrite_configuration_values(self):
         original = copy.deepcopy(self.payload)
         validated = validate_config(self.payload)
@@ -205,6 +242,7 @@ class ModelConfigTests(unittest.TestCase):
         self.assertIn("geometry.bedrock.support.model", paths)
 
     def test_bedrock_allows_explicit_bond(self):
+        self.payload.pop("bedrock_analysis", None)
         self.payload["geometry"].pop("foundation", None)
         self.payload["geometry"]["wall"].pop("step_end_taper_ratio", None)
         self.payload["geometry"]["bedrock"]["support"]["model"] = "bonded"
@@ -212,22 +250,34 @@ class ModelConfigTests(unittest.TestCase):
         self.payload["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         validate_config(self.payload)
 
-    def test_painted_tensile_strength_is_optional_finite_and_nonnegative(self):
-        for value in (0., 1e6, 2e6):
-            self.payload["material"]["concrete"]["selected_tensile_strength_pa"] = value
-            validate_config(self.payload)
-        for value in (-1., True, float("nan"), float("inf")):
-            self.payload["material"]["concrete"]["selected_tensile_strength_pa"] = value
-            self.assert_invalid_at(self.payload, "material.concrete.selected_tensile_strength_pa")
+    def test_retired_painted_concrete_properties_are_rejected(self):
+        for key, value in (("selected_tensile_strength_pa", 1e6), ("selected_youngs_modulus", 15e9)):
+            payload = copy.deepcopy(self.payload)
+            payload["material"]["concrete"][key] = value
+            self.assert_invalid_at(payload, f"material.concrete.{key}")
 
-    def test_damaged_youngs_modulus_is_optional_positive_and_not_stiffer(self):
-        concrete = self.payload["material"]["concrete"]
-        for value in (1e3, 15e9, concrete["youngs_modulus"]):
-            concrete["selected_youngs_modulus"] = value
+    def test_max_damage_count_is_optional_null_or_an_integer_of_at_least_two(self):
+        self.assertIsNone(self.payload["damage_selection"]["max_damage_count"])
+        for selection in ({}, {"max_damage_count": None}, {"max_damage_count": 2},
+                          {"max_damage_count": 500}, {"max_damage_count": 40.0}):
+            self.payload["damage_selection"] = selection
             validate_config(self.payload)
-        for value in (0., -1., True, float("nan"), concrete["youngs_modulus"] * 2):
-            concrete["selected_youngs_modulus"] = value
-            self.assert_invalid_at(self.payload, "material.concrete.selected_youngs_modulus")
+        del self.payload["damage_selection"]
+        validate_config(self.payload)
+        for value in (0, 1, -3, 2.5, True, "10", float("nan"), float("inf")):
+            self.payload["damage_selection"] = {"max_damage_count": value}
+            self.assert_invalid_at(self.payload, "damage_selection.max_damage_count")
+        for selection in (None, [], {"max_damage_count": 4, "rings": 2}):
+            self.payload["damage_selection"] = selection
+            self.assertRaises(ConfigurationValidationError, validate_config, self.payload)
+
+    def test_maximum_overload_factor_is_optional_null_or_between_one_and_ten(self):
+        for factor in (None, 1, 1.0, 2.5, 10):
+            self.payload["damage_selection"] = {"max_damage_count": None, "maximum_overload_factor": factor}
+            validate_config(self.payload)
+        for factor in (0.99, 0, -1, 10.5, True, "2", float("nan"), float("inf")):
+            self.payload["damage_selection"] = {"maximum_overload_factor": factor}
+            self.assert_invalid_at(self.payload, "damage_selection.maximum_overload_factor")
 
     def test_obsolete_interface_overrides_are_rejected(self):
         self.assertNotIn("interfaces", self.payload)

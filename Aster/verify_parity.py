@@ -55,8 +55,17 @@ def verify(output_dir: Path) -> dict:
             }
         projector_path = output_dir / "native_projector_audit.json"
         projector_path.write_text(json.dumps(projector_audit, indent=2, allow_nan=False) + "\n")
-        if not np.array_equal(arrays["nodes"], source_points[arrays["source_node_ids"]]):
+        physical = arrays["source_node_ids"] >= 0
+        if not np.array_equal(arrays["nodes"][physical], source_points[arrays["source_node_ids"][physical]]):
             raise ValueError("Exported coordinates differ from source node identities")
+        auxiliary = np.flatnonzero(~physical)
+        support_auxiliary = arrays.get("support_interpolation_nodes", np.empty(0, dtype=np.int64))
+        if not np.array_equal(auxiliary, support_auxiliary):
+            raise ValueError("Unexpected auxiliary nodes in the elastic baseline")
+        if len(auxiliary) and not np.allclose(arrays["nodes"][auxiliary],
+                np.einsum("ni,nij->nj", arrays["support_interpolation_weights"],
+                          arrays["nodes"][arrays["support_interpolation_parents"]]), rtol=0., atol=1e-9):
+            raise ValueError("Support quadrature coordinates differ from their P1 traces")
         for key, tags in (("tetra4_concrete", (1, 3)), ("tetra4_bedrock", (2,))):
             if not np.array_equal(arrays["source_node_ids"][arrays[key]], source_cells[np.isin(source_tags, tags)]):
                 raise ValueError("Exported volume topology differs from source")
@@ -66,14 +75,19 @@ def verify(output_dir: Path) -> dict:
         source_displacement[ids] = displacement
         if not np.allclose(displacement, source_displacement[ids], rtol=1e-8, atol=1e-12):
             raise ValueError("Partition duplicates have inconsistent source displacements")
-        if not np.isfinite(source_displacement[arrays["source_node_ids"]]).all():
+        if not np.isfinite(source_displacement[arrays["source_node_ids"][physical]]).all():
             raise ValueError("Source displacement does not cover the full model")
-        # Evaluated with the port's lumped springs: not Elmer's native assembled reactions/energy.
-        reference_diagnostics = diagnostics(output_dir, source_displacement[arrays["source_node_ids"]])
+        reference_displacement = np.empty_like(arrays["nodes"])
+        reference_displacement[physical] = source_displacement[arrays["source_node_ids"][physical]]
+        if len(auxiliary):
+            reference_displacement[auxiliary] = np.einsum(
+                "ni,nij->nj", arrays["support_interpolation_weights"],
+                reference_displacement[arrays["support_interpolation_parents"]])
+        reference_diagnostics = diagnostics(output_dir, reference_displacement)
         concrete = json.loads(Path(manifest["source_config"]).read_text())["material"]["concrete"]
         element_checks = common_element_stress_checks(
             arrays["nodes"], arrays["tetra4_concrete"], arrays["concrete_body_ids"],
-            source_displacement[arrays["source_node_ids"]], aster["displacement_m"],
+            reference_displacement, aster["displacement_m"],
             concrete["youngs_modulus"], concrete["poisson_ratio"],
         )
         sample_path = output_dir / "stress_samples.json"
@@ -86,7 +100,7 @@ def verify(output_dir: Path) -> dict:
             sample_path.write_text(json.dumps(sample_contract, indent=2, allow_nan=False) + "\n")
         sample_checks = fixed_sample_checks(
             arrays["nodes"], arrays["tetra4_concrete"], arrays["concrete_body_ids"],
-            source_displacement[arrays["source_node_ids"]], aster["displacement_m"],
+            reference_displacement, aster["displacement_m"],
             concrete["youngs_modulus"], concrete["poisson_ratio"], sample_contract,
         )
     energy_difference = abs(

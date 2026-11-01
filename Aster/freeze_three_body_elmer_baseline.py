@@ -88,6 +88,10 @@ def _locate_solve_dir(output_dir: Path) -> Path:
 def freeze(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict:
     solve_dir = _locate_solve_dir(output_dir)
     model_dir = solve_dir / "model"
+    mesh_manifest = json.loads((output_dir / "mesh_manifest.json").read_text(encoding="utf-8"))
+    layer_mode = mesh_manifest.get("bedrock_analysis_mode") == "elastic_layer"
+    body_ids = (1,) if layer_mode else (1, 3)
+    reporting_scope = "wall" if layer_mode else "concrete"
     pvtu_path = model_dir / "results" / "three_body_results_t0001.pvtu"
     if not pvtu_path.is_file():
         raise BaselineFreezeError(f"Expected Elmer three-body baseline artifact is missing: {pvtu_path}")
@@ -96,7 +100,7 @@ def freeze(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict:
     hashed_paths = [pvtu_path, *partitions]
     hashes = {str(path.resolve()): file_hash(path) for path in hashed_paths}
 
-    points, displacement, stress, cells = parse_vtu(pvtu_path, body_ids=(1, 3))
+    points, displacement, stress, cells = parse_vtu(pvtu_path, body_ids=body_ids)
     if not cells:
         raise BaselineFreezeError(f"{pvtu_path} contains no volume elements")
     if not (
@@ -121,7 +125,7 @@ def freeze(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict:
     from Aster.build_three_body_mesh_arrays import _read_gmsh_ascii
     from Aster.parity_checks import source_node_ids
     source_points, source_cells, source_tags, _, _ = _read_gmsh_ascii(model_dir / "three_body.msh")
-    source_cells = source_cells[np.isin(source_tags, (1, 3))]
+    source_cells = source_cells[np.isin(source_tags, body_ids)]
     ids = source_node_ids(undeformed_points, cells, source_points, source_cells)
 
     max_tension, max_compression = _peak_principal_stresses(undeformed_points, stress)
@@ -134,13 +138,13 @@ def freeze(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict:
     np.savez_compressed(
         output_dir / field_archive_name,
         points_m=undeformed_points, displacement_m=displacement, stress_pa=stress,
-        reporting_scope="concrete",
+        reporting_scope=reporting_scope,
         source_node_ids=ids,
     )
 
     manifest = {
         "schema_version": 1,
-        "reporting_scope": "concrete",
+        "reporting_scope": reporting_scope,
         "stress_method": "recovered_nodal",
         "source_solve_dir": str(solve_dir.resolve()),
         "source_sha256": hashes,

@@ -10,10 +10,30 @@ import meshio
 from mpi4py import MPI
 import numpy as np
 
+
+def maximum_wall_displacement(imported, displacement) -> float:
+    wall_cells = imported.cell_tags.find(1)
+    dofs = np.unique(np.asarray(displacement.function_space.dofmap.list)[wall_cells].ravel())
+    values = displacement.x.array.reshape(-1, 3)[dofs]
+    comm = displacement.function_space.mesh.comm
+    if not comm.allreduce(bool(np.isfinite(values).all()), op=MPI.LAND):
+        raise ValueError("Non-finite wall displacement")
+    if not comm.allreduce(len(dofs), op=MPI.SUM):
+        raise ValueError("Missing wall displacement nodes")
+    local = float(np.linalg.norm(values, axis=1).max()) if len(values) else 0.
+    return float(comm.allreduce(local, op=MPI.MAX))
+
+
+def rock_support_report(structure) -> dict:
+    return {
+        key: value.tolist() if isinstance(value, np.ndarray) else value
+        for key, value in rock_support(structure).items()
+    }
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from Elmer.model_config import foundation_support
+from Elmer.model_config import bedrock_analysis_mode, foundation_support
 
 # Wall (1) may crack; bedrock (2) and optional concrete foundation (3) stay intact.
 DAMAGE_REGION_IDS = (1,)
@@ -77,26 +97,32 @@ def source_foundation(config, diagnostic, wall_joints):
     """Validate the optional foundation and semantic interface pairs against the snapshot."""
     foundation = config["geometry"].get("foundation")
     metadata = diagnostic.get("foundation")
+    source_body_ids = diagnostic.get("source_body_ids", diagnostic.get("solver_body_ids"))
     if foundation is None:
-        if metadata not in (None, {"present": False}) or diagnostic.get("solver_body_ids") != {"wall": 1, "bedrock": 2}:
+        if metadata not in (None, {"present": False}) or source_body_ids != {"wall": 1, "bedrock": 2}:
             raise ValueError("Source foundation differs from the submitted configuration")
         return None, None
     if not isinstance(metadata, dict) or any(metadata.get(key) != value for key, value in foundation.items()):
         raise ValueError("Source foundation dimensions differ from geometry.foundation")
-    if diagnostic.get("solver_body_ids") != {"wall": 1, "bedrock": 2, "foundation": 3}:
+    layer_mode = bedrock_analysis_mode(config) == "elastic_layer"
+    expected_body_ids = {"wall": 1, "foundation": 3} if layer_mode else {
+        "wall": 1, "bedrock": 2, "foundation": 3,
+    }
+    if source_body_ids != expected_body_ids:
         raise ValueError("Source foundation body tags differ from the submitted configuration")
     geometry = config["geometry"]
     support = foundation_support(config)
     bonded = support["model"] == "bonded"
-    bedrock_bonded = geometry["bedrock"]["support"]["model"] == "bonded"
-    bedrock_connection = "bonded" if bedrock_bonded else "spring"
+    bedrock_bonded_setting = geometry["bedrock"]["support"]["model"] == "bonded"
+    bedrock_spring = not layer_mode and not bedrock_bonded_setting
+    bedrock_connection = "elastic_layer" if layer_mode else "bonded" if bedrock_bonded_setting else "spring"
     if (diagnostic.get("wall_bedrock_connection") != "not_in_contact"
                 or diagnostic.get("wall_foundation_connection") != support["model"]
                 or diagnostic.get("foundation_bedrock_connection") != bedrock_connection):
                 raise ValueError("Source foundation connections differ from the submitted configuration")
     expected = {
                 **({} if bonded else {"wall_foundation": [17, 18]}),
-                **({} if bedrock_bonded else {"foundation_bedrock": [11, 12]}),
+                **({} if not bedrock_spring else {"foundation_bedrock": [11, 12]}),
                 **{joint["name"]: list(joint["tags"]) for joint in wall_joints},
     }
     declared = diagnostic.get("spring_pairs")
@@ -107,7 +133,7 @@ def source_foundation(config, diagnostic, wall_joints):
                     "name": "wall_foundation", "tags": (17, 18),
                     "spring_n_per_m3": support["spring_n_per_m3"],
                 }]),
-                *([] if bedrock_bonded else [{
+                *([] if not bedrock_spring else [{
                     "name": "foundation_bedrock", "tags": (11, 12),
                     "spring_n_per_m3": geometry["bedrock"]["support"]["spring_n_per_m3"],
                 }]),
@@ -171,7 +197,7 @@ def source_foundation(config, diagnostic, wall_joints):
                                                       ("normal_spread_deg", item["max_angle_deg"] + 1e-6)))):
                         raise ValueError(f"Invalid near-planar metrics for {name}/{part}")
             expanded.append(item)
-    if bedrock_bonded:
+    if bedrock_bonded_setting and not layer_mode:
         expanded.append({
             "name": "foundation_bedrock", "tags": (),
             "spring_n_per_m3": None, "connection": "bonded",
@@ -293,6 +319,7 @@ def connection_report(structure):
         return {"foundation": foundation, "wall_bedrock_connection": "not_in_contact",
                 "wall_foundation_connection": foundation_support(structure.three_body_config)["model"],
                 "foundation_bedrock_connection": (
+                    "elastic_layer" if bedrock_analysis_mode(structure.three_body_config) == "elastic_layer" else
                     "bonded" if structure.three_body_config["geometry"]["bedrock"]["support"]["model"] == "bonded"
                     else "spring")}
     return {"wall_bedrock_connection": (
@@ -348,7 +375,8 @@ def load_structure(config_path: Path, model: Path, structure):
     bonded_seat = source_wall_bedrock_seat(config, diagnostic)
     wall_connection, wall_joints = source_wall_joints(config, diagnostic)
     foundation, pairs = source_foundation(config, diagnostic, wall_joints)
-    body_ids = (1, 2, 3) if foundation is not None else (1, 2)
+    layer_mode = bedrock_analysis_mode(config) == "elastic_layer"
+    body_ids = (1, 3) if layer_mode else (1, 2, 3) if foundation is not None else (1, 2)
     mesh_path = model / "three_body.msh"
     source = meshio.read(mesh_path)
     cells, regions, boundaries = [], [], []
@@ -369,14 +397,15 @@ def load_structure(config_path: Path, model: Path, structure):
                  if tag == region for node in cell}
         for region in body_ids
     }
-    shared_seat = body_nodes[1] & body_nodes[2]
-    if bool(shared_seat) != bonded_seat:
-        raise ValueError("Wall/bedrock mesh connectivity does not implement the configured connection")
-    if bonded_seat:
-        validate_bonded_interface(
-            cells, regions, 1, 2, shared_seat,
-            diagnostic["wall_rock_seat_triangles"], "wall/bedrock",
-        )
+    if not layer_mode:
+        shared_seat = body_nodes[1] & body_nodes[2]
+        if bool(shared_seat) != bonded_seat:
+            raise ValueError("Wall/bedrock mesh connectivity does not implement the configured connection")
+        if bonded_seat:
+            validate_bonded_interface(
+                cells, regions, 1, 2, shared_seat,
+                diagnostic["wall_rock_seat_triangles"], "wall/bedrock",
+            )
     if foundation is not None:
         bonded_foundation = foundation_support(config)["model"] == "bonded"
         shared_wall_foundation = body_nodes[3] & body_nodes[1]
@@ -387,15 +416,16 @@ def load_structure(config_path: Path, model: Path, structure):
                 cells, regions, 1, 3, shared_wall_foundation,
                 foundation["wall_seat_node_snap"]["matched_faces"], "wall/foundation",
             )
-        bonded_foundation_bedrock = config["geometry"]["bedrock"]["support"]["model"] == "bonded"
-        shared_foundation_bedrock = body_nodes[3] & body_nodes[2]
-        if bool(shared_foundation_bedrock) != bonded_foundation_bedrock:
-            raise ValueError("Foundation/bedrock mesh connectivity does not implement the configured connection")
-        if bonded_foundation_bedrock:
-            validate_bonded_interface(
-                cells, regions, 3, 2, shared_foundation_bedrock,
-                diagnostic["wall_rock_seat_triangles"], "foundation/bedrock",
-            )
+        if not layer_mode:
+            bonded_foundation_bedrock = config["geometry"]["bedrock"]["support"]["model"] == "bonded"
+            shared_foundation_bedrock = body_nodes[3] & body_nodes[2]
+            if bool(shared_foundation_bedrock) != bonded_foundation_bedrock:
+                raise ValueError("Foundation/bedrock mesh connectivity does not implement the configured connection")
+            if bonded_foundation_bedrock:
+                validate_bonded_interface(
+                    cells, regions, 3, 2, shared_foundation_bedrock,
+                    diagnostic["wall_rock_seat_triangles"], "foundation/bedrock",
+                )
         validate_foundation_faces(source.points, boundaries, body_nodes, pairs)
     if __package__:
         from .dam_mesh import compact_unused_nodes
@@ -416,17 +446,51 @@ def load_structure(config_path: Path, model: Path, structure):
     }
     if joint_tags - {tag for tag, _ in result.boundaries}:
         raise ValueError("Source mesh lacks the declared wall-joint spring faces")
-    result.rock_support = diagnostic.get("rock_outer_support", {"model": "fixed_bottom"})
-    configured = config["material"]["bedrock"].get("support", {"model": "fixed_bottom"})
-    if result.rock_support["model"] != configured["model"]:
-        raise ValueError("Source outer rock support differs from material.bedrock.support")
-    if configured["model"] == "rollers":
-        springs = configured["spring_n_per_m3"]
-        faces = result.rock_support["faces"]
-        if sorted(int(tag) for tag in faces) != list(ROLLER_FACES) or any(
-            face["normal_stiffness_n_per_m3"] != springs[face["local_axis"]] for face in faces.values()
-        ):
-            raise ValueError("Source rock roller faces/stiffness differ from material.bedrock.support")
+    if layer_mode:
+        layer = diagnostic.get("elastic_layer_support")
+        if not isinstance(layer, dict):
+            raise ValueError("Elastic-layer source is missing its support contract")
+        retained = np.unique(np.asarray([cell for _, cell in cells], dtype=np.int64))
+        source_to_compact = np.full(len(source.points), -1, dtype=np.int64)
+        source_to_compact[retained] = np.arange(len(retained))
+        source_support_nodes = np.asarray(layer.get("support_nodes"), dtype=np.int64)
+        support_matrices = np.asarray(layer.get("support_matrices_n_per_m"), dtype=float)
+        if (support_matrices.shape != (len(source_support_nodes), 3, 3)
+                or np.any(source_to_compact[source_support_nodes] < 0)):
+            raise ValueError("Elastic-layer support nodes/matrices do not match the retained concrete mesh")
+        result.rock_support = {
+            "model": "elastic_layer",
+            "support_nodes": source_to_compact[source_support_nodes],
+            "support_matrices_n_per_m": support_matrices,
+            "effective_depth_min_m": layer["effective_depth_min_m"],
+            "effective_depth_max_m": layer["effective_depth_max_m"],
+        }
+        face_groups = layer.get("face_groups")
+        if not isinstance(face_groups, list) or not face_groups:
+            raise ValueError("Elastic-layer source lacks consistent face tensors")
+        support_faces, support_tensors = [], []
+        for item in face_groups:
+            tag = int(item["source_tag"])
+            selected = [tri for boundary_tag, tri in result.boundaries if boundary_tag == tag]
+            if not selected:
+                raise ValueError(f"Elastic-layer tag {tag} has no source faces")
+            support_faces.extend(selected)
+            support_tensors.extend([item["matrix_n_per_m3"]] * len(selected))
+        result.rock_support.update(
+            support_faces=np.asarray(support_faces, dtype=np.int64),
+            support_face_tensors_n_per_m3=np.asarray(support_tensors, dtype=float))
+    else:
+        result.rock_support = diagnostic.get("rock_outer_support", {"model": "fixed_bottom"})
+        configured = config["material"]["bedrock"].get("support", {"model": "fixed_bottom"})
+        if result.rock_support["model"] != configured["model"]:
+            raise ValueError("Source outer rock support differs from material.bedrock.support")
+        if configured["model"] == "rollers":
+            springs = configured["spring_n_per_m3"]
+            faces = result.rock_support["faces"]
+            if sorted(int(tag) for tag in faces) != list(ROLLER_FACES) or any(
+                face["normal_stiffness_n_per_m3"] != springs[face["local_axis"]] for face in faces.values()
+            ):
+                raise ValueError("Source rock roller faces/stiffness differ from material.bedrock.support")
     result.submitted_configuration_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
     result.three_body_source = {
         "model_directory": str(model.resolve()),
@@ -580,9 +644,32 @@ def require_support_tags(imported, structure):
 
 def support_reactions(imported, space, structure, displacement, residual_form, ds, *, interface_springs=None):
     """Rock support reactions (N) on the structure, per support face."""
-    if rock_support(structure)["model"] == "fixed_bottom":
+    support = rock_support(structure)
+    if support["model"] == "fixed_bottom":
         return {"rock_bottom": bottom_reactions(
             imported, space, residual_form, interface_springs=interface_springs, displacement=displacement)}
+    if support["model"] == "elastic_layer":
+        domain = imported.domain
+        local_values = {}
+        field_values = displacement.x.array.reshape(-1, 3)
+        source_cells = domain.geometry.input_global_indices[domain.geometry.dofmaps[0]]
+        field_cells = np.asarray(space.dofmap.list).reshape(source_cells.shape)
+        for source_row, field_row in zip(source_cells, field_cells, strict=True):
+            for source_node, field_node in zip(source_row, field_row, strict=True):
+                local_values[int(source_node)] = field_values[int(field_node)].copy()
+        nodal_values = {}
+        for rank_values in domain.comm.allgather(local_values):
+            for source_node, value in rank_values.items():
+                prior = nodal_values.setdefault(source_node, value)
+                if not np.allclose(prior, value, rtol=0., atol=1e-12):
+                    raise ValueError("Distributed elastic-layer support displacement is inconsistent")
+        support_force = np.zeros(3)
+        for node, matrix in zip(support["support_nodes"], support["support_matrices_n_per_m"], strict=True):
+            try:
+                support_force -= matrix @ nodal_values[int(node)]
+            except KeyError as error:
+                raise ValueError(f"Elastic-layer support node {node} has no displacement value") from error
+        return {"elastic_layer": support_force.tolist()}
     import ufl
 
     comm = imported.domain.comm
