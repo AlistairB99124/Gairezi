@@ -364,6 +364,22 @@ class CaseTests(unittest.TestCase):
         self.assertAlmostEqual(joint["initial_stiffness_pa_per_m"],
                                ac.JOINT_PENALTY_FACTOR * 3e10 / joint["mean_facet_edge_m"], delta=1.0)
 
+    def test_strength_only_changes_do_not_reduce_initial_joint_stiffness(self):
+        arrays = column_fixture()
+        faces = crack_faces(arrays)
+        intact = ac.joint_parameters(arrays, faces,
+                                     {"tensile_strength_pa": 2e6, "fracture_energy_j_m2": 100.}, 35e9, .2)
+        weak = ac.joint_parameters(arrays, faces,
+                                   {"tensile_strength_pa": 1.2e6, "fracture_energy_j_m2": 60.}, 35e9, .2)
+        self.assertAlmostEqual(weak["initial_stiffness_pa_per_m"],
+                               intact["initial_stiffness_pa_per_m"], delta=1.)
+        self.assertAlmostEqual(weak["critical_opening_m"], 1e-4)
+        self.assertAlmostEqual(weak["elastic_limit_opening_m"] /
+                               intact["elastic_limit_opening_m"], .6)
+        tougher = ac.joint_parameters(arrays, faces,
+                                      {"tensile_strength_pa": 1.2e6, "fracture_energy_j_m2": 150.}, 35e9, .2)
+        self.assertGreater(tougher["critical_opening_m"], weak["critical_opening_m"])
+
     def test_committed_baseline_case_has_every_patched_section(self):
         base = (ROOT / "Aster" / "cases" / "01_three_body_baseline.comm").read_text(encoding="utf-8")
         joint = {"tensile_strength_pa": 8e5, "fracture_energy_j_m2": 200.0, "pena_adherence": 1e-4,
@@ -514,6 +530,9 @@ class PostprocessTests(unittest.TestCase):
         self.assertEqual(report["first_initiation_bracket"], [0.5, 1.0])
         self.assertAlmostEqual(report["linear_first_initiation_estimate"], 1.0)
         self.assertEqual(report["design_load"]["opened_faces"], 1)
+        self.assertEqual(report["opening_assessment"]["initiated_faces"], 2)
+        self.assertEqual(report["opening_assessment"]["separated_faces"], 0)
+        self.assertIn("not full separation", report["opening_assessment"]["note"])
         corroboration = report["corroboration"]
         self.assertEqual(corroboration["verdict"], "corroborated")
         self.assertEqual(corroboration["initiated_overlap"], 1.0)

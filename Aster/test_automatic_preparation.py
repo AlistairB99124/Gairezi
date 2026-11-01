@@ -12,6 +12,48 @@ from Aster.test_automatic_cohesive import column_fixture, fixture_manifest, fixt
 
 
 class AutomaticPreparationTests(unittest.TestCase):
+    def test_selected_material_is_saved_and_assigned_by_exact_source_rows(self):
+        from Aster import automatic_cohesive as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config_path = self.fixture(root)
+            config = json.loads(config_path.read_text())
+            properties = {"density": 2100., "youngs_modulus": 12e9, "poisson_ratio": .23,
+                          "tensile_strength_pa": 7e4, "compressive_strength_pa": 15e6,
+                          "cohesive_fracture_energy_j_m2": 60.}
+            config["damage_selection"] = {"damaged_element_properties": properties}
+            prep.write_json(config_path, config)
+            arrays = column_fixture()
+            arrays["source_cell_rows"] = np.arange(len(arrays["tetra4_concrete"]) + len(arrays["tetra4_bedrock"]))
+            np.savez(baseline / "three_body_mesh_arrays.npz", **arrays)
+            manifest = fixture_manifest(arrays)
+            manifest.update(source_mesh=str(model / "three_body.msh"), source_config=str(config_path),
+                            source_hashes={name: prep.file_hash(model / name) for name in ("three_body.msh", "config.json")})
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening, prepared = root / "screening", root / "prepared"
+            result = prep.run(config_path, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
+            self.assertEqual(result["material_assignment"]["properties"], properties)
+            result = prep.run(config_path, model, baseline, prepared, job_id="fixture",
+                              relative_tolerance=1e-4, screening=screening)
+            def render(root=None, mesh_manifest_path=None):
+                return fixture_base_comm(json.loads(mesh_manifest_path.read_text()), 4e3), {
+                    "material": {"concrete": {"youngs_modulus_pa": 30e9, "poissons_ratio": .2}}}
+            with patch("Aster.generate_three_body_case.render_comm", side_effect=render):
+                inputs = native.prepare(baseline, prepared, root / "native")
+            with np.load(root / "native" / "three_body_mesh_arrays.npz") as stored:
+                selected = stored["damaged_cells"]
+                np.testing.assert_array_equal(selected, np.isin(stored["source_cell_rows"],
+                                               result["material_assignment"]["selected_source_rows"]))
+                self.assertTrue(selected.any())
+                self.assertFalse(selected[len(stored["tetra4_concrete"]):].any())
+            comm = (root / "native" / "case.comm").read_text()
+            self.assertIn("E=12000000000", comm)
+            self.assertIn("RHO=2100", comm)
+            self.assertIn("GROUP_MA='DAMAGED_ELEMENTS', MATER=DAMAGED_MAT", comm)
+            self.assertEqual(inputs["joint"]["tensile_strength_pa"], 7e4)
+            self.assertEqual(inputs["baseline_displacement_sha256"], prep.file_hash(baseline / "aster_full_displacement.npz"))
+            compile(comm, "selected.comm", "exec")
+
     def test_native_hand_off_keeps_consistent_support_and_overload(self):
         from Aster import automatic_cohesive as native
         from Aster.support_trace import add_consistent_support, render_constraints

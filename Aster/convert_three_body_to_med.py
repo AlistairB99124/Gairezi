@@ -127,6 +127,25 @@ def convert(npz_path: Path, med_path: Path) -> None:
                 group = mc.DataArrayInt.New(ids.tolist())
                 group.setName(name)
                 volume_group_arrays.append(group)
+    if "damaged_cells" in data:
+        selected = np.asarray(data["damaged_cells"])
+        if (selected.dtype != np.dtype(bool)
+                or selected.shape != (len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"]),)
+                or selected[len(data["tetra4_concrete"]):].any()
+                or np.any(data["concrete_body_ids"][selected[:len(data["tetra4_concrete"])]] != 1)):
+            raise ValueError("Damaged material group must contain only selected wall tetrahedra")
+        if selected.any():
+            group = mc.DataArrayInt.New(np.flatnonzero(selected).tolist())
+            group.setName("DAMAGED_ELEMENTS")
+            volume_group_arrays.append(group)
+    if "damaged_joint_faces" in data and "hexa8_joints" in data:
+        for selected, name in ((True, "DAMAGED_JOINTS"), (False, "INTACT_JOINTS")):
+            mask = data["damaged_joint_faces"][data["joint_parent_faces"]] == selected
+            ids = np.flatnonzero(mask) + len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"])
+            if len(ids):
+                group = mc.DataArrayInt.New(ids.tolist())
+                group.setName(name)
+                volume_group_arrays.append(group)
 
     face_blocks = [
         (mc.NORM_TRI3, data["tri3_upstream"], "UPSTREAM"),

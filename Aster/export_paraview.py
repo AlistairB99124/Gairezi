@@ -18,9 +18,12 @@ def export_mesh(arrays: dict, displacement: np.ndarray, output: Path,
         raise ValueError("Aster ParaView export requires a finite full nodal displacement field")
     output.mkdir(parents=True, exist_ok=True)
     path = output / "aster_final.vtu"
+    cell_data = {"GeometryIds": [regions]}
+    if "damaged_cells" in arrays:
+        cell_data["selected_material"] = [arrays["damaged_cells"].astype(np.int32)]
     meshio.write(path, meshio.Mesh(points, [("tetra", cells)],
                                   point_data={"displacement": displacement},
-                                  cell_data={"GeometryIds": [regions]}))
+                                  cell_data=cell_data))
     joints = np.asarray(arrays["penta6_joints"], dtype=np.int64)
     if damage.shape != (len(joints),) or opening.shape != damage.shape or not (
             np.isfinite(damage).all() and np.isfinite(opening).all()):

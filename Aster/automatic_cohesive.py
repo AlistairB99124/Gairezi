@@ -553,6 +553,35 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
         + _ANCHORS["chmat"]))
         comm = comm.replace(_ANCHORS["concrete_mat"], _ANCHORS["concrete_mat"] + (
         "        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n"))
+    assignment = joint.get("material_assignment")
+    if has_joints and assignment is not None:
+        original = joint["intact_joint"]
+        comm = comm.replace(_ANCHORS["chmat"], (
+            "INTACT_JOINT_MAT = DEFI_MATERIAU(\n"
+            f"    ELAS=_F(E={original['concrete_youngs_modulus_pa']:.12g}, NU={original['concrete_poissons_ratio']:.12g}),\n"
+            f"    RUPT_FRAG=_F(GC={original['fracture_energy_j_m2']:.12g}, SIGM_C={original['tensile_strength_pa']:.12g}, "
+            f"PENA_ADHERENCE={original['pena_adherence']:.12g}, PENA_CONTACT=1.0),\n"
+            ")\n" + _ANCHORS["chmat"]))
+        groups = ""
+        if joint["damaged_joint_count"]:
+            groups += "        _F(GROUP_MA='DAMAGED_JOINTS', MATER=JOINT_MAT),\n"
+        if joint["damaged_joint_count"] < joint["candidate_face_count"]:
+            groups += "        _F(GROUP_MA='INTACT_JOINTS', MATER=INTACT_JOINT_MAT),\n"
+        comm = comm.replace("        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n", groups)
+    opening_threshold = repr(joint.get("elastic_limit_opening_m", 0.))
+    if assignment is not None:
+        thresholds = np.where(interpolation["damaged_joint_faces"][interpolation["joint_parent_faces"]],
+                              joint["elastic_limit_opening_m"], joint["intact_joint"]["elastic_limit_opening_m"])
+        opening_threshold = "np.asarray(" + repr(thresholds.tolist()) + ")"
+    if assignment is not None and assignment["selected_source_rows"]:
+        properties = assignment["properties"]
+        comm = comm.replace(_ANCHORS["chmat"], (
+            "DAMAGED_MAT = DEFI_MATERIAU(\n"
+            f"    ELAS=_F(E={properties['youngs_modulus']:.12g}, NU={properties['poisson_ratio']:.12g}, "
+            f"RHO={properties['density']:.12g}),\n"
+            ")\n" + _ANCHORS["chmat"]))
+        comm = comm.replace(_ANCHORS["concrete_mat"], _ANCHORS["concrete_mat"] +
+                            "        _F(GROUP_MA='DAMAGED_ELEMENTS', MATER=DAMAGED_MAT),\n")
     targets = ", ".join(f"{value:.10g}" for value in factors)
     tie_load = ""
     tie_excit = ""
@@ -680,7 +709,7 @@ for target in TARGETS:
           f"{{int(np.sum(history['damage_state'][-1] >= 1.0))}}", flush=True)
     if {joint.get("stop_overload_on_opening", False)!r} and target >= 1.0 and np.any(
             (history["damage_state"][-1] >= 1.0) &
-            (history["normal_jump_m"][-1] > {joint.get("elastic_limit_opening_m", 0.0):.12g})):
+            (history["normal_jump_m"][-1] > {opening_threshold})):
         save({{"overload_stopped_on_opening": True}})
         break
 
@@ -741,6 +770,21 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     relieve_neighbourhoods(split)
     ties = len(split["arrays"]["tie_node_pairs"])
     integrate_joint_faces(split)
+    assignment = summary.get("material_assignment")
+    if assignment is not None:
+        selected_rows = np.asarray(assignment["selected_source_rows"], dtype=np.int64)
+        volume_rows = split["arrays"]["source_cell_rows"]
+        selected = np.isin(volume_rows, selected_rows)
+        concrete_count = len(split["arrays"]["tetra4_concrete"])
+        if (len(np.unique(selected_rows)) != len(selected_rows) or selected.sum() != len(selected_rows)
+                or selected[concrete_count:].any()
+                or np.any(split["arrays"]["concrete_body_ids"][selected[:concrete_count]] != 1)):
+            raise CorroborationError("Damaged material assignment must match exact selected wall source cells")
+        split["arrays"]["damaged_cells"] = selected
+        selected_faces = {tuple(sorted(face)) for cell in arrays["tetra4_concrete"][selected[:concrete_count]]
+                          for face in (cell[[0, 1, 2]], cell[[0, 1, 3]], cell[[0, 2, 3]], cell[[1, 2, 3]])}
+        split["arrays"]["damaged_joint_faces"] = np.array(
+            [tuple(sorted(face)) in selected_faces for face in faces], dtype=bool)
     output_dir.mkdir(parents=True, exist_ok=True)
     np.savez(output_dir / SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
     baseline_manifest = json.loads((baseline_dir / MESH_MANIFEST_NAME).read_text(encoding="utf-8"))
@@ -752,6 +796,16 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     joint = joint_parameters(arrays, faces, summary, concrete["youngs_modulus_pa"], concrete["poissons_ratio"])
     joint["has_joints"] = bool(len(faces))
     joint["stop_overload_on_opening"] = summary.get("status") == "prepared_aster_candidates"
+    joint["material_assignment"] = assignment
+    if assignment is not None:
+        config = json.loads(Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))
+        original = config["material"]["concrete"]
+        joint["intact_joint"] = joint_parameters(
+            arrays, faces, {"tensile_strength_pa": original["tensile_strength_pa"],
+                            "fracture_energy_j_m2": original["cohesive_fracture_energy_j_m2"]},
+            concrete["youngs_modulus_pa"], concrete["poissons_ratio"])
+        joint["damaged_joint_count"] = int(split["arrays"]["damaged_joint_faces"].sum())
+        joint["candidate_face_count"] = len(faces)
     factors = load_factors(summary)
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
@@ -779,11 +833,16 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         "baseline_manifest_sha256": file_hash(baseline_dir / MESH_MANIFEST_NAME),
         "source_configuration_sha256": file_hash(Path(baseline_manifest["source_config"])),
     }
+    if assignment is not None:
+        baseline_fields = baseline_dir / "aster_full_displacement.npz"
+        inputs.update(material_assignment=assignment, baseline_displacement_path=str(baseline_fields.resolve()),
+                      baseline_displacement_sha256=file_hash(baseline_fields),
+                      intact_concrete_properties=concrete)
     (output_dir / "case_inputs.json").write_text(json.dumps(inputs, indent=2) + "\n", encoding="utf-8")
     return inputs
 
 
-def solve(output_dir: Path, time_limit_s: int, memory_limit_mb: int = MEMORY_LIMIT_MB,
+def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEMORY_LIMIT_MB,
           runtime: str = "wsl") -> dict:
     """Run the prepared case with the local Code_Aster; returns the case's own status."""
     from Aster.run_case import build_med_mesh, detect_installation, MESH_UNIT, run_solver, run_wsl_solver
@@ -802,9 +861,9 @@ def solve(output_dir: Path, time_limit_s: int, memory_limit_mb: int = MEMORY_LIM
         converter = ROOT / "Aster" / "convert_three_body_to_med.py"
         converted = run_wsl_solver(distribution, root, output_dir, [
             f"{root}/bin/python3", wsl_path(converter), wsl_path(output_dir / SPLIT_ARRAYS_NAME),
-            wsl_path(med_path)], min(time_limit_s, 120), run_dir / "conversion.log")
+            wsl_path(med_path)], min(time_limit_s, 120) if time_limit_s is not None else 120, run_dir / "conversion.log")
         if converted.returncode in (124, 137):
-            raise subprocess.TimeoutExpired(converted.args, min(time_limit_s, 120))
+            raise subprocess.TimeoutExpired(converted.args, min(time_limit_s, 120) if time_limit_s is not None else 120)
         if converted.returncode != 0 or not med_path.is_file():
             raise CorroborationError(f"WSL Aster mesh conversion failed: {converted.stdout}\n{converted.stderr}")
         case = output_dir / CASE_NAME
@@ -828,7 +887,7 @@ def solve(output_dir: Path, time_limit_s: int, memory_limit_mb: int = MEMORY_LIM
         (run_dir / name).unlink(missing_ok=True)
     export_path = run_dir / "aster_cohesive.export"
     export_path.write_text("\n".join([
-        f"P time_limit {int(time_limit_s)}",
+        *([f"P time_limit {int(time_limit_s)}"] if time_limit_s is not None else []),
         f"P memory_limit {int(memory_limit_mb)}",
         "P mpi_nbcpu 1",
         f"F comm {case_path} D 1",
@@ -838,10 +897,10 @@ def solve(output_dir: Path, time_limit_s: int, memory_limit_mb: int = MEMORY_LIM
     if runtime == "wsl" and os.name == "nt":
         completed = run_wsl_solver(distribution, root, run_dir,
                                    [f"{root}/bin/run_aster", wsl_path(export_path)],
-                                   int(time_limit_s), run_dir / "solver.live.log")
+                                   time_limit_s, run_dir / "solver.live.log")
     else:
         completed = run_solver([installation["launcher_path"], str(export_path.resolve())],
-                               run_dir, int(time_limit_s), live_log=run_dir / "solver.live.log")
+                               run_dir, time_limit_s, live_log=run_dir / "solver.live.log")
     (run_dir / "stdout.log").write_text(completed.stdout, encoding="utf-8")
     (run_dir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
     try:
@@ -960,7 +1019,13 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     if damage.shape[1] != len(areas):
         raise CorroborationError("Aster joint results do not match the FEniCSx candidate facets")
     initiated = damage >= 1.0 - 1e-9
-    opened = initiated & (jump > joint["elastic_limit_opening_m"] * (1.0 + 1e-6))
+    opening_limit = joint["elastic_limit_opening_m"]
+    if inputs.get("material_assignment") is not None:
+        with np.load(output_dir / SPLIT_ARRAYS_NAME) as arrays:
+            opening_limit = np.where(arrays["damaged_joint_faces"], opening_limit,
+                                     joint["intact_joint"]["elastic_limit_opening_m"])
+        report["material_assignment"] = inputs["material_assignment"]
+    opened = initiated & (jump > opening_limit * (1.0 + 1e-6))
     separated = damage >= 2.0 - 1e-9
     step_rows = [{
         "load_factor": float(factor),
@@ -976,7 +1041,12 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     bracket = None if first is None else [float(factors[first - 1]) if first else 0.0, float(factors[first])]
     linear_estimate = None
     if len(areas) and not initiated[0].any() and traction[0].max() > 0:
-        linear_estimate = float(factors[0] * joint["tensile_strength_pa"] / traction[0].max())
+        strengths = np.full(len(areas), joint["tensile_strength_pa"], dtype=float)
+        if inputs.get("material_assignment") is not None:
+            with np.load(output_dir / SPLIT_ARRAYS_NAME) as arrays:
+                strengths[~arrays["damaged_joint_faces"]] = joint["intact_joint"]["tensile_strength_pa"]
+        positive = traction[0] > 0
+        linear_estimate = float(np.min(factors[0] * strengths[positive] / traction[0, positive]))
 
     def state_at(target: float) -> int | None:
         matches = np.flatnonzero(np.isclose(factors, target, atol=1e-9, rtol=0.))
@@ -995,12 +1065,27 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         linear_first_initiation_estimate=linear_estimate,
         design_load=None if design is None else step_rows[design],
     )
+    report["opening_assessment"] = {
+        "peak_opening_m": step_rows[-1]["peak_opening_m"],
+        "initiated_faces": step_rows[-1]["initiated_faces"],
+        "opened_faces": step_rows[-1]["opened_faces"],
+        "separated_faces": step_rows[-1]["separated_faces"],
+        "note": ("CZM_LIN_REG initiation is not full separation. Opened faces have passed the elastic "
+                 "opening threshold; separated faces have native damage state 2. Areas count original "
+                 "facets touched, not a fully separated surface. Full-separation opening is 2 Gf / ft "
+                 "for each assigned cohesive law. Lower peak wall displacement is not evidence of "
+                 "greater strength; inspect matched locations, stress redistribution and separation."),
+    }
 
     displacement_path = run_dir / STEPS_NAME.replace(".npz", "_displacement.npz")
     if displacement_path.is_file():
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=True) as arrays:
             nodes = np.asarray(arrays["nodes"], dtype=float)
-            wall = np.asarray(arrays["tetra4_concrete"])[np.asarray(arrays["concrete_body_ids"]) == 1]
+            wall_mask = np.asarray(arrays["concrete_body_ids"]) == 1
+            wall = np.asarray(arrays["tetra4_concrete"])[wall_mask]
+            source_ids = arrays["source_node_ids"].copy()
+            damaged_wall = (arrays["damaged_cells"][:len(wall_mask)][wall_mask]
+                            if "damaged_cells" in arrays else np.zeros(len(wall), dtype=bool))
         with np.load(displacement_path) as fields:
             coordinates, first_u, final_u = fields["coordinates"], fields["first"], fields["final"]
         if (first_u.shape != nodes.shape or final_u.shape != nodes.shape
@@ -1009,10 +1094,35 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         if coordinates.shape != nodes.shape or np.abs(coordinates - nodes).max() > 1e-6:
             raise CorroborationError("Aster node order does not match the split mesh arrays")
         e_pa, nu = joint["concrete_youngs_modulus_pa"], joint["concrete_poissons_ratio"]
-        cracked = _stress_summary(nodes, wall, wall_cell_stress(nodes, wall, final_u, e_pa, nu), final_u)
+        final_stress = wall_cell_stress(nodes, wall, final_u, e_pa, nu)
+        assignment = inputs.get("material_assignment")
+        if assignment is not None:
+            properties = assignment["properties"]
+            final_stress[damaged_wall] = wall_cell_stress(
+                nodes, wall[damaged_wall], final_u, properties["youngs_modulus"], properties["poisson_ratio"])
+        cracked = _stress_summary(nodes, wall, final_stress, final_u)
         comparison = {"load_factor": float(factors[-1]), "scope": "wall (body 1) cells, constant P1 stress",
                       "cracked": cracked, "intact": None}
-        if not initiated[0].any():
+        if assignment is not None:
+            path = Path(inputs["baseline_displacement_path"])
+            if file_hash(path) != inputs["baseline_displacement_sha256"]:
+                raise CorroborationError("Intact baseline displacement changed since material assignment")
+            with np.load(path) as baseline:
+                ids = baseline["source_node_ids"]
+                valid = ids >= 0
+                ids, first = np.unique(ids[valid], return_index=True)
+                physical = source_ids >= 0
+                positions = np.searchsorted(ids, source_ids[physical])
+                if np.any(positions >= len(ids)) or not np.array_equal(ids[positions], source_ids[physical]):
+                    raise CorroborationError("Selected-material result cannot map to intact baseline nodes")
+                intact_u = np.zeros_like(final_u)
+                intact_u[physical] = baseline["displacement_m"][valid][first][positions] * factors[-1]
+                if not np.allclose(baseline["coordinates_m"][valid][first][positions], nodes[physical], atol=1e-9, rtol=0.):
+                    raise CorroborationError("Intact baseline coordinates do not match selected-material result")
+            comparison["intact"] = _stress_summary(nodes, wall, wall_cell_stress(nodes, wall, intact_u, e_pa, nu), intact_u)
+            comparison["intact_definition"] = "original concrete Aster baseline scaled to final load factor; differences include selected material changes and cracking"
+            np.savez(displacement_path, coordinates=coordinates, first=first_u, final=final_u, intact=intact_u)
+        elif not initiated[0].any():
             # Before initiation the joints are linear, so the bonded state scales with the load.
             scale = factors[-1] / factors[0]
             intact_u = first_u * scale

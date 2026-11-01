@@ -30,7 +30,7 @@ OPTIONAL_CONFIG_KEYS = {
 }
 BEDROCK_ANALYSIS_MODES = {"full_volume", "elastic_layer"}
 # Automatic element selection (see FEniCSx/automatic_screening.select_damage_cells).
-DAMAGE_SELECTION_KEYS = {"max_damage_count", "maximum_overload_factor"}
+DAMAGE_SELECTION_KEYS = {"max_damage_count", "maximum_overload_factor", "damaged_element_properties"}
 # Proportional overload search beyond the design load (FEniCSx/automatic_cracking.maximum_overload_factor).
 MAXIMUM_OVERLOAD_FACTOR = 10.0
 # One cohesive facet needs both owner cells, so fewer than two cells can never crack.
@@ -641,7 +641,9 @@ class _ConfigValidator:
             if isinstance(cracks, list) and isinstance(outputs.get("cracking_risk"), bool):
                 if cracks and not outputs["cracking_risk"]:
                     self.issue("outputs.cracking_risk", "must be true when a crack is defined in cracking")
-                elif not cracks and outputs["cracking_risk"]:
+                elif not cracks and outputs["cracking_risk"] and not (
+                        isinstance(root.get("damage_selection"), dict)
+                        and root["damage_selection"].get("damaged_element_properties") is not None):
                     self.issue("outputs.cracking_risk", "must be false when cracking defines no crack")
         if "crack_simulations" in root:
             self.validate_cracks(root["crack_simulations"])
@@ -710,6 +712,17 @@ class _ConfigValidator:
             factor = self.number(selection["maximum_overload_factor"], path)
             if factor is not None and not 1 <= factor <= MAXIMUM_OVERLOAD_FACTOR:
                 self.issue(path, f"must be between 1 and {MAXIMUM_OVERLOAD_FACTOR:g}")
+        if selection is not None and "damaged_element_properties" in selection:
+            path = "damage_selection.damaged_element_properties"
+            properties = self.object(selection["damaged_element_properties"], path,
+                                     MATERIAL_KEYS | {"compressive_strength_pa", "cohesive_fracture_energy_j_m2"})
+            if properties is not None:
+                for key in ("density", "youngs_modulus", "tensile_strength_pa",
+                            "compressive_strength_pa", "cohesive_fracture_energy_j_m2"):
+                    self.field_number(properties, key, path, positive=True)
+                poisson = self.field_number(properties, "poisson_ratio", path)
+                if poisson is not None and not -1 < poisson < .5:
+                    self.issue(f"{path}.poisson_ratio", "must be greater than -1 and less than 0.5")
 
     def validate_fracture_debug(self, value: object) -> None:
         """Optional per-job overrides of FEniCSx/fracture_defaults.json (and Aster softening).

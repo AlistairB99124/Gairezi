@@ -44,10 +44,63 @@ SIF must activate both; converted mesh bodies are checked before solving.
 Historical inputs targeting foundation body 3 produced an inactive foundation
 and require a new isolated source run, not a supporting-stage restart alone.
 
-Current repair verification remains incomplete for the corrected Elmer reference
-and live restart. Three isolated corrected Elmer trials stopped on a 450-second
-assembly budget, including exactly grouped seat conditions and single-threaded
-BLAS. These outputs are not accepted and no live job/source restart was performed.
+Investigation prefers accepted native Aster whole-wall cracking even when the
+supporting FEniCSx baseline is rejected. The adapter checks input hashes, source
+Gmsh IDs and canonical cell/body mapping, reconstructs raw P1 tensors from saved
+native displacement, and checks peaks against the native report. Its intact
+comparison scales the pre-initiation elastic state to the reached load factor;
+no preparation archive is treated as a nonlinear solution. Unrecorded native
+dissipation stays unavailable. Missing or stale native artifacts produce an
+explicit error, not a supporting-solver substitute. A supporting baseline restart
+must not invalidate or rerun already accepted Aster cracking.
+
+New app configurations no longer define manual cracks. Automatic selection is
+enabled by `damage_selection.damaged_element_properties`, with the six concrete
+properties copied as independent editable defaults. Exact selected wall source
+rows and assigned properties are saved by selection/preparation. Native Aster
+assigns elastic stiffness, Poisson's ratio and density to the `DAMAGED_ELEMENTS`
+MED group only; all other volumes retain their original materials. Cohesive
+facets touching selected cells use assigned tensile strength/fracture energy,
+while neighbouring unselected candidate facets retain concrete values.
+Compressive strength remains an inspection reference, not a crushing law.
+The original baseline remains intact; selected-material comparisons use its
+saved displacement scaled to the final load factor, so differences include
+material changes as well as cracking. Old CLI seed inputs remain readable,
+but the app clears them for new automatic submissions.
+
+### Review of the external material suggestions
+
+The native solver uses elastic volume materials plus `CZM_LIN_REG` on inserted
+interfaces, not `MAZARS`. Tensile strength controls cohesive traction capacity;
+the screening criterion is one-sided facet-normal stress, not a guarantee of
+damage at any raw principal-stress peak. Keeping E, Poisson's ratio and density
+unchanged is appropriate for a strength-only sensitivity case. Reducing initial
+E is still allowed, but changes load distribution before cracking. The editor
+now displays these distinctions, material ratios and `2 Gf / ft` in micrometres.
+It never changes submitted properties to fit a target response.
+
+Fracture energy is an independent physical input. Higher Gf increases separation
+toughness; automatic proportional scaling with strength is not justified without
+material data. The suggestions' `ft / E` calculations are uniaxial strain
+estimates, not inputs or a multiaxial initiation guarantee for this cohesive law.
+Switching to MAZARS with example AT/BT/AC/BC coefficients would require a separate
+calibrated continuum-damage model, mesh-objectivity treatment and benchmark
+validation; no such switch or arbitrary coefficient tuning is implemented.
+
+Native reports and Investigation distinguish initiation, opening beyond the
+elastic cohesive branch and native state-2 separation. Touched-facet areas are
+not necessarily fully separated areas, and a lower maximum displacement is not
+evidence of increased strength. The overload search stops at softening opening,
+not full separation, and applies exterior water loads, not crack-face pressure.
+
+Three isolated corrected Elmer trials stopped on a 450-second assembly budget,
+including exactly grouped seat conditions and single-threaded BLAS. A subsequent
+user-authorized extended verification completed the corrected reference in
+1,638 seconds. Against that reference, full FEniCSx displacement and recovered
+stress differences were 3.62e-5 / 5.87e-5, both below the unchanged 1e-4 threshold;
+assembled force imbalance was 7.30e-12, below 1e-6. The updated API was restarted
+and the saved configuration resubmitted through its normal protected endpoint
+into a new isolated job. Historical source/result files were not replaced.
 Exact Aster coefficient grouping reduced the saved source's support definitions
 from 17,376 to 4,689. Compact MED coefficient groups retain every spring and tensor
 but omit redundant per-element group metadata. The full Linux Aster baseline then
@@ -55,8 +108,7 @@ completed with extraction in 206 seconds on 166,326 tetrahedra. Wall/foundation
 maximum displacements were 9.342 mm / 0.114 mm; these are numerical results, not
 engineering acceptance or a passed wall-displacement gauge.
 
-The same-source FEniCSx solve balances its assembled forces to 7.3e-12, but its
-displacement differs from this Aster baseline by 1.29%. Aster's existing lumped
+The same-source FEniCSx displacement differs from this Aster baseline by 1.29%. Aster's existing lumped
 interface springs and FEniCSx's Galerkin mortar operator remain distinct; this is
 not a passed parity gate and no tolerance was relaxed. Native small trace,
 crack-growth and zero-candidate equilibrium/postprocessing fixtures pass.
@@ -74,6 +126,9 @@ Saved Windows source paths are mapped into WSL for provenance checks; hashes
 are neither rewritten nor bypassed. Full Aster-only screening, candidate
 preparation and native mesh hand-off pass for 7,401 candidate facets / 22,203
 HEXA8 joint patches. This does not establish completed full-network growth.
+The complete Aster pipeline against the corrected reference subsequently solved
+and extracted fields in 158 seconds. Comparison remains requires_verification:
+completed numerical output is not independent engineering acceptance.
 
 Aster uses native `3D_JOINT` / `CZM_LIN_REG` cohesive facets. Each original
 triangular interface has three HEXA8 quadrilateral patches with FPG4 integration;

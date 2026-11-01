@@ -88,6 +88,13 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                           cohesive_fracture_energy_j_m2=concrete.get("cohesive_fracture_energy_j_m2"),
                           cohesive_fracture_energy_provenance="user-supplied; not independently verified",
                           configuration_sha256=file_hash(configuration))
+            properties = (config.get("damage_selection") or {}).get("damaged_element_properties")
+            if properties is not None:
+                result["material_assignment"] = {
+                    "properties": properties,
+                    "selected_source_rows": result["selection"]["selected_source_rows"],
+                    "scope": "exact selected wall volume cells; baseline and unselected cells unchanged",
+                }
             write_json(output / "screening.json", result)
             manifest.update(status=COMPLETED, screening_sha256=file_hash(output / "screening.json"))
         else:
@@ -131,6 +138,9 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             split = (split_interior_wall_faces(coordinates, cells, regions, faces, drop_fully_tied=True)
                      if len(faces) else None)
             energy = concrete.get("cohesive_fracture_energy_j_m2")
+            properties = (config.get("damage_selection") or {}).get("damaged_element_properties")
+            if properties is not None:
+                energy = properties["cohesive_fracture_energy_j_m2"]
             if (isinstance(energy, bool) or not isinstance(energy, (int, float))
                     or not np.isfinite(energy) or energy <= 0):
                 raise ValueError("A positive supplied cohesive fracture energy is required")
@@ -152,6 +162,10 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                                           if len(result["selection"]["selected_source_rows"]) else
                                           "proportional maximum-overload screening; no eligible facets means native elastic steps"),
                       "outcome_basis": "Preparation only; native Aster nonlinear equilibrium is still required"}
+            if properties is not None:
+                result["material_assignment"] = {"properties": properties, "selected_source_rows": selected_rows.tolist(),
+                                                 "scope": "exact selected wall volume cells"}
+                result["tensile_strength_pa"] = properties["tensile_strength_pa"]
             write_json(output / "summary.json", result)
             manifest.update(status=PREPARED, summary_sha256=file_hash(output / "summary.json"),
                             candidate_state_sha256=file_hash(output / "cohesive_state.npz"))

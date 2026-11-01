@@ -46,7 +46,7 @@ RESULT_UNIT = 80  # must match IMPR_RESU(UNITE=...) in the .comm file.
 MED_CONVERT_TIMEOUT_S = 120
 
 
-def run_solver(command: list[str], run_dir: Path, timeout: int,
+def run_solver(command: list[str], run_dir: Path, timeout: int | None,
                live_log: Path | None = None, env: dict | None = None,
                keep_stdin_open: bool = False) -> subprocess.CompletedProcess:
     """Keep a timeout from leaving a solver child running behind its launcher.
@@ -81,7 +81,7 @@ def _terminate_tree(process: subprocess.Popen) -> None:
         os.killpg(process.pid, signal.SIGKILL)
 
 
-def _run_solver_streaming(command: list[str], run_dir: Path, timeout: int,
+def _run_solver_streaming(command: list[str], run_dir: Path, timeout: int | None,
                           live_log: Path, env: dict | None = None,
                           keep_stdin_open: bool = False) -> subprocess.CompletedProcess:
     # Solver children write to a pipe, which Python and gfortran block-buffer
@@ -439,12 +439,13 @@ sys.exit(child.wait())
 
 
 def run_wsl_solver(distribution: str, root: str, directory: Path, program: list[str],
-                   timeout: int, live_log: Path) -> subprocess.CompletedProcess:
+                   timeout: int | None, live_log: Path) -> subprocess.CompletedProcess:
     from Aster.whole_model_crack import linux_command
+    timed_program = ["timeout", "--kill-after=10", str(timeout), *program] if timeout is not None else program
     command = linux_command(distribution, root, directory, [
         f"{root}/bin/python3", "-c", WSL_PROCESS_GUARD,
-        "timeout", "--kill-after=10", str(timeout), *program])
-    return run_solver(command, directory, timeout + 30,
+        *timed_program])
+    return run_solver(command, directory, timeout + 30 if timeout is not None else None,
                       live_log=live_log, keep_stdin_open=True)
 
 

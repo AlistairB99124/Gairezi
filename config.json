@@ -150,26 +150,25 @@
     "max_tensile_stress": true,
     "cracking_risk": true
   },
-  "cracking": [
-    {
-      "face": "upstream",
-      "depth_m": 3.0,
-      "opening_m": 0.002,
-      "full_width": true,
-      "buffer_m": 1.0,
-      "length_m": null
-    }
-  ],
+  "cracking": [],
   "damage_selection": {
     "max_damage_count": null,
-    "maximum_overload_factor": 2.0
+    "maximum_overload_factor": 2.0,
+    "damaged_element_properties": {
+      "density": 2400,
+      "youngs_modulus": 35000000000.0,
+      "poisson_ratio": 0.2,
+      "tensile_strength_pa": 2000000.0,
+      "compressive_strength_pa": 30000000.0,
+      "cohesive_fracture_energy_j_m2": 100.0
+    }
   },
   "fracture_debug": {
     "model": "AT2",
     "critical_energy_release_rate_j_m2": 2700.0,
     "length_scale_m": 0.25,
     "residual_stiffness": 1e-08,
-    "crack_water_pressure_factor": 0.0,
+    "crack_water_pressure_factor": 1.0,
     "load_steps": 10,
     "solver": {
       "maximum_staggered_iterations": 50,

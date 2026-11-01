@@ -257,6 +257,7 @@ class ModelConfigTests(unittest.TestCase):
             self.assert_invalid_at(payload, f"material.concrete.{key}")
 
     def test_max_damage_count_is_optional_null_or_an_integer_of_at_least_two(self):
+        self.payload["outputs"]["cracking_risk"] = False
         self.assertIsNone(self.payload["damage_selection"]["max_damage_count"])
         for selection in ({}, {"max_damage_count": None}, {"max_damage_count": 2},
                           {"max_damage_count": 500}, {"max_damage_count": 40.0}):
@@ -272,6 +273,7 @@ class ModelConfigTests(unittest.TestCase):
             self.assertRaises(ConfigurationValidationError, validate_config, self.payload)
 
     def test_maximum_overload_factor_is_optional_null_or_between_one_and_ten(self):
+        self.payload["outputs"]["cracking_risk"] = False
         for factor in (None, 1, 1.0, 2.5, 10):
             self.payload["damage_selection"] = {"max_damage_count": None, "maximum_overload_factor": factor}
             validate_config(self.payload)
@@ -308,6 +310,12 @@ class ModelConfigTests(unittest.TestCase):
 
     def test_cracking_seed_settings_are_optional_and_validated(self):
         from Elmer.model_config import collect_warnings
+        self.assertEqual(self.payload["cracking"], [])
+        self.payload["damage_selection"].pop("damaged_element_properties")
+        self.payload["cracking"] = [{
+            "face": "upstream", "depth_m": 3.0, "opening_m": 0.002,
+            "full_width": True, "buffer_m": 1.0, "length_m": None,
+        }]
         self.assertEqual(self.payload["cracking"], [{
             "face": "upstream", "depth_m": 3.0, "opening_m": 0.002,
             "full_width": True, "buffer_m": 1.0, "length_m": None,
@@ -326,6 +334,7 @@ class ModelConfigTests(unittest.TestCase):
         self.assert_invalid_at(payload, "cracking[0].length_m")
         payload["cracking"][0].update(length_m=10.0, buffer_m=0.0, face="downstream")
         self.assertIs(validate_config(payload), payload)
+
         payload["cracking"][0]["full_width"] = True
         self.assertIn("cracking[0].length_m", {w.path for w in collect_warnings(payload)})
         for cracks in ({"face": "upstream"}, [copy.deepcopy(self.payload["cracking"][0])] * 2):
@@ -343,6 +352,21 @@ class ModelConfigTests(unittest.TestCase):
         self.assert_invalid_at(payload, "outputs.cracking_risk")
         del self.payload["cracking"]
         self.assertIs(validate_config(self.payload), self.payload)
+
+    def test_damaged_element_properties_default_to_concrete_and_are_physically_validated(self):
+        properties = self.payload["damage_selection"]["damaged_element_properties"]
+        self.assertEqual(properties, self.payload["material"]["concrete"])
+        for key in properties:
+            for value in (None, True, "bad", float("inf"), float("nan"), -1, 0):
+                if key == "poisson_ratio" and value == 0:
+                    continue
+                with self.subTest(key=key, value=value):
+                    payload = copy.deepcopy(self.payload)
+                    payload["damage_selection"]["damaged_element_properties"][key] = value
+                    self.assert_invalid_at(payload, f"damage_selection.damaged_element_properties.{key}")
+        payload = copy.deepcopy(self.payload)
+        payload["damage_selection"]["damaged_element_properties"]["poisson_ratio"] = .5
+        self.assert_invalid_at(payload, "damage_selection.damaged_element_properties.poisson_ratio")
 
     def test_phase_field_controls_are_explicit_and_validated(self):
         self.add_legacy_crack_fixture()
