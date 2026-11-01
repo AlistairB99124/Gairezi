@@ -96,14 +96,15 @@ class CampaignTests(unittest.TestCase):
     def test_hydraulic_controls_compare_against_new_intact_not_saved_cracking_result(self):
         controls = campaign.initial_cases(hydraulic=True)
         self.assertEqual(controls[0], campaign.Case("A1-reproduction"))
-        self.assertIn(campaign.Case("A4-historical-material-full-load", e_gpa=10, nu=.15, gf=150), controls)
+        self.assertEqual(controls[0].ft_mpa, 2.)
+        self.assertIn(campaign.Case("A4-historical-material-full-load", e_gpa=10, nu=.15, ft_mpa=.8, gf=150), controls)
 
     def test_bounded_initial_matrix_and_restoration_controls(self):
         cases = campaign.initial_cases()
         self.assertLess(len(cases), campaign.MAX_LAUNCHES - campaign.RESERVED)
         self.assertEqual(len({c.name for c in cases}), len(cases))
         concrete = {"density": 2400, "youngs_modulus": 35e9, "poisson_ratio": .2,
-                    "tensile_strength_pa": .8e6, "compressive_strength_pa": 30e6,
+                    "tensile_strength_pa": 2e6, "compressive_strength_pa": 30e6,
                     "cohesive_fracture_energy_j_m2": 100}
         for case in cases:
             properties = case.properties(concrete)
@@ -111,8 +112,12 @@ class CampaignTests(unittest.TestCase):
         controls = campaign.confirmations(campaign.Case("target", e_gpa=1, ft_mpa=.02, gf=1))
         self.assertEqual(len(controls), 5)
         self.assertTrue(controls[1].bonded)
+        self.assertIn(campaign.Case("F-restore-ft_mpa", e_gpa=1, ft_mpa=2., gf=1, fine=True), controls)
+        self.assertEqual(campaign.Case("intact-strength", ft_mpa=2.).properties(concrete)["tensile_strength_pa"], 2e6)
         with self.assertRaises(ValueError):
             campaign.Case("invalid", e_gpa=0).properties(concrete)
+        with self.assertRaises(ValueError):
+            campaign.Case("invalid", ft_mpa=2.1).properties(concrete)
 
     def test_threshold_uses_converged_physical_magnitude_not_nonconvergence(self):
         with tempfile.TemporaryDirectory() as temp:

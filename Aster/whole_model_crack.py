@@ -69,9 +69,13 @@ def wsl_path(path: Path) -> str:
 
 def linux_environment(root: str, threads: int) -> list[str]:
     """``env`` arguments for the relocated Code_Aster runtime (not the Windows PATH)."""
+    # run_aster scratches its JEVEUX bases under mkdtemp(); WSL's /tmp is a small
+    # RAM-backed tmpfs that large joint models overflow, so point temporary files
+    # at the persistent disk. run_aster still removes the directory afterwards.
     return [f"PYTHONHOME={root}", f"LD_LIBRARY_PATH={root}/lib:{root}/lib64",
             f"PATH={root}/bin:/usr/bin:/bin", f"OMP_NUM_THREADS={threads}",
-            "PYTHONUNBUFFERED=1", "GFORTRAN_UNBUFFERED_PRECONNECTED=y"]
+            "PYTHONUNBUFFERED=1", "GFORTRAN_UNBUFFERED_PRECONNECTED=y",
+            "TMPDIR=/var/tmp"]
 
 
 def linux_command(distribution: str, root: str, directory: Path, program: list[str],

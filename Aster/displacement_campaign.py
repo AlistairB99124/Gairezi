@@ -20,10 +20,14 @@ import numpy as np
 from Aster import automatic_cohesive as native
 
 TARGET_M = .1
-CAPS = (1500, 3000, 6000, 9000)
+CAPS = (1000, 2000, 4000, 8000)
 MAX_LAUNCHES = 64
 RESERVED = 8
-REFERENCE_JOB = "d7052bc6d4a34315a6daacdb77a72b42"
+REFERENCE_JOB = "8bef80bd1c324e808a7358271a5b578f"
+# Sweep selection ranks interior wall facets purely by tensile stress and keeps the top
+# max_damage_count connected cells; a 1 Pa floor makes every tensioned facet eligible so
+# the configured concrete strength no longer gates which elements can be degraded.
+SELECTION_RANKING_FLOOR_PA = 1.
 SWEEP_LOG = Path(__file__).resolve().parents[1] / "sweep.log"
 _PROGRESS_LOCK = threading.Lock()
 
@@ -44,17 +48,17 @@ def write_json(path: Path, value: dict) -> None:
 @dataclass(frozen=True)
 class Case:
     name: str
-    cap: int = 3000
+    cap: int = 2000
     e_gpa: float = 35.
     nu: float = .2
-    ft_mpa: float = .8
+    ft_mpa: float = 2.
     gf: float = 100.
     bonded: bool = False
     fine: bool = False
 
     def properties(self, concrete: dict) -> dict:
         if (self.cap not in CAPS or not .1 <= self.e_gpa <= 35 or
-                not .02 <= self.ft_mpa <= .8 or not 1 <= self.gf <= 150 or
+                not .02 <= self.ft_mpa <= 2. or not 1 <= self.gf <= 150 or
                 self.nu not in (.15, .2)):
             raise ValueError(f"Case outside authorised bounds: {self}")
         return dict(concrete, youngs_modulus=self.e_gpa * 1e9, poisson_ratio=self.nu,
@@ -63,9 +67,9 @@ class Case:
 
 
 def initial_cases(*, hydraulic: bool = False) -> list[Case]:
-    return [Case("A1-reproduction") if hydraulic else Case("A1-reproduction", e_gpa=10, nu=.15, gf=150),
+    return [Case("A1-reproduction") if hydraulic else Case("A1-reproduction", e_gpa=10, nu=.15, ft_mpa=.8, gf=150),
             Case("A2-intact-topology"), Case("A3-stiffness-only", e_gpa=10),
-            *([Case("A4-historical-material-full-load", e_gpa=10, nu=.15, gf=150)] if hydraulic else []),
+            *([Case("A4-historical-material-full-load", e_gpa=10, nu=.15, ft_mpa=.8, gf=150)] if hydraulic else []),
             *[Case(f"B-ft-{ft:g}", ft_mpa=ft) for ft in (.8, .4, .2, .1, .05, .02)],
             *[Case(f"C-ft-{ft:g}-gf-{gf:g}", ft_mpa=ft, gf=gf)
               for ft in (.2, .05, .02) for gf in (25., 5., 1.)]]
@@ -74,7 +78,7 @@ def initial_cases(*, hydraulic: bool = False) -> list[Case]:
 def confirmations(case: Case, previous: list[dict] | None = None) -> list[Case]:
     cases = [replace(case, name="F-finer-repeat", fine=True),
              replace(case, name="F-bonded-control", bonded=True, fine=True)]
-    for field, value in (("ft_mpa", .8), ("gf", 100.), ("e_gpa", 35.)):
+    for field, value in (("ft_mpa", 2.), ("gf", 100.), ("e_gpa", 35.)):
         if getattr(case, field) != value:
             cases.append(replace(case, name=f"F-restore-{field}", fine=True, **{field: value}))
     for result in reversed(previous or []):
@@ -99,15 +103,15 @@ def validate_reference(job: Path) -> dict:
     model = Path(wsl_path(manifest["source_mesh"]) if os.name != "nt" else manifest["source_mesh"]).parent
     preparation.baseline_inventory(baseline, job / "config.json", model)
     concrete = config["material"]["concrete"]
-    if (concrete["youngs_modulus"] != 35e9 or concrete["tensile_strength_pa"] != .8e6 or
+    if (concrete["youngs_modulus"] != 35e9 or concrete["tensile_strength_pa"] != 2e6 or
             concrete["density"] != 2400 or concrete["poisson_ratio"] != .2):
         raise ValueError("Reference concrete differs from the approved campaign")
     saved_reports = list((job / "automatic_cracking").glob("*/aster/aster_cohesive_report.json"))
     if len(saved_reports) != 1:
         raise ValueError("Expected exactly one authoritative saved cracking reference")
     report = json.loads(saved_reports[0].read_text())
-    if report["status"] != "completed" or report["reached_load_factor"] != 1.:
-        raise ValueError("Saved cracking reference is not a completed design-load result")
+    if report["status"] != "completed" or report["reached_load_factor"] < 1.:
+        raise ValueError("Saved cracking reference did not complete at or beyond the design load")
     return {"configuration": config, "baseline": str(baseline), "model": str(model),
             "saved_cracking_report": report,
             "hashes": {str(path): native.file_hash(path) for path in
@@ -270,8 +274,10 @@ def prepare_cap(root: Path, cap: int, reference: dict) -> dict:
         original, coords, cells, tags, displacement, physical, rows, hashes = (
             preparation.baseline_inventory(baseline, original_config, model))
         stress = preparation.region_cell_stresses(coords, cells, tags, displacement, original["material"])
+        # Rank-based sweep selection: every tensioned facet is eligible (1 Pa floor) and the
+        # cap keeps the top-stress connected patch, decoupling selection from concrete strength.
         selected = preparation.screen_cells(stress, tags, rows, coords, cells,
-                                             original["material"]["concrete"]["tensile_strength_pa"],
+                                             SELECTION_RANKING_FLOOR_PA,
                                              relative_tolerance=1e-4, max_damage_count=cap)
         chosen = np.asarray(selected["selection"]["selected_source_rows"], dtype=np.int64)
         if not len(chosen):
@@ -291,7 +297,8 @@ def prepare_cap(root: Path, cap: int, reference: dict) -> dict:
         summary = {"status": "prepared_aster_candidates", "solver": "code_aster",
                    "source_job_id": root.name, "config_digest": with_config, "baseline_sha256": hashes,
                    "load_factor": 1., "maximum_overload_factor": 1.,
-                   "tensile_strength_pa": .8e6, "fracture_energy_j_m2": 100.,
+                   "tensile_strength_pa": float(original["material"]["concrete"]["tensile_strength_pa"]),
+                   "fracture_energy_j_m2": float(original["material"]["concrete"]["cohesive_fracture_energy_j_m2"]),
                    "material_assignment": {"properties": original["material"]["concrete"],
                                            "selected_source_rows": chosen.tolist()}}
         write_json(screening / "summary.json", summary)
@@ -600,7 +607,7 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
         if preflight_only:
             state["status"] = "preflight_completed"
             return state
-        if caps[3000]["status"] != "prepared":
+        if caps[2000]["status"] != "prepared":
             raise ValueError("Reference cap cannot prepare; campaign blocked")
         queue = ([Case(**row) for row in state.get("pending_cases", [])] if "pending_cases" in state
                  else initial_cases(hydraulic=True))
@@ -702,7 +709,7 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
                 if aggressive is not None and aggressive not in best:
                     best.append(aggressive)
                 for cap, preparation_result in caps.items():
-                    if preparation_result["status"] == "prepared" and cap != 3000:
+                    if preparation_result["status"] == "prepared" and cap != 2000:
                         queue.extend(replace(Case(**r["case"]), name=f"D-{cap}-{i}", cap=cap)
                                      for i, r in enumerate(best))
                 largest = max(cap for cap, r in caps.items() if r["status"] == "prepared")

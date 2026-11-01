@@ -54,7 +54,10 @@ CASE_NAME = "case.comm"
 JOINT_PENALTY_FACTOR = 1000.0
 FIRST_LOAD_FACTOR = 0.5
 LOAD_INCREMENT = 0.1
-MEMORY_LIMIT_MB = 8192
+# Upper cap only; displacement_campaign.resource_check still bounds each solve
+# to half the available memory. 8192 starved the joint-model control case
+# (JEVEUX needed ~10.1 GB) while the machine had ~27 GB free.
+MEMORY_LIMIT_MB = 24576
 LOADED_TRI_KEYS = ("tri3_upstream", "tri3_downstream", "tri3_crest", "tri3_rock_bottom", "tri3_rock_sides")
 # Code_Aster refuses joint models with any cell above 200 vertex neighbours (VOLUFINI_3);
 # the margin covers any difference in how Code_Aster counts them.

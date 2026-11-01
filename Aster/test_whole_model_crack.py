@@ -196,6 +196,7 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(command[:6], ["wsl.exe", "-d", "Ubuntu", "--cd", "/mnt/d/run", "--exec"])
         self.assertIn("OMP_NUM_THREADS=6", command)
         self.assertIn("PATH=/opt/ca/bin:/usr/bin:/bin", command)
+        self.assertIn("TMPDIR=/var/tmp", command)
         self.assertEqual(command[-2:], ["/opt/ca/bin/run_aster", "c.export"])
 
     def test_solver_works_on_disk_and_removes_its_work_directory_after_failure(self):
