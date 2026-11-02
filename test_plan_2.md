@@ -2,6 +2,16 @@
 
 ## Scope
 
+> **Amendment (2026-11-02):** the original reference job was deleted from app
+> storage. The campaign is re-anchored to job `8bef80bd1c324e808a7358271a5b578f`
+> (intact best-case baseline, concrete ft 2.0 MPa, completed native elastic
+> staircase to 2.0x design load). Selection is now rank-based: every tensioned
+> interior wall facet is eligible and each cap keeps the top-stress connected
+> patch (reference cap 2000; extent ladder 1000/2000/4000/8000). A-controls use
+> intact strength ft 2.0 MPa; the historical-material cases keep ft 0.8 MPa.
+> The paragraphs below describe the original campaign against the deleted job
+> and are retained as history.
+
 Reference job: `d7052bc6d4a34315a6daacdb77a72b42`, native run
 `20261101T151043Z-30b55786`. Preserve its frozen geometry, mesh, intact
 concrete, foundation, springs, density, gravity, reservoir/tailwater and crest

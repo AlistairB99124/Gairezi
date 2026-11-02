@@ -753,5 +753,49 @@ class AsterFixtureRun(unittest.TestCase):
                     np.einsum("ni,nij->nj", stored["support_interpolation_weights"],
                               final[stored["support_interpolation_parents"]]), atol=1e-12)
 
+class SupportDegradationTest(unittest.TestCase):
+    def fixture(self):
+        theta = np.linspace(0., np.pi / 2, 8)
+        points = np.column_stack((10 * np.cos(theta), 10 * np.sin(theta), np.zeros(8)))
+        arrays = {"nodes": points, "support_nodes": np.arange(8),
+                  "support_matrices_n_per_m": np.repeat(np.eye(3)[None], 8, axis=0),
+                  "interface_stiffness_n_per_m": np.array([[2., 4., 6.]])}
+        manifest = {"wall_foundation_springs": [{"stiffness_n_per_m": [2., 4., 6.]}],
+                    "support_springs": [{"matrix_n_per_m": np.eye(3).tolist()} for _ in range(8)]}
+        return manifest, arrays
+
+    def test_interface_and_abutment_sector_scaling(self):
+        manifest, arrays = self.fixture()
+        applied = ac.apply_support_degradation(manifest, arrays, {
+            "interface_scale": .5, "abutment": {"scale": .1, "fraction": .25, "end": "positive"}})
+        self.assertEqual(manifest["wall_foundation_springs"][0]["stiffness_n_per_m"], [1., 2., 3.])
+        np.testing.assert_allclose(arrays["interface_stiffness_n_per_m"], [[1., 2., 3.]])
+        self.assertEqual(applied["interface_springs_scaled"], 1)
+        scaled = [i for i, s in enumerate(manifest["support_springs"]) if s["matrix_n_per_m"][0][0] != 1.]
+        self.assertEqual(scaled, [6, 7])
+        self.assertEqual(applied["abutment"]["support_springs_scaled"], 2)
+        for index in range(8):
+            expected = .1 if index in scaled else 1.
+            self.assertAlmostEqual(manifest["support_springs"][index]["matrix_n_per_m"][0][0], expected)
+            # The MED compact grouping partitions by the array tensors; they must
+            # track the manifest exactly or the comm references missing groups.
+            np.testing.assert_allclose(arrays["support_matrices_n_per_m"][index],
+                                       np.asarray(manifest["support_springs"][index]["matrix_n_per_m"]))
+        manifest, arrays = self.fixture()
+        ac.apply_support_degradation(manifest, arrays,
+                                     {"abutment": {"scale": .1, "fraction": .25, "end": "negative"}})
+        scaled = [i for i, s in enumerate(manifest["support_springs"]) if s["matrix_n_per_m"][0][0] != 1.]
+        self.assertEqual(scaled, [0, 1])
+
+    def test_degradation_validation(self):
+        for degradation in ({"bogus": 1}, {"interface_scale": 0}, {"interface_scale": 1.5},
+                            {"abutment": {"scale": .1, "fraction": .75, "end": "positive"}},
+                            {"abutment": {"scale": 0., "fraction": .25, "end": "positive"}},
+                            {"abutment": {"scale": .1, "fraction": .25, "end": "sideways"}}):
+            manifest, arrays = self.fixture()
+            with self.assertRaises(ac.CorroborationError):
+                ac.apply_support_degradation(manifest, arrays, degradation)
+
+
 if __name__ == "__main__":
     unittest.main()

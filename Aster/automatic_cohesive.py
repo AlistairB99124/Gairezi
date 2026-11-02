@@ -298,6 +298,66 @@ def split_for_joints(arrays: dict, faces: np.ndarray) -> dict:
     }
 
 
+def apply_support_degradation(manifest: dict, arrays: dict, degradation: dict) -> dict:
+    """Scenario boundary-condition degradation: scale spring stiffnesses.
+
+    ``interface_scale`` multiplies every wall/foundation interface spring
+    (foundation contact sliding/debonding scenarios); ``abutment`` scales the
+    elastic-layer support matrices whose point springs lie within an angular
+    fraction of the seat measured from one end of the arch (abutment support-loss
+    scenarios, Design_Docs/failure_scenarios.md). The manifest entries and the
+    mesh-array stiffnesses are scaled identically: the MED conversion derives the
+    compact K_OUT/K_IF group partition from the arrays while the rendered comm
+    derives it from the manifest, and the two must agree. Returns applied counts."""
+    unknown = set(degradation) - {"interface_scale", "abutment"}
+    if unknown:
+        raise CorroborationError(f"Unknown support degradation keys: {sorted(unknown)}")
+    applied = dict(degradation)
+    interface = degradation.get("interface_scale")
+    if interface is not None:
+        if isinstance(interface, bool) or not np.isfinite(interface) or not 0 < float(interface) <= 1:
+            raise CorroborationError("interface_scale must lie in (0, 1]")
+        stiffness = np.asarray(arrays["interface_stiffness_n_per_m"], dtype=float)
+        if len(stiffness) != len(manifest["wall_foundation_springs"]):
+            raise CorroborationError("Interface springs do not match the mesh arrays")
+        arrays["interface_stiffness_n_per_m"] = stiffness * float(interface)
+        for entry in manifest["wall_foundation_springs"]:
+            entry["stiffness_n_per_m"] = (np.asarray(entry["stiffness_n_per_m"], dtype=float)
+                                          * float(interface)).tolist()
+        applied["interface_springs_scaled"] = len(manifest["wall_foundation_springs"])
+    abutment = degradation.get("abutment")
+    if abutment is not None:
+        scale, fraction, end = abutment.get("scale"), abutment.get("fraction"), abutment.get("end")
+        if (any(isinstance(v, bool) or not np.isfinite(v) for v in (scale, fraction))
+                or not 0 < float(scale) <= 1 or not 0 < float(fraction) <= .5
+                or end not in ("positive", "negative")):
+            raise CorroborationError(
+                "Abutment degradation requires scale in (0, 1], fraction in (0, 0.5] and end positive/negative")
+        springs = manifest["support_springs"]
+        matrices = np.asarray(arrays["support_matrices_n_per_m"], dtype=float)
+        points = np.asarray(arrays["nodes"])[np.asarray(arrays["support_nodes"], dtype=np.int64)]
+        if len(springs) != len(points) or len(matrices) != len(points):
+            raise CorroborationError("Support spring groups do not match the support geometry")
+        # The source arch is centred on (0, 0); normalise seat angles to [0, 1]
+        # relative to an anchor on the seat so the sector is wraparound-safe.
+        theta = np.arctan2(points[:, 1], points[:, 0])
+        relative = np.angle(np.exp(1j * (theta - theta[0])))
+        span = float(relative.max() - relative.min())
+        if span <= 0:
+            raise CorroborationError("Support seat has no angular extent")
+        position = (relative - relative.min()) / span
+        selected = position >= 1 - float(fraction) if end == "positive" else position <= float(fraction)
+        if not selected.any():
+            raise CorroborationError("Abutment sector selected no support springs")
+        matrices[selected] *= float(scale)
+        arrays["support_matrices_n_per_m"] = matrices
+        for index in np.flatnonzero(selected):
+            springs[index]["matrix_n_per_m"] = (np.asarray(springs[index]["matrix_n_per_m"], dtype=float)
+                                                * float(scale)).tolist()
+        applied["abutment"] = {**abutment, "support_springs_scaled": int(selected.sum())}
+    return applied
+
+
 def split_manifest(manifest: dict, split: dict) -> dict:
     """Mesh manifest for the split mesh: interface springs follow the split rows."""
     result = json.loads(json.dumps(manifest))
@@ -826,9 +886,12 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         split["arrays"]["damaged_joint_faces"] = np.array(
             [tuple(sorted(face)) in selected_faces for face in faces], dtype=bool)
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(output_dir / SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
     baseline_manifest = json.loads((baseline_dir / MESH_MANIFEST_NAME).read_text(encoding="utf-8"))
     manifest = split_manifest(baseline_manifest, split)
+    degradation = summary.get("support_degradation")
+    if degradation is not None:
+        degradation = apply_support_degradation(manifest, split["arrays"], degradation)
+    np.savez(output_dir / SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
     manifest_path = output_dir / MESH_MANIFEST_NAME
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     base_comm, base_inputs = render_comm(mesh_manifest_path=manifest_path)
@@ -872,6 +935,7 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         "interpolation_nodes": len(split["arrays"]["interpolation_nodes"]),
         "tangent_update_interval": 1,
         "shared_interface_springs": len(split["spring_shares"]),
+        "support_degradation": degradation,
         "fenicsx_summary_sha256": file_hash(fenicsx_output / "summary.json"),
         "fenicsx_state_sha256": file_hash(fenicsx_output / "cohesive_state.npz"),
         "baseline_arrays_sha256": file_hash(baseline_dir / SPLIT_ARRAYS_NAME),

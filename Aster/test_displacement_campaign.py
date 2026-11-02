@@ -99,6 +99,79 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(controls[0].ft_mpa, 2.)
         self.assertIn(campaign.Case("A4-historical-material-full-load", e_gpa=10, nu=.15, ft_mpa=.8, gf=150), controls)
 
+    @unittest.skipIf(os.name == "nt", "CLI path conversion requires the Linux branch")
+    def test_layer_scope_cases_and_flag(self):
+        cases = campaign.layer_cases()
+        self.assertEqual(cases[0].name, "A5-layer-intact-strength")
+        self.assertEqual(cases[0].ft_mpa, 2.)
+        self.assertTrue(all(case.layer for case in cases))
+        self.assertEqual(len({case.name for case in cases}), len(cases))
+        self.assertLess(len(cases), campaign.MAX_LAUNCHES - campaign.RESERVED)
+        concrete = {"density": 2400, "youngs_modulus": 35e9, "poisson_ratio": .2,
+                    "tensile_strength_pa": 2e6, "compressive_strength_pa": 30e6,
+                    "cohesive_fracture_energy_j_m2": 100}
+        for case in cases:
+            case.properties(concrete)
+        self.assertEqual(campaign.Case(**campaign.asdict(cases[1])), cases[1])
+        arguments = ["sweep", "--job", r"C:\jobs\reference", "--output", r"C:\sweeps",
+                     "--constitutive-gate", r"C:\gate\gate.json", "--execute",
+                     "--accept-native-cpu-guard", "--new-output", "--layer-scope"]
+        with patch.object(sys, "argv", arguments), patch.object(campaign, "run_campaign") as execute:
+            campaign.main()
+        self.assertTrue(execute.call_args.kwargs["layer_scope"])
+        arguments.remove("--layer-scope")
+        with patch.object(sys, "argv", arguments), patch.object(campaign, "run_campaign") as execute:
+            campaign.main()
+        self.assertFalse(execute.call_args.kwargs["layer_scope"])
+
+    @unittest.skipIf(os.name == "nt", "CLI path conversion requires the Linux branch")
+    def test_scenario_ladders_and_cli(self):
+        concrete = {"density": 2400, "youngs_modulus": 35e9, "poisson_ratio": .2,
+                    "tensile_strength_pa": 2e6, "compressive_strength_pa": 30e6,
+                    "cohesive_fracture_energy_j_m2": 100}
+        for kind in campaign.SCENARIOS:
+            cases = campaign.scenario_cases(kind)
+            self.assertTrue(cases[0].name.startswith("A"))
+            self.assertTrue(all(case.layer for case in cases))
+            self.assertEqual(len({case.name for case in cases}), len(cases))
+            for case in cases:
+                case.properties(concrete)
+        self.assertEqual(campaign.scenario_cases("abutment")[1].support_scale, .5)
+        self.assertEqual(campaign.scenario_cases("interface")[1].interface_scale, .5)
+        self.assertEqual(campaign.scenario_cases("overload")[-1].overload, 3.)
+        with self.assertRaises(ValueError):
+            campaign.scenario_cases("bogus")
+        for invalid in (campaign.Case("x", support_scale=0.), campaign.Case("x", interface_scale=1.5),
+                        campaign.Case("x", overload=11.)):
+            with self.assertRaises(ValueError):
+                invalid.properties(concrete)
+        arguments = ["sweep", "--job", r"C:\jobs\reference", "--output", r"C:\sweeps",
+                     "--constitutive-gate", r"C:\gate\gate.json", "--execute",
+                     "--accept-native-cpu-guard", "--new-output", "--scenario", "abutment",
+                     "--layer-z", "-28.5"]
+        with patch.object(sys, "argv", arguments), patch.object(campaign, "run_campaign") as execute:
+            campaign.main()
+        self.assertEqual(execute.call_args.kwargs["scenario"], "abutment")
+        self.assertEqual(execute.call_args.kwargs["layer_z"], -28.5)
+
+    def test_overload_case_extends_targets_and_keeps_design_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            text = ("TARGETS = [0.5, 1]\nsave()\nEXCIT = (\n)\n"
+                    "for target in TARGETS:\n"
+                    "    reached = target\n"
+                    "    if True and target >= 1.0 and np.any([]):\n        break\n")
+            (root / "case.comm").write_text(text)
+            campaign.write_json(root / "case_inputs.json", {"load_factors": [.5, 1.]})
+            np.savez(root / campaign.native.SPLIT_ARRAYS_NAME, nodes=np.zeros((4, 3)),
+                     source_node_ids=np.arange(4), tetra4_concrete=np.array([[0, 1, 2, 3]]),
+                     concrete_body_ids=np.array([1]))
+            campaign.configure_case(root, campaign.Case("overload", overload=3., layer=True))
+            factors = json.loads((root / "case_inputs.json").read_text())["load_factors"]
+            self.assertIn(1., factors)
+            self.assertEqual(factors[-1], 3.)
+            self.assertLessEqual(np.diff(factors).max(), .0500001)
+
     def test_bounded_initial_matrix_and_restoration_controls(self):
         cases = campaign.initial_cases()
         self.assertLess(len(cases), campaign.MAX_LAUNCHES - campaign.RESERVED)

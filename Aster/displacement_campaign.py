@@ -55,11 +55,17 @@ class Case:
     gf: float = 100.
     bonded: bool = False
     fine: bool = False
+    layer: bool = False
+    support_scale: float = 1.
+    interface_scale: float = 1.
+    overload: float = 1.
 
     def properties(self, concrete: dict) -> dict:
         if (self.cap not in CAPS or not .1 <= self.e_gpa <= 35 or
                 not .02 <= self.ft_mpa <= 2. or not 1 <= self.gf <= 150 or
-                self.nu not in (.15, .2)):
+                self.nu not in (.15, .2) or
+                not 0 < self.support_scale <= 1 or not 0 < self.interface_scale <= 1 or
+                not 1 <= self.overload <= 10):
             raise ValueError(f"Case outside authorised bounds: {self}")
         return dict(concrete, youngs_modulus=self.e_gpa * 1e9, poisson_ratio=self.nu,
                     tensile_strength_pa=self.ft_mpa * 1e6,
@@ -73,6 +79,41 @@ def initial_cases(*, hydraulic: bool = False) -> list[Case]:
             *[Case(f"B-ft-{ft:g}", ft_mpa=ft) for ft in (.8, .4, .2, .1, .05, .02)],
             *[Case(f"C-ft-{ft:g}-gf-{gf:g}", ft_mpa=ft, gf=gf)
               for ft in (.2, .05, .02) for gf in (25., 5., 1.)]]
+
+
+def layer_cases() -> list[Case]:
+    """Bank-to-bank two-element layer at the peak-tension elevation.
+
+    Rank/cap patches cannot move the wall because the arch redistributes around any
+    local cluster; this scope instead severs the cantilever load path across one
+    elevation. A5 gates the joint topology (intact-strength joints must reproduce
+    the intact response) before the layer is weakened."""
+    return [Case("A5-layer-intact-strength", layer=True),
+            *[Case(f"L-ft-{ft:g}", ft_mpa=ft, layer=True) for ft in (.8, .4, .2, .1, .05, .02)],
+            *[Case(f"L-ft-{ft:g}-gf-{gf:g}", ft_mpa=ft, gf=gf, layer=True)
+              for ft in (.2, .05) for gf in (5., 1.)]]
+
+
+SCENARIOS = ("abutment", "interface", "overload")
+
+
+def scenario_cases(kind: str) -> list[Case]:
+    """Foundation/abutment failure-scenario ladders (Design_Docs/failure_scenarios.md).
+
+    Every ladder keeps intact-strength layer joints and starts with an undegraded
+    A-control that must reproduce the intact baseline within 1%."""
+    scales = (.5, .1, .01, .001)
+    if kind == "abutment":
+        return [Case("A6-abutment-control", layer=True),
+                *[Case(f"S1-abutment-{scale:g}", layer=True, support_scale=scale) for scale in scales]]
+    if kind == "interface":
+        return [Case("A7-interface-control", layer=True),
+                *[Case(f"S2-interface-{scale:g}", layer=True, interface_scale=scale) for scale in scales]]
+    if kind == "overload":
+        return [Case("A8-overload-control", layer=True),
+                *[Case(f"S4-overload-{factor:g}", layer=True, overload=factor)
+                  for factor in (1.5, 2., 2.5, 3.)]]
+    raise ValueError(f"Unknown scenario {kind!r}; choose one of {SCENARIOS}")
 
 
 def confirmations(case: Case, previous: list[dict] | None = None) -> list[Case]:
@@ -319,6 +360,87 @@ def prepare_cap(root: Path, cap: int, reference: dict) -> dict:
     return result
 
 
+def prepare_layer(root: Path, reference: dict, centre_z: float | None = None) -> dict:
+    """Geometric selection: every wall cell within one mean element height of the
+    peak-tension centroid elevation (or an explicit ``centre_z``, e.g. the base
+    lift joint). The two-element band puts the horizontal mid-plane facets between
+    selected cells, so the cut includes the bank-to-bank delamination surface (a
+    one-element layer would only cut hoop-compressed vertical facets, which
+    cohesive joints never open)."""
+    from Aster import automatic_preparation as preparation
+    directory = root / "caps" / "layer"
+    result_path = directory / "result.json"
+    if result_path.is_file():
+        result = json.loads(result_path.read_text())
+        if result["status"] == "prepared":
+            verify_hashes(result["hashes"])
+            if centre_z is not None and result["selection"].get("requested_centre_z_m") != centre_z:
+                raise ValueError("Existing layer preparation used another elevation; use a new output directory")
+        return result
+    directory.mkdir(parents=True, exist_ok=False)
+    config = json.loads(json.dumps(reference["configuration"]))
+    config["damage_selection"]["max_damage_count"] = None
+    config["damage_selection"]["maximum_overload_factor"] = 1.
+    baseline, model = Path(reference["baseline"]), Path(reference["model"])
+    original_config = Path(next(iter(reference["hashes"])))
+    try:
+        screening = directory / "screening"
+        with_config = preparation.config_digest(config)
+        original, coords, cells, tags, displacement, physical, rows, hashes = (
+            preparation.baseline_inventory(baseline, original_config, model))
+        stress = preparation.region_cell_stresses(coords, cells, tags, displacement, original["material"])
+        wall = np.flatnonzero(tags == 1)
+        principal = np.linalg.eigvalsh(.5 * (stress[wall] + np.swapaxes(stress[wall], 1, 2)))[:, -1]
+        corner_z = coords[cells[wall]][:, :, 2]
+        centroid_z = corner_z.mean(axis=1)
+        centre = float(centroid_z[int(np.argmax(principal))]) if centre_z is None else float(centre_z)
+        half_band = float((corner_z.max(axis=1) - corner_z.min(axis=1)).mean())
+        indices = wall[np.abs(centroid_z - centre) <= half_band]
+        if not len(indices):
+            raise ValueError("Layer selection is empty")
+        chosen = np.sort(rows[indices]).astype(np.int64)
+        membership = preparation.candidate_region(cells, tags, indices, 0)
+        faces = preparation.region_candidate_faces(cells, tags, membership)
+        if len(faces) > 20000:
+            raise ValueError("Existing 20000 candidate facet limit exceeded")
+        split = preparation.split_interior_wall_faces(coords, cells, tags, faces, drop_fully_tied=True)
+        if not len(split.source_faces):
+            raise ValueError("Selected layer is not openable")
+        screening.mkdir()
+        np.savez_compressed(screening / "cohesive_state.npz", coordinates_m=split.coordinates_m,
+                            parent_node_ids=physical[split.parent_node_ids], minus=split.faces.minus,
+                            plus=split.faces.plus, areas_m2=split.faces.areas)
+        summary = {"status": "prepared_aster_candidates", "solver": "code_aster",
+                   "source_job_id": root.name, "config_digest": with_config, "baseline_sha256": hashes,
+                   "load_factor": 1., "maximum_overload_factor": 1.,
+                   "tensile_strength_pa": float(original["material"]["concrete"]["tensile_strength_pa"]),
+                   "fracture_energy_j_m2": float(original["material"]["concrete"]["cohesive_fracture_energy_j_m2"]),
+                   "material_assignment": {"properties": original["material"]["concrete"],
+                                           "selected_source_rows": chosen.tolist()}}
+        write_json(screening / "summary.json", summary)
+        write_json(screening / "manifest.json", {"status": "prepared_aster_candidates",
+                   "summary_sha256": native.file_hash(screening / "summary.json"),
+                   "candidate_state_sha256": native.file_hash(screening / "cohesive_state.npz")})
+        xyz = coords[cells]
+        volumes = np.abs(np.linalg.det(xyz[:, 1:] - xyz[:, :1])) / 6
+        result = {"status": "prepared", "actual_count": int(len(indices)),
+                  "volume_fraction": float(volumes[indices].sum() / volumes[tags == 1].sum()),
+                  "candidate_faces": len(split.source_faces),
+                  "selection": {"rule": "every wall cell whose centroid lies within one mean element "
+                                        "height of the peak-tension centroid elevation",
+                                "centre_z_m": centre, "half_band_m": half_band,
+                                "requested_centre_z_m": centre_z,
+                                "peak_principal_stress_pa": float(principal.max()),
+                                "selected_cells": int(len(indices))},
+                  "selected_rows_sha256": hashlib.sha256(chosen.tobytes()).hexdigest(),
+                  "hashes": {str(path): native.file_hash(path) for path in screening.iterdir()}}
+        write_json(directory / "derivative_config.json", config)
+    except (ValueError, KeyError, native.CorroborationError) as error:
+        result = {"status": "preparation_limited", "error": str(error)}
+    write_json(result_path, result)
+    return result
+
+
 STEP_CAPTURE = '''
 from pathlib import Path
 CAMPAIGN_DIR = Path(STEPS_PATH).parent
@@ -381,7 +503,11 @@ def configure_case(directory: Path, case: Case) -> None:
     path = directory / native.CASE_NAME
     text = path.read_text(encoding="utf-8")
     inputs = json.loads((directory / "case_inputs.json").read_text())
-    targets = [float(v) for v in np.round(np.arange(.01, 1., .02 if case.fine else .05), 8)] + [1.]
+    final = max(1., float(case.overload))
+    step = .02 if case.fine else .05
+    targets = [float(v) for v in np.round(np.arange(.01, 1., step), 8)] + [1.]
+    if final > 1.:
+        targets += [float(v) for v in np.round(np.arange(1. + step, final, step), 8)] + [final]
     old_targets = "TARGETS = [" + ", ".join(f"{v:.10g}" for v in inputs["load_factors"]) + "]"
     if text.count(old_targets) != 1 or text.count("    reached = target\n") != 1:
         raise ValueError("Native renderer anchors changed; campaign patch refused")
@@ -525,7 +651,11 @@ def render_report(root: Path, state: dict) -> None:
 
 def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
                  case_time_limit: int | None, minimum_free_gb: float,
-                 constitutive_gate: Path | None = None) -> dict:
+                 constitutive_gate: Path | None = None, layer_scope: bool = False,
+                 scenario: str | None = None, layer_z: float | None = None) -> dict:
+    if scenario is not None and scenario not in SCENARIOS:
+        raise ValueError(f"Unknown scenario {scenario!r}; choose one of {SCENARIOS}")
+    use_layer = layer_scope or scenario is not None
     if execute == preflight_only:
         raise ValueError("Choose exactly one of --preflight-only and --execute")
     if execute and constitutive_gate is None:
@@ -546,7 +676,9 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
         materialize_reference(root, reference)
         if state_path.exists():
             state = json.loads(state_path.read_text())
-            scope = "full_hydraulic" if execute else "historical_preflight"
+            scope = ((f"full_hydraulic_scenario_{scenario}" if scenario
+                      else "full_hydraulic_layer" if layer_scope else "full_hydraulic")
+                     if execute else "historical_preflight")
             if state.get("load_scope") != scope:
                 raise ValueError("Existing campaign has another/legacy load scope; use a new output directory")
             if state["reference"]["hashes"] != reference["hashes"]:
@@ -554,7 +686,9 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
             if state.get("active_case"):
                 raise ValueError("Interrupted active case: preserve evidence and create a new campaign")
         state["reference"] = reference
-        state["load_scope"] = "full_hydraulic" if execute else "historical_preflight"
+        state["load_scope"] = ((f"full_hydraulic_scenario_{scenario}" if scenario
+                                else "full_hydraulic_layer" if layer_scope else "full_hydraulic")
+                               if execute else "historical_preflight")
         if constitutive_gate is not None:
             state["constitutive_gate"] = validate_constitutive_gate(constitutive_gate)
         state["runtime"] = {"wall_clock_limit_s": case_time_limit,
@@ -595,11 +729,12 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
             log_progress("PREFLIGHT_SCOPE", note="Historical no-uplift selection preview only; execution "
                          "will solve a new uplift baseline and re-screen into a separate output directory")
         caps = {}
-        for cap in CAPS:
+        for cap in (("layer",) if use_layer else CAPS):
             log_progress("CAP_PREFLIGHT_START", cap=cap)
             resource_check(root, minimum_free_gb)
             verify_hashes(reference["hashes"])
-            caps[cap] = prepare_cap(root, cap, reference)
+            caps[cap] = (prepare_layer(root, reference, centre_z=layer_z) if cap == "layer"
+                         else prepare_cap(root, cap, reference))
             log_progress("CAP_PREFLIGHT_FINISH", cap=cap,
                          result={key: value for key, value in caps[cap].items()
                                  if key in ("status", "actual_count", "volume_fraction", "candidate_faces", "error")})
@@ -607,10 +742,11 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
         if preflight_only:
             state["status"] = "preflight_completed"
             return state
-        if caps[2000]["status"] != "prepared":
-            raise ValueError("Reference cap cannot prepare; campaign blocked")
+        if caps["layer" if use_layer else 2000]["status"] != "prepared":
+            raise ValueError("Reference selection cannot prepare; campaign blocked")
         queue = ([Case(**row) for row in state.get("pending_cases", [])] if "pending_cases" in state
-                 else initial_cases(hydraulic=True))
+                 else scenario_cases(scenario) if scenario
+                 else layer_cases() if layer_scope else initial_cases(hydraulic=True))
         extent_added = state.get("extent_added", False)
         confirming = state.get("confirming", False)
         done = {r["case"]["name"] for r in state["results"]}
@@ -629,22 +765,30 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
             directory = root / "cases" / case.name
             directory.mkdir(parents=True, exist_ok=False)
             candidate = directory / "candidate"
-            shutil.copytree(root / "caps" / str(case.cap) / "screening", candidate)
+            selection_key = "layer" if case.layer else case.cap
+            shutil.copytree(root / "caps" / str(selection_key) / "screening", candidate)
             summary = json.loads((candidate / "summary.json").read_text())
             summary["material_assignment"]["properties"] = case.properties(reference["configuration"]["material"]["concrete"])
             summary.update(tensile_strength_pa=case.ft_mpa * 1e6, fracture_energy_j_m2=case.gf)
+            if case.support_scale != 1. or case.interface_scale != 1.:
+                degradation = {}
+                if case.interface_scale != 1.:
+                    degradation["interface_scale"] = case.interface_scale
+                if case.support_scale != 1.:
+                    degradation["abutment"] = {"scale": case.support_scale, "fraction": .25, "end": "positive"}
+                summary["support_degradation"] = degradation
             write_json(candidate / "summary.json", summary)
             manifest = json.loads((candidate / "manifest.json").read_text())
             manifest["summary_sha256"] = native.file_hash(candidate / "summary.json")
             write_json(candidate / "manifest.json", manifest)
             derivative = json.loads(json.dumps(reference["configuration"]))
-            derivative["damage_selection"].update(max_damage_count=case.cap,
+            derivative["damage_selection"].update(max_damage_count=None if case.layer else case.cap,
                 damaged_element_properties=summary["material_assignment"]["properties"])
             write_json(directory / "config.json", derivative)
             write_json(directory / "provenance.json", {"original_hashes": reference["hashes"],
                        "baseline_reuse": "Unmodified accepted intact baseline; selected changes applied only after screening",
                        "derivative_config_sha256": native.file_hash(directory / "config.json"),
-                       "selection": caps[case.cap]["selected_rows_sha256"], "case": asdict(case)})
+                       "selection": caps[selection_key]["selected_rows_sha256"], "case": asdict(case)})
             try:
                 native.prepare(Path(reference["baseline"]), candidate, directory / "native")
                 configure_case(directory / "native", case)
@@ -673,7 +817,9 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
                     report = native.postprocess(directory / "native", candidate, status)
                     write_json(directory / "native" / "aster_cohesive_report.json", report)
                     result["joint_steps"] = report.get("steps", [])
-                if case.name in ("A1-reproduction", "A2-intact-topology") and result["status"].startswith("converged_"):
+                if (case.name in ("A1-reproduction", "A2-intact-topology", "A5-layer-intact-strength",
+                                  "A6-abutment-control", "A7-interface-control", "A8-overload-control")
+                        and result["status"].startswith("converged_")):
                     expected = reference["hydraulic_intact_maximum_m"]
                     discrepancy = abs(result["maximum_wall_displacement_m"] / expected - 1.)
                     result["reproduction_relative_difference"] = discrepancy
@@ -697,7 +843,7 @@ def run_campaign(job: Path, root: Path, *, preflight_only: bool, execute: bool,
             if case.name.startswith("A") and not result["status"].startswith("converged_"):
                 state["status"] = "control_gate_failed"
                 break
-            if not queue and not extent_added and not confirming:
+            if not queue and not extent_added and not confirming and not use_layer:
                 candidates = [r for r in state["results"] if r["status"] == "converged_below_100mm"
                               and r["case"]["name"].startswith(("B", "C"))]
                 if not candidates:
@@ -757,7 +903,19 @@ def main() -> None:
                         help="Acknowledge installed native CPU safeguard despite no outer wall-clock timeout")
     parser.add_argument("--constitutive-gate", type=Path,
                         help="Hash-authenticated native separation/unloading gate.json required for execution")
+    parser.add_argument("--layer-scope", action="store_true",
+                        help="Replace the cap ladder with the bank-to-bank peak-tension layer scope (A5 + L cases)")
+    parser.add_argument("--scenario", choices=SCENARIOS,
+                        help="Foundation/abutment failure-scenario ladder (uses the layer screening; "
+                             "see Design_Docs/failure_scenarios.md)")
+    parser.add_argument("--layer-z", type=float, default=None,
+                        help="Explicit layer centre elevation in metres (e.g. the base lift joint); "
+                             "defaults to the peak-tension elevation")
     args = parser.parse_args()
+    if args.layer_z is not None and not (args.layer_scope or args.scenario):
+        parser.error("--layer-z requires --layer-scope or --scenario")
+    if args.scenario and args.layer_scope:
+        parser.error("Choose one of --layer-scope and --scenario")
     if args.execute and os.name == "nt":
         parser.error("Run the full campaign in Ubuntu/WSL with SciPy and the activated Aster environment")
     if args.execute and args.case_time_limit is None and not args.accept_native_cpu_guard:
@@ -776,7 +934,8 @@ def main() -> None:
         args.output = args.output / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     run_campaign(args.job, args.output, preflight_only=args.preflight_only, execute=args.execute,
                  case_time_limit=args.case_time_limit, minimum_free_gb=args.minimum_free_gb,
-                 constitutive_gate=args.constitutive_gate)
+                 constitutive_gate=args.constitutive_gate, layer_scope=args.layer_scope,
+                 scenario=args.scenario, layer_z=args.layer_z)
 
 
 if __name__ == "__main__":
