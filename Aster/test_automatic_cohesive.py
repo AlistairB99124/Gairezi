@@ -356,6 +356,16 @@ class CaseTests(unittest.TestCase):
         self.assertEqual(ac.load_factors({"load_factor": 1.0}), [0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
         self.assertEqual(ac.load_factors({"load_factor": 1.25})[-2:], [1.2, 1.25])
 
+    def test_friction_load_factors_climb_in_fine_checkpointed_steps(self):
+        summary = {"load_factor": 1.0, "damaged_joint_friction": {"friction_coefficient": 1.0}}
+        factors = ac.load_factors(summary)
+        self.assertEqual(factors[:7], [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4])
+        self.assertEqual(factors[-1], 1.0)
+        self.assertEqual(factors, sorted(set(factors)))
+        overload = ac.load_factors({**summary, "maximum_overload_factor": 2.0})
+        self.assertEqual(overload[:7], factors[:7])
+        self.assertEqual(overload[-1], 2.0)
+
     def test_joint_law_matches_the_fenicsx_softening(self):
         arrays = column_fixture()
         joint = ac.joint_parameters(arrays, crack_faces(arrays), {"tensile_strength_pa": 8e5,

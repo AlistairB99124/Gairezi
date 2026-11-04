@@ -9,6 +9,7 @@ import unittest
 from Elmer import structure_assembly as assembly
 from Elmer.model_config import (
     ConfigurationValidationError,
+    collect_warnings,
     tapered_wall_downstream_radius_at,
     validate_config,
     wall_downstream_radius_at,
@@ -120,6 +121,18 @@ class StepEndTaperTests(unittest.TestCase):
         without_foundation = base_payload()
         without_foundation["geometry"]["wall"]["step_end_taper_ratio"] = 1.0
         self.assertIn("geometry.wall.step_end_taper_ratio", self.issues(without_foundation))
+
+    def test_ratio_without_steps_is_an_inert_warning_not_an_error(self):
+        # The user's scenario: the shipped default config with thickness_steps removed
+        # but step_end_taper_ratio retained must stay submittable (uniform wall).
+        payload = json.loads(assembly.CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        payload["geometry"]["wall"].pop("thickness_steps", None)
+        payload["geometry"]["wall"]["step_end_taper_ratio"] = 1.0
+        validate_config(payload)
+        self.assertIn(
+            "geometry.wall.step_end_taper_ratio",
+            {warning.path for warning in collect_warnings(payload)},
+        )
 
     def test_tapered_wall_has_no_full_width_shelf_on_shallow_seats(self):
         source = json.loads(assembly.CONFIG_PATH.read_text(encoding="utf-8-sig"))

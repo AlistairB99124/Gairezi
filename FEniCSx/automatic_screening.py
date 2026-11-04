@@ -18,6 +18,7 @@ import numpy as np
 from scipy import sparse
 
 WALL_REGION = 1
+FOUNDATION_REGION = 3
 SCREENING_VERSION = 3
 # Detailed rows are listed for the strongest cells only; counts and source rows stay complete.
 MAXIMUM_LISTED_CELLS = 500
@@ -232,8 +233,67 @@ def select_damage_cells(pairs, facet_stress_pa, critical, source_rows, max_damag
     }
 
 
+def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, cells,
+                          pairs, facet_stress_pa, critical, crack_base=False) -> dict:
+    """Uncapped automatic selection: the peak-tension element's layer plus the layer below.
+
+    The most tensioned wall element sets the elevation; the band spans that element
+    layer and one element layer below it (cohesive joints only open on the
+    horizontal mid-plane facets between two selected layers) and continues through
+    the foundation at the same elevation so the weak band is not anchored at its
+    ends by intact foundation concrete. Joints are still inserted on wall facets
+    only; foundation members carry the damaged material assignment.
+
+    With ``crack_base`` the elevation is the base of the wall instead of the peak:
+    the band is the bottom two element layers, confined to the valley floor rather
+    than spanning the dam bank to bank."""
+    corner_z = coordinates_m[cells][:, :, 2]
+    centroid_z = corner_z.mean(axis=1)
+    heights = corner_z[wall].max(axis=1) - corner_z[wall].min(axis=1)
+    band_height = float(heights.mean())
+    if crack_base:
+        # Bottom of band = lowest wall corner; the usual member window
+        # [centre - 1.5h, centre + 0.5h] then spans exactly the bottom two layers.
+        centre = float(corner_z[wall].min()) + 1.5 * band_height
+    else:
+        centre = float(centroid_z[wall[int(np.argmax(principal))]])
+    member = ((centroid_z <= centre + band_height / 2)
+              & (centroid_z >= centre - 1.5 * band_height)
+              & np.isin(regions, (WALL_REGION, FOUNDATION_REGION)))
+    chosen = np.flatnonzero(member)
+    critical_ids = np.flatnonzero(np.asarray(critical, dtype=bool))
+    pairs = np.asarray(pairs).reshape(-1, 2)
+    stress = np.asarray(facet_stress_pa, dtype=float)
+    facets_inside = (member[pairs[critical_ids]].all(axis=1) if len(critical_ids)
+                     else np.zeros(0, dtype=bool))
+    inside, outside = critical_ids[facets_inside], critical_ids[~facets_inside]
+    return {
+        "rule": (("every wall and foundation cell whose centroid lies within two element heights "
+                  "above the lowest wall corner (the bottom two element layers at the base of the wall)")
+                 if crack_base else
+                 ("every wall and foundation cell whose centroid lies between one element height below and "
+                  "half an element height above the peak-tension wall element's centroid elevation "
+                  "(the peak element's layer plus the layer below, bank to bank)")),
+        "crack_base": bool(crack_base),
+        "max_damage_count": None,
+        "capped": False,
+        "eligible_cells": int(member.sum()),
+        "eligible_facets": int(len(critical_ids)),
+        "selected_cells": int(member.sum()),
+        "selected_facets": int(facets_inside.sum()),
+        "selected_source_rows": np.unique(np.asarray(source_rows)[chosen]).astype(int).tolist(),
+        "selected_wall_cells": int((np.asarray(regions)[chosen] == WALL_REGION).sum()),
+        "selected_foundation_cells": int((np.asarray(regions)[chosen] == FOUNDATION_REGION).sum()),
+        "layer_centre_z_m": centre,
+        "layer_band_height_m": band_height,
+        "lowest_selected_facet_stress_pa": float(stress[inside].min()) if len(inside) else None,
+        "peak_unselected_facet_stress_pa": float(stress[outside].max()) if len(outside) else None,
+    }
+
+
 def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates_m, geometry_cells,
-                 tensile_strength_pa, *, relative_tolerance: float, max_damage_count=None) -> dict:
+                 tensile_strength_pa, *, relative_tolerance: float, max_damage_count=None,
+                 crack_base=False, selection_enabled=True) -> dict:
     """Classify wall cells by max principal stress against f_t (tension positive)."""
     stress = np.asarray(cell_stress_pa, dtype=float)
     regions = np.asarray(cell_region_tags)
@@ -258,6 +318,12 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
     if (isinstance(relative_tolerance, bool) or not np.isfinite(relative_tolerance)
             or not 0 < relative_tolerance < 1):
         raise ValueError("relative_tolerance must lie in (0, 1)")
+    if type(crack_base) is not bool:
+        raise ValueError("crack_base must be a boolean")
+    if crack_base and max_damage_count is not None:
+        raise ValueError("crack_base requires max_damage_count to be null (band selection)")
+    if type(selection_enabled) is not bool:
+        raise ValueError("selection_enabled must be a boolean")
     wall = np.flatnonzero(regions == WALL_REGION)
     if not len(wall):
         raise ValueError("No wall-concrete cells are present in the native mesh")
@@ -274,8 +340,21 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
     over_ids = np.flatnonzero(over)[order]
     pairs, one_sided, critical, facets = facet_check(coordinates, cells, regions, stress, tensile_strength_pa,
                                                      relative_tolerance)
-    selection = select_damage_cells(pairs, one_sided, critical, rows, max_damage_count,
-                                    coordinates_m=coordinates, tetrahedra=cells, regions=regions)
+    if not selection_enabled:
+        # Control run: damage selection is disabled, so nothing is selected and automatic
+        # cracking has no candidates regardless of the stress field.
+        selection = {
+            "rule": "damage selection disabled: no elements are selected (control run with no damaged elements)",
+            "enabled": False, "max_damage_count": None, "capped": False,
+            "eligible_cells": 0, "eligible_facets": 0, "selected_cells": 0, "selected_facets": 0,
+            "selected_source_rows": [], "selected_wall_cells": 0, "selected_foundation_cells": 0,
+        }
+    elif max_damage_count is None:
+        selection = _layer_band_selection(principal, wall, regions, rows, coordinates, cells,
+                                          pairs, one_sided, critical, crack_base=crack_base)
+    else:
+        selection = select_damage_cells(pairs, one_sided, critical, rows, max_damage_count,
+                                        coordinates_m=coordinates, tetrahedra=cells, regions=regions)
     return {
         "screening_version": SCREENING_VERSION,
         "status": "overstressed_cells_found" if over.any() else "no_overstressed_cells",
@@ -317,12 +396,14 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
 
 
 def screening_from_archives(intact_cell_stress: Path, native_inputs: Path, tensile_strength_pa: float,
-                            *, relative_tolerance: float, max_damage_count=None) -> dict:
+                            *, relative_tolerance: float, max_damage_count=None, crack_base=False,
+                            selection_enabled=True) -> dict:
     with np.load(intact_cell_stress, allow_pickle=False) as stress, np.load(native_inputs, allow_pickle=False) as native:
         result = screen_cells(
             stress["cell_stress_pa"], stress["cell_region_tags"], stress["source_cell_rows"],
             native["coordinates_m"], native["geometry_cells"], tensile_strength_pa,
-            relative_tolerance=relative_tolerance, max_damage_count=max_damage_count)
+            relative_tolerance=relative_tolerance, max_damage_count=max_damage_count,
+            crack_base=crack_base, selection_enabled=selection_enabled)
     result["native_archive_sha256"] = {
         "intact_cell_stress.npz": hashlib.sha256(Path(intact_cell_stress).read_bytes()).hexdigest(),
         "native_inputs.npz": hashlib.sha256(Path(native_inputs).read_bytes()).hexdigest(),
@@ -337,6 +418,18 @@ def max_damage_count(config: dict):
     """The configured ``damage_selection.max_damage_count`` (None = every eligible cell)."""
     selection = config.get("damage_selection") if isinstance(config, dict) else None
     return selection.get("max_damage_count") if isinstance(selection, dict) else None
+
+
+def crack_base(config: dict) -> bool:
+    """The configured ``damage_selection.crack_base`` (default False = peak-tension band)."""
+    selection = config.get("damage_selection") if isinstance(config, dict) else None
+    return bool(selection.get("crack_base")) if isinstance(selection, dict) else False
+
+
+def selection_enabled(config: dict) -> bool:
+    """The configured ``damage_selection.enabled`` (absent = enabled; False = control run)."""
+    selection = config.get("damage_selection") if isinstance(config, dict) else None
+    return selection.get("enabled") is not False if isinstance(selection, dict) else True
 
 
 def config_digest(config: dict) -> str:
@@ -401,7 +494,9 @@ def prepare_and_screen(configuration: Path, model_directory: Path, baseline_dire
                                          event_directory / "native_inputs.npz",
                                          float(concrete["tensile_strength_pa"]),
                                          relative_tolerance=relative_tolerance,
-                                         max_damage_count=max_damage_count(config))
+                                         max_damage_count=max_damage_count(config),
+                                         crack_base=crack_base(config),
+                                         selection_enabled=selection_enabled(config))
         energy = concrete.get("cohesive_fracture_energy_j_m2")
         result.update({
             "source_job_id": job_id,

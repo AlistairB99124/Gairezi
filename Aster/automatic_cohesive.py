@@ -54,6 +54,12 @@ CASE_NAME = "case.comm"
 JOINT_PENALTY_FACTOR = 1000.0
 FIRST_LOAD_FACTOR = 0.5
 LOAD_INCREMENT = 0.1
+# Friction solves climb in fine targets first: every completed STAT_NON_LINE target is
+# an archived checkpoint (a later stall still reports the reached capacity instead of
+# discarding converged equilibria), and the smaller target gaps bound the DECOUPE
+# window, giving a ~10x finer minimum substep through the sliding-onset zone.
+FRICTION_FINE_INCREMENT = 0.05
+FRICTION_FINE_LIMIT = 0.3
 # Upper cap only; displacement_campaign.resource_check still bounds each solve
 # to half the available memory. 8192 starved the joint-model control case
 # (JEVEUX needed ~10.1 GB) while the machine had ~27 GB free.
@@ -62,6 +68,9 @@ LOADED_TRI_KEYS = ("tri3_upstream", "tri3_downstream", "tri3_crest", "tri3_rock_
 # Code_Aster refuses joint models with any cell above 200 vertex neighbours (VOLUFINI_3);
 # the margin covers any difference in how Code_Aster counts them.
 NEIGHBOUR_TARGET = 150
+# OpenMP threads for the cohesive solve (export ncpus; run_aster ignores the caller's
+# OMP_NUM_THREADS). Matches whole_model_crack.DEFAULT_THREADS.
+SOLVER_THREADS = 8
 DIFFERENCES = (
     "CZM_LIN_REG damages on the mixed-mode jump norm; FEniCSx opens in mode I with a tied tangential response.",
     "Aster joints are intrinsic: a stiff initial penalty (1000 E/h) instead of FEniCSx's rigid tie before initiation.",
@@ -537,12 +546,19 @@ def candidate_faces(state) -> np.ndarray:
 
 def load_factors(summary: dict) -> list[float]:
     """The proportional load factors to solve: FEniCSx's first step, then fixed increments
-    to the larger of 1 and the factor FEniCSx finished at."""
+    to the larger of 1 and the factor FEniCSx finished at.
+
+    Friction runs instead start at FRICTION_FINE_INCREMENT and climb in fine steps up to
+    FRICTION_FINE_LIMIT: the first dam-scale run stalled inside a single 0->0.5 target at
+    load factor ~0.23 and lost every converged equilibrium with it."""
     final = max(1.0, float(summary.get("load_factor") or 1.0),
                 float(summary.get("maximum_overload_factor") or 1.0))
-    factors = [FIRST_LOAD_FACTOR]
+    friction = summary.get("damaged_joint_friction") is not None
+    factors = [FRICTION_FINE_INCREMENT if friction else FIRST_LOAD_FACTOR]
     while factors[-1] < final - 1e-9:
-        factors.append(round(min(final, factors[-1] + LOAD_INCREMENT), 10))
+        increment = (FRICTION_FINE_INCREMENT if friction and factors[-1] < FRICTION_FINE_LIMIT - 1e-9
+                     else LOAD_INCREMENT)
+        factors.append(round(min(final, factors[-1] + increment), 10))
     return factors
 
 
@@ -596,6 +612,36 @@ def _comm_string(value) -> str:
     return repr(str(value))
 
 
+def friction_joint_parameters(friction: dict, stiffness_pa_per_m: float) -> dict:
+    """Mohr-Coulomb (JOINT_MECA_FROT) parameters for pre-cracked damaged joints.
+
+    The damaged joints keep the mesh-derived penalty stiffness as K_N/K_T; the
+    friction coefficient and adhesion come from the configuration. A friction
+    joint carries compression and Coulomb shear but no tension or cohesive
+    softening — the correct model for an existing crack, which CZM_LIN_REG with a
+    near-zero strength cannot represent (it loses all shear transfer and leaves
+    the block above a full-section cut as a mechanism)."""
+    unknown = set(friction) - {"friction_coefficient", "adhesion_pa"}
+    if unknown:
+        raise CorroborationError(f"Unknown damaged joint friction keys: {sorted(unknown)}")
+    mu = friction.get("friction_coefficient")
+    adhesion = friction.get("adhesion_pa", 0.)
+    if (isinstance(mu, bool) or not isinstance(mu, (int, float)) or not np.isfinite(mu)
+            or not 1e-3 <= float(mu) <= 10.):
+        raise CorroborationError("Damaged joint friction coefficient must lie in [0.001, 10]")
+    if (isinstance(adhesion, bool) or not isinstance(adhesion, (int, float))
+            or not np.isfinite(adhesion) or adhesion < 0):
+        raise CorroborationError("Damaged joint adhesion must be finite and nonnegative")
+    return {"law": "JOINT_MECA_FROT", "friction_coefficient": float(mu), "adhesion_pa": float(adhesion),
+            "k_n_pa_per_m": float(stiffness_pa_per_m),
+            # The bond-mimicking tangential penalty (1000 E/h) makes frictional
+            # stick-slip Newton iterations chatter; E/h regularises stick with
+            # micrometre-scale pre-slip elasticity and converges. The normal penalty
+            # must stay stiff: softening it leaves near-singular tangential pivots
+            # wherever the contact pressure is small.
+            "k_t_pa_per_m": float(stiffness_pa_per_m) / JOINT_PENALTY_FACTOR}
+
+
 def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], steps_path: Path,
                          status_path: Path, tie_pairs: int = 0,
                          interpolation: dict | None = None) -> str:
@@ -626,7 +672,26 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
         comm = comm.replace(_ANCHORS["concrete_mat"], _ANCHORS["concrete_mat"] + (
         "        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n"))
     assignment = joint.get("material_assignment")
-    if has_joints and assignment is not None:
+    friction_law = joint.get("damaged_friction")
+    if has_joints and assignment is not None and friction_law is not None:
+        comm = comm.replace(_ANCHORS["chmat"], (
+            "FROT_MAT = DEFI_MATERIAU(\n"
+            f"    JOINT_MECA_FROT=_F(K_N={friction_law['k_n_pa_per_m']:.12g}, "
+            f"K_T={friction_law['k_t_pa_per_m']:.12g},\n"
+            f"                       MU={friction_law['friction_coefficient']:.12g}, "
+            f"ADHESION={friction_law['adhesion_pa']:.12g}),\n"
+            ")\n"
+            "# Doc R7.01.25 JOINT_MECA_FROT: Mohr-Coulomb joint with contact. Pre-cracked damaged\n"
+            "# joints carry compression and friction but no tension or cohesive softening; the\n"
+            "# intact joints keep the CZM_LIN_REG law built from the intact concrete.\n\n"
+            + _ANCHORS["chmat"]))
+        groups = ""
+        if joint["damaged_joint_count"]:
+            groups += "        _F(GROUP_MA='DAMAGED_JOINTS', MATER=FROT_MAT),\n"
+        if joint["damaged_joint_count"] < joint["candidate_face_count"]:
+            groups += "        _F(GROUP_MA='INTACT_JOINTS', MATER=JOINT_MAT),\n"
+        comm = comm.replace("        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n", groups)
+    elif has_joints and assignment is not None:
         original = joint["intact_joint"]
         comm = comm.replace(_ANCHORS["chmat"], (
             "INTACT_JOINT_MAT = DEFI_MATERIAU(\n"
@@ -641,10 +706,17 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
             groups += "        _F(GROUP_MA='INTACT_JOINTS', MATER=INTACT_JOINT_MAT),\n"
         comm = comm.replace("        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n", groups)
     opening_threshold = repr(joint.get("elastic_limit_opening_m", 0.))
+    friction_cells = "None"
     if assignment is not None:
+        # Friction joints have no cohesive elastic limit; any opening beyond the
+        # hydraulic tolerance counts as open.
+        damaged_limit = 1e-9 if friction_law is not None else joint["elastic_limit_opening_m"]
         thresholds = np.where(interpolation["damaged_joint_faces"][interpolation["joint_parent_faces"]],
-                              joint["elastic_limit_opening_m"], joint["intact_joint"]["elastic_limit_opening_m"])
+                              damaged_limit, joint["intact_joint"]["elastic_limit_opening_m"])
         opening_threshold = "np.asarray(" + repr(thresholds.tolist()) + ")"
+        if friction_law is not None:
+            mask = interpolation["damaged_joint_faces"][interpolation["joint_parent_faces"]]
+            friction_cells = "np.asarray(" + repr([bool(value) for value in mask]) + ")"
     if assignment is not None and assignment["selected_source_rows"]:
         properties = assignment["properties"]
         comm = comm.replace(_ANCHORS["chmat"], (
@@ -655,6 +727,16 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
         comm = comm.replace(_ANCHORS["concrete_mat"], _ANCHORS["concrete_mat"] +
                             "        _F(GROUP_MA='DAMAGED_ELEMENTS', MATER=DAMAGED_MAT),\n")
     targets = ", ".join(f"{value:.10g}" for value in factors)
+    if not has_joints:
+        comport_joints = ""
+    elif friction_law is not None:
+        comport_joints = ""
+        if joint["damaged_joint_count"]:
+            comport_joints += "    _F(RELATION='JOINT_MECA_FROT', GROUP_MA='DAMAGED_JOINTS'),\n"
+        if joint["damaged_joint_count"] < joint["candidate_face_count"]:
+            comport_joints += "    _F(RELATION='CZM_LIN_REG', GROUP_MA='INTACT_JOINTS'),\n"
+    else:
+        comport_joints = "    _F(RELATION='CZM_LIN_REG', GROUP_MA='JOINTS'),\n"
     tie_load = ""
     tie_excit = ""
     if tie_pairs:
@@ -687,13 +769,35 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
             "                                      INTERPOLATION_WEIGHTS)\n"
             "    for dof in ('DX', 'DY', 'DZ')])\n\n")
         tie_excit += "    _F(CHARGE=INTERPOLATION),\n"
-    comm += f'''RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 100.0, 100.0), PROL_DROITE='LINEAIRE')
+    # Friction joints need self-weight established before significant water load: ramping
+    # gravity proportionally with the water leaves every friction face at the Mohr-Coulomb
+    # apex (zero normal stress, indeterminate stick/slip) at small load factors, while a
+    # constant gravity cannot be eased by time-step subdivision. Ramping gravity to full
+    # by load factor 0.05 keeps compression ahead of shear at every instant and stays
+    # subdividable; every solve target (the first is also 0.05) carries full self-weight.
+    gravity_excit = ("    _F(CHARGE=GRAVITE, FONC_MULT=GRAVITY_RAMP),\n" if friction_law is not None
+                     else "    _F(CHARGE=GRAVITE, FONC_MULT=RAMP),\n")
+    gravity_ramp = ("GRAVITY_RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 0.05, 1.0), "
+                    "PROL_DROITE='CONSTANT')\n" if friction_law is not None else "")
+    line_search = ("\n        RECH_LINEAIRE=_F(METHODE='MIXTE', ITER_LINE_MAXI=3),"
+                   if friction_law is not None else "")
+    # Friction steps empirically converge by iteration ~30 or oscillate forever on toggling
+    # faces; a 100-iteration budget made every failed bite cost ~30 wall-clock minutes
+    # before DECOUPE was allowed to subdivide. 40 keeps margin over the observed
+    # convergence tail while making failures 2.5x cheaper.
+    convergence = (f"CONVERGENCE=_F(ITER_GLOB_MAXI=40, "
+                   f"RESI_GLOB_MAXI={friction_law['residual_tolerance_n']:.6g}),"
+                   if friction_law is not None else
+                   "CONVERGENCE=_F(ITER_GLOB_MAXI=30, RESI_GLOB_RELA=1.0e-6),")
+    comm += f'''{gravity_ramp}RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 100.0, 100.0), PROL_DROITE='LINEAIRE')
 # Every load is scaled by the load factor (= INST), as in the FEniCSx proportional ramp.
 
 STEPS_PATH = {_comm_string(steps_path)}
 STATUS_PATH = {_comm_string(status_path)}
 TARGETS = [{targets}]
 JOINT_CELLS = list(MAIL.getCells('JOINTS')) if {has_joints!r} else []
+# Per-joint-cell mask of Mohr-Coulomb friction cells (None = all cohesive).
+FRICTION_CELLS = {friction_cells}
 
 
 def joint_component(field, component):
@@ -733,14 +837,12 @@ def save(final=None):
 
 save()
 EXCIT = (
-    _F(CHARGE=GRAVITE, FONC_MULT=RAMP),
-    _F(CHARGE=PRESSIONS, FONC_MULT=RAMP),
+{gravity_excit}    _F(CHARGE=PRESSIONS, FONC_MULT=RAMP),
     _F(CHARGE=CREST_SURCHARGE, FONC_MULT=RAMP),
 {tie_excit})
 COMPORT = (
     _F(RELATION='ELAS', TOUT='OUI'),
-{ "    _F(RELATION='CZM_LIN_REG', GROUP_MA='JOINTS')," if has_joints else "" }
-)
+{comport_joints})
 RESU = None
 reached = 0.0
 for target in TARGETS:
@@ -751,8 +853,8 @@ for target in TARGETS:
     )
     options = dict(
         MODELE=MODELE, CHAM_MATER=CHMAT, CARA_ELEM=CARA_ROCK, EXCIT=EXCIT, COMPORTEMENT=COMPORT,
-        INCREMENT=_F(LIST_INST=times), NEWTON=_F(MATRICE='TANGENTE', REAC_ITER=1),
-        CONVERGENCE=_F(ITER_GLOB_MAXI=30, RESI_GLOB_RELA=1.0e-6),
+        INCREMENT=_F(LIST_INST=times), NEWTON=_F(MATRICE='TANGENTE', REAC_ITER=1),{line_search}
+        {convergence}
         SOLVEUR=_F(METHODE='MULT_FRONT'),
     )
     try:
@@ -771,9 +873,19 @@ for target in TARGETS:
     vari = RESU.getField('VARI_ELGA', last) if JOINT_CELLS else None
     sief = RESU.getField('SIEF_ELGA', last) if JOINT_CELLS else None
     history["load_factor"].append(target)
-    history["damage_state"].append(joint_component(vari, 'V3'))
+    # CZM_LIN_REG: V3=INDIENDO (damage), V5=DISSIP, V7=SAUT_N.
+    # JOINT_MECA_FROT: V2=INDIPLAS (sliding), V5=INDIOUV (open), V7=SAUT_N.
+    damage = joint_component(vari, 'V3')
+    dissipated = joint_component(vari, 'V5')
+    if FRICTION_CELLS is not None and len(damage):
+        opened = joint_component(vari, 'V5')
+        sliding = joint_component(vari, 'V2')
+        damage = np.where(FRICTION_CELLS,
+                          np.where(opened > 0.5, 2.0, np.where(sliding > 0.5, 1.0, 0.0)), damage)
+        dissipated = np.where(FRICTION_CELLS, 0.0, dissipated)
+    history["damage_state"].append(damage)
     history["normal_jump_m"].append(joint_component(vari, 'V7'))
-    history["dissipated_energy_j_m2"].append(joint_component(vari, 'V5'))
+    history["dissipated_energy_j_m2"].append(dissipated)
     history["normal_traction_pa"].append(joint_component(sief, 'SIGN'))
     if len(history["load_factor"]) == 1:
         first_depl = nodal_displacement(RESU.getField('DEPL', last))
@@ -878,8 +990,8 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         concrete_count = len(split["arrays"]["tetra4_concrete"])
         if (len(np.unique(selected_rows)) != len(selected_rows) or selected.sum() != len(selected_rows)
                 or selected[concrete_count:].any()
-                or np.any(split["arrays"]["concrete_body_ids"][selected[:concrete_count]] != 1)):
-            raise CorroborationError("Damaged material assignment must match exact selected wall source cells")
+                or np.any(~np.isin(split["arrays"]["concrete_body_ids"][selected[:concrete_count]], (1, 3)))):
+            raise CorroborationError("Damaged material assignment must match exact selected wall/foundation source cells")
         split["arrays"]["damaged_cells"] = selected
         selected_faces = {tuple(sorted(face)) for cell in arrays["tetra4_concrete"][selected[:concrete_count]]
                           for face in (cell[[0, 1, 2]], cell[[0, 1, 3]], cell[[0, 2, 3]], cell[[1, 2, 3]])}
@@ -896,7 +1008,30 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     base_comm, base_inputs = render_comm(mesh_manifest_path=manifest_path)
     concrete = base_inputs["material"]["concrete"]
-    joint = joint_parameters(arrays, faces, summary, concrete["youngs_modulus_pa"], concrete["poissons_ratio"])
+    friction = summary.get("damaged_joint_friction")
+    if friction is not None and assignment is None:
+        raise CorroborationError("Damaged joint friction requires a damaged material assignment")
+    law_summary = summary
+    if friction is not None:
+        original_concrete = json.loads(
+            Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))["material"]["concrete"]
+        # The damaged joints use Mohr-Coulomb friction; the CZM parameters then
+        # describe the intact joints and must not be derived from the (possibly
+        # strengthless) damaged properties.
+        law_summary = {**summary, "tensile_strength_pa": original_concrete["tensile_strength_pa"],
+                       "fracture_energy_j_m2": original_concrete["cohesive_fracture_energy_j_m2"]}
+    joint = joint_parameters(arrays, faces, law_summary, concrete["youngs_modulus_pa"], concrete["poissons_ratio"])
+    if friction is not None:
+        joint["damaged_friction"] = friction_joint_parameters(friction, joint["initial_stiffness_pa_per_m"])
+        # A handful of marginal friction faces toggle forever at machine precision, so the
+        # friction solve converges on an absolute residual scaled by the structure weight;
+        # RESI_GLOB_RELA normalises by the largest nodal load and is unreachable while
+        # those faces flip. Dam-scale runs plateau at ~1e-4 of self-weight (a 0.01%
+        # imbalance localised at the toggling faces), so that is the acceptance level.
+        corners = np.asarray(arrays["nodes"], dtype=float)[np.asarray(arrays["tetra4_concrete"], dtype=np.int64)]
+        volume = float(np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])).sum() / 6.)
+        density = float(original_concrete.get("density", 2400.))
+        joint["damaged_friction"]["residual_tolerance_n"] = max(1e-4 * volume * density * 9.81, 1.)
     joint["has_joints"] = bool(len(faces))
     joint["stop_overload_on_opening"] = summary.get("status") == "prepared_aster_candidates"
     joint["material_assignment"] = assignment
@@ -1003,6 +1138,9 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
         *([f"P time_limit {int(time_limit_s)}"] if time_limit_s is not None else []),
         f"P memory_limit {int(memory_limit_mb)}",
         "P mpi_nbcpu 1",
+        # run_aster overrides OMP_NUM_THREADS with the export's ncpus (default 1);
+        # without this line the whole nonlinear solve factorizes single-threaded.
+        f"P ncpus {SOLVER_THREADS}",
         f"F comm {case_path} D 1",
         f"F libr {mesh_path} D {MESH_UNIT}",
         "",

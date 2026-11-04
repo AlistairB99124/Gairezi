@@ -281,6 +281,29 @@ class ModelConfigTests(unittest.TestCase):
             self.payload["damage_selection"] = {"maximum_overload_factor": factor}
             self.assert_invalid_at(self.payload, "damage_selection.maximum_overload_factor")
 
+    def test_crack_base_is_an_optional_boolean_requiring_an_uncapped_count(self):
+        self.payload["outputs"]["cracking_risk"] = False
+        for selection in ({"crack_base": True}, {"crack_base": False},
+                          {"crack_base": True, "max_damage_count": None},
+                          {"crack_base": False, "max_damage_count": 12}):
+            self.payload["damage_selection"] = selection
+            validate_config(self.payload)
+        for value in (1, 0, "true", None):
+            self.payload["damage_selection"] = {"crack_base": value}
+            self.assert_invalid_at(self.payload, "damage_selection.crack_base")
+        self.payload["damage_selection"] = {"crack_base": True, "max_damage_count": 12}
+        self.assert_invalid_at(self.payload, "damage_selection.crack_base")
+
+    def test_enabled_is_an_optional_boolean(self):
+        self.payload["outputs"]["cracking_risk"] = False
+        for selection in ({"enabled": True}, {"enabled": False},
+                          {"enabled": False, "max_damage_count": 12}):
+            self.payload["damage_selection"] = selection
+            validate_config(self.payload)
+        for value in (1, 0, "true", None):
+            self.payload["damage_selection"] = {"enabled": value}
+            self.assert_invalid_at(self.payload, "damage_selection.enabled")
+
     def test_obsolete_interface_overrides_are_rejected(self):
         self.assertNotIn("interfaces", self.payload)
         self.assertIs(validate_config(self.payload), self.payload)
@@ -312,6 +335,7 @@ class ModelConfigTests(unittest.TestCase):
         from Elmer.model_config import collect_warnings
         self.assertEqual(self.payload["cracking"], [])
         self.payload["damage_selection"].pop("damaged_element_properties")
+        self.payload["damage_selection"].pop("damaged_joint_friction", None)
         self.payload["cracking"] = [{
             "face": "upstream", "depth_m": 3.0, "opening_m": 0.002,
             "full_width": True, "buffer_m": 1.0, "length_m": None,
@@ -355,7 +379,14 @@ class ModelConfigTests(unittest.TestCase):
 
     def test_damaged_element_properties_default_to_concrete_and_are_physically_validated(self):
         properties = self.payload["damage_selection"]["damaged_element_properties"]
-        self.assertEqual(properties, self.payload["material"]["concrete"])
+        # The default damaged material is pre-cracked: concrete elasticity with a
+        # near-zero but mutually consistent strength/fracture-energy pair; the
+        # damaged joints themselves default to Mohr-Coulomb friction.
+        self.assertEqual(properties, {**self.payload["material"]["concrete"],
+                                      "tensile_strength_pa": 100.0,
+                                      "cohesive_fracture_energy_j_m2": 1.0})
+        self.assertEqual(self.payload["damage_selection"]["damaged_joint_friction"],
+                         {"friction_coefficient": 1.0, "adhesion_pa": 0.0})
         for key in properties:
             for value in (None, True, "bad", float("inf"), float("nan"), -1, 0):
                 if key == "poisson_ratio" and value == 0:
@@ -367,6 +398,25 @@ class ModelConfigTests(unittest.TestCase):
         payload = copy.deepcopy(self.payload)
         payload["damage_selection"]["damaged_element_properties"]["poisson_ratio"] = .5
         self.assert_invalid_at(payload, "damage_selection.damaged_element_properties.poisson_ratio")
+
+    def test_damaged_joint_friction_is_optional_and_validated(self):
+        self.payload["damage_selection"]["damaged_joint_friction"] = {"friction_coefficient": 1.0}
+        validate_config(self.payload)
+        self.payload["damage_selection"]["damaged_joint_friction"] = {"friction_coefficient": .75,
+                                                                      "adhesion_pa": 0.0}
+        validate_config(self.payload)
+        for coefficient in (None, True, "bad", 0, 5e-4, 11):
+            payload = copy.deepcopy(self.payload)
+            payload["damage_selection"]["damaged_joint_friction"] = {"friction_coefficient": coefficient}
+            self.assert_invalid_at(payload, "damage_selection.damaged_joint_friction.friction_coefficient")
+        payload = copy.deepcopy(self.payload)
+        payload["damage_selection"]["damaged_joint_friction"] = {"friction_coefficient": 1.0, "adhesion_pa": -1}
+        self.assert_invalid_at(payload, "damage_selection.damaged_joint_friction.adhesion_pa")
+        payload = copy.deepcopy(self.payload)
+        payload["outputs"]["cracking_risk"] = False
+        payload["damage_selection"].pop("damaged_element_properties")
+        payload["damage_selection"]["damaged_joint_friction"] = {"friction_coefficient": 1.0}
+        self.assert_invalid_at(payload, "damage_selection.damaged_joint_friction")
 
     def test_phase_field_controls_are_explicit_and_validated(self):
         self.add_legacy_crack_fixture()

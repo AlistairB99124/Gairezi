@@ -30,7 +30,8 @@ OPTIONAL_CONFIG_KEYS = {
 }
 BEDROCK_ANALYSIS_MODES = {"full_volume", "elastic_layer"}
 # Automatic element selection (see FEniCSx/automatic_screening.select_damage_cells).
-DAMAGE_SELECTION_KEYS = {"max_damage_count", "maximum_overload_factor", "damaged_element_properties"}
+DAMAGE_SELECTION_KEYS = {"max_damage_count", "maximum_overload_factor", "damaged_element_properties",
+                         "damaged_joint_friction", "crack_base", "enabled"}
 # Proportional overload search beyond the design load (FEniCSx/automatic_cracking.maximum_overload_factor).
 MAXIMUM_OVERLOAD_FACTOR = 10.0
 # One cohesive facet needs both owner cells, so fewer than two cells can never crack.
@@ -575,10 +576,17 @@ class _ConfigValidator:
                 self.validate_wall_joint_support(wall["joint_support"])
             if wall is not None and "step_end_taper_ratio" in wall:
                 self.field_number(wall, "step_end_taper_ratio", "geometry.wall", positive=True)
-                if not wall.get("thickness_steps") or "foundation" not in geometry:
+                if not wall.get("thickness_steps"):
+                    # The taper only shapes thickness-step ends; without steps it is
+                    # inert, and rejecting it forces edits to two keys in lockstep.
+                    self.warn(
+                        "geometry.wall.step_end_taper_ratio",
+                        "has no effect without geometry.wall.thickness_steps",
+                    )
+                elif "foundation" not in geometry:
                     self.issue(
                         "geometry.wall.step_end_taper_ratio",
-                        "requires geometry.wall.thickness_steps and geometry.foundation",
+                        "requires geometry.foundation",
                     )
             if wall is not None:
                 self.field_number(wall, "height_m", "geometry.wall")
@@ -707,6 +715,16 @@ class _ConfigValidator:
         if selection is not None and selection.get("max_damage_count") is not None:
             self.debug_integer(selection["max_damage_count"], "damage_selection.max_damage_count",
                                MINIMUM_DAMAGE_COUNT)
+        if selection is not None and "enabled" in selection:
+            # False = control run: nothing is selected and automatic cracking has no candidates.
+            if type(selection["enabled"]) is not bool:
+                self.issue("damage_selection.enabled", "must be a boolean")
+        if selection is not None and "crack_base" in selection:
+            path = "damage_selection.crack_base"
+            if type(selection["crack_base"]) is not bool:
+                self.issue(path, "must be a boolean")
+            elif selection["crack_base"] and selection.get("max_damage_count") is not None:
+                self.issue(path, "requires max_damage_count to be null (the base band is uncapped)")
         if selection is not None and selection.get("maximum_overload_factor") is not None:
             path = "damage_selection.maximum_overload_factor"
             factor = self.number(selection["maximum_overload_factor"], path)
@@ -723,6 +741,20 @@ class _ConfigValidator:
                 poisson = self.field_number(properties, "poisson_ratio", path)
                 if poisson is not None and not -1 < poisson < .5:
                     self.issue(f"{path}.poisson_ratio", "must be greater than -1 and less than 0.5")
+        if selection is not None and selection.get("damaged_joint_friction") is not None:
+            path = "damage_selection.damaged_joint_friction"
+            if selection.get("damaged_element_properties") is None:
+                self.issue(path, "requires damaged_element_properties (friction replaces the damaged joints' law)")
+            friction = self.object(selection["damaged_joint_friction"], path,
+                                   {"friction_coefficient"}, optional={"adhesion_pa"})
+            if friction is not None:
+                coefficient = self.field_number(friction, "friction_coefficient", path, positive=True)
+                if coefficient is not None and not 1e-3 <= coefficient <= 10:
+                    self.issue(f"{path}.friction_coefficient", "must be between 0.001 and 10")
+                if friction.get("adhesion_pa") is not None:
+                    adhesion = self.field_number(friction, "adhesion_pa", path)
+                    if adhesion is not None and adhesion < 0:
+                        self.issue(f"{path}.adhesion_pa", "must be at least 0")
 
     def validate_fracture_debug(self, value: object) -> None:
         """Optional per-job overrides of FEniCSx/fracture_defaults.json (and Aster softening).

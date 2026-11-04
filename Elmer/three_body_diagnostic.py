@@ -1024,8 +1024,17 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
 
 def check_active_bodies(mesh: Path, solver_input: Path) -> None:
     """Reject ElmerGrid body renumbering that leaves volume elements inactive."""
-    with (mesh / "mesh.elements").open() as stream:
-        actual = {int(line.split()[1]) for line in stream if line.strip()}
+    sources = [mesh / "mesh.elements"]
+    if not sources[0].is_file():
+        # A partitioned conversion writes only partitioning.N/part.K.elements;
+        # the body column has the same position in both formats.
+        sources = sorted(mesh.glob("partitioning.*/part.*.elements"))
+        if not sources:
+            raise RuntimeError(f"No Elmer mesh elements were found under {mesh}")
+    actual = set()
+    for source in sources:
+        with source.open() as stream:
+            actual.update(int(line.split()[1]) for line in stream if line.strip())
     declared = set()
     for body, block in re.findall(r"(?ms)^Body (\d+)\n(.*?)^End\s*$",
                                   solver_input.read_text(encoding="utf-8")):

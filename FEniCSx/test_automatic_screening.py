@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from automatic_screening import (interior_wall_facet_normal_stress, max_damage_count, screen_cells,
-                                 select_damage_cells)
+from automatic_screening import (crack_base, interior_wall_facet_normal_stress, max_damage_count,
+                                 screen_cells, select_damage_cells, selection_enabled)
 
 UNIT_TET = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
 
@@ -72,6 +72,88 @@ class AutomaticScreeningTest(unittest.TestCase):
         capped = screen_cells(tensors, np.array([1, 1], dtype=np.int32), np.array([7, 8]), coordinates, cells,
                               2e6, relative_tolerance=1e-3, max_damage_count=2)["selection"]
         self.assertEqual((capped["max_damage_count"], capped["selected_facets"], capped["capped"]), (2, 1, False))
+
+    def test_uncapped_selection_takes_peak_layer_plus_below_including_foundation(self):
+        # Disjoint unit tets at z offsets: peak wall cell at 0, wall below at -1 (selected),
+        # wall above at +1 (excluded), foundation at the peak elevation (selected),
+        # and a region-2 cell at the peak elevation (never selected).
+        offsets = (0., -1., 1., 0., 0.)
+        regions = np.array([1, 1, 1, 3, 2], dtype=np.int32)
+        coordinates = np.concatenate([UNIT_TET + [2. * index, 0., offset]
+                                      for index, offset in enumerate(offsets)])
+        cells = np.arange(4 * len(offsets)).reshape(len(offsets), 4)
+        tensors = np.zeros((len(offsets), 3, 3))
+        for index, value in enumerate((3e6, 1e6, 2.5e6, 4e6, 5e6)):
+            tensors[index] = np.diag([value, -1e5, -2e5])
+        result = screen_cells(tensors, regions, np.arange(10, 15), coordinates, cells,
+                              2e6, relative_tolerance=1e-3)
+        selection = result["selection"]
+        self.assertIsNone(selection["max_damage_count"])
+        self.assertEqual(selection["selected_source_rows"], [10, 11, 13])
+        self.assertEqual(selection["selected_wall_cells"], 2)
+        self.assertEqual(selection["selected_foundation_cells"], 1)
+        self.assertEqual(selection["selected_cells"], 3)
+        self.assertAlmostEqual(selection["layer_centre_z_m"], .25)
+        self.assertAlmostEqual(selection["layer_band_height_m"], 1.)
+        self.assertIn("foundation", selection["rule"])
+        self.assertFalse(selection["crack_base"])
+
+    def test_crack_base_selects_the_bottom_two_wall_layers(self):
+        # Peak tension sits in the top layer (+2), but crack_base anchors the band at the
+        # lowest wall corner (0): layers at 0 and +1 are selected (wall and foundation),
+        # the peak layer and a region-2 cell are not.
+        offsets = (2., 0., 1., 0., 0.)
+        regions = np.array([1, 1, 1, 3, 2], dtype=np.int32)
+        coordinates = np.concatenate([UNIT_TET + [2. * index, 0., offset]
+                                      for index, offset in enumerate(offsets)])
+        cells = np.arange(4 * len(offsets)).reshape(len(offsets), 4)
+        tensors = np.zeros((len(offsets), 3, 3))
+        for index, value in enumerate((5e6, 1e6, 2e6, 3e6, 4e6)):
+            tensors[index] = np.diag([value, -1e5, -2e5])
+        result = screen_cells(tensors, regions, np.arange(10, 15), coordinates, cells,
+                              2e6, relative_tolerance=1e-3, crack_base=True)
+        selection = result["selection"]
+        self.assertTrue(selection["crack_base"])
+        self.assertEqual(selection["selected_source_rows"], [11, 12, 13])
+        self.assertEqual(selection["selected_wall_cells"], 2)
+        self.assertEqual(selection["selected_foundation_cells"], 1)
+        self.assertIn("base of the wall", selection["rule"])
+        self.assertAlmostEqual(selection["layer_centre_z_m"], 1.5)
+
+    def test_crack_base_rejects_a_capped_count_and_non_booleans(self):
+        tensors, regions, rows, coordinates, cells = fixture([3e6, 1e6], [1, 1])
+        with self.assertRaisesRegex(ValueError, "max_damage_count"):
+            screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                         relative_tolerance=1e-3, max_damage_count=2, crack_base=True)
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                         relative_tolerance=1e-3, crack_base=1)
+
+    def test_crack_base_config_helper_defaults_to_false(self):
+        self.assertFalse(crack_base({}))
+        self.assertFalse(crack_base({"damage_selection": {}}))
+        self.assertTrue(crack_base({"damage_selection": {"crack_base": True}}))
+
+    def test_disabled_selection_selects_nothing_despite_overstress(self):
+        tensors, regions, rows, coordinates, cells = fixture([3e6, 1e6], [1, 1])
+        result = screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                              relative_tolerance=1e-3, selection_enabled=False)
+        selection = result["selection"]
+        self.assertIs(selection["enabled"], False)
+        self.assertEqual(selection["selected_source_rows"], [])
+        self.assertEqual(selection["selected_cells"], 0)
+        self.assertIn("disabled", selection["rule"])
+        # Screening itself still reports the overstress; only the selection is empty.
+        self.assertEqual(result["status"], "overstressed_cells_found")
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                         relative_tolerance=1e-3, selection_enabled=1)
+
+    def test_selection_enabled_config_helper_defaults_to_true(self):
+        self.assertTrue(selection_enabled({}))
+        self.assertTrue(selection_enabled({"damage_selection": {}}))
+        self.assertTrue(selection_enabled({"damage_selection": {"enabled": True}}))
+        self.assertFalse(selection_enabled({"damage_selection": {"enabled": False}}))
 
 
 # Five critical facets over cells 0..6 (facet stress, owners); facet 5 is below strength.

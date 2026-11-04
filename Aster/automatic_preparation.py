@@ -14,7 +14,8 @@ import numpy as np
 from Aster.automatic_cohesive import file_hash
 from FEniCSx.automatic_cracking import candidate_region, region_cell_stresses, region_candidate_faces
 from FEniCSx.automatic_cracking import maximum_overload_factor
-from FEniCSx.automatic_screening import COMPLETED, config_digest, max_damage_count, screen_cells
+from FEniCSx.automatic_screening import (COMPLETED, config_digest, crack_base, max_damage_count,
+                                         screen_cells, selection_enabled)
 from FEniCSx.fracture_topology import split_interior_wall_faces
 
 PREPARED = "prepared_aster_candidates"
@@ -81,7 +82,8 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
             result = screen_cells(stress, regions, rows, coordinates, cells,
                                   float(concrete["tensile_strength_pa"]),
-                                  relative_tolerance=relative_tolerance, max_damage_count=max_damage_count(config))
+                                  relative_tolerance=relative_tolerance, max_damage_count=max_damage_count(config),
+                                  crack_base=crack_base(config), selection_enabled=selection_enabled(config))
             result.update(source_job_id=job_id, config_digest=manifest["config_digest"],
                           solver="code_aster", stress_association="raw P1 cell stress from accepted Aster displacement",
                           verified_baseline_source_sha256=hashes,
@@ -93,7 +95,7 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 result["material_assignment"] = {
                     "properties": properties,
                     "selected_source_rows": result["selection"]["selected_source_rows"],
-                    "scope": "exact selected wall volume cells; baseline and unselected cells unchanged",
+                    "scope": "exact selected wall/foundation volume cells; baseline and unselected cells unchanged",
                 }
             write_json(output / "screening.json", result)
             manifest.update(status=COMPLETED, screening_sha256=file_hash(output / "screening.json"))
@@ -108,23 +110,29 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 raise ValueError("Candidate preparation requires this exact current Aster screening")
             selected_rows = np.asarray(result["selection"]["selected_source_rows"], dtype=np.int64)
             overload_factor = maximum_overload_factor(config)
-            if not len(selected_rows) and result["facet_check"]["critical_facets"] == 0 and overload_factor > 1:
+            # A disabled selection is an intentional control run: no candidates regardless
+            # of facet stress, so neither overload screening nor empty-selection errors apply.
+            disabled = result["selection"].get("enabled") is False
+            if (not len(selected_rows) and not disabled
+                    and result["facet_check"]["critical_facets"] == 0 and overload_factor > 1):
                 stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
                 overload = screen_cells(stress * overload_factor, regions, rows, coordinates, cells,
                                         float(concrete["tensile_strength_pa"]), relative_tolerance=relative_tolerance,
-                                        max_damage_count=max_damage_count(config))
+                                        max_damage_count=max_damage_count(config), crack_base=crack_base(config))
                 selected_rows = np.asarray(overload["selection"]["selected_source_rows"], dtype=np.int64)
                 if not len(selected_rows) and overload["facet_check"]["critical_facets"] > 0:
                     raise ValueError(overload["selection"].get("message") or "Overload candidate selection is empty")
-            if not len(selected_rows) and result["facet_check"]["critical_facets"] > 0:
+            if not len(selected_rows) and not disabled and result["facet_check"]["critical_facets"] > 0:
                 raise ValueError(result["selection"].get("message") or "Aster candidate selection is empty")
             if np.any(selected_rows < 0) or np.any(selected_rows >= len(cells)):
                 raise ValueError("Aster screening selected no valid wall cells")
             inverse_rows = np.argsort(rows)
             selected = inverse_rows[selected_rows]
-            if not np.all(regions[selected] == 1):
-                raise ValueError("Aster screening selected cells outside the wall")
-            rings = 0 if max_damage_count(config) is not None else 2
+            if not np.all(np.isin(regions[selected], (1, 3))):
+                raise ValueError("Aster screening selected cells outside the wall and foundation")
+            # The uncapped selection is a complete bank-to-bank band by construction;
+            # capped patches are openable by construction. No neighbour rings either way.
+            rings = 0
             membership = candidate_region(cells, regions, selected, rings)
             faces = region_candidate_faces(cells, regions, membership)
             while len(faces) > 20000 and rings > 0:
@@ -160,12 +168,19 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                       "fracture_energy_j_m2": float(energy), "candidate_faces": len(split.source_faces) if split is not None else 0,
                       "candidate_basis": ("design-load screening, with neighbour rings where uncapped"
                                           if len(result["selection"]["selected_source_rows"]) else
-                                          "proportional maximum-overload screening; no eligible facets means native elastic steps"),
+                                          ("damage selection disabled: control preparation with no candidates"
+                                           if result["selection"].get("enabled") is False else
+                                           "proportional maximum-overload screening; no eligible facets means native elastic steps")),
                       "outcome_basis": "Preparation only; native Aster nonlinear equilibrium is still required"}
             if properties is not None:
                 result["material_assignment"] = {"properties": properties, "selected_source_rows": selected_rows.tolist(),
-                                                 "scope": "exact selected wall volume cells"}
+                                                 "scope": "exact selected wall/foundation volume cells"}
                 result["tensile_strength_pa"] = properties["tensile_strength_pa"]
+            friction = (config.get("damage_selection") or {}).get("damaged_joint_friction")
+            if friction is not None:
+                if properties is None:
+                    raise ValueError("damaged_joint_friction requires damaged_element_properties")
+                result["damaged_joint_friction"] = friction
             write_json(output / "summary.json", result)
             manifest.update(status=PREPARED, summary_sha256=file_hash(output / "summary.json"),
                             candidate_state_sha256=file_hash(output / "cohesive_state.npz"))

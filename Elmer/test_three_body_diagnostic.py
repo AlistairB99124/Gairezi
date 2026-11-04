@@ -40,6 +40,24 @@ class ActiveBodyTests(unittest.TestCase):
                 else:
                     check_active_bodies(mesh, sif)
 
+    def test_partitioned_meshes_check_bodies_across_all_parts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mesh = Path(directory)
+            parts = mesh / "partitioning.2"
+            parts.mkdir()
+            # Partitioned conversions write no serial mesh.elements; the body id
+            # stays in the second column (first is "elementid/partition").
+            (parts / "part.1.elements").write_text("1/1 1 504 1 2 3 4\n")
+            (parts / "part.2.elements").write_text("2/2 2 504 5 6 7 8\n")
+            sif = mesh / "case.sif"
+            sif.write_text("Body 1\n Equation = 1\nEnd\nBody 2\n Equation = 1\nEnd\n")
+            check_active_bodies(mesh, sif)
+            sif.write_text("Body 1\n Equation = 1\nEnd\n")
+            with self.assertRaisesRegex(RuntimeError, "body renumbering"):
+                check_active_bodies(mesh, sif)
+            with self.assertRaisesRegex(RuntimeError, "No Elmer mesh elements"):
+                check_active_bodies(mesh / "missing", sif)
+
 
 class ElasticLayerParallelTests(unittest.TestCase):
     def test_reduced_mesh_selects_serial_before_conversion_and_records_reason(self):

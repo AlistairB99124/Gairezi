@@ -132,8 +132,8 @@ def convert(npz_path: Path, med_path: Path) -> None:
         if (selected.dtype != np.dtype(bool)
                 or selected.shape != (len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"]),)
                 or selected[len(data["tetra4_concrete"]):].any()
-                or np.any(data["concrete_body_ids"][selected[:len(data["tetra4_concrete"])]] != 1)):
-            raise ValueError("Damaged material group must contain only selected wall tetrahedra")
+                or np.any(~np.isin(data["concrete_body_ids"][selected[:len(data["tetra4_concrete"])]], (1, 3)))):
+            raise ValueError("Damaged material group must contain only selected wall/foundation tetrahedra")
         if selected.any():
             group = mc.DataArrayInt.New(np.flatnonzero(selected).tolist())
             group.setName("DAMAGED_ELEMENTS")

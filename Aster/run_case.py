@@ -44,6 +44,9 @@ RESULT_UNIT = 80  # must match IMPR_RESU(UNITE=...) in the .comm file.
 # ~0.5s on the full ~101k-cell mesh); this timeout is just a generous safety
 # margin, not a tuned budget.
 MED_CONVERT_TIMEOUT_S = 120
+# OpenMP threads for Aster solves (export ncpus; run_aster overrides the caller's
+# OMP_NUM_THREADS with this value, default 1). Matches whole_model_crack.DEFAULT_THREADS.
+SOLVER_THREADS = 8
 
 
 def run_solver(command: list[str], run_dir: Path, timeout: int | None,
@@ -369,6 +372,7 @@ def run_case(
             *([f"P time_limit {time_limit_s}"] if time_limit_s is not None else []),
             "P memory_limit 4096",
             "P mpi_nbcpu 1",
+            f"P ncpus {SOLVER_THREADS}",
             f"F comm {case_path.resolve()} D 1",
             f"F libr {med_path.resolve()} D {MESH_UNIT}",
             f"F rmed {result_med_path.resolve()} R {RESULT_UNIT}",
@@ -500,7 +504,7 @@ def run_wsl_case(case_path: Path, output_dir: Path, mesh_dir: Path, arrays_filen
         export_path = run_dir / f"{export_name}.export"
         export_path.write_text("\n".join((
             *([f"P time_limit {time_limit_s}"] if time_limit_s is not None else []),
-            "P memory_limit 8192", "P mpi_nbcpu 1",
+            "P memory_limit 8192", "P mpi_nbcpu 1", f"P ncpus {SOLVER_THREADS}",
             f"F comm {wsl_path(case_path)} D 1", f"F libr {wsl_path(med_path)} D {MESH_UNIT}",
             f"F rmed {wsl_path(result_med)} R {RESULT_UNIT}", "")), encoding="utf-8")
         manifest["export_path"] = str(export_path.resolve())

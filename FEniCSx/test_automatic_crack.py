@@ -64,6 +64,11 @@ class UserLocatedCrackTests(unittest.TestCase):
         # Null fracture_debug: the shipped fracture_defaults.json apply.
         self.config["fracture_debug"] = None
         self.config["geometry"]["wall"].pop("thickness_steps", None)
+        # The shipped config has no manual crack; these tests locate one explicitly
+        # with the solver's legacy fallback settings.
+        if not self.config.get("cracking"):
+            self.config["cracking"] = [{"face": "upstream", "depth_m": 3.0, "opening_m": 0.002,
+                                        "full_width": True, "buffer_m": 1.0}]
         self.fields = synthetic_fields()
 
     def test_crack_carries_upstream_hydrostatic_water(self):

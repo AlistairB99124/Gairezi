@@ -54,6 +54,96 @@ class AutomaticPreparationTests(unittest.TestCase):
             self.assertEqual(inputs["baseline_displacement_sha256"], prep.file_hash(baseline / "aster_full_displacement.npz"))
             compile(comm, "selected.comm", "exec")
 
+    def test_friction_joints_replace_the_damaged_cohesive_law(self):
+        from Aster import automatic_cohesive as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config_path = self.fixture(root)
+            config = json.loads(config_path.read_text())
+            properties = {"density": 2100., "youngs_modulus": 12e9, "poisson_ratio": .23,
+                          "tensile_strength_pa": 100., "compressive_strength_pa": 15e6,
+                          "cohesive_fracture_energy_j_m2": 1.}
+            config["damage_selection"] = {"damaged_element_properties": properties,
+                                          "damaged_joint_friction": {"friction_coefficient": 1.,
+                                                                     "adhesion_pa": 0.}}
+            prep.write_json(config_path, config)
+            arrays = column_fixture()
+            arrays["source_cell_rows"] = np.arange(len(arrays["tetra4_concrete"]) + len(arrays["tetra4_bedrock"]))
+            np.savez(baseline / "three_body_mesh_arrays.npz", **arrays)
+            manifest = fixture_manifest(arrays)
+            manifest.update(source_mesh=str(model / "three_body.msh"), source_config=str(config_path),
+                            source_hashes={name: prep.file_hash(model / name) for name in ("three_body.msh", "config.json")})
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening, prepared = root / "screening", root / "prepared"
+            prep.run(config_path, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
+            result = prep.run(config_path, model, baseline, prepared, job_id="fixture",
+                              relative_tolerance=1e-4, screening=screening)
+            self.assertEqual(result["damaged_joint_friction"]["friction_coefficient"], 1.)
+
+            def render(root=None, mesh_manifest_path=None):
+                return fixture_base_comm(json.loads(mesh_manifest_path.read_text()), 4e3), {
+                    "material": {"concrete": {"youngs_modulus_pa": 30e9, "poissons_ratio": .2}}}
+            with patch("Aster.generate_three_body_case.render_comm", side_effect=render):
+                inputs = native.prepare(baseline, prepared, root / "native")
+            friction = inputs["joint"]["damaged_friction"]
+            self.assertEqual(friction["law"], "JOINT_MECA_FROT")
+            self.assertEqual(friction["k_n_pa_per_m"], inputs["joint"]["initial_stiffness_pa_per_m"])
+            self.assertGreater(friction["residual_tolerance_n"], 0.)
+            # The CZM parameters describe the intact joints, not the strengthless damaged ones.
+            self.assertEqual(inputs["joint"]["tensile_strength_pa"],
+                             json.loads(config_path.read_text())["material"]["concrete"]["tensile_strength_pa"])
+            comm = (root / "native" / "case.comm").read_text()
+            self.assertIn("JOINT_MECA_FROT=_F(K_N=", comm)
+            self.assertIn("MU=1, ADHESION=0", comm)
+            self.assertIn("_F(GROUP_MA='DAMAGED_JOINTS', MATER=FROT_MAT),", comm)
+            self.assertIn("_F(RELATION='JOINT_MECA_FROT', GROUP_MA='DAMAGED_JOINTS'),", comm)
+            self.assertIn("FRICTION_CELLS = np.asarray(", comm)
+            compile(comm, "friction.comm", "exec")
+
+    def test_disabled_selection_prepares_a_control_with_no_candidates(self):
+        from Aster import automatic_cohesive as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config_path = self.fixture(root)
+            config = json.loads(config_path.read_text())
+            properties = {"density": 2100., "youngs_modulus": 12e9, "poisson_ratio": .23,
+                          "tensile_strength_pa": 100., "compressive_strength_pa": 15e6,
+                          "cohesive_fracture_energy_j_m2": 1.}
+            config["damage_selection"] = {"enabled": False,
+                                          "damaged_element_properties": properties,
+                                          "damaged_joint_friction": {"friction_coefficient": 1.,
+                                                                     "adhesion_pa": 0.}}
+            prep.write_json(config_path, config)
+            arrays = column_fixture()
+            arrays["source_cell_rows"] = np.arange(len(arrays["tetra4_concrete"]) + len(arrays["tetra4_bedrock"]))
+            np.savez(baseline / "three_body_mesh_arrays.npz", **arrays)
+            manifest = fixture_manifest(arrays)
+            manifest.update(source_mesh=str(model / "three_body.msh"), source_config=str(config_path),
+                            source_hashes={name: prep.file_hash(model / name) for name in ("three_body.msh", "config.json")})
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening, prepared = root / "screening", root / "prepared"
+            result = prep.run(config_path, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
+            self.assertIs(result["selection"]["enabled"], False)
+            self.assertEqual(result["selection"]["selected_source_rows"], [])
+            self.assertEqual(result["material_assignment"]["selected_source_rows"], [])
+            result = prep.run(config_path, model, baseline, prepared, job_id="fixture",
+                              relative_tolerance=1e-4, screening=screening)
+            self.assertEqual(result["status"], prep.PREPARED)
+            self.assertEqual(result["candidate_faces"], 0)
+            self.assertIn("disabled", result["candidate_basis"])
+
+            def render(root=None, mesh_manifest_path=None):
+                return fixture_base_comm(json.loads(mesh_manifest_path.read_text()), 4e3), {
+                    "material": {"concrete": {"youngs_modulus_pa": 30e9, "poissons_ratio": .2}}}
+            with patch("Aster.generate_three_body_case.render_comm", side_effect=render):
+                inputs = native.prepare(baseline, prepared, root / "native")
+            self.assertFalse(inputs["joint"]["has_joints"])
+            comm = (root / "native" / "case.comm").read_text()
+            self.assertNotIn("DAMAGED_JOINTS", comm)
+            self.assertNotIn("JOINT_MECA_FROT=_F(", comm)
+            self.assertNotIn("RELATION='JOINT_MECA_FROT'", comm)
+            compile(comm, "control.comm", "exec")
+
     def test_native_hand_off_keeps_consistent_support_and_overload(self):
         from Aster import automatic_cohesive as native
         from Aster.support_trace import add_consistent_support, render_constraints
@@ -103,16 +193,43 @@ class AutomaticPreparationTests(unittest.TestCase):
             np.savez(baseline / "three_body_mesh_arrays.npz", **arrays)
             screening = root / "screening"
             result = prep.run(config, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
-            source_wall = set(arrays["source_cell_rows"][:len(arrays["concrete_body_ids"])][arrays["concrete_body_ids"] == 1])
-            self.assertTrue(set(result["selection"]["selected_source_rows"]).issubset(source_wall))
+            source_concrete = set(arrays["source_cell_rows"][:len(arrays["concrete_body_ids"])][
+                np.isin(arrays["concrete_body_ids"], (1, 3))])
+            self.assertTrue(set(result["selection"]["selected_source_rows"]).issubset(source_concrete))
+            self.assertGreater(result["selection"]["selected_wall_cells"], 0)
             result = prep.run(config, model, baseline, root / "prepared", job_id="fixture",
                               relative_tolerance=1e-4, screening=screening)
             self.assertGreater(result["candidate_faces"], 0)
 
-    def test_no_eligible_facets_prepares_native_elastic_steps_not_fake_success(self):
+    def test_no_eligible_facets_still_prepares_the_peak_layer_band_when_uncapped(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model, baseline, config = self.fixture(root)
+            with np.load(baseline / "aster_full_displacement.npz") as fields:
+                values = {key: fields[key] for key in fields.files}
+            values["displacement_m"] *= 0.
+            np.savez(baseline / "aster_full_displacement.npz", **values)
+            screening = root / "screening"
+            result = prep.run(config, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
+            self.assertGreater(result["selection"]["selected_cells"], 0)
+            result = prep.run(config, model, baseline, root / "prepared", job_id="fixture",
+                              relative_tolerance=1e-4, screening=screening)
+            self.assertGreater(result["candidate_faces"], 0)
+            self.assertFalse(result["accepted"])
+            with np.load(root / "prepared" / "cohesive_state.npz") as state:
+                self.assertGreater(len(state["minus"]), 0)
+
+    def test_capped_no_eligible_facets_prepares_native_elastic_steps_not_fake_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config = self.fixture(root)
+            data = json.loads(config.read_text())
+            data["damage_selection"] = {"max_damage_count": 4}
+            prep.write_json(config, data)
+            manifest = json.loads((baseline / "mesh_manifest.json").read_text())
+            manifest["source_hashes"] = {name: prep.file_hash(model / name)
+                                         for name in ("three_body.msh", "config.json")}
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
             with np.load(baseline / "aster_full_displacement.npz") as fields:
                 values = {key: fields[key] for key in fields.files}
             values["displacement_m"] *= 0.

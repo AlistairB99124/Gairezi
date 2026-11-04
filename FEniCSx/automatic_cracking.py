@@ -764,6 +764,18 @@ def prepare_and_run(configuration: Path, model_directory: Path, screening_output
                 "verdict": _bound_verdict("peak facet normal stress", float(facets["peak_facet_normal_stress_pa"]),
                                           strength),
             })
+        elif ("outcome" not in summary and isinstance(screening.get("selection"), dict)
+                and screening["selection"].get("enabled") is False):
+            # Control run: damage selection is disabled, so no cohesive candidates exist
+            # regardless of facet stress; the equilibrium stays the intact elastic solution.
+            summary["damage_selection"] = {key: value for key, value in screening["selection"].items()
+                                           if key != "selected_source_rows"}
+            summary.update({
+                "outcome": "no_damage_initiated", "load_factor": 1.0,
+                "outcome_basis": "damage selection disabled: control run with no damaged elements",
+                "initiated_faces": 0, "opened_area_m2": 0., "cohesive_dissipated_energy_j": 0.,
+                "steps": [],
+            })
         elif "outcome" not in summary:
             selection = screening.get("selection") if isinstance(screening.get("selection"), dict) else None
             confined = selection is not None and selection.get("max_damage_count") is not None
