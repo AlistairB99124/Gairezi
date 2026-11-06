@@ -579,6 +579,32 @@ class PostprocessTests(unittest.TestCase):
         self.assertEqual(report["status"], "partial")
         self.assertEqual(report["corroboration"]["verdict"], "incomplete")
 
+    def test_capacity_limit_stop_reports_structural_failure_in_english(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            status = self.write_case(root, [[0, 0, 0, 0], [1, 1, 0, 0]], [[0] * 4, [2e-5, 0, 0, 0]],
+                                     [[4e5] * 4, [8e5] * 4], [0.5, 0.9], status="stopped")
+            status["stopped_at_load_factor"] = 1.0
+            report = ac.postprocess(root, fake_fenicsx(root / "f", 4), status)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["outcome"], "capacity_limit")
+        capacity = report["capacity_assessment"]
+        self.assertEqual(capacity["reached_load_factor"], 0.9)
+        self.assertEqual(capacity["failed_load_factor"], 1.0)
+        self.assertIn("no static equilibrium above 90%", capacity["message"])
+        self.assertIn("the structure cannot carry that load", capacity["message"])
+        self.assertEqual(capacity["last_converged_state"]["load_factor"], 0.9)
+
+    def test_a_genuine_crash_is_not_reported_as_a_capacity_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            status = self.write_case(root, [[0, 0, 0, 0]], [[0] * 4], [[1e5] * 4], [0.5], status="failed")
+            status["stopped_at_load_factor"] = 1.0
+            report = ac.postprocess(root, fake_fenicsx(root / "f", 4), status)
+        self.assertEqual(report["status"], "partial")
+        self.assertNotIn("outcome", report)
+        self.assertNotIn("capacity_assessment", report)
+
     def test_integrated_patch_results_keep_original_facet_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

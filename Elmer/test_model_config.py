@@ -294,6 +294,28 @@ class ModelConfigTests(unittest.TestCase):
         self.payload["damage_selection"] = {"crack_base": True, "max_damage_count": 12}
         self.assert_invalid_at(self.payload, "damage_selection.crack_base")
 
+    def test_support_degradation_is_optional_and_validated(self):
+        self.payload["outputs"]["cracking_risk"] = False
+        for degradation in (None, {"interface_scale": 0.01}, {"interface_scale": 1},
+                            {"abutment": {"scale": 0.1, "fraction": 0.25, "end": "positive"}},
+                            {"interface_scale": 0.5,
+                             "abutment": {"scale": 0.1, "fraction": 0.5, "end": "negative"}}):
+            self.payload["damage_selection"] = {"support_degradation": degradation}
+            validate_config(self.payload)
+        for scale in (0, -1, 1.5, True, "0.1", float("nan")):
+            self.payload["damage_selection"] = {"support_degradation": {"interface_scale": scale}}
+            self.assert_invalid_at(self.payload, "damage_selection.support_degradation.interface_scale")
+        for abutment, issue in ((
+                {"scale": 0, "fraction": 0.25, "end": "positive"}, "scale"), (
+                {"scale": 1.5, "fraction": 0.25, "end": "positive"}, "scale"), (
+                {"scale": 0.1, "fraction": 0.75, "end": "positive"}, "fraction"), (
+                {"scale": 0.1, "fraction": 0.25, "end": "sideways"}, "end")):
+            self.payload["damage_selection"] = {"support_degradation": {"abutment": abutment}}
+            self.assert_invalid_at(
+                self.payload, f"damage_selection.support_degradation.abutment.{issue}")
+        self.payload["damage_selection"] = {"support_degradation": {"unknown": 1}}
+        self.assertRaises(ConfigurationValidationError, validate_config, self.payload)
+
     def test_enabled_is_an_optional_boolean(self):
         self.payload["outputs"]["cracking_risk"] = False
         for selection in ({"enabled": True}, {"enabled": False},
@@ -303,6 +325,24 @@ class ModelConfigTests(unittest.TestCase):
         for value in (1, 0, "true", None):
             self.payload["damage_selection"] = {"enabled": value}
             self.assert_invalid_at(self.payload, "damage_selection.enabled")
+
+    def test_crack_thickness_is_an_optional_validated_block(self):
+        self.payload["outputs"]["cracking_risk"] = False
+        for thickness in (None, {"elements": 1, "from": "upstream"},
+                          {"elements": 8, "from": "downstream"}):
+            self.payload["damage_selection"] = {"crack_thickness": thickness}
+            validate_config(self.payload)
+        for elements in (0, -1, 1.5, True, "2", None):
+            self.payload["damage_selection"] = {"crack_thickness": {"elements": elements, "from": "upstream"}}
+            self.assert_invalid_at(self.payload, "damage_selection.crack_thickness.elements")
+        self.payload["damage_selection"] = {"crack_thickness": {"elements": 2, "from": "sideways"}}
+        self.assert_invalid_at(self.payload, "damage_selection.crack_thickness.from")
+        self.payload["damage_selection"] = {"crack_thickness": {"elements": 2, "from": "upstream"},
+                                            "max_damage_count": 12}
+        self.assert_invalid_at(self.payload, "damage_selection.crack_thickness")
+        for block in ({"elements": 2}, {"from": "upstream"}, {"elements": 2, "from": "upstream", "x": 1}, []):
+            self.payload["damage_selection"] = {"crack_thickness": block}
+            self.assertRaises(ConfigurationValidationError, validate_config, self.payload)
 
     def test_obsolete_interface_overrides_are_rejected(self):
         self.assertNotIn("interfaces", self.payload)
@@ -331,6 +371,38 @@ class ModelConfigTests(unittest.TestCase):
         self.payload["outputs"]["max_displacement"] = 1
         self.assert_invalid_at(self.payload, "outputs.max_displacement")
 
+    def test_custom_section_is_optional_and_sanitized(self):
+        payload = copy.deepcopy(self.payload)
+        payload["custom"] = {
+            "notes": "Engineer notes.\nLine two.", "enabled": True,
+            "factor": 1.5, "flags": ["a", "b"], "empty": None,
+        }
+        self.assertIs(validate_config(payload), payload)
+        for key, value in (("Bad Key", "x"), ("notes", "<script>x</script>"),
+                           ("notes", "a < b"), ("notes", "x\x00y"), ("notes", "a" * 4001),
+                           ("nested", {"a": 1}), ("deep", [[1]])):
+            bad = copy.deepcopy(self.payload)
+            bad["custom"] = {key: value}
+            with self.subTest(key=key):
+                path = f"custom.{key}" if key != "Bad Key" else "custom.Bad Key"
+                self.assert_invalid_at(bad, path)
+        bad = copy.deepcopy(self.payload)
+        bad["custom"] = "not an object"
+        self.assert_invalid_at(bad, "custom")
+
+    def test_tiny_global_element_size_warns_but_validates(self):
+        from Elmer.model_config import collect_warnings
+        payload = copy.deepcopy(self.payload)
+        payload["geometry"]["global_element_size_m"] = 0.1
+        payload["geometry"]["local_element_size_m"] = 0.1
+        self.assertIs(validate_config(payload), payload)
+        warnings = {w.path: w.message for w in collect_warnings(payload)}
+        self.assertIn("geometry.global_element_size_m", warnings)
+        self.assertIn("target_wall_tetrahedral_elements", warnings["geometry.global_element_size_m"])
+        # The shipped default (0.5) must stay warning-free.
+        clean = {w.path for w in collect_warnings(self.payload)}
+        self.assertNotIn("geometry.global_element_size_m", clean)
+
     def test_cracking_seed_settings_are_optional_and_validated(self):
         from Elmer.model_config import collect_warnings
         self.assertEqual(self.payload["cracking"], [])
@@ -345,7 +417,7 @@ class ModelConfigTests(unittest.TestCase):
             "full_width": True, "buffer_m": 1.0, "length_m": None,
         }])
         self.assertIs(self.payload["outputs"]["cracking_risk"], True)
-        for key, value in (("face", "crest"), ("depth_m", 0.0), ("depth_m", 4.0),
+        for key, value in (("face", "crest"), ("depth_m", 0.0), ("depth_m", 4.5),
                            ("opening_m", 0.0005), ("opening_m", 0.02), ("buffer_m", -0.1),
                            ("buffer_m", 2.5), ("full_width", "yes"), ("length_m", 0.0),
                            ("length_m", True), ("unknown", 1)):
@@ -379,14 +451,14 @@ class ModelConfigTests(unittest.TestCase):
 
     def test_damaged_element_properties_default_to_concrete_and_are_physically_validated(self):
         properties = self.payload["damage_selection"]["damaged_element_properties"]
-        # The default damaged material is pre-cracked: concrete elasticity with a
-        # near-zero but mutually consistent strength/fracture-energy pair; the
-        # damaged joints themselves default to Mohr-Coulomb friction.
+        # The default damaged material is a crushed (rubble) band: concrete properties
+        # with the modulus reduced 1000x; the joints stay inert (intact strength and
+        # fracture energy) and the foundation seat is degraded instead.
         self.assertEqual(properties, {**self.payload["material"]["concrete"],
-                                      "tensile_strength_pa": 100.0,
-                                      "cohesive_fracture_energy_j_m2": 1.0})
-        self.assertEqual(self.payload["damage_selection"]["damaged_joint_friction"],
-                         {"friction_coefficient": 1.0, "adhesion_pa": 0.0})
+                                      "youngs_modulus": 35000000.0})
+        self.assertEqual(self.payload["damage_selection"]["support_degradation"],
+                         {"interface_scale": 0.01})
+        self.assertNotIn("damaged_joint_friction", self.payload["damage_selection"])
         for key in properties:
             for value in (None, True, "bad", float("inf"), float("nan"), -1, 0):
                 if key == "poisson_ratio" and value == 0:

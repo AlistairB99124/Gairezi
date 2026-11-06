@@ -18,6 +18,13 @@ class SharedSeedTests(unittest.TestCase):
     def setUp(self):
         self.config = load_config()
         self.config["geometry"]["wall"].pop("thickness_steps", None)
+        # Pin the legacy 4 m wall and manual seed; the shipped default is a uniform
+        # 4.5 m wall with no manual crack.
+        self.config["geometry"]["wall"].update(
+            {"radial_width_m": 4.0, "centerline_radius_m": 78.0, "downstream_radius_m": 76.0})
+        if not self.config.get("cracking"):
+            self.config["cracking"] = [{"face": "upstream", "depth_m": 3.0, "opening_m": 0.002,
+                                        "full_width": True, "buffer_m": 1.0}]
         self.y, self.z = 78 * math.cos(108.5 / 78), -27.5
         radii = np.array([76., 77., 78., 79., 80.])
         theta = 108.5 / 78
@@ -106,8 +113,11 @@ class FractureDebugTests(unittest.TestCase):
         spec, _, report = locate_crack(self.config, (self.shared.y, self.shared.z), self.shared.fields)
         self.assertEqual((spec.model, spec.critical_energy_release_rate_j_m2, spec.length_scale_m),
                          ("AT2", 2700.0, 0.25))
-        self.assertEqual(spec.internal_pressure_pa, 0.0)
-        self.assertEqual(report["crack_water_pressure"]["factor"], 0.0)
+        # The shipped defaults apply the full hydrostatic head inside the crack.
+        self.assertEqual(report["crack_water_pressure"]["factor"], 1.0)
+        self.assertAlmostEqual(spec.internal_pressure_pa,
+                               report["crack_water_pressure"]["pressure_pa"])
+        self.assertGreater(spec.internal_pressure_pa, 0.0)
 
     def test_default_block_reproduces_the_shipped_defaults(self):
         baseline, baseline_options, baseline_report = locate_crack(

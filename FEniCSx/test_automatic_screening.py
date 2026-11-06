@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from automatic_screening import (crack_base, interior_wall_facet_normal_stress, max_damage_count,
-                                 screen_cells, select_damage_cells, selection_enabled)
+from automatic_screening import (crack_base, crack_thickness, interior_wall_facet_normal_stress,
+                                 max_damage_count, screen_cells, select_damage_cells, selection_enabled)
 
 UNIT_TET = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
 
@@ -154,6 +154,63 @@ class AutomaticScreeningTest(unittest.TestCase):
         self.assertTrue(selection_enabled({"damage_selection": {}}))
         self.assertTrue(selection_enabled({"damage_selection": {"enabled": True}}))
         self.assertFalse(selection_enabled({"damage_selection": {"enabled": False}}))
+
+    def radial_fixture(self):
+        # Four wall cells across the thickness (centroid radii ~76.25..79.25 along +y)
+        # plus foundation pads beyond each face, all at the same elevation band.
+        radii = (76.0, 77.0, 78.0, 79.0)
+        offsets = [(0.0, r, 0.0) for r in radii] + [(0.0, 80.2, 0.0), (0.0, 74.8, 0.0)]
+        regions = np.array([1, 1, 1, 1, 3, 3], dtype=np.int32)
+        coordinates = np.concatenate([UNIT_TET + offset for offset in offsets])
+        cells = np.arange(4 * len(offsets)).reshape(len(offsets), 4)
+        tensors = np.zeros((len(offsets), 3, 3))
+        for index, value in enumerate((3e6, 2.5e6, 2.4e6, 2.3e6, 1e5, 1e5)):
+            tensors[index] = np.diag([value, -1e5, -2e5])
+        return tensors, regions, np.arange(10, 10 + len(offsets)), coordinates, cells
+
+    def test_crack_thickness_limits_the_band_from_the_chosen_face(self):
+        tensors, regions, rows, coordinates, cells = self.radial_fixture()
+        upstream = screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                                relative_tolerance=1e-3,
+                                crack_thickness={"elements": 2, "from": "upstream"})["selection"]
+        # Upstream = larger radius: the two outer wall cells plus the outer foundation pad.
+        self.assertEqual(upstream["selected_source_rows"], [12, 13, 14])
+        self.assertEqual(upstream["crack_thickness"]["max_x_elements"], 4)
+        self.assertEqual(upstream["crack_thickness"]["effective_elements"], 2)
+        self.assertIn("2 of 4 element-sized steps from the upstream face", upstream["rule"])
+        downstream = screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                                  relative_tolerance=1e-3,
+                                  crack_thickness={"elements": 1, "from": "downstream"})["selection"]
+        # Downstream = smaller radius: the innermost wall cell plus the inner foundation pad.
+        self.assertEqual(downstream["selected_source_rows"], [10, 15])
+        full = screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                            relative_tolerance=1e-3,
+                            crack_thickness={"elements": 99, "from": "upstream"})["selection"]
+        unlimited = screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                                 relative_tolerance=1e-3)["selection"]
+        # Clamped at the measured maximum = exactly the full-thickness selection.
+        self.assertEqual(full["selected_source_rows"], unlimited["selected_source_rows"])
+        self.assertEqual(full["crack_thickness"]["effective_elements"], 4)
+        self.assertIsNone(unlimited["crack_thickness"])
+
+    def test_crack_thickness_is_validated(self):
+        tensors, regions, rows, coordinates, cells = fixture([3e6, 1e6], [1, 1])
+        for invalid in ({"elements": 0, "from": "upstream"}, {"elements": 1.5, "from": "upstream"},
+                        {"elements": True, "from": "upstream"}, {"elements": 2, "from": "sideways"},
+                        {"elements": 2}, {"from": "upstream"}, {"elements": 2, "from": "upstream", "x": 1}, []):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                             relative_tolerance=1e-3, crack_thickness=invalid)
+        with self.assertRaisesRegex(ValueError, "max_damage_count"):
+            screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                         relative_tolerance=1e-3, max_damage_count=2,
+                         crack_thickness={"elements": 1, "from": "upstream"})
+
+    def test_crack_thickness_config_helper_defaults_to_none(self):
+        self.assertIsNone(crack_thickness({}))
+        self.assertIsNone(crack_thickness({"damage_selection": {}}))
+        self.assertEqual(crack_thickness({"damage_selection": {"crack_thickness": {
+            "elements": 2, "from": "upstream"}}}), {"elements": 2, "from": "upstream"})
 
 
 # Five critical facets over cells 0..6 (facet stress, owners); facet 5 is below strength.

@@ -233,8 +233,25 @@ def select_damage_cells(pairs, facet_stress_pa, critical, source_rows, max_damag
     }
 
 
+CRACK_THICKNESS_SIDES = ("upstream", "downstream")
+
+
+def _validate_crack_thickness(crack_thickness) -> dict | None:
+    if crack_thickness is None:
+        return None
+    if (not isinstance(crack_thickness, dict)
+            or set(crack_thickness) - {"elements", "from"}
+            or isinstance(crack_thickness.get("elements"), bool)
+            or not isinstance(crack_thickness.get("elements"), int)
+            or crack_thickness["elements"] < 1
+            or crack_thickness.get("from") not in CRACK_THICKNESS_SIDES):
+        raise ValueError("crack_thickness must be {elements: int >= 1, from: upstream|downstream}")
+    return crack_thickness
+
+
 def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, cells,
-                          pairs, facet_stress_pa, critical, crack_base=False) -> dict:
+                          pairs, facet_stress_pa, critical, crack_base=False,
+                          crack_thickness=None) -> dict:
     """Uncapped automatic selection: the peak-tension element's layer plus the layer below.
 
     The most tensioned wall element sets the elevation; the band spans that element
@@ -246,7 +263,14 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
 
     With ``crack_base`` the elevation is the base of the wall instead of the peak:
     the band is the bottom two element layers, confined to the valley floor rather
-    than spanning the dam bank to bank."""
+    than spanning the dam bank to bank.
+
+    ``crack_thickness`` = {"elements": N, "from": "upstream"|"downstream"} limits the
+    band's radial depth: the wall faces and mean radial element size are measured
+    from the band itself, the thickness is divided into max_x element-sized steps,
+    and only cells within N steps of the chosen face stay selected (plus foundation
+    cells on the cracked side, so the band stays un-anchored at that face).
+    N >= max_x is exactly the full-thickness selection."""
     corner_z = coordinates_m[cells][:, :, 2]
     centroid_z = corner_z.mean(axis=1)
     heights = corner_z[wall].max(axis=1) - corner_z[wall].min(axis=1)
@@ -260,6 +284,32 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
     member = ((centroid_z <= centre + band_height / 2)
               & (centroid_z >= centre - 1.5 * band_height)
               & np.isin(regions, (WALL_REGION, FOUNDATION_REGION)))
+    thickness_report = None
+    if crack_thickness is not None and (member & (regions == WALL_REGION)).any():
+        # Measure the faces and the radial element size from the band's own wall
+        # cells (the arch is centred on the origin, so radius = hypot(x, y)).
+        corner_r = np.hypot(coordinates_m[cells][:, :, 0], coordinates_m[cells][:, :, 1])
+        band_wall = member & (regions == WALL_REGION)
+        r_up = float(corner_r[band_wall].max())
+        r_down = float(corner_r[band_wall].min())
+        radial_size = float((corner_r[band_wall].max(axis=1) - corner_r[band_wall].min(axis=1)).mean())
+        thickness = r_up - r_down
+        max_x = max(1, round(thickness / radial_size)) if radial_size > 0 else 1
+        requested = int(crack_thickness["elements"])
+        effective = min(max(requested, 1), max_x)
+        side = crack_thickness["from"]
+        thickness_report = {"elements": requested, "from": side,
+                            "effective_elements": effective, "max_x_elements": int(max_x),
+                            "wall_thickness_m": thickness,
+                            "window_m": thickness * effective / max_x}
+        if effective < max_x:
+            depth = thickness * effective / max_x
+            centroid_r = np.hypot(*coordinates_m[cells].mean(axis=1)[:, :2].T)
+            # One rule covers wall and foundation: keep the cracked side of the
+            # window (foundation beyond the chosen face stays, the far side goes).
+            cracked_side = (centroid_r >= r_up - depth if side == "upstream"
+                            else centroid_r <= r_down + depth)
+            member &= cracked_side
     chosen = np.flatnonzero(member)
     critical_ids = np.flatnonzero(np.asarray(critical, dtype=bool))
     pairs = np.asarray(pairs).reshape(-1, 2)
@@ -268,13 +318,17 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
                      else np.zeros(0, dtype=bool))
     inside, outside = critical_ids[facets_inside], critical_ids[~facets_inside]
     return {
-        "rule": (("every wall and foundation cell whose centroid lies within two element heights "
-                  "above the lowest wall corner (the bottom two element layers at the base of the wall)")
-                 if crack_base else
-                 ("every wall and foundation cell whose centroid lies between one element height below and "
-                  "half an element height above the peak-tension wall element's centroid elevation "
-                  "(the peak element's layer plus the layer below, bank to bank)")),
+        "rule": ((("every wall and foundation cell whose centroid lies within two element heights "
+                   "above the lowest wall corner (the bottom two element layers at the base of the wall)")
+                  if crack_base else
+                  ("every wall and foundation cell whose centroid lies between one element height below and "
+                   "half an element height above the peak-tension wall element's centroid elevation "
+                   "(the peak element's layer plus the layer below, bank to bank)"))
+                 + ("" if thickness_report is None else
+                    f"; radially limited to {thickness_report['effective_elements']} of "
+                    f"{thickness_report['max_x_elements']} element-sized steps from the {thickness_report['from']} face")),
         "crack_base": bool(crack_base),
+        "crack_thickness": thickness_report,
         "max_damage_count": None,
         "capped": False,
         "eligible_cells": int(member.sum()),
@@ -293,7 +347,7 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
 
 def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates_m, geometry_cells,
                  tensile_strength_pa, *, relative_tolerance: float, max_damage_count=None,
-                 crack_base=False, selection_enabled=True) -> dict:
+                 crack_base=False, selection_enabled=True, crack_thickness=None) -> dict:
     """Classify wall cells by max principal stress against f_t (tension positive)."""
     stress = np.asarray(cell_stress_pa, dtype=float)
     regions = np.asarray(cell_region_tags)
@@ -324,6 +378,9 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
         raise ValueError("crack_base requires max_damage_count to be null (band selection)")
     if type(selection_enabled) is not bool:
         raise ValueError("selection_enabled must be a boolean")
+    crack_thickness = _validate_crack_thickness(crack_thickness)
+    if crack_thickness is not None and max_damage_count is not None:
+        raise ValueError("crack_thickness requires max_damage_count to be null (band selection)")
     wall = np.flatnonzero(regions == WALL_REGION)
     if not len(wall):
         raise ValueError("No wall-concrete cells are present in the native mesh")
@@ -351,7 +408,8 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
         }
     elif max_damage_count is None:
         selection = _layer_band_selection(principal, wall, regions, rows, coordinates, cells,
-                                          pairs, one_sided, critical, crack_base=crack_base)
+                                          pairs, one_sided, critical, crack_base=crack_base,
+                                          crack_thickness=crack_thickness)
     else:
         selection = select_damage_cells(pairs, one_sided, critical, rows, max_damage_count,
                                         coordinates_m=coordinates, tetrahedra=cells, regions=regions)
@@ -397,13 +455,14 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
 
 def screening_from_archives(intact_cell_stress: Path, native_inputs: Path, tensile_strength_pa: float,
                             *, relative_tolerance: float, max_damage_count=None, crack_base=False,
-                            selection_enabled=True) -> dict:
+                            selection_enabled=True, crack_thickness=None) -> dict:
     with np.load(intact_cell_stress, allow_pickle=False) as stress, np.load(native_inputs, allow_pickle=False) as native:
         result = screen_cells(
             stress["cell_stress_pa"], stress["cell_region_tags"], stress["source_cell_rows"],
             native["coordinates_m"], native["geometry_cells"], tensile_strength_pa,
             relative_tolerance=relative_tolerance, max_damage_count=max_damage_count,
-            crack_base=crack_base, selection_enabled=selection_enabled)
+            crack_base=crack_base, selection_enabled=selection_enabled,
+            crack_thickness=crack_thickness)
     result["native_archive_sha256"] = {
         "intact_cell_stress.npz": hashlib.sha256(Path(intact_cell_stress).read_bytes()).hexdigest(),
         "native_inputs.npz": hashlib.sha256(Path(native_inputs).read_bytes()).hexdigest(),
@@ -430,6 +489,12 @@ def selection_enabled(config: dict) -> bool:
     """The configured ``damage_selection.enabled`` (absent = enabled; False = control run)."""
     selection = config.get("damage_selection") if isinstance(config, dict) else None
     return selection.get("enabled") is not False if isinstance(selection, dict) else True
+
+
+def crack_thickness(config: dict) -> dict | None:
+    """The configured ``damage_selection.crack_thickness`` (None = full wall thickness)."""
+    selection = config.get("damage_selection") if isinstance(config, dict) else None
+    return selection.get("crack_thickness") if isinstance(selection, dict) else None
 
 
 def config_digest(config: dict) -> str:
@@ -496,7 +561,8 @@ def prepare_and_screen(configuration: Path, model_directory: Path, baseline_dire
                                          relative_tolerance=relative_tolerance,
                                          max_damage_count=max_damage_count(config),
                                          crack_base=crack_base(config),
-                                         selection_enabled=selection_enabled(config))
+                                         selection_enabled=selection_enabled(config),
+                                         crack_thickness=crack_thickness(config))
         energy = concrete.get("cohesive_fracture_energy_j_m2")
         result.update({
             "source_job_id": job_id,

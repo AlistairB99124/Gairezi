@@ -144,6 +144,43 @@ class AutomaticPreparationTests(unittest.TestCase):
             self.assertNotIn("RELATION='JOINT_MECA_FROT'", comm)
             compile(comm, "control.comm", "exec")
 
+    def test_support_degradation_passes_through_only_when_selection_is_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config_path = self.fixture(root)
+            config = json.loads(config_path.read_text())
+            properties = {"density": 2400., "youngs_modulus": 35e6, "poisson_ratio": .2,
+                          "tensile_strength_pa": 2e6, "compressive_strength_pa": 30e6,
+                          "cohesive_fracture_energy_j_m2": 100.}
+            config["damage_selection"] = {"enabled": True, "damaged_element_properties": properties,
+                                          "support_degradation": {"interface_scale": 0.01}}
+            prep.write_json(config_path, config)
+            arrays = column_fixture()
+            arrays["source_cell_rows"] = np.arange(len(arrays["tetra4_concrete"]) + len(arrays["tetra4_bedrock"]))
+            np.savez(baseline / "three_body_mesh_arrays.npz", **arrays)
+            manifest = fixture_manifest(arrays)
+            manifest.update(source_mesh=str(model / "three_body.msh"), source_config=str(config_path),
+                            source_hashes={name: prep.file_hash(model / name) for name in ("three_body.msh", "config.json")})
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening, prepared = root / "screening", root / "prepared"
+            prep.run(config_path, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
+            result = prep.run(config_path, model, baseline, prepared, job_id="fixture",
+                              relative_tolerance=1e-4, screening=screening)
+            self.assertEqual(result["support_degradation"], {"interface_scale": 0.01})
+            summary = json.loads((prepared / "summary.json").read_text())
+            self.assertEqual(summary["support_degradation"], {"interface_scale": 0.01})
+            # The control run keeps the intact supports.
+            config["damage_selection"]["enabled"] = False
+            prep.write_json(config_path, config)
+            manifest["source_hashes"] = {name: prep.file_hash(model / name)
+                                         for name in ("three_body.msh", "config.json")}
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            control_screening, control = root / "control_screening", root / "control"
+            prep.run(config_path, model, baseline, control_screening, job_id="fixture", relative_tolerance=1e-4)
+            result = prep.run(config_path, model, baseline, control, job_id="fixture",
+                              relative_tolerance=1e-4, screening=control_screening)
+            self.assertNotIn("support_degradation", result)
+
     def test_native_hand_off_keeps_consistent_support_and_overload(self):
         from Aster import automatic_cohesive as native
         from Aster.support_trace import add_consistent_support, render_constraints

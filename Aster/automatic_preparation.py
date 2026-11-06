@@ -14,8 +14,8 @@ import numpy as np
 from Aster.automatic_cohesive import file_hash
 from FEniCSx.automatic_cracking import candidate_region, region_cell_stresses, region_candidate_faces
 from FEniCSx.automatic_cracking import maximum_overload_factor
-from FEniCSx.automatic_screening import (COMPLETED, config_digest, crack_base, max_damage_count,
-                                         screen_cells, selection_enabled)
+from FEniCSx.automatic_screening import (COMPLETED, config_digest, crack_base, crack_thickness,
+                                         max_damage_count, screen_cells, selection_enabled)
 from FEniCSx.fracture_topology import split_interior_wall_faces
 
 PREPARED = "prepared_aster_candidates"
@@ -83,7 +83,8 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             result = screen_cells(stress, regions, rows, coordinates, cells,
                                   float(concrete["tensile_strength_pa"]),
                                   relative_tolerance=relative_tolerance, max_damage_count=max_damage_count(config),
-                                  crack_base=crack_base(config), selection_enabled=selection_enabled(config))
+                                  crack_base=crack_base(config), selection_enabled=selection_enabled(config),
+                                  crack_thickness=crack_thickness(config))
             result.update(source_job_id=job_id, config_digest=manifest["config_digest"],
                           solver="code_aster", stress_association="raw P1 cell stress from accepted Aster displacement",
                           verified_baseline_source_sha256=hashes,
@@ -118,7 +119,8 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
                 overload = screen_cells(stress * overload_factor, regions, rows, coordinates, cells,
                                         float(concrete["tensile_strength_pa"]), relative_tolerance=relative_tolerance,
-                                        max_damage_count=max_damage_count(config), crack_base=crack_base(config))
+                                        max_damage_count=max_damage_count(config), crack_base=crack_base(config),
+                                        crack_thickness=crack_thickness(config))
                 selected_rows = np.asarray(overload["selection"]["selected_source_rows"], dtype=np.int64)
                 if not len(selected_rows) and overload["facet_check"]["critical_facets"] > 0:
                     raise ValueError(overload["selection"].get("message") or "Overload candidate selection is empty")
@@ -181,6 +183,11 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 if properties is None:
                     raise ValueError("damaged_joint_friction requires damaged_element_properties")
                 result["damaged_joint_friction"] = friction
+            degradation = (config.get("damage_selection") or {}).get("support_degradation")
+            if degradation is not None and selection_enabled(config):
+                # Applied only in the cracked solve (automatic_cohesive.prepare); the
+                # control run (enabled false) keeps the intact supports.
+                result["support_degradation"] = degradation
             write_json(output / "summary.json", result)
             manifest.update(status=PREPARED, summary_sha256=file_hash(output / "summary.json"),
                             candidate_state_sha256=file_hash(output / "cohesive_state.npz"))

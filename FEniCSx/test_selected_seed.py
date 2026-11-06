@@ -19,6 +19,13 @@ class PreparedSeedTests(unittest.TestCase):
     def setUp(self):
         self.config = load_config()
         self.config["geometry"]["wall"].pop("thickness_steps", None)
+        # Pin the legacy 4 m wall and manual seed; the shipped default is a uniform
+        # 4.5 m wall with no manual crack.
+        self.config["geometry"]["wall"].update(
+            {"radial_width_m": 4.0, "centerline_radius_m": 78.0, "downstream_radius_m": 76.0})
+        if not self.config.get("cracking"):
+            self.config["cracking"] = [{"face": "upstream", "depth_m": 3.0, "opening_m": 0.002,
+                                        "full_width": True, "buffer_m": 1.0}]
         self.config_bytes = json.dumps(self.config).encode("utf-8")
         theta, z = 108.5 / 78, -27.5
         radii = np.array([76., 77., 78., 79., 80.])

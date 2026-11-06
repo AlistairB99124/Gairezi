@@ -12,6 +12,9 @@ from crack_field import CrackSpecification, signed_distance
 from crack_selection import selection_map
 
 CONFIG = json.loads((Path(__file__).parents[1] / "config.json").read_text())
+# These cases pin the legacy 4 m wall; the shipped default is a uniform 4.5 m wall.
+CONFIG["geometry"]["wall"].update(
+    {"radial_width_m": 4.0, "centerline_radius_m": 78.0, "downstream_radius_m": 76.0})
 
 
 def synthetic_fields(upstream_tension=True):

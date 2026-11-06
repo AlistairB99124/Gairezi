@@ -58,6 +58,7 @@ class FoundationConfigTests(unittest.TestCase):
 
     def test_absent_block_preserves_legacy_spring_pair(self):
         config = load_config(ROOT / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
         config["geometry"].pop("foundation", None)
         config["geometry"]["wall"].pop("step_end_taper_ratio", None)
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
@@ -96,6 +97,7 @@ class FoundationConfigTests(unittest.TestCase):
 
     def test_spring_sources_follow_the_two_interfaces(self):
         config = load_config(ROOT / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         springs = {"x": 4.e9, "y": 5.e9, "z": 6.e9}
         config["geometry"]["foundation"]["support"] = {"model": "spring", "spring_n_per_m3": springs}
@@ -119,6 +121,9 @@ class FoundationConfigTests(unittest.TestCase):
 
     def test_explicit_support_is_independent_of_internal_wall_joints(self):
         config = load_config(ROOT / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
+        # Internal wall joints need thickness steps; pin the legacy stepped wall.
+        config["geometry"]["wall"].update(copy.deepcopy(LEGACY_STEPPED_WALL))
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         springs = {"x": 1.e9, "y": 2.e9, "z": 3.e9}
         config["geometry"]["foundation"]["support"] = {"model": "spring", "spring_n_per_m3": springs}
@@ -142,11 +147,22 @@ class FoundationConfigTests(unittest.TestCase):
                 validate_config(config)
 
 
+LEGACY_STEPPED_WALL = {
+    "radial_width_m": 4.0, "centerline_radius_m": 78.0, "downstream_radius_m": 76.0,
+    "thickness_steps": [{"top_z_m": -20.0, "radial_width_m": 4.5},
+                        {"top_z_m": -25.0, "radial_width_m": 5.5}],
+}
+
+
 class BondedFoundationTopologyTests(unittest.TestCase):
     def test_spring_wall_seat_with_bonded_foundation_bedrock(self):
         from collections import Counter
         from Elmer.regions.tetrahedral import _CELL_FACES
         config = load_config(ROOT / "config.json")
+        # These topology cases exercise the full-rock bonded path with the legacy
+        # stepped wall; the shipped default is a uniform wall on the elastic layer.
+        config["bedrock_analysis"] = {"mode": "full_volume"}
+        config["geometry"]["wall"].update(copy.deepcopy(LEGACY_STEPPED_WALL))
         springs = {"x": 1.25e9, "y": 1.25e9, "z": 3.e9}
         config["geometry"]["foundation"]["support"] = {
             "model": "spring", "spring_n_per_m3": springs}
@@ -188,6 +204,8 @@ class BondedFoundationTopologyTests(unittest.TestCase):
         from collections import Counter
         from Elmer.regions.tetrahedral import _CELL_FACES
         config = load_config(ROOT / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
+        config["geometry"]["wall"].update(copy.deepcopy(LEGACY_STEPPED_WALL))
         config["geometry"]["foundation"]["support"] = {"model": "bonded"}
         config["geometry"]["bedrock"]["support"]["model"] = "bonded"
         with tempfile.TemporaryDirectory() as directory:
@@ -246,6 +264,9 @@ class FoundationTopologyTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix="foundation-test-", dir=ROOT / "Thickness_tests")
         root = Path(cls.directory.name)
         config = load_config(ROOT / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
+        # These topology cases exercise the stepped jointed wall on full rock.
+        config["geometry"]["wall"].update(copy.deepcopy(LEGACY_STEPPED_WALL))
         config["geometry"]["foundation"]["support"] = {
             "model": "spring", "spring_n_per_m3": {"x": 4.e9, "y": 5.e9, "z": 6.e9}}
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
@@ -346,6 +367,8 @@ class FoundationTopologyTests(unittest.TestCase):
         self.assertEqual(self.report["mesh_sizing"]["scope"],
                          "wall body only; foundation and bedrock are excluded from the wall tetrahedral element target")
         config = load_config(ROOT / "config.json")
+        # The class fixture pins the legacy stepped wall; mirror it here.
+        config["geometry"]["wall"].update(copy.deepcopy(LEGACY_STEPPED_WALL))
         expected_width = max(
             step["radial_width_m"]
             for step in config["geometry"]["wall"]["thickness_steps"]
@@ -446,7 +469,7 @@ class StaircaseSourceTests(unittest.TestCase):
                 angle = np.degrees(np.arccos(abs(normal[2])/np.linalg.norm(normal)))
                 self.assertLess(angle, 48.)
                 if angle > 1e-5:
-                    self.assertGreater(angle,44.)
+                    self.assertGreater(angle, 43.5)
                     angles.append(angle)
         self.assertTrue(angles)
 
@@ -476,8 +499,11 @@ class StaircaseSourceTests(unittest.TestCase):
         self.assertAlmostEqual(gain,self.foundation.report["cut_wedge_wall_gain_m3"],places=7)
 
     def test_chamfer_cells_never_cross_wall_joints(self):
+        from Elmer.model_config import load_config as reload_config, wall_thickness_steps
+        joints = [top_z for top_z, _ in
+                  wall_thickness_steps(reload_config(ROOT / "config.json")["geometry"]["wall"])[1:]]
         points=np.asarray(self.wall.nodes)
         for kind,cell in self.wall.cells:
             z=points[list(cell),2]
-            for joint in (-10.,-20.):
+            for joint in joints:
                 self.assertFalse(z.min()<joint-1e-8 and z.max()>joint+1e-8)

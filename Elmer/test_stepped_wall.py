@@ -31,6 +31,13 @@ STEPS = [{"top_z_m": -10.0, "radial_width_m": 4.5}, {"top_z_m": -20.0, "radial_w
 def base_payload() -> dict:
     payload = json.loads(assembly.CONFIG_PATH.read_text(encoding="utf-8-sig"))
     payload["geometry"].pop("foundation", None)
+    # These cases pin the legacy stepped-wall geometry; the shipped default is now a
+    # uniform wall, and elastic_layer requires the foundation these cases remove.
+    payload["bedrock_analysis"] = {"mode": "full_volume"}
+    payload["geometry"]["wall"].update({
+        "radial_width_m": 4.0, "centerline_radius_m": 78.0, "downstream_radius_m": 76.0,
+    })
+    payload["geometry"]["wall"].pop("step_end_taper_ratio", None)
     payload["geometry"]["wall"]["thickness_steps"] = copy.deepcopy(STEPS)
     return payload
 

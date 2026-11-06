@@ -136,6 +136,12 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         # Exercise legacy-config compatibility without regenerating a large
         # Gmsh volume in each SIF test. Graded-mesh tests cover the new mesher.
         config = load_config(Path(__file__).resolve().parents[1] / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
+        config["geometry"]["wall"].update({
+            "radial_width_m": 4.0, "centerline_radius_m": 78.0, "downstream_radius_m": 76.0,
+            "thickness_steps": [{"top_z_m": -20.0, "radial_width_m": 4.5},
+                                {"top_z_m": -25.0, "radial_width_m": 5.5}],
+        })
         config["geometry"].pop("foundation", None)
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"
         del config["geometry"]["bedrock"]["mesh"]
@@ -146,6 +152,9 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         wall_loader = patch("Elmer.regions.uniform_wall.load_config", return_value=config)
         wall_loader.start()
         self.addCleanup(wall_loader.stop)
+        structure_loader = patch("Elmer.regions.combined_structure.load_config", return_value=config)
+        structure_loader.start()
+        self.addCleanup(structure_loader.stop)
 
     def test_prepared_model_has_connected_rock_and_explicit_assumptions(self):
         root = Path(__file__).resolve().parents[1]
@@ -316,11 +325,21 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         import meshio
         root = Path(__file__).resolve().parents[1]
         config = load_config(root / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
+        config["geometry"]["wall"].update({
+            "radial_width_m": 4.0, "centerline_radius_m": 78.0, "downstream_radius_m": 76.0,
+            "thickness_steps": [{"top_z_m": -20.0, "radial_width_m": 4.5},
+                                {"top_z_m": -25.0, "radial_width_m": 5.5}],
+        })
         config["geometry"].pop("foundation", None)
         config["geometry"]["bedrock"]["support"]["model"] = "bonded"
         del config["geometry"]["bedrock"]["mesh"]
         with tempfile.TemporaryDirectory() as directory, patch(
             "Elmer.three_body_diagnostic.load_config", return_value=config,
+        ), patch(
+            "Elmer.regions.uniform_wall.load_config", return_value=config,
+        ), patch(
+            "Elmer.regions.combined_structure.load_config", return_value=config,
         ):
             output = Path(directory)
             report = prepare(root, output, joints="spring", integrated=True)
@@ -373,6 +392,7 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
     def test_directional_springs_use_snapshot_values_in_axis_order(self):
         root = Path(__file__).resolve().parents[1]
         config = load_config(root / "config.json")
+        config["bedrock_analysis"] = {"mode": "full_volume"}
         config["geometry"].pop("foundation", None)
         del config["geometry"]["bedrock"]["mesh"]
         config["geometry"]["bedrock"]["support"]["model"] = "distributed_elastic_granite"

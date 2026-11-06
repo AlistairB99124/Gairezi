@@ -6,7 +6,8 @@ import numpy as np
 
 
 def export_mesh(arrays: dict, displacement: np.ndarray, output: Path,
-                damage: np.ndarray, opening: np.ndarray) -> dict:
+                damage: np.ndarray, opening: np.ndarray,
+                concrete_cell_stress: dict | None = None) -> dict:
     import meshio
 
     points = np.asarray(arrays["nodes"], dtype=float)
@@ -21,6 +22,14 @@ def export_mesh(arrays: dict, displacement: np.ndarray, output: Path,
     cell_data = {"GeometryIds": [regions]}
     if "damaged_cells" in arrays:
         cell_data["selected_material"] = [arrays["damaged_cells"].astype(np.int32)]
+    if concrete_cell_stress:
+        # Final-state constant P1 stress per concrete (wall + foundation) cell; rock
+        # cells carry NaN because no rock constitutive stress is recovered here.
+        for name, values in concrete_cell_stress.items():
+            values = np.asarray(values, dtype=float)
+            if values.shape != (len(concrete),):
+                raise ValueError(f"Concrete cell stress array {name} does not match the concrete cells")
+            cell_data[name] = [np.concatenate((values, np.full(len(rock), np.nan)))]
     meshio.write(path, meshio.Mesh(points, [("tetra", cells)],
                                   point_data={"displacement": displacement},
                                   cell_data=cell_data))

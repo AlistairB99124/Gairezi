@@ -24,21 +24,11 @@
     "local_element_size_m": 0.1,
     "target_wall_tetrahedral_elements": 150000,
     "wall": {
-      "radial_width_m": 4.0,
+      "radial_width_m": 4.5,
       "height_m": 29.0,
       "upstream_radius_m": 80.0,
-      "centerline_radius_m": 78.0,
-      "downstream_radius_m": 76.0,
-      "thickness_steps": [
-        {
-          "top_z_m": -20.0,
-          "radial_width_m": 4.5
-        },
-        {
-          "top_z_m": -25.0,
-          "radial_width_m": 5.5
-        }
-      ],
+      "centerline_radius_m": 77.75,
+      "downstream_radius_m": 75.5,
       "joint_support": {
         "model": "spring",
         "spring_n_per_m3": {
@@ -46,8 +36,7 @@
           "y": 1250000000.0,
           "z": 3000000000.0
         }
-      },
-      "step_end_taper_ratio": 1.0
+      }
     },
     "bedrock": {
       "mesh": {
@@ -166,20 +155,20 @@
   },
   "cracking": [],
   "damage_selection": {
-    "enabled": false,
+    "enabled": true,
+    "crack_base": true,
     "max_damage_count": null,
-    "maximum_overload_factor": 2.0,
+    "maximum_overload_factor": 1.0,
     "damaged_element_properties": {
       "density": 2400,
-      "youngs_modulus": 35000000000.0,
+      "youngs_modulus": 35000000.0,
       "poisson_ratio": 0.2,
-      "tensile_strength_pa": 100.0,
+      "tensile_strength_pa": 2000000.0,
       "compressive_strength_pa": 30000000.0,
-      "cohesive_fracture_energy_j_m2": 1.0
+      "cohesive_fracture_energy_j_m2": 100.0
     },
-    "damaged_joint_friction": {
-      "friction_coefficient": 1.0,
-      "adhesion_pa": 0.0
+    "support_degradation": {
+      "interface_scale": 0.01
     }
   },
   "fracture_debug": {

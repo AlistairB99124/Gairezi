@@ -5,12 +5,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import json
 import math
+import re
 from pathlib import Path
 
 from .mesh_sizing import MINIMUM_WALL_TETRAHEDRAL_TARGET
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+
+# Below this, the rock/foundation mesh (sized by global_element_size_m) becomes
+# so large that meshing takes hours and the solve exhausts memory; warn and
+# point at target_wall_tetrahedral_elements, the intended wall-refinement knob.
+GLOBAL_ELEMENT_SIZE_WARNING_M = 0.3
 
 CONFIG_KEYS = {
     "geometry": {"global_element_size_m", "local_element_size_m", "wall", "bedrock"},
@@ -27,11 +33,18 @@ CONFIG_KEYS = {
 }
 OPTIONAL_CONFIG_KEYS = {
     "crack_simulations", "cracking", "fracture_debug", "damage_selection", "bedrock_analysis",
+    "custom",
 }
+# The free-form "custom" section is written by the app's backend-defined Custom tab
+# (Lamb.API custom_fields.json). Solvers ignore it; it is carried for provenance.
+# Strings are length-capped and angle brackets are rejected so a configuration can
+# never smuggle markup/script into logs, reports or web views that render it.
+CUSTOM_STRING_MAX_LENGTH = 4000
 BEDROCK_ANALYSIS_MODES = {"full_volume", "elastic_layer"}
 # Automatic element selection (see FEniCSx/automatic_screening.select_damage_cells).
 DAMAGE_SELECTION_KEYS = {"max_damage_count", "maximum_overload_factor", "damaged_element_properties",
-                         "damaged_joint_friction", "crack_base", "enabled"}
+                         "damaged_joint_friction", "crack_base", "enabled", "support_degradation",
+                         "crack_thickness"}
 # Proportional overload search beyond the design load (FEniCSx/automatic_cracking.maximum_overload_factor).
 MAXIMUM_OVERLOAD_FACTOR = 10.0
 # One cohesive facet needs both owner cells, so fewer than two cells can never crack.
@@ -477,10 +490,47 @@ class _ConfigValidator:
                     if value is not None and key != "minimum_elements_per_length_scale" and value >= 1:
                         self.issue(f"{path}.solver.{key}", "must be less than 1")
 
+    def validate_custom(self, value: object) -> None:
+        """The free-form "custom" section: backend-defined field values keyed by
+        field name. Scalars and flat scalar arrays only; strings are length-capped
+        and must not contain markup or control characters (script-injection guard
+        for anything that later renders them)."""
+        custom = value if isinstance(value, dict) else None
+        if custom is None:
+            self.issue("custom", "must be an object")
+            return
+        for key, entry in custom.items():
+            path = f"custom.{key}"
+            if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", key):
+                self.issue(path, "keys must be 1-64 lowercase letters, digits or underscores")
+                continue
+            values = entry if isinstance(entry, list) else [entry]
+            if isinstance(entry, list) and any(isinstance(item, list) for item in entry):
+                self.issue(path, "arrays must be flat (scalars only)")
+                continue
+            for item in values:
+                if item is None or isinstance(item, (bool, int, float)):
+                    continue
+                if not isinstance(item, str):
+                    self.issue(path, "values must be booleans, numbers, strings or flat arrays of them")
+                    break
+                if len(item) > CUSTOM_STRING_MAX_LENGTH:
+                    self.issue(path, f"text must not exceed {CUSTOM_STRING_MAX_LENGTH} characters")
+                    break
+                if "<" in item or ">" in item:
+                    self.issue(path, "text must not contain '<' or '>'")
+                    break
+                if any(ord(ch) < 32 and ch not in "\n\r\t" for ch in item):
+                    self.issue(path, "text must not contain control characters")
+                    break
+
     def validate(self, payload: object) -> list[ValidationIssue]:
         root = self.object(payload, "", set(CONFIG_KEYS), optional=OPTIONAL_CONFIG_KEYS)
         if root is None:
             return self.issues
+
+        if "custom" in root:
+            self.validate_custom(root["custom"])
 
         geometry = self.object(root.get("geometry"), "geometry", CONFIG_KEYS["geometry"],
                                {"foundation", "target_wall_tetrahedral_elements"})
@@ -519,6 +569,15 @@ class _ConfigValidator:
             local_size = self.field_number(geometry, "local_element_size_m", "geometry", positive=True)
             if global_size is not None and local_size is not None and local_size > global_size:
                 self.issue("geometry.local_element_size_m", "must not exceed global_element_size_m")
+            if global_size is not None and 0 < global_size < GLOBAL_ELEMENT_SIZE_WARNING_M:
+                # The global size meshes the rock and foundation volumes; element
+                # count grows with 1/size^3 (0.1 m is ~125x the 0.5 m default).
+                self.warn(
+                    "geometry.global_element_size_m",
+                    f"below {GLOBAL_ELEMENT_SIZE_WARNING_M} m meshes the rock/foundation volumes extremely "
+                    "finely; meshing and the solvers may take hours and exhaust memory. To refine the "
+                    "wall, raise geometry.target_wall_tetrahedral_elements instead.",
+                )
 
             wall = self.object(
                 geometry.get("wall"),
@@ -725,6 +784,17 @@ class _ConfigValidator:
                 self.issue(path, "must be a boolean")
             elif selection["crack_base"] and selection.get("max_damage_count") is not None:
                 self.issue(path, "requires max_damage_count to be null (the base band is uncapped)")
+        if selection is not None and selection.get("crack_thickness") is not None:
+            # Partial-thickness crack band: element count from the chosen wall face
+            # (FEniCSx/automatic_screening._layer_band_selection).
+            path = "damage_selection.crack_thickness"
+            thickness = self.object(selection["crack_thickness"], path, {"elements", "from"})
+            if thickness is not None:
+                self.debug_integer(thickness.get("elements"), f"{path}.elements", 1)
+                if thickness.get("from") not in ("upstream", "downstream"):
+                    self.issue(f"{path}.from", "must be 'upstream' or 'downstream'")
+                if selection.get("max_damage_count") is not None:
+                    self.issue(path, "requires max_damage_count to be null (band selection)")
         if selection is not None and selection.get("maximum_overload_factor") is not None:
             path = "damage_selection.maximum_overload_factor"
             factor = self.number(selection["maximum_overload_factor"], path)
@@ -755,6 +825,30 @@ class _ConfigValidator:
                     adhesion = self.field_number(friction, "adhesion_pa", path)
                     if adhesion is not None and adhesion < 0:
                         self.issue(f"{path}.adhesion_pa", "must be at least 0")
+        if selection is not None and selection.get("support_degradation") is not None:
+            # Scenario boundary-condition degradation applied only in the cracked solve
+            # (Aster/automatic_cohesive.apply_support_degradation).
+            path = "damage_selection.support_degradation"
+            degradation = self.object(selection["support_degradation"], path, set(),
+                                      optional={"interface_scale", "abutment"})
+            if degradation is not None:
+                if "interface_scale" in degradation:
+                    scale = self.field_number(degradation, "interface_scale", path, positive=True)
+                    if scale is not None and scale > 1:
+                        self.issue(f"{path}.interface_scale", "must be at most 1")
+                if degradation.get("abutment") is not None:
+                    abutment_path = f"{path}.abutment"
+                    abutment = self.object(degradation["abutment"], abutment_path,
+                                           {"scale", "fraction", "end"})
+                    if abutment is not None:
+                        scale = self.field_number(abutment, "scale", abutment_path, positive=True)
+                        if scale is not None and scale > 1:
+                            self.issue(f"{abutment_path}.scale", "must be at most 1")
+                        fraction = self.field_number(abutment, "fraction", abutment_path, positive=True)
+                        if fraction is not None and fraction > .5:
+                            self.issue(f"{abutment_path}.fraction", "must be at most 0.5")
+                        if abutment.get("end") not in ("positive", "negative"):
+                            self.issue(f"{abutment_path}.end", "must be 'positive' or 'negative'")
 
     def validate_fracture_debug(self, value: object) -> None:
         """Optional per-job overrides of FEniCSx/fracture_defaults.json (and Aster softening).

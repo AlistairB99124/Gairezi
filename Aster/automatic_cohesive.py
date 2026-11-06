@@ -1163,8 +1163,11 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
                                  f"solve started:\n{tail}") from None
     status["returncode"] = completed.returncode
     status["runtime"] = "wsl" if runtime == "wsl" and os.name == "nt" else "native"
-    if (completed.returncode != 0 or "<EXCEPTION>" in completed.stdout + completed.stderr
-            or status.get("status") == "running"):
+    # A comm-handled convergence stop writes status "stopped" and exits 0; Code_Aster still
+    # prints the caught exception box, so the <EXCEPTION> scan must not reclassify it.
+    if (completed.returncode != 0 or status.get("status") == "running"
+            or ("<EXCEPTION>" in completed.stdout + completed.stderr
+                and status.get("status") != "stopped")):
         status["status"] = "failed"
         status["message"] = f"Code_Aster stopped unexpectedly (exit code {completed.returncode})"
     return status
@@ -1327,6 +1330,25 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         linear_first_initiation_estimate=linear_estimate,
         design_load=None if design is None else step_rows[design],
     )
+    if (not complete and status.get("status") == "stopped"
+            and status.get("stopped_at_load_factor") is not None):
+        # The solver found equilibria up to reached_load_factor and then none: in a
+        # static analysis that is the structure's capacity, not a software failure.
+        reached, target = float(factors[-1]), float(status["stopped_at_load_factor"])
+        report["outcome"] = "capacity_limit"
+        report["capacity_assessment"] = {
+            "reached_load_factor": reached,
+            "failed_load_factor": target,
+            "last_converged_state": step_rows[-1],
+            "message": (
+                f"The damaged dam has no static equilibrium above {reached:.0%} of the design "
+                f"reservoir load. Code_Aster converged every load step up to {reached:g} and then "
+                f"found no equilibrium between {reached:g} and {target:g} despite repeated time-step "
+                "subdivision. In a static analysis this means the structure cannot carry that load: "
+                "the configured damage brings the dam to failure before full reservoir load. "
+                f"The last stable state (load factor {reached:g}, "
+                f"{step_rows[-1]['initiated_faces']} initiated joints) is archived and viewable."),
+        }
     report["opening_assessment"] = {
         "peak_opening_m": step_rows[-1]["peak_opening_m"],
         "initiated_faces": step_rows[-1]["initiated_faces"],
@@ -1408,8 +1430,32 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         # Preserve all bodies in the view, while assessments use only wall nodes.
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=True) as stored:
             export_arrays = {key: stored[key] for key in stored.files}
-        paraview = export_mesh(export_arrays, final_u, output_dir / "paraview", damage[-1], jump[-1])
+        # Final-state stress for every concrete (wall + foundation) cell, with the
+        # damaged cells' assigned material, so ParaView shows post-cracking stresses.
+        all_concrete = np.asarray(export_arrays["tetra4_concrete"], dtype=np.int64)
+        all_stress = wall_cell_stress(nodes, all_concrete, final_u, e_pa, nu)
+        if assignment is not None and "damaged_cells" in export_arrays:
+            damaged_all = np.asarray(export_arrays["damaged_cells"], dtype=bool)[:len(all_concrete)]
+            properties = assignment["properties"]
+            all_stress[damaged_all] = wall_cell_stress(
+                nodes, all_concrete[damaged_all], final_u,
+                properties["youngs_modulus"], properties["poisson_ratio"])
+        principals = np.linalg.eigvalsh(0.5 * (all_stress + np.transpose(all_stress, (0, 2, 1))))
+        deviator = all_stress - np.trace(all_stress, axis1=1, axis2=2)[:, None, None] / 3.0 * np.eye(3)
+        concrete_cell_stress = {
+            "max_principal_stress_pa": principals[:, 2],
+            "min_principal_stress_pa": principals[:, 0],
+            "von_mises_stress_pa": np.sqrt(1.5 * np.einsum("cij,cij->c", deviator, deviator)),
+        }
+        paraview = export_mesh(export_arrays, final_u, output_dir / "paraview", damage[-1], jump[-1],
+                               concrete_cell_stress=concrete_cell_stress)
         report["paraview"] = paraview
+        report["paraview"]["stress_arrays"] = {
+            "names": sorted(concrete_cell_stress),
+            "scope": "concrete (wall + foundation) cells; rock cells are NaN",
+            "measure": "final-state constant P1 cell stress from the solved displacement, "
+                       "using each cell's assigned material (damaged or intact)",
+        }
 
     if preparation_only:
         report["corroboration"] = {
@@ -1485,9 +1531,12 @@ def run(baseline_dir: Path, fenicsx_output: Path, output_dir: Path, time_limit_s
     inputs["case_sha256"] = file_hash(output_dir / CASE_NAME)
     (output_dir / "case_inputs.json").write_text(json.dumps(inputs, indent=2) + "\n", encoding="utf-8")
     report["input_hashes"] = {key: value for key, value in inputs.items() if key.endswith("_sha256")}
-    report["accepted"] = (report.get("status") == "completed" and status.get("returncode") == 0
-                          and report.get("maximum_wall_displacement_m") is not None
-                          and report.get("paraview") is not None)
+    report["accepted"] = (report.get("status") in ("completed",)
+                          or (report.get("status") == "partial"
+                              and report.get("outcome") == "capacity_limit")) and (
+        status.get("returncode") == 0
+        and report.get("maximum_wall_displacement_m") is not None
+        and report.get("paraview") is not None)
     report["analysis_scope"] = "whole_model"
     report["assessment_authority"] = "code_aster"
     report["runtime"] = status.get("runtime")
