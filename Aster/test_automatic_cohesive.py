@@ -517,6 +517,40 @@ class PostprocessTests(unittest.TestCase):
             self.assertEqual(status["status"], "failed")
             self.assertEqual(status["returncode"], 1)
             self.assertEqual(status["runtime"], "wsl")
+            self.assertNotIn("interrupted", status)
+
+    def test_solver_killed_mid_solve_is_reported_as_interrupted_not_as_a_model_failure(self):
+        import subprocess
+        marker = f"{ac.RUN_ASTER_EXIT_MARKER}502=1\n"
+        progress = ("ASTER_COHESIVE_STEP done load_factor=0.175 damaged_joints=0\n"
+                    "ASTER_COHESIVE_STEP start load_factor=0.2\n")
+        for stdout, returncode, interrupted in ((progress, 1, True), (progress + marker, 1, False),
+                                                (progress, 137, False)):
+            with self.subTest(returncode=returncode, marker=marker in stdout), \
+                    tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "run").mkdir()
+                (root / ac.CASE_NAME).write_text("SOLVEUR=_F(METHODE='MULT_FRONT')")
+
+                def execute(distribution, installation, directory, program, timeout, log):
+                    if "convert_three_body_to_med.py" in " ".join(program):
+                        (root / "mesh.med").write_text("mesh")
+                        return subprocess.CompletedProcess(program, 0, "converted", "")
+                    (root / "run" / ac.STATUS_NAME).write_text('{"status":"running"}')
+                    return subprocess.CompletedProcess(program, returncode, stdout, "")
+
+                with patch("Aster.whole_model_crack.find_linux_installation", return_value="/opt/aster"), \
+                        patch("Aster.whole_model_crack.wsl_path", side_effect=str), \
+                        patch("Aster.run_case.run_wsl_solver", side_effect=execute), \
+                        patch("Aster.automatic_cohesive.os.name", "nt"):
+                    status = ac.solve(root, 60)
+                self.assertEqual(status["status"], "failed")
+                self.assertEqual(status.get("interrupted", False), interrupted)
+                if interrupted:
+                    self.assertIn("terminated from outside while solving load factor 0.2", status["message"])
+                    self.assertIn("not a model result", status["message"])
+                else:
+                    self.assertIn("stopped unexpectedly", status["message"])
 
     def test_aster_only_preparation_has_no_fabricated_supporting_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -579,7 +613,7 @@ class PostprocessTests(unittest.TestCase):
         self.assertEqual(report["status"], "partial")
         self.assertEqual(report["corroboration"]["verdict"], "incomplete")
 
-    def test_capacity_limit_stop_reports_structural_failure_in_english(self):
+    def test_convergence_stop_is_reported_without_claiming_structural_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             status = self.write_case(root, [[0, 0, 0, 0], [1, 1, 0, 0]], [[0] * 4, [2e-5, 0, 0, 0]],
@@ -591,8 +625,13 @@ class PostprocessTests(unittest.TestCase):
         capacity = report["capacity_assessment"]
         self.assertEqual(capacity["reached_load_factor"], 0.9)
         self.assertEqual(capacity["failed_load_factor"], 1.0)
-        self.assertIn("no static equilibrium above 90%", capacity["message"])
-        self.assertIn("the structure cannot carry that load", capacity["message"])
+        # Newton non-convergence without load control is not established failure (U2.05.07 4.3).
+        self.assertIs(capacity["established"], False)
+        self.assertIn("did not converge between 0.9 and 1", capacity["message"])
+        self.assertIn("not, by itself, evidence that the dam fails", capacity["message"])
+        self.assertIn("2 joints had initiated, 0 had fully separated", capacity["message"])
+        for overclaim in ("no static equilibrium", "cannot carry that load", "brings the dam to failure"):
+            self.assertNotIn(overclaim, capacity["message"])
         self.assertEqual(capacity["last_converged_state"]["load_factor"], 0.9)
 
     def test_a_genuine_crash_is_not_reported_as_a_capacity_limit(self):
@@ -634,6 +673,130 @@ def _aster_launcher():
 
 
 @unittest.skipUnless(_aster_launcher(), "Code_Aster is not installed")
+class ReportDiagnosticsTests(unittest.TestCase):
+    """The checks that showed the first lift-joint run had not cracked where it claimed."""
+
+    def test_joint_class_summary_reports_a_bypassed_weak_plane(self):
+        areas = np.array([1., 2., 3., 4.])
+        traction = np.array([[1e4, 2e4, 1e5, 4e5], [1.7e4, 1.5e4, 5e5, 5e5]])
+        jump = np.array([[1e-6, 2e-6, 0., 1e-5], [8e-6, 3e-6, 1e-4, 2e-4]])
+        initiated = np.array([False, False, True, True])
+        lift = ac.joint_class_summary(np.array([True, True, False, False]), areas, initiated, initiated,
+                                      np.zeros(4, bool), traction, jump, 2e5, "JOINT_MECA_RUPT")
+        self.assertEqual((lift["faces"], lift["area_m2"], lift["initiated_faces"]), (2, 3., 0))
+        self.assertAlmostEqual(lift["utilisation"], 0.1)          # 20 kPa of a 200 kPa strength
+        self.assertEqual(lift["peak_opening_m"], 8e-6)
+        damaged = ac.joint_class_summary(np.array([False, False, True, True]), areas, initiated, initiated,
+                                         np.zeros(4, bool), traction, jump, 5e5, "CZM_LIN_REG")
+        self.assertEqual((damaged["initiated_faces"], damaged["utilisation"]), (2, 1.))
+        friction = ac.joint_class_summary(np.array([True, False, False, False]), areas, initiated, initiated,
+                                          np.zeros(4, bool), traction, jump, None, "JOINT_MECA_FROT")
+        self.assertIsNone(friction["utilisation"])
+
+    def test_lift_plane_sliding_compares_shear_demand_with_mohr_coulomb_capacity(self):
+        areas = np.array([2., 2.])
+        normal = np.array([[-1e5, -1e5], [-1e5, 5e4]])           # second step: one face in tension
+        shear = np.array([[3e4, 5e4], [8e4, 0.]])
+        sliding, slip = np.array([[0., 0.], [1., 0.]]), np.array([[0., 0.], [2e-4, 0.]])
+        jump = np.array([[0., 0.], [0., 1e-5]])
+        law = {"law": "JOINT_MECA_FROT", "friction_coefficient": 0.7, "adhesion_pa": 1e4}
+        report = ac.lift_plane_sliding([0.5, 1.0], areas, normal, shear, sliding, slip, jump, law)
+        first, final = report["steps"]
+        self.assertAlmostEqual(first["normal_compression_n"], 4e5)
+        self.assertAlmostEqual(first["shear_demand_n"], 1.6e5)
+        self.assertAlmostEqual(first["shear_capacity_n"], (1e4 + 0.7 * 1e5) * 4.)
+        self.assertAlmostEqual(first["mobilisation"], 1.6e5 / 3.2e5)
+        self.assertAlmostEqual(first["required_friction_coefficient"], 0.4)
+        # A face in tension has capacity c - mu sigma_n = 1e4 - 0.7 * 5e4 < 0, i.e. none.
+        self.assertAlmostEqual(final["shear_capacity_n"], (1e4 + 0.7 * 1e5) * 2.)
+        self.assertAlmostEqual(final["mobilisation"], 1.0)
+        self.assertEqual((final["tension_area_fraction"], final["open_area_fraction"],
+                          final["sliding_area_fraction"]), (0.5, 0.5, 0.5))
+        self.assertEqual(final["peak_cumulative_slip_m"], 2e-4)
+        self.assertIs(report["final"], final)
+        rupture = ac.lift_plane_sliding([1.0], areas, normal[:1], shear[:1], None, None, jump[:1],
+                                        {"law": "JOINT_MECA_RUPT"})
+        self.assertNotIn("mobilisation", rupture["final"])
+        self.assertAlmostEqual(rupture["final"]["required_friction_coefficient"], 0.4)
+        self.assertIn("no slip limit", rupture["definition"])
+
+    def test_unjointed_overstress_counts_only_cells_that_cannot_crack(self):
+        # Three tetrahedra on a line: the first two share a jointed face (split nodes), the
+        # third has no joint. Only the third counts, however high the jointed cells' stress.
+        points = np.array([[0., 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                           [1., 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1],
+                           [5., 0, 0], [6, 0, 0], [5, 1, 0], [5, 0, 1]])
+        wall = np.array([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]])
+        joints = np.array([[1, 2, 3, 4, 5, 6]])
+        stress = np.stack([np.diag([3e6, 0., 0.]), np.diag([3e6, 0., 0.]), np.diag([2.5e6, 0., 0.])])
+        report = ac.unjointed_overstress(points, wall, stress, joints, 2e6)
+        self.assertEqual((report["jointed_wall_cells"], report["unjointed_wall_cells"], report["cells"]), (2, 1, 1))
+        self.assertAlmostEqual(report["volume_m3"], 1 / 6)
+        self.assertEqual(report["peak_principal_stress_pa"], 2.5e6)
+        np.testing.assert_allclose(report["peak_centroid_xyz_m"], [5.25, .25, .25])
+        self.assertIn("cannot crack", report["note"])
+        calm = ac.unjointed_overstress(points, wall, stress * 0.5, joints, 2e6)
+        self.assertEqual(calm["cells"], 0)
+        self.assertEqual(calm["peak_principal_stress_pa"], 1.25e6)
+        self.assertIn("No wall cell", calm["note"])
+
+    def test_displacement_attribution_separates_softening_from_cracking(self):
+        wall_nodes = np.array([0, 1])
+        intact = np.array([[6.62e-3, 0, 0], [1e-3, 0, 0], [9., 9, 9]])      # node 2 is not wall
+        first = np.array([[15.88e-5, 0, 0], [2e-5, 0, 0], [0., 0, 0]])       # load factor 0.01
+        final = np.array([[15.90e-3, 0, 0], [2e-3, 0, 0], [0., 0, 0]])       # load factor 1
+        sources = ["wall/foundation seat springs scaled by 0.1"]
+        report = ac.displacement_attribution(first, final, intact, wall_nodes, [0.01, 0.5, 1.0], False, True, sources)
+        self.assertAlmostEqual(report["softened_uncracked_peak_m"], 15.88e-3)
+        self.assertAlmostEqual(report["elastic_softening_change_m"], 15.88e-3 - 6.62e-3)
+        self.assertAlmostEqual(report["cracking_change_m"], 0.02e-3)
+        self.assertEqual(report["softening_sources"], sources)
+        # Friction runs load self-weight first, and a first step that already cracked is not linear.
+        for first_initiated, proportional, text in ((False, False, "self-weight is applied before the water"),
+                                                    (True, True, "already initiated at the first step")):
+            report = ac.displacement_attribution(first, final, intact, wall_nodes, [0.01, 1.0],
+                                                 first_initiated, proportional, [])
+            self.assertIsNone(report["softened_uncracked_peak_m"])
+            self.assertAlmostEqual(report["total_change_m"], 15.90e-3 - 6.62e-3)
+            self.assertIn(text, report["basis"])
+            self.assertIn("no elastic softening is configured", report["basis"])
+
+    def test_assessment_notes_say_what_each_part_of_the_model_did(self):
+        report = {
+            "joint_classes": {
+                "lift": {"law": "JOINT_MECA_RUPT", "faces": 372, "area_m2": 160.4, "initiated_faces": 0,
+                         "opened_faces": 0, "separated_faces": 0, "peak_normal_traction_pa": 1.7e4,
+                         "tensile_strength_pa": 2e5, "utilisation": 0.085, "peak_opening_m": 7.75e-6},
+                "damaged": {"law": "CZM_LIN_REG", "faces": 4036, "area_m2": 2000., "initiated_faces": 2318,
+                            "opened_faces": 1342, "separated_faces": 2, "peak_normal_traction_pa": 5e5,
+                            "tensile_strength_pa": 5e5, "utilisation": 1.0, "peak_opening_m": 1.46e-4}},
+            "lift_plane_sliding": {"law": "JOINT_MECA_FROT", "friction_coefficient": 0.7, "final": {
+                "shear_demand_n": 6.1e7, "shear_capacity_n": 7.4e7, "mobilisation": 0.82,
+                "normal_compression_n": 9e7, "sliding_area_fraction": 0.4, "open_area_fraction": 0.1,
+                "peak_cumulative_slip_m": 3e-4, "required_friction_coefficient": 0.68}},
+            "displacement_attribution": {
+                "final_peak_m": 15.90e-3, "intact_peak_m": 6.62e-3, "softened_uncracked_peak_m": 15.88e-3,
+                "elastic_softening_change_m": 9.26e-3, "cracking_change_m": 0.02e-3,
+                "softening_sources": ["wall/foundation seat springs scaled by 0.1"]},
+            "unjointed_overstress": {"cells": 12, "volume_m3": 1.5, "tensile_strength_pa": 9e5,
+                                     "peak_principal_stress_pa": 3.44e6},
+        }
+        notes = ac.assessment_notes(report)
+        self.assertEqual(len(notes), 5)
+        self.assertIn("8.5% of the 200 kPa strength", notes[0])
+        self.assertIn("never approached their strength", notes[0])
+        self.assertIn("2318 initiated, 1342 opened, 2 fully separated", notes[1])
+        self.assertNotIn("never approached", notes[1])
+        self.assertIn("mobilisation 0.82", notes[2])
+        self.assertIn("40% of the plane is sliding and 10% is open", notes[2])
+        self.assertIn("Cracking changed the displacement field by at most 0.02 mm", notes[3])
+        self.assertIn("the softened inputs alone, before any cracking, changed it by 9.26 mm", notes[3])
+        self.assertIn("seat springs scaled by 0.1", notes[3])
+        self.assertIn("12 wall cells outside the jointed band", notes[4])
+        self.assertIn("up to 3.44 MPa", notes[4])
+        self.assertEqual(ac.assessment_notes({}), [])
+
+
 class AsterFixtureRun(unittest.TestCase):
     """Real Code_Aster run of the column with a partial cohesive section (about a minute)."""
 
@@ -717,6 +880,305 @@ class AsterFixtureRun(unittest.TestCase):
         self.assertEqual(report["maximum_wall_displacement_m"], stress["cracked"]["maximum_displacement_m"])
         self.assertGreater(stress["intact"]["maximum_principal_tensile_stress_pa"], 0.0)
         self.assertNotEqual(stress["cracked"]["maximum_displacement_m"], stress["intact"]["maximum_displacement_m"])
+
+    def test_lift_joint_plane_cracks_and_postprocesses(self):
+        """Weak lift plane (JOINT_MECA_RUPT) at z = 2 with the intact CZM_LIN_REG elsewhere: the
+        material passes the catalogue, the weight-scaled residual criterion closes the solve
+        and the post-processing accepts an assignment without degraded element properties."""
+        arrays = column_fixture()
+        # Upstream half of the z = 2 plane as weak lift joints; the tied x > 0.5 ligament keeps
+        # the upper block from becoming a mechanism once the weak plane ruptures.
+        faces = crack_faces(arrays)
+        split = ac.split_for_joints(arrays, faces)
+        ac.integrate_joint_faces(split)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            split["arrays"]["damaged_cells"] = np.zeros(
+                len(split["arrays"]["tetra4_concrete"]) + len(split["arrays"]["tetra4_bedrock"]), dtype=bool)
+            split["arrays"]["damaged_joint_faces"] = np.zeros(len(faces), dtype=bool)
+            split["arrays"]["lift_joint_faces"] = np.ones(len(faces), dtype=bool)
+            np.savez(root / ac.SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
+            manifest = ac.split_manifest(fixture_manifest(arrays), split)
+            summary = {"tensile_strength_pa": 3.0e5, "fracture_energy_j_m2": 100.0, "load_factor": 1.0}
+            joint = ac.joint_parameters(arrays, faces, summary, 30e9, 0.2)
+            joint["intact_joint"] = dict(joint)
+            lift = {"tensile_strength_pa": 5.0e3, "cohesive_fracture_energy_j_m2": 0.003, "alpha": 1.0,
+                    "pena_contact": 1.0, "law": "JOINT_MECA_RUPT", "max_normal_deviation_deg": 15.0,
+                    "include_base_contact": False, "lift_joint_facets": len(faces)}
+            joint["lift_joint"] = ac.lift_joint_parameters(lift, joint["initial_stiffness_pa_per_m"])
+            joint["lift_joint"]["residual_tolerance_n"] = 1.0
+            joint["material_assignment"] = {"joint_properties": lift, "selected_source_rows": [0]}
+            joint["lift_joint_count"] = len(faces)
+            joint["damaged_joint_count"] = 0
+            joint["candidate_face_count"] = len(faces)
+            factors = [0.1, *ac.load_factors(summary)]
+            (root / "run").mkdir()
+            comm = ac.render_cohesive_comm(fixture_base_comm(manifest, 4.0e5), joint, factors,
+                                           (root / "run" / ac.STEPS_NAME).resolve(),
+                                           (root / "run" / ac.STATUS_NAME).resolve(),
+                                           tie_pairs=len(split["arrays"]["tie_node_pairs"]),
+                                           interpolation=split["arrays"])
+            self.assertIn("JOINT_MECA_RUPT=_F(", comm)
+            self.assertIn("PENA_RUPTURE=10,", comm)
+            self.assertIn("RESI_GLOB_MAXI=1", comm)
+            self.assertIn("RECH_LINEAIRE", comm)
+            (root / ac.CASE_NAME).write_text(comm, encoding="utf-8")
+            # A zero intact baseline over the original nodes is enough for the comparison path
+            # that crashed on the live job (it assumed degraded element properties).
+            baseline = root / "aster_full_displacement.npz"
+            np.savez(baseline, source_node_ids=arrays["source_node_ids"], coordinates_m=arrays["nodes"],
+                     displacement_m=np.zeros_like(arrays["nodes"]))
+            (root / "case_inputs.json").write_text(json.dumps({
+                "joint": joint, "load_factors": factors, "candidate_faces": len(faces),
+                "split_nodes": split["split_nodes"], "added_nodes": split["added_nodes"],
+                "joint_integration": "three_HEXA8_FPG4_patches_exact_P1_trace",
+                "material_assignment": joint["material_assignment"],
+                "baseline_displacement_path": str(baseline),
+                "baseline_displacement_sha256": ac.file_hash(baseline),
+                "native_joint_cells": len(split["arrays"]["hexa8_joints"])}), encoding="utf-8")
+            status = ac.solve(root, time_limit_s=480, memory_limit_mb=2048)
+            log = (root / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
+            self.assertEqual(status["status"], "completed", f"{status}\n{log[-4000:]}")
+            fenicsx = fake_fenicsx(root / "f", len(faces))
+            report = ac.postprocess(root, fenicsx, status)
+        self.assertEqual(report["reached_load_factor"], 1.0)
+        self.assertEqual(report["lift_joints"]["law"], "JOINT_MECA_RUPT")
+        self.assertEqual(report["lift_joints"]["lift_joint_faces"], len(faces))
+        self.assertGreater(report["steps"][-1]["initiated_faces"], 0, report)
+        self.assertNotIn("properties", report["material_assignment"])
+        self.assertIn("lift-joint cracking only", report["stress_comparison"]["intact_definition"])
+        # The report says which joint class did the work and what the plane's shear demand is.
+        lift_class = report["joint_classes"]["lift"]
+        self.assertEqual((lift_class["law"], lift_class["faces"]), ("JOINT_MECA_RUPT", len(faces)))
+        self.assertGreater(lift_class["initiated_faces"], 0)
+        self.assertGreater(lift_class["utilisation"], 0.5)
+        self.assertNotIn("damaged", report["joint_classes"])
+        sliding = report["lift_plane_sliding"]
+        self.assertEqual(sliding["law"], "JOINT_MECA_RUPT")
+        self.assertEqual(len(sliding["steps"]), len(report["steps"]))
+        # The plane carries shear until it ruptures; a broken JOINT_MECA_RUPT face carries none.
+        self.assertGreater(max(step["shear_demand_n"] for step in sliding["steps"]), 0.)
+        self.assertNotIn("mobilisation", sliding["final"])
+        # The weak plane has already initiated at the first load step, so no linear step exists
+        # to scale: only the total change from the intact baseline can be reported, and since
+        # a stiff joint (K_N >= E/h) is the only softening source that total is the joints'.
+        attribution = report["displacement_attribution"]
+        self.assertEqual(attribution["softening_sources"],
+                         [source for source in attribution["softening_sources"] if "lift-joint" in source])
+        self.assertIsNone(attribution["softened_uncracked_peak_m"])
+        self.assertGreater(attribution["total_change_m"], 0.)
+        self.assertIn("already initiated at the first step", attribution["basis"])
+        overstress = report["unjointed_overstress"]
+        self.assertEqual(overstress["jointed_wall_cells"] + overstress["unjointed_wall_cells"], report["mesh_cells"])
+        self.assertGreater(overstress["jointed_wall_cells"], 0)
+
+    def test_frictional_lift_plane_carries_uplift_as_effective_stress(self):
+        """JOINT_MECA_FROT lift plane with pore pressure inside it, through a real Code_Aster run.
+
+        Only self-weight and the plane's pore pressure act (the reservoir load on the face is
+        negligible), so the plane stays closed and its effective compression must fall by
+        exactly the uplift resultant as the load factor rises."""
+        arrays = column_fixture()
+        # The whole z = 2 section: no crack front inside the wall, so every pore force acts
+        # through the joint (front nodes are tied and would absorb their share).
+        faces = plane_faces(arrays, 2, 2.0, lambda points: True)
+        straight = arrays["nodes"].copy()
+        # Curve the straight column onto an arch centred on the origin (the uplift profile is
+        # radial): the upstream face x = 0 becomes the outer radius, as on the dam.
+        radius, angle = 81. - straight[:, 0], -straight[:, 1] / 80.
+        arrays["nodes"][:, 0], arrays["nodes"][:, 1] = radius * np.cos(angle), radius * np.sin(angle)
+        unit_weight = 2e4
+        split = ac.split_for_joints(arrays, faces)
+        ac.integrate_joint_faces(split)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            split["arrays"]["damaged_cells"] = np.zeros(
+                len(split["arrays"]["tetra4_concrete"]) + len(split["arrays"]["tetra4_bedrock"]), dtype=bool)
+            split["arrays"]["damaged_joint_faces"] = np.zeros(len(faces), dtype=bool)
+            split["arrays"]["lift_joint_faces"] = np.ones(len(faces), dtype=bool)
+            np.savez(root / ac.SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
+            manifest = ac.split_manifest(fixture_manifest(arrays), split)
+            summary = {"tensile_strength_pa": 3.0e5, "fracture_energy_j_m2": 100.0, "load_factor": 1.0}
+            joint = ac.joint_parameters(arrays, faces, summary, 30e9, 0.2)
+            joint["intact_joint"] = dict(joint)
+            lift = {"tensile_strength_pa": 5.0e3, "cohesive_fracture_energy_j_m2": 1.0, "alpha": 1.0,
+                    "pena_contact": 1.0, "law": "JOINT_MECA_FROT", "friction_coefficient": 0.7,
+                    "uplift": "linear_upstream_to_downstream", "max_normal_deviation_deg": 15.0,
+                    "include_base_contact": False, "lift_joint_facets": len(faces)}
+            joint["lift_joint"] = ac.lift_joint_parameters(lift, joint["initial_stiffness_pa_per_m"])
+            joint["lift_joint"]["residual_tolerance_n"] = 1.0
+            joint["material_assignment"] = {"joint_properties": lift, "selected_source_rows": [0]}
+            joint["lift_joint_count"] = len(faces)
+            joint["damaged_joint_count"] = 0
+            joint["candidate_face_count"] = len(faces)
+            from Aster.hydraulic_loads import CRACK_WATER_SETTINGS
+            joint["hydraulic_loads"] = {
+                "settings": CRACK_WATER_SETTINGS, "upstream_z_m": 3., "gradient_pa_per_m": unit_weight,
+                "uplift": {"mode": "none", "resultant_n": [0., 0., 0.]},
+                "lift_plane_uplift": {"mode": "linear_upstream_to_downstream", "downstream_z_m": 1.}}
+            factors = [.05, .1, .2, .3, .4, .5]
+            (root / "run").mkdir()
+            comm = ac.render_cohesive_comm(fixture_base_comm(manifest, 1e-3), joint, factors,
+                                           (root / "run" / ac.STEPS_NAME).resolve(),
+                                           (root / "run" / ac.STATUS_NAME).resolve(),
+                                           tie_pairs=len(split["arrays"]["tie_node_pairs"]),
+                                           interpolation=split["arrays"])
+            for text in ("JOINT_MECA_FROT=_F(K_N=", "MU=0.7, ADHESION=3500)",
+                         "_F(RELATION='JOINT_MECA_FROT', GROUP_MA='LIFT_JOINTS')", "FRICTION_CELLS = np.asarray(",
+                         "LIFT_CELLS = None", "GRAVITY_RAMP = DEFI_FONCTION",
+                         "pore_faces=np.asarray(hydraulic_arrays['lift_joint_faces'], dtype=bool), downstream_z=1.0",
+                         "status['lift_plane_uplift'] = crack_water.pore_report"):
+                self.assertIn(text, comm)
+            self.assertNotIn("JOINT_MECA_RUPT", comm.split("COMPORT = (")[1].split(")")[0])
+            (root / ac.CASE_NAME).write_text(comm, encoding="utf-8")
+            baseline = root / "aster_full_displacement.npz"
+            np.savez(baseline, source_node_ids=arrays["source_node_ids"], coordinates_m=arrays["nodes"],
+                     displacement_m=np.zeros_like(arrays["nodes"]))
+            (root / "case_inputs.json").write_text(json.dumps({
+                "joint": joint, "load_factors": factors, "candidate_faces": len(faces),
+                "split_nodes": split["split_nodes"], "added_nodes": split["added_nodes"],
+                "joint_integration": "three_HEXA8_FPG4_patches_exact_P1_trace",
+                "material_assignment": joint["material_assignment"],
+                "baseline_displacement_path": str(baseline),
+                "baseline_displacement_sha256": ac.file_hash(baseline),
+                "native_joint_cells": len(split["arrays"]["hexa8_joints"])}), encoding="utf-8")
+            status = ac.solve(root, time_limit_s=480, memory_limit_mb=2048)
+            log = (root / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
+            self.assertEqual(status["status"], "completed", f"{status}\n{log[-4000:]}")
+            # The stand-in candidate state carries placeholder areas; resultants need the real ones.
+            points = arrays["nodes"][faces]
+            areas = np.linalg.norm(np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]), axis=1) / 2
+            candidates = fake_fenicsx(root / "f", len(faces))
+            with np.load(candidates / "cohesive_state.npz") as state:
+                stored = {key: state[key] for key in state.files}
+            np.savez(candidates / "cohesive_state.npz", **{**stored, "areas_m2": areas})
+            report = ac.postprocess(root, candidates, status)
+        self.assertEqual(report["reached_load_factor"], factors[-1])
+        # Independent expectation: the wall is 1 m wide, so the radial fraction is the straight
+        # x and the pore pressure at the plane (reservoir 1 m above it, tailwater below it) is
+        # unit_weight * (1 - x) at full load, integrated over the curved facets.
+        pore_force = float((areas * unit_weight * (1. - straight[faces][:, :, 0].mean(axis=1))).sum())
+        uplift = report["lift_plane_uplift"]
+        self.assertEqual((uplift["mode"], uplift["faces"]), ("linear_upstream_to_downstream", len(faces)))
+        self.assertAlmostEqual(uplift["resultant_on_one_lip_n"], pore_force, delta=1e-3 * pore_force)
+        self.assertGreater(uplift["maximum_pressure_pa"], uplift["minimum_pressure_pa"])
+        # The plane stays closed: every lift face carries pore pressure and none is wet.
+        history = report["hydraulic_steps"]
+        for step in history:
+            self.assertEqual((step["wet_faces"], step["pore_pressure_faces"]), (0, len(faces)))
+            np.testing.assert_allclose(step["paired_resultant_n"], 0., atol=1e-6)
+        self.assertEqual(report["lift_joints"]["law"], "JOINT_MECA_FROT")
+        self.assertIn("perfectly plastic", report["lift_joints"]["limitation"])
+        sliding = report["lift_plane_sliding"]
+        self.assertEqual((sliding["law"], sliding["friction_coefficient"], sliding["adhesion_pa"]),
+                         ("JOINT_MECA_FROT", .7, 3500.))
+        steps = {round(step["load_factor"], 6): step for step in sliding["steps"]}
+        # Effective stress: self-weight is complete from load factor 0.05, the pore pressure
+        # scales with the load factor, so the compression falls by the uplift resultant.
+        drop = steps[.1]["normal_compression_n"] - steps[.5]["normal_compression_n"]
+        self.assertAlmostEqual(drop, .4 * pore_force, delta=.02 * .4 * pore_force)
+        weight = 2400. * 9.81 * 1. * areas.sum()           # 1 m of wall above the plane
+        for factor in (.1, .5):
+            # Vertical equilibrium of the block above the plane: joint compression = weight - uplift.
+            self.assertAlmostEqual(steps[factor]["normal_compression_n"], weight - factor * pore_force,
+                                   delta=.02 * weight)
+        for step in sliding["steps"]:
+            self.assertEqual((step["tension_area_fraction"], step["open_area_fraction"]), (0., 0.))
+            # All faces compressed, so capacity = c A + mu N; nothing shears the plane here.
+            self.assertAlmostEqual(step["shear_capacity_n"],
+                                   3500. * areas.sum() + .7 * step["normal_compression_n"], delta=1e-6 * weight)
+            self.assertLess(step["mobilisation"], .05)
+            self.assertEqual(step["sliding_area_fraction"], 0.)
+        # Self-weight is applied before the water, so the first step cannot be scaled.
+        attribution = report["displacement_attribution"]
+        self.assertIsNone(attribution["softened_uncracked_peak_m"])
+        self.assertEqual(attribution["softening_sources"], [])
+        self.assertIn("self-weight is applied before the water", attribution["basis"])
+        lift_class = report["joint_classes"]["lift"]
+        self.assertEqual((lift_class["law"], lift_class["initiated_faces"]), ("JOINT_MECA_FROT", 0))
+
+    def test_lift_and_damaged_joints_combine_in_one_native_run(self):
+        """Three facet classes in one Code_Aster case: the upstream quarter of the z = 2 half-plane
+        as weak lift joints, the rest of it as the degraded elements' CZM (DAMAGED_JOINTS with
+        DAMAGED_MAT on the adjacent cells), and the intact law everywhere else."""
+        arrays = column_fixture()
+        faces = crack_faces(arrays)
+        centroids = arrays["nodes"][faces].mean(axis=1)
+        lift_mask = centroids[:, 0] < np.median(centroids[:, 0])
+        damaged_mask = ~lift_mask
+        self.assertTrue(lift_mask.any() and damaged_mask.any())
+        split = ac.split_for_joints(arrays, faces)
+        ac.integrate_joint_faces(split)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            concrete = split["arrays"]["tetra4_concrete"]
+            damaged_faces = {tuple(sorted(face)) for face in faces[damaged_mask]}
+            damaged_cells = np.array([any(tuple(sorted(cell[list(face)])) in damaged_faces
+                                          for face in ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)))
+                                      for cell in concrete], dtype=bool)
+            self.assertTrue(damaged_cells.any())
+            split["arrays"]["damaged_cells"] = np.r_[damaged_cells,
+                                                    np.zeros(len(split["arrays"]["tetra4_bedrock"]), dtype=bool)]
+            split["arrays"]["damaged_joint_faces"] = damaged_mask
+            split["arrays"]["lift_joint_faces"] = lift_mask
+            np.savez(root / ac.SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
+            manifest = ac.split_manifest(fixture_manifest(arrays), split)
+            properties = {"density": 2400.0, "youngs_modulus": 20e9, "poisson_ratio": 0.2,
+                          "tensile_strength_pa": 1.5e5, "compressive_strength_pa": 30e6,
+                          "cohesive_fracture_energy_j_m2": 50.0}
+            summary = {"tensile_strength_pa": properties["tensile_strength_pa"],
+                       "fracture_energy_j_m2": properties["cohesive_fracture_energy_j_m2"], "load_factor": 1.0}
+            joint = ac.joint_parameters(arrays, faces, summary, 30e9, 0.2)
+            joint["intact_joint"] = ac.joint_parameters(
+                arrays, faces, {"tensile_strength_pa": 3.0e5, "fracture_energy_j_m2": 100.0}, 30e9, 0.2)
+            lift = {"tensile_strength_pa": 5.0e3, "cohesive_fracture_energy_j_m2": 0.003, "alpha": 1.0,
+                    "pena_contact": 1.0, "law": "JOINT_MECA_RUPT", "max_normal_deviation_deg": 15.0,
+                    "include_base_contact": False, "lift_joint_facets": int(lift_mask.sum())}
+            joint["lift_joint"] = ac.lift_joint_parameters(lift, joint["initial_stiffness_pa_per_m"])
+            joint["lift_joint"]["residual_tolerance_n"] = 1.0
+            joint["material_assignment"] = {"properties": properties, "joint_properties": lift,
+                                            "selected_source_rows": np.flatnonzero(damaged_cells).tolist()}
+            joint["lift_joint_count"] = int(lift_mask.sum())
+            joint["damaged_joint_count"] = int(damaged_mask.sum())
+            joint["candidate_face_count"] = len(faces)
+            factors = [0.1, *ac.load_factors(summary)]
+            (root / "run").mkdir()
+            comm = ac.render_cohesive_comm(fixture_base_comm(manifest, 4.0e5), joint, factors,
+                                           (root / "run" / ac.STEPS_NAME).resolve(),
+                                           (root / "run" / ac.STATUS_NAME).resolve(),
+                                           tie_pairs=len(split["arrays"]["tie_node_pairs"]),
+                                           interpolation=split["arrays"])
+            for text in ("LIFT_MAT = DEFI_MATERIAU", "DAMAGED_MAT = DEFI_MATERIAU", "INTACT_JOINT_MAT = DEFI_MATERIAU",
+                         "_F(GROUP_MA='LIFT_JOINTS', MATER=LIFT_MAT)", "_F(GROUP_MA='DAMAGED_JOINTS', MATER=JOINT_MAT)",
+                         "_F(GROUP_MA='DAMAGED_ELEMENTS', MATER=DAMAGED_MAT)",
+                         "_F(RELATION='JOINT_MECA_RUPT', GROUP_MA='LIFT_JOINTS')",
+                         "_F(RELATION='CZM_LIN_REG', GROUP_MA='DAMAGED_JOINTS')"):
+                self.assertIn(text, comm)
+            # Every candidate facet is lift or damaged here, so no (empty) intact group is written.
+            self.assertNotIn("GROUP_MA='INTACT_JOINTS'", comm)
+            (root / ac.CASE_NAME).write_text(comm, encoding="utf-8")
+            baseline = root / "aster_full_displacement.npz"
+            np.savez(baseline, source_node_ids=arrays["source_node_ids"], coordinates_m=arrays["nodes"],
+                     displacement_m=np.zeros_like(arrays["nodes"]))
+            (root / "case_inputs.json").write_text(json.dumps({
+                "joint": joint, "load_factors": factors, "candidate_faces": len(faces),
+                "split_nodes": split["split_nodes"], "added_nodes": split["added_nodes"],
+                "joint_integration": "three_HEXA8_FPG4_patches_exact_P1_trace",
+                "material_assignment": joint["material_assignment"],
+                "baseline_displacement_path": str(baseline),
+                "baseline_displacement_sha256": ac.file_hash(baseline),
+                "native_joint_cells": len(split["arrays"]["hexa8_joints"])}), encoding="utf-8")
+            status = ac.solve(root, time_limit_s=480, memory_limit_mb=2048)
+            log = (root / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
+            self.assertEqual(status["status"], "completed", f"{status}\n{log[-4000:]}")
+            fenicsx = fake_fenicsx(root / "f", len(faces))
+            report = ac.postprocess(root, fenicsx, status)
+        self.assertEqual(report["reached_load_factor"], 1.0)
+        self.assertEqual(report["lift_joints"]["lift_joint_faces"], int(lift_mask.sum()))
+        self.assertEqual(report["material_assignment"]["properties"], properties)
+        self.assertEqual(report["material_assignment"]["joint_properties"]["law"], "JOINT_MECA_RUPT")
+        self.assertIn("selected material changes and cracking", report["stress_comparison"]["intact_definition"])
+        self.assertTrue(np.isfinite(report["maximum_wall_displacement_m"]))
 
     def test_isolated_tetrahedron_has_no_initial_joint_mechanism(self):
         arrays = column_fixture()
@@ -831,6 +1293,63 @@ class SupportDegradationTest(unittest.TestCase):
             manifest, arrays = self.fixture()
             with self.assertRaises(ac.CorroborationError):
                 ac.apply_support_degradation(manifest, arrays, degradation)
+
+
+class VerticalCrackPathTests(unittest.TestCase):
+    def setUp(self):
+        # Peak at radius 10 m on the +x axis, so the radial plane is y = 0 and its normal is +y.
+        self.peak = np.array([10.0, 0.0, 5.0])
+
+    def triangles(self):
+        """Facets: vertical on the plane (in band), vertical but far off, horizontal, and radial-normal."""
+        coords = np.array([
+            [9.0, 0.1, 0.0], [11.0, 0.1, 0.0], [9.0, 0.1, 1.0],        # 0 vertical, normal y, near
+            [9.0, 5.0, 0.0], [11.0, 5.0, 0.0], [9.0, 5.0, 1.0],        # 1 vertical, normal y, far
+            [9.0, 0.0, 5.0], [11.0, 0.0, 5.0], [9.0, 1.0, 5.0],        # 2 horizontal (normal z)
+            [10.0, 0.0, 4.0], [10.0, 1.0, 4.0], [10.0, 0.0, 6.0],      # 3 vertical, normal x (radial)
+        ], dtype=float)
+        faces = np.array([[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]], dtype=np.int64)
+        return coords, faces
+
+    def test_selects_only_near_vertical_facets_on_the_radial_plane(self):
+        coords, faces = self.triangles()
+        mask = ac.vertical_crack_facets(coords, faces, self.peak, band_m=0.5, max_normal_deviation_deg=15.0)
+        self.assertEqual(mask.tolist(), [True, False, False, False])
+
+    def test_band_widens_the_plane(self):
+        coords, faces = self.triangles()
+        mask = ac.vertical_crack_facets(coords, faces, self.peak, band_m=6.0, max_normal_deviation_deg=15.0)
+        self.assertEqual(mask.tolist(), [True, True, False, False])
+
+    def test_peak_on_axis_is_refused(self):
+        coords, faces = self.triangles()
+        with self.assertRaises(ac.CorroborationError):
+            ac.vertical_crack_facets(coords, faces, [0.0, 0.0, 5.0], band_m=0.5, max_normal_deviation_deg=15.0)
+
+    def test_strength_gives_the_target_critical_opening(self):
+        f_t = ac.vertical_joint_strength(critical_opening_m=2.0e-3, fracture_energy_j_m2=150.0)
+        self.assertAlmostEqual(f_t, 150.0e3)
+        self.assertAlmostEqual(2.0 * 150.0 / f_t, 2.0e-3)
+
+    def test_settings_read_the_damage_selection_block(self):
+        config = {"damage_selection": {"vertical_joint": {
+            "fracture_energy_j_m2": 150.0, "critical_opening_m": 0.002, "band_m": None}}}
+        settings = ac.vertical_joint_settings(config)
+        self.assertEqual(settings["critical_opening_m"], 0.002)
+        self.assertEqual(settings["max_normal_deviation_deg"], 15.0)
+        self.assertIsNone(settings["band_m"])
+        config["damage_selection"]["vertical_joint"]["enabled"] = False
+        self.assertIsNone(ac.vertical_joint_settings(config))
+        self.assertIsNone(ac.vertical_joint_settings({}))
+
+    def test_vertical_mask_is_saved_for_the_mesh_converter(self):
+        mask = np.array([True, False, True])
+        split = {"joints": np.zeros((2, 6), dtype=np.int64),
+                 "arrays": {"vertical_joint_faces": mask, "lift_joint_faces": np.zeros(3, dtype=bool)}}
+        with tempfile.TemporaryDirectory() as temp:
+            ac.save_split_arrays(Path(temp), split)
+            with np.load(Path(temp) / ac.SPLIT_ARRAYS_NAME) as saved:
+                self.assertEqual(saved["vertical_joint_faces"].tolist(), mask.tolist())
 
 
 if __name__ == "__main__":

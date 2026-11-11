@@ -1,4 +1,5 @@
 numpy
+scipy
 matplotlib
 meshio
 gmsh>=4.15,<5

@@ -69,7 +69,6 @@ def build_foundation(config: dict, concrete) -> FoundationMesh:
     # A conservative common vertical offset preserves >=depth normal thickness
     # on every inclined triangular facet, including the inner-radius facets.
     vertical_depth = depth * math.sqrt(1+max(slopes)**2)
-    floors = [z-vertical_depth for z in tops]
     treads = [(a+b)/2 for a,b in zip(tops,tops[1:])]
     radii = sorted({round(math.hypot(x, y), 8) for x, y, z in coordinates} | {inner, outer})
     complete_radii = [radii[0]]
@@ -92,8 +91,15 @@ def build_foundation(config: dict, concrete) -> FoundationMesh:
     for i in range(len(tops)-1):
         for layer in range(layers):
             lower, upper = layer/layers, (layer+1)/layers
-            z0,z1 = floors[i]+lower*vertical_depth,floors[i]+upper*vertical_depth
-            w0,w1 = floors[i+1]+lower*vertical_depth,floors[i+1]+upper*vertical_depth
+            # Measure each layer DOWN from the exact seat elevation so the top
+            # layer (upper == 1) lands on tops[i] bit-for-bit and reuses the
+            # wall-seat nodes. Computing it up from a separate floor as
+            # (tops[i] - vertical_depth) + vertical_depth drifts by ~1e-8, and
+            # because node() dedupes on round(z, 8) that spawns a distinct roof
+            # node which orphans the seat node - the "missing wall faces" at
+            # stepped (terraced) seats.
+            z0,z1 = tops[i]-(1-lower)*vertical_depth, tops[i]-(1-upper)*vertical_depth
+            w0,w1 = tops[i+1]-(1-lower)*vertical_depth, tops[i+1]-(1-upper)*vertical_depth
             for j in range(len(radii)-1):
                 hexes.append((grid(i,j,z0),grid(i+1,j,w0),grid(i+1,j+1,w0),grid(i,j+1,z0),
                               grid(i,j,z1),grid(i+1,j,w1),grid(i+1,j+1,w1),grid(i,j+1,z1)))

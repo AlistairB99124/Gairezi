@@ -93,6 +93,145 @@ after the FEniCSx baseline (no manual selection); the API exposes only the
 read routes `/jobs/{id}/automatic-cracking/screening` and `/run`, plus
 `/run/cancel`.
 
+### Weak construction (lift) joints
+
+A dam wall is poured in horizontal lifts, and the realistic construction defect is
+not two layers of bad concrete but a poorly prepared surface between pours (laitance
+or debris left on the dried lift) that weakens the *bond between layers*. This is the
+standard interface/cohesive-zone modelling case (Goodman 1968; Hillerborg 1976) and
+the purpose of Code_Aster's R7.01.25 "lois de comportement des joints des barrages".
+FERC Engineering Guidelines ch. III and EPRI TR-100345 (1992) put a poorly bonded
+lift joint below 10 % of the parent tensile strength (often taken as zero), with
+cohesion 0-0.35 MPa and a 27-35 degree friction angle.
+
+A weak pour plane does not fail by cracking in tension under normal load. It fails by
+opening at its upstream edge, letting water in, and sliding (FERC ch. 3 and ch. 11:
+shear-friction with uplift on the plane). `Gairezi/taking_a_breath.md` records why the
+first tension-only attempts showed nothing, and what was changed.
+
+`damage_selection.lift_joints` can be used alone or combined with
+`damaged_element_properties`. `config.json` ships the rupture law beside (undegraded)
+element properties; `cracked_config.json` ships the sliding scenario, lift joints only:
+
+```json
+"lift_joints": {
+  "tensile_strength_pa": 20000.0,
+  "cohesive_fracture_energy_j_m2": 1.0,
+  "max_normal_deviation_deg": 15.0,
+  "include_base_contact": false,
+  "law": "JOINT_MECA_FROT",
+  "friction_coefficient": 0.7,
+  "plane_elevation_m": -25.0,
+  "uplift": "linear_upstream_to_downstream",
+  "alpha": 1.0,
+  "pena_contact": 1.0
+}
+```
+
+| key | meaning |
+|---|---|
+| `law` | `JOINT_MECA_RUPT` (default): tensile rupture with contact, no slip limit. `JOINT_MECA_FROT`: Mohr-Coulomb friction with contact; the plane can slide. |
+| `tensile_strength_pa` | Bond tensile strength. For the friction law it is the cone's apex: `ADHESION = friction_coefficient * tensile_strength_pa`. That law is perfectly plastic and keeps the capacity after opening (R7.01.25 1.2.2), so a poorly bonded surface gets a small value. |
+| `cohesive_fracture_energy_j_m2` | Rupture law: sets the joint stiffness (below). Friction law: not used by Code_Aster; the supporting FEniCSx mode-I law still uses it. |
+| `friction_coefficient` | Required for, and only allowed with, `JOINT_MECA_FROT` (0.001 to 10). |
+| `plane_elevation_m` | Optional pour-plane elevation. The band is the element layer below and the layer above the nearest horizontal mesh plane, bank to bank. Excludes `crack_base`. |
+| `uplift` | `none` (default) or `linear_upstream_to_downstream`; needs `crack_water_pressure`. |
+| `alpha`, `pena_contact` | `JOINT_MECA_RUPT` only. |
+| `include_base_contact` | Informational. The wall/foundation seat is a spring layer, so no joint is inserted there. It no longer requires `support_degradation`: a softened seat carries tension and takes the heel lift away from the lift plane. Validation warns when lift joints and a softened seat are combined. |
+
+**Where the plane goes.** With lift joints the band always sits on one horizontal mesh
+plane, so it is exactly two element layers: the configured `plane_elevation_m`, else the
+plane under the peak-tension element's layer (the plane above it when that layer sits on
+the seat), else the base band with `crack_base`. `lift_joints.py` keeps, of the interior
+wall facets between two selected cells, those whose unit normal lies within
+`max_normal_deviation_deg` of vertical. Screening records them in `selection.lift_joints`
+(count, area, elevation, mean facet edge, `source_faces`) and writes `lift_plane_survey`:
+for every horizontal plane of the wall, its area, mean and peak vertical stress, the peak
+vertical tension in the upstream third, and the intact normal and shear resultants with
+their ratio. That ratio is the friction coefficient the plane would need to carry its
+shear by friction alone, before any uplift; planes where it approaches the available
+friction are the ones a weak joint makes critical. Peak principal stress is not the
+criterion: a horizontal plane sees the vertical stress, not the principal one.
+
+**Facet classes.** `material_assignment` carries `joint_properties` beside `properties`
+when both blocks are configured:
+
+| class | facets | law |
+|---|---|---|
+| lift | the recorded near-horizontal plane between selected cells | `JOINT_MECA_RUPT` or `JOINT_MECA_FROT` (`LIFT_MAT`) |
+| damaged | the other facets between two selected cells | `damaged_element_properties` `f_t`/`Gf` (`CZM_LIN_REG` `JOINT_MAT`, or `JOINT_MECA_FROT` with `damaged_joint_friction`) |
+| intact | everything else | concrete `f_t`/`Gf` (`INTACT_JOINT_MAT`) |
+
+Without `damaged_element_properties` the damaged class is empty and every element keeps
+the intact concrete, which keeps the joints' effect separate from elastic softening. In
+FEniCSx the runner builds a `FacetCohesiveLaws` (`cohesive_mode_i.py`) with one mode-I law
+per class from the strengths and energies; it is supporting evidence and has no friction.
+
+**Joint stiffness (Code_Aster U2.05.07 4.1.2).** "The initial stiffness of the joint
+elements must be greater than the stiffness of the neighbouring volume elements." A softer
+joint is an elastic layer that sheds its load before reaching its strength, which is what
+the first lift-joint runs did.
+
+- `JOINT_MECA_FROT`: `K_N` is the shared mesh penalty (1000 E/h), `K_T` is E/h as for the
+  damaged friction joints.
+- `JOINT_MECA_RUPT`: the law has no fracture-energy input. `PENA_RUPTURE` is capped at 10
+  by the catalogue, so `K_N = f_t^2 (1 + 10) / (2 Gf)` at that cap, and full separation is at
+  `2 Gf / f_t` (ssnp162b). Element selection and `automatic_cohesive.prepare` refuse a
+  fracture energy for which this `K_N` falls below E/h over the lift facets, and name the
+  largest energy the law can carry (about 7.7 J/m2 at 0.2 MPa on a 1.2 m mesh; it scales with
+  the strength squared). A joint so brittle that `K_N` would exceed the mesh penalty keeps
+  the penalty and solves `PENA_RUPTURE` instead. R7.01.25 1.2.1 suggests `K_N` of the order
+  of 1e12 Pa/m and `PENA_RUPTURE` near 1: this law models a nearly brittle joint.
+
+**Uplift.** With `uplift: linear_upstream_to_downstream` the coupled crack-water solve
+(`Aster/hydraulic_loads.CrackWater`) applies, on the lift plane's closed faces, a pore
+pressure that varies linearly across the wall from the reservoir head at the upstream face
+to the tailwater head at the downstream face; opened, reservoir-connected faces take the
+full head instead. The pressure acts on both lips as equal and opposite forces, so the
+joint carries the effective stress and its friction capacity falls with the uplift. Base
+uplift at the seat stays off: the seat is a linear spring layer that cannot open or slide.
+
+**Loading.** Friction runs (a frictional lift plane or `damaged_joint_friction`) apply
+full self-weight by load factor 0.05 and then raise the water, so compression is in place
+before shear. Other runs scale every load together. Lift runs use `RECH_LINEAIRE` and
+accept a residual of 1e-4 times the concrete weight, because faces toggling between open
+and closed otherwise cycle the Newton residual.
+
+**What the report says** (`aster_cohesive_report.json`):
+
+- `joint_classes`: per class, faces initiated/opened/separated, the highest tension seen and
+  its ratio to the strength. A weak plane far below 1 with nothing initiated was bypassed.
+- `lift_plane_sliding`: per step, the plane's compression, shear demand and, for the
+  friction law, Mohr-Coulomb capacity `sum(max(c - mu sigma_n, 0) A)`, their ratio
+  (`mobilisation`; 1 = the whole plane at its friction limit), sliding and open area
+  fractions and the largest slip.
+- `displacement_attribution`: the first load step is linear while nothing has initiated, so
+  scaled to the final load it is the softened-but-uncracked response. The report gives the
+  change due to the softened inputs alone and the change due to cracking, and lists the
+  softening sources (seat spring scale, degraded modulus, soft joint). Not available for
+  friction runs (self-weight first) or when the first step already initiated.
+- `unjointed_overstress`: wall cells with no cohesive joint whose final principal tension
+  exceeds the intact strength. A cohesive model cracks only along the joints it was given
+  (U2.05.07 3.1), so tension there means the crack path lies outside the modelled one.
+- `capacity_assessment`: when Newton stops converging before full load, `established` is
+  false and the message says so. Without load control (U2.05.07 4.3 calls it essential for
+  cohesive laws) a stop may be a local snap-back rather than the structure's capacity.
+- `assessment_notes`: the same findings as sentences, shown in the app's results view.
+
+`cracking_sweeps/run_sweep.py` varies `tensile_strength_pa`/`cohesive_fracture_energy_j_m2`
+by factors and `alpha`/`friction_coefficient` as absolute values (`scenarios.json`); with
+both blocks configured each case's factors are keyed by block, and a derivative may never
+drop a block. The shipped cases pair each strength factor with an energy factor of that
+factor squared or less, which keeps a rupture joint's stiffness from falling.
+
+Tests: `FEniCSx/test_lift_joints.py` and the lift cases in `test_automatic_screening`
+(from `FEniCSx`), `FacetLawTests` in `test_automatic_cracking`, `FEniCSx.test_cohesive_network`,
+`Aster.test_automatic_preparation`, `Aster.test_hydraulic_loads`,
+`Aster.test_automatic_cohesive` (`ReportDiagnosticsTests`, and the real Code_Aster fixtures
+`test_lift_joint_plane_cracks_and_postprocesses` and
+`test_frictional_lift_plane_carries_uplift_as_effective_stress`),
+`Elmer.test_model_config` and `cracking_sweeps.test_run_sweep`.
+
 Every network solve covers the whole dam (Max Damage Count limits the
 candidate facets, not the system size). `sparse_direct.py` solves systems of
 at least `MUMPS_MINIMUM_UNKNOWNS` (20,000) unknowns with PETSc/MUMPS LU and

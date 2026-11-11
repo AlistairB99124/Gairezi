@@ -1,4 +1,6 @@
 import unittest
+from copy import deepcopy
+import tempfile
 
 import numpy as np
 
@@ -9,6 +11,12 @@ from pathlib import Path
 
 
 class HydraulicTests(unittest.TestCase):
+    def test_crack_water_can_be_enabled_without_base_uplift(self):
+        self.assertEqual(water.validate_settings(water.CRACK_WATER_SETTINGS)["base_uplift"], "none")
+        for value in (True, 0, float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                water.validate_settings(dict(water.CRACK_WATER_SETTINGS, opening_tolerance_m=value))
+
     def test_linear_pressure_resultant_and_moment(self):
         vertices = np.array([[0., 0, 0], [2., 0, 0], [0., 1, 0]])
         pressure = np.array([300., 100., 300.])
@@ -60,6 +68,108 @@ class HydraulicTests(unittest.TestCase):
         displacement[3, 2] = .001
         self.assertFalse(system.evaluate(displacement)[0].any())
 
+    def test_elastic_joint_compliance_cannot_admit_water_before_damage(self):
+        arrays = self.network()
+        system = water.CrackWater(arrays, 2., 100., 1e-9)
+        displacement = np.zeros_like(arrays["nodes"])
+        displacement[:7, 2] = .001
+        wet, forces = system.evaluate(displacement, np.zeros(3, dtype=bool))
+        self.assertFalse(wet.any())
+        np.testing.assert_allclose(forces, 0)
+        wet, _ = system.evaluate(displacement, np.array([True, True, True]))
+        np.testing.assert_array_equal(wet, [True, True, False])
+        wet, _ = system.evaluate(displacement, np.array([False, True, True]))
+        self.assertFalse(wet.any())
+        with self.assertRaises(ValueError):
+            system.evaluate(displacement, np.ones(3))
+
+    @staticmethod
+    def lift_plane():
+        """Horizontal sector of a wall at z = 0: radii 10 (downstream) to 12 (upstream), 8 facets."""
+        radii, angles = (10., 11., 12.), (0., .1, .2)
+        index = lambda r, a: 3 * r + a
+        points = np.array([[radius * np.cos(angle), radius * np.sin(angle), 0.]
+                           for radius in radii for angle in angles])
+        faces = []
+        for r in range(2):
+            for a in range(2):
+                faces += [[index(r, a), index(r + 1, a), index(r + 1, a + 1)],
+                          [index(r, a), index(r + 1, a + 1), index(r, a + 1)]]
+        faces = np.array(faces)
+        return {"nodes": np.vstack([points, points]), "source_node_ids": np.tile(np.arange(9), 2),
+                "penta6_joints": np.hstack([faces, faces + 9]),
+                "tri3_upstream": np.array([[index(2, 0), index(2, 1), index(2, 2)]]),
+                "tri3_downstream": np.array([[index(0, 0), index(0, 1), index(0, 2)]])}, faces
+
+    def test_lift_plane_uplift_is_linear_across_the_wall_and_full_head_where_wet(self):
+        arrays, faces = self.lift_plane()
+        points = arrays["nodes"][:9]
+        areas = np.linalg.norm(np.cross(points[faces[:, 1]] - points[faces[:, 0]],
+                                        points[faces[:, 2]] - points[faces[:, 0]]), axis=1) / 2
+        pore = np.ones(8, dtype=bool)
+        pore[-1] = False
+        # Reservoir 5 m and tailwater 1 m above the plane, unit weight 100 N/m3.
+        system = water.CrackWater(arrays, 5., 100., 1e-9, pore_faces=pore, downstream_z=1.)
+        radius = np.linalg.norm(points[:, :2], axis=1)
+        pressure = 100. * (5. + (1. - 5.) * (12. - radius) / 2.)    # 500 Pa upstream, 100 Pa downstream
+        self.assertAlmostEqual(system.pore_report["maximum_pressure_pa"], 500.)
+        self.assertAlmostEqual(system.pore_report["minimum_pressure_pa"], 100.)
+        self.assertEqual(system.pore_report["faces"], 7)
+        closed = np.zeros_like(arrays["nodes"])
+        wet, force = system.evaluate(closed, np.zeros(8, dtype=bool))
+        self.assertFalse(wet.any())
+        expected = (areas[pore] * pressure[faces[pore]].mean(axis=1)).sum()
+        # Equal and opposite on the two lips: the joint carries the effective stress.
+        self.assertAlmostEqual(abs(force[:9, 2].sum()), expected)
+        np.testing.assert_allclose(force.sum(axis=0), 0, atol=1e-9)
+        np.testing.assert_allclose(force[:9] + force[9:], 0, atol=1e-9)
+        # Open, reservoir-connected faces take the full head instead (never both).
+        opened = closed.copy()
+        opened[:9, 2] = 1e-3 * np.sign(system.normals[0, 2])
+        wet, force = system.evaluate(opened, np.ones(8, dtype=bool))
+        self.assertTrue(wet.all())
+        self.assertAlmostEqual(abs(force[:9, 2].sum()), areas.sum() * 500.)
+        # Without the plane's faces on both wall surfaces the profile cannot be built.
+        with self.assertRaisesRegex(ValueError, "upstream and downstream faces"):
+            water.CrackWater({**arrays, "tri3_downstream": np.array([[0, 0, 0]])}, 5., 100., 1e-9,
+                             pore_faces=pore, downstream_z=1.)
+        for bad in (np.ones(8), np.ones(7, dtype=bool), np.zeros(8, dtype=bool)):
+            with self.assertRaises(ValueError):
+                water.CrackWater(arrays, 5., 100., 1e-9, pore_faces=bad, downstream_z=1.)
+        with self.assertRaisesRegex(ValueError, "tailwater"):
+            water.CrackWater(arrays, 5., 100., 1e-9, pore_faces=pore)
+        self.assertEqual(water.CrackWater(arrays, 5., 100., 1e-9).pore_report, {"mode": "none"})
+
+    def test_missing_or_unstable_wet_history_cannot_be_accepted(self):
+        report = {"hydraulic_loads": {"settings": water.CRACK_WATER_SETTINGS},
+                  "steps": [{"load_factor": 1.}],
+                  "hydraulic_steps": [{"load_factor": 1., "active_set_stable": True, "iterations": 2,
+                      "wet_faces": 1, "paired_resultant_n": [0., 0., 0.],
+                      "paired_moment_n_m": [0., 0., 0.], "uplift_resultant_n": [0., 0., 0.],
+                      "sum_nodal_force_magnitudes_n": 100.}]}
+        water.validate_crack_water_evidence(report)
+        for key, value in (("active_set_stable", False), ("load_factor", .9), ("wet_faces", -1),
+                           ("iterations", 21), ("sum_nodal_force_magnitudes_n", float("nan")),
+                           ("uplift_resultant_n", [0., 0., 1.])):
+            broken = deepcopy(report)
+            broken["hydraulic_steps"][0][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                water.validate_crack_water_evidence(broken)
+        with self.assertRaises(ValueError):
+            water.validate_crack_water_evidence({})
+        broken = deepcopy(report)
+        broken["hydraulic_steps"] = []
+        with self.assertRaises(ValueError):
+            water.validate_crack_water_evidence(broken)
+
+    def test_wet_load_factors_are_explicit_and_dry_defaults_are_unchanged(self):
+        self.assertEqual(cohesive.load_factors({}), [.5, .6, .7, .8, .9, 1.])
+        factors = cohesive.load_factors({"crack_water_pressure": True})
+        self.assertEqual(factors[0], .01)
+        self.assertEqual(factors[-1], 1.)
+        self.assertTrue(np.all(np.diff(factors) > 0))
+        self.assertLessEqual(max(np.diff(factors)), .025 + 1e-9)
+
     def test_uplift_on_wall_only_using_measured_heel_to_toe(self):
         arrays = column_fixture()
         radius = arrays["nodes"][:, 0] + 80.
@@ -93,7 +203,12 @@ class HydraulicTests(unittest.TestCase):
         self.assertNotIn("reuse=RESU, ETAT_INIT", comm)
         self.assertIn("Crack-water active set did not converge", comm)
         self.assertIn('status["hydraulic_steps"] = hydraulic_history', comm)
-        self.assertNotIn("times = DEFI_LIST_INST(", comm)
+        # Trials keep the dry path's DECOUPE sub-stepping: the trial's last archived instant is
+        # still the target and ETAT_INIT(INST=reached) is unaffected by archived sub-instants.
+        self.assertIn("times = DEFI_LIST_INST(", comm)
+        self.assertIn("ACTION='DECOUPE'", comm)
+        self.assertIn("hydraulic_open_faces(trial)", comm)
+        self.assertIn("(damage >= 1. - 1e-9) & (jump > HYDRAULIC_OPENING_LIMIT)", comm)
 
     def test_uplift_is_invariant_under_cohesive_and_relief_node_splitting(self):
         arrays = column_fixture()
@@ -112,6 +227,61 @@ class HydraulicTests(unittest.TestCase):
         self.assertEqual(intact["faces"], cracked["faces"])
         np.testing.assert_allclose(intact["resultant_n"], cracked["resultant_n"], rtol=1e-12)
         np.testing.assert_allclose(intact["moment_n_m"], cracked["moment_n_m"], rtol=1e-12)
+
+
+class NativeCrackWaterTests(unittest.TestCase):
+    def test_native_opened_section_carries_reservoir_pressure_without_uplift(self):
+        self.solve_section(with_joints=True)
+
+    def test_native_jointless_control_remains_dry_with_stable_hydraulic_history(self):
+        self.solve_section(with_joints=False)
+
+    def solve_section(self, *, with_joints):
+        from Aster.test_automatic_cohesive import _aster_launcher
+        if not _aster_launcher():
+            self.skipTest("Code_Aster is not installed")
+        arrays = column_fixture()
+        faces = crack_faces(arrays) if with_joints else np.empty((0, 3), dtype=np.int64)
+        split = cohesive.split_for_joints(arrays, faces)
+        cohesive.integrate_joint_faces(split)
+        joint = cohesive.joint_parameters(arrays, faces,
+            {"tensile_strength_pa": 3e5, "fracture_energy_j_m2": 100.}, 30e9, .2)
+        joint["has_joints"] = with_joints
+        joint["hydraulic_loads"] = {
+            "settings": water.CRACK_WATER_SETTINGS, "upstream_z_m": 3.,
+            "gradient_pa_per_m": 4e5, "uplift": {"mode": "none", "resultant_n": [0., 0., 0.]}}
+        factors = [.1, .2, .3, .4, .5, .6, .7, .8, .9, 1.] if with_joints else [.5, 1.]
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "run").mkdir()
+            np.savez(root / cohesive.SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
+            comm = cohesive.render_cohesive_comm(fixture_base_comm(
+                cohesive.split_manifest(fixture_manifest(arrays), split), 4e5),
+                joint, factors, root / "run" / cohesive.STEPS_NAME, root / "run" / cohesive.STATUS_NAME,
+                tie_pairs=len(split["arrays"]["tie_node_pairs"]), interpolation=split["arrays"])
+            (root / cohesive.CASE_NAME).write_text(comm, encoding="utf-8")
+            status = cohesive.solve(root, time_limit_s=450, memory_limit_mb=2048)
+            log = (root / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
+            self.assertEqual(status["status"], "completed", f"{status}\n{log[-6000:]}")
+            self.assertEqual(status["returncode"], 0)
+            history = status["hydraulic_steps"]
+            self.assertEqual(len(history), len(factors))
+            self.assertEqual(history[0]["wet_faces"], 0)
+            if with_joints:
+                self.assertGreater(history[-1]["wet_faces"], 0, status)
+                self.assertGreater(history[-1]["sum_nodal_force_magnitudes_n"], 0)
+            else:
+                self.assertTrue(all(step["wet_faces"] == 0 for step in history))
+                self.assertTrue(all(step["sum_nodal_force_magnitudes_n"] == 0 for step in history))
+            water.validate_crack_water_evidence({
+                "hydraulic_loads": joint["hydraulic_loads"], "hydraulic_steps": history,
+                "steps": [{"load_factor": value} for value in factors]})
+            for step in history:
+                np.testing.assert_allclose(step["paired_resultant_n"], 0., atol=1e-8)
+                np.testing.assert_allclose(step["paired_moment_n_m"], 0., atol=1e-8)
+                np.testing.assert_allclose(step["uplift_resultant_n"], 0.)
+            with np.load(root / "run" / cohesive.STEPS_NAME.replace(".npz", "_hydraulic.npz")) as stored:
+                self.assertEqual(stored["wet_faces"].shape, (len(factors), len(faces)))
 
 
 if __name__ == "__main__":

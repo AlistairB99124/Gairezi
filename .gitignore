@@ -10,3 +10,5 @@ __pycache__/
 *.bak
 *.bak_*
 /sweep.log
+/cracking_sweeps/runs/
+/candidate

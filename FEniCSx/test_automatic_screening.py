@@ -2,10 +2,32 @@ import unittest
 
 import numpy as np
 
-from automatic_screening import (crack_base, crack_thickness, interior_wall_facet_normal_stress,
+from automatic_screening import (crack_base, crack_thickness, interior_wall_facet_normal_stress, lift_joints,
                                  max_damage_count, screen_cells, select_damage_cells, selection_enabled)
 
 UNIT_TET = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
+
+
+def layered_box(nx, ny, nz):
+    """Conforming tetrahedral box of unit cubes (Kuhn split), with horizontal faces on integer z."""
+    from itertools import permutations
+    index = lambda i, j, k: (i * (ny + 1) + j) * (nz + 1) + k
+    coordinates = np.array([[i, j, k] for i in range(nx + 1) for j in range(ny + 1) for k in range(nz + 1)],
+                           dtype=float)
+    cells = []
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                for order in permutations(range(3)):
+                    corner, tet = [i, j, k], [index(i, j, k)]
+                    for axis in order:
+                        corner[axis] += 1
+                        tet.append(index(*corner))
+                    points = coordinates[tet]
+                    if np.linalg.det(points[1:] - points[0]) < 0:
+                        tet[2], tet[3] = tet[3], tet[2]
+                    cells.append(tet)
+    return coordinates, np.array(cells, dtype=np.int64)
 
 
 def fixture(stresses, regions):
@@ -98,6 +120,35 @@ class AutomaticScreeningTest(unittest.TestCase):
         self.assertIn("foundation", selection["rule"])
         self.assertFalse(selection["crack_base"])
 
+    def test_peak_in_bottom_wall_layer_shifts_the_band_above_the_seat(self):
+        # Peak wall cell at 0 sits on the foundation (foundation at -1 and 0, no wall below):
+        # the band takes the layer above (+1) so a wall-wall lift plane exists; wall at +2
+        # and the foundation below the seat are excluded.
+        offsets = (0., 1., 2., -1., 0., 1.)
+        regions = np.array([1, 1, 1, 3, 3, 3], dtype=np.int32)
+        coordinates = np.concatenate([UNIT_TET + [2. * index, 0., offset]
+                                      for index, offset in enumerate(offsets)])
+        cells = np.arange(4 * len(offsets)).reshape(len(offsets), 4)
+        tensors = np.zeros((len(offsets), 3, 3))
+        for index, value in enumerate((3e6, 1e6, 2.5e6, 1e5, 1e5, 1e5)):
+            tensors[index] = np.diag([value, -1e5, -2e5])
+        result = screen_cells(tensors, regions, np.arange(10, 16), coordinates, cells,
+                              2e6, relative_tolerance=1e-3)
+        selection = result["selection"]
+        self.assertTrue(selection["band_shifted_above_seat"])
+        self.assertEqual(selection["selected_source_rows"], [10, 11, 14, 15])
+        self.assertEqual((selection["selected_wall_cells"], selection["selected_foundation_cells"]), (2, 2))
+        self.assertAlmostEqual(selection["layer_centre_z_m"], 1.25)
+        self.assertIn("layer above", selection["rule"])
+        # With a wall layer below the peak the band is unchanged.
+        regions[3] = 1
+        result = screen_cells(tensors, regions, np.arange(10, 16), coordinates, cells,
+                              2e6, relative_tolerance=1e-3)
+        selection = result["selection"]
+        self.assertFalse(selection["band_shifted_above_seat"])
+        self.assertEqual(selection["selected_source_rows"], [10, 13, 14])
+        self.assertAlmostEqual(selection["layer_centre_z_m"], .25)
+
     def test_crack_base_selects_the_bottom_two_wall_layers(self):
         # Peak tension sits in the top layer (+2), but crack_base anchors the band at the
         # lowest wall corner (0): layers at 0 and +1 are selected (wall and foundation),
@@ -119,6 +170,112 @@ class AutomaticScreeningTest(unittest.TestCase):
         self.assertEqual(selection["selected_foundation_cells"], 1)
         self.assertIn("base of the wall", selection["rule"])
         self.assertAlmostEqual(selection["layer_centre_z_m"], 1.5)
+
+    def test_lift_joints_report_the_horizontal_facets_between_selected_cells(self):
+        # Two wall tets share the horizontal z=0 face (0,1,2); a third shares the vertical
+        # x=0 face (0,2,3) with the first. Both planes lie in the two-layer band.
+        coordinates = np.array([[0., 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1], [-1, 0, 0]])
+        cells = np.array([[0, 1, 2, 3], [0, 1, 2, 4], [0, 2, 3, 5]])
+        tensors = np.zeros((3, 3, 3))
+        tensors[0] = np.diag([1e5, 1e5, 3e6])
+        tensors[1] = np.diag([1e5, 1e5, 1e6])
+        tensors[2] = np.diag([3e6, 1e5, 1e5])
+        joints = {"tensile_strength_pa": 2e5, "cohesive_fracture_energy_j_m2": 10.}
+        result = screen_cells(tensors, np.array([1, 1, 1], dtype=np.int32), np.array([7, 8, 9]), coordinates,
+                              cells, 2e6, relative_tolerance=1e-3, crack_base=True, lift_joints=joints)
+        selection = result["selection"]
+        self.assertEqual(selection["selected_source_rows"], [7, 8, 9])
+        lift = selection["lift_joints"]
+        self.assertEqual(lift["lift_joint_facets"], 1)
+        self.assertEqual(lift["candidate_facets"], 2)
+        self.assertEqual(lift["source_faces"], [[0, 1, 2]])
+        self.assertAlmostEqual(lift["lift_joint_area_m2"], .5)
+        self.assertEqual(lift["lift_plane_z_m"], [0., 0.])
+        self.assertEqual(lift["law"], "JOINT_MECA_RUPT")
+        self.assertAlmostEqual(lift["critical_opening_m"], 1e-4)
+        self.assertEqual(lift["max_normal_deviation_deg"], 15.)
+        self.assertIn("15 degrees", lift["rule"])
+        # Only the vertical plane: no lift facet exists, which is a configuration error.
+        with self.assertRaisesRegex(ValueError, "no near-horizontal"):
+            screen_cells(tensors[[0, 2]], np.array([1, 1], dtype=np.int32), np.array([7, 9]),
+                         coordinates, cells[[0, 2]], 2e6, relative_tolerance=1e-3, crack_base=True,
+                         lift_joints=joints)
+        with self.assertRaisesRegex(ValueError, "band selection"):
+            screen_cells(tensors, np.array([1, 1, 1], dtype=np.int32), np.array([7, 8, 9]), coordinates, cells,
+                         2e6, relative_tolerance=1e-3, max_damage_count=2, lift_joints=joints)
+        with self.assertRaisesRegex(ValueError, "lift_joints"):
+            screen_cells(tensors, np.array([1, 1, 1], dtype=np.int32), np.array([7, 8, 9]), coordinates, cells,
+                         2e6, relative_tolerance=1e-3, crack_base=True, lift_joints={"tensile_strength_pa": 2e5})
+        self.assertIsNone(lift_joints({"damage_selection": {}}))
+        self.assertEqual(lift_joints({"damage_selection": {"lift_joints": joints}}), joints)
+
+    def test_lift_plane_elevation_places_the_band_and_surveys_every_horizontal_plane(self):
+        # 2 x 1 x 4 unit cubes (six tetrahedra each), so horizontal planes lie at z = 1, 2, 3.
+        # The peak principal stress is in the bottom layer; the configured pour plane is not.
+        coordinates, cells = layered_box(2, 1, 4)
+        centroid_z = coordinates[cells].mean(axis=1)[:, 2]
+        tensors = np.zeros((len(cells), 3, 3))
+        tensors[:, 2, 2] = -1e5 * (4. - centroid_z)       # weight-like vertical compression
+        tensors[:, 0, 2] = tensors[:, 2, 0] = 2e4          # uniform horizontal shear on z-planes
+        tensors[centroid_z < 1, 0, 0] = 3e6                # peak tension low in the wall
+        regions = np.ones(len(cells), dtype=np.int32)
+        rows = np.arange(len(cells))
+        joints = {"tensile_strength_pa": 2e4, "cohesive_fracture_energy_j_m2": 1., "law": "JOINT_MECA_FROT",
+                  "friction_coefficient": .7, "plane_elevation_m": 2.2, "uplift": "none"}
+        result = screen_cells(tensors, regions, rows, coordinates, cells, 2e6, relative_tolerance=1e-3,
+                              lift_joints=joints)
+        selection = result["selection"]
+        self.assertEqual(selection["plane_z_m"], 2.)
+        self.assertIn("z = 2 m", selection["rule"])
+        self.assertFalse(selection["band_shifted_above_seat"])
+        chosen = np.asarray(selection["selected_source_rows"])
+        np.testing.assert_array_equal(chosen, np.flatnonzero((centroid_z > 1) & (centroid_z < 3)))
+        lift = selection["lift_joints"]
+        self.assertEqual(lift["lift_plane_z_m"], [2., 2.])
+        self.assertEqual(lift["lift_joint_facets"], 4)     # two triangles per unit square
+        self.assertAlmostEqual(lift["lift_joint_area_m2"], 2.)
+        self.assertEqual((lift["law"], lift["friction_coefficient"], lift["plane_elevation_m"], lift["uplift"]),
+                         ("JOINT_MECA_FROT", .7, 2.2, "none"))
+        self.assertAlmostEqual(lift["adhesion_pa"], .7 * 2e4)
+        survey = result["lift_plane_survey"]
+        self.assertEqual([round(plane["z_m"], 9) for plane in survey], [1., 2., 3.])
+        for plane in survey:
+            self.assertAlmostEqual(plane["area_m2"], 2.)
+            self.assertAlmostEqual(plane["shear_resultant_n"], 2e4 * 2.)
+            self.assertEqual(plane["tension_area_fraction"], 0.)
+        # Each facet averages its two owner cells: z = 2 lies between centroids near 1.5 and 2.5.
+        middle = survey[1]
+        self.assertAlmostEqual(middle["mean_vertical_stress_pa"], -2e5, delta=1e3)
+        self.assertAlmostEqual(middle["shear_to_compression"], 2e4 / 2e5, delta=1e-3)
+        self.assertLess(survey[2]["normal_compression_n"], survey[0]["normal_compression_n"])
+        # Without an elevation the band snaps to the plane by the peak layer: the peak is in the
+        # bottom layer, so the plane above it (z = 1) is used and the band is layers 0-1 and 1-2.
+        automatic = screen_cells(tensors, regions, rows, coordinates, cells, 2e6, relative_tolerance=1e-3,
+                                 lift_joints={key: value for key, value in joints.items()
+                                              if key != "plane_elevation_m"})["selection"]
+        self.assertEqual(automatic["plane_z_m"], 1.)
+        self.assertTrue(automatic["band_shifted_above_seat"])
+        self.assertIn("bottom wall layer", automatic["rule"])
+        np.testing.assert_array_equal(automatic["selected_source_rows"], np.flatnonzero(centroid_z < 2))
+        self.assertEqual(automatic["lift_joints"]["lift_plane_z_m"], [1., 1.])
+        self.assertNotIn("plane_elevation_m", automatic["lift_joints"])
+        # A peak higher up takes the plane under its layer.
+        raised = tensors.copy()
+        raised[:, 0, 0] = np.where((centroid_z > 2) & (centroid_z < 3), 3e6, 0.)
+        upper = screen_cells(raised, regions, rows, coordinates, cells, 2e6, relative_tolerance=1e-3,
+                             lift_joints={key: value for key, value in joints.items()
+                                          if key != "plane_elevation_m"})["selection"]
+        self.assertEqual((upper["plane_z_m"], upper["band_shifted_above_seat"]), (2., False))
+        np.testing.assert_array_equal(upper["selected_source_rows"],
+                                      np.flatnonzero((centroid_z > 1) & (centroid_z < 3)))
+        with self.assertRaisesRegex(ValueError, "more than one element layer"):
+            screen_cells(tensors, regions, rows, coordinates, cells, 2e6, relative_tolerance=1e-3,
+                         lift_joints=dict(joints, plane_elevation_m=10.))
+        with self.assertRaisesRegex(ValueError, "crack_base"):
+            screen_cells(tensors, regions, rows, coordinates, cells, 2e6, relative_tolerance=1e-3,
+                         crack_base=True, lift_joints=joints)
+        self.assertIsNone(screen_cells(tensors, regions, rows, coordinates, cells, 2e6,
+                                       relative_tolerance=1e-3)["lift_plane_survey"])
 
     def test_crack_base_rejects_a_capped_count_and_non_booleans(self):
         tensors, regions, rows, coordinates, cells = fixture([3e6, 1e6], [1, 1])

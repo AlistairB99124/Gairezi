@@ -45,13 +45,13 @@ if __package__:
     from .automatic_screening import (COMPLETED as SCREENING_COMPLETED, WALL_REGION, _wall_faces, config_digest,
                                       facet_check, interior_wall_facet_normal_stress)
     from .cohesive_contact import CohesiveOptions
-    from .cohesive_mode_i import LinearModeICohesiveLaw
+    from .cohesive_mode_i import FacetCohesiveLaws, LinearModeICohesiveLaw
     from .cohesive_network import LIMITATIONS, CohesiveNetwork, NetworkOptions, NetworkWater
 else:
     from automatic_screening import (COMPLETED as SCREENING_COMPLETED, WALL_REGION, _wall_faces, config_digest,
                                      facet_check, interior_wall_facet_normal_stress)
     from cohesive_contact import CohesiveOptions
-    from cohesive_mode_i import LinearModeICohesiveLaw
+    from cohesive_mode_i import FacetCohesiveLaws, LinearModeICohesiveLaw
     from cohesive_network import LIMITATIONS, CohesiveNetwork, NetworkOptions, NetworkWater
 
 RUNNER_VERSION = 5
@@ -346,11 +346,43 @@ def _seed_cells(original, screening, seed_rows=None):
     return np.flatnonzero(np.isin(parents, sorted(rows)) & (np.asarray(original.regions) == WALL_REGION))
 
 
+def _facet_laws(split, law, lift_joints, damaged_law=None, degraded_cells=None):
+    """Per-candidate-face laws: the recorded lift planes take the weak joint law, the other
+    facets between degraded cells (original cell ids) the degraded material's law when one is
+    given, and everything else the intact concrete's. Returns (laws, lift mask, damaged mask)."""
+    if lift_joints is None and damaged_law is None:
+        return law, None, None
+    keys = np.sort(np.asarray(split.source_faces, dtype=np.int64), axis=1).tolist()
+    lift_mask = np.zeros(len(keys), dtype=bool)
+    laws = [law]
+    index = np.zeros(len(keys), dtype=np.int64)
+    if lift_joints is not None:
+        planes = {tuple(face) for face in lift_joints["source_faces"]}
+        lift_mask = np.array([tuple(face) in planes for face in keys], dtype=bool)
+        if int(lift_mask.sum()) != len(planes):
+            raise ValueError(f"{int(lift_mask.sum())} candidate facets match the screening's {len(planes)} lift planes; "
+                             "the candidate region must contain every lift-joint facet")
+        laws.append(LinearModeICohesiveLaw(float(lift_joints["tensile_strength_pa"]),
+                                           float(lift_joints["cohesive_fracture_energy_j_m2"])))
+        index[lift_mask] = len(laws) - 1
+    damaged_mask = np.zeros(len(keys), dtype=bool)
+    if damaged_law is not None and degraded_cells is not None and len(degraded_cells):
+        owners = np.asarray(split.parent_cell_ids)[np.asarray(split.adjacent_cells, dtype=np.int64)]
+        damaged_mask = np.isin(owners, degraded_cells).all(axis=1) & ~lift_mask
+        if damaged_mask.any():
+            laws.append(damaged_law)
+            index[damaged_mask] = len(laws) - 1
+    if len(laws) == 1:
+        return law, lift_mask if lift_joints is not None else None, None
+    return (FacetCohesiveLaws(tuple(laws), index), (lift_mask if lift_joints is not None else None),
+            (damaged_mask if damaged_law is not None else None))
+
+
 def run_network_on_structure(structure, screening, *, gf_j_m2, tensile_strength_pa, relative_tolerance,
-                             maximum_volume_change, rings=2, maximum_candidate_faces=20000,
+                             maximum_volume_change, rings=2, maximum_candidate_faces=100000,
                              maximum_region_expansions=3, maximum_solves=5000, progress=print,
                              should_stop=None, seed_rows=None, confined=False, overload_factor=1.0,
-                             overload_increment=OVERLOAD_INCREMENT):
+                             overload_increment=OVERLOAD_INCREMENT, lift_joints=None, damaged_properties=None):
     """Bounded-region cohesive network solve; returns (NetworkResult, prepared, region report).
 
     The region report carries ``design_load`` (the state at load factor 1). When no
@@ -362,6 +394,10 @@ def run_network_on_structure(structure, screening, *, gf_j_m2, tensile_strength_
     example with the cells adjacent to intact critical facets. ``confined`` limits the
     candidate facets to those between seed cells (no neighbour rings, no region growth);
     wall facets outside that still reach f_t are reported, not used to reject the result.
+    ``lift_joints`` (the screening's recorded block) gives the listed near-horizontal facets
+    the weak construction-joint law. ``damaged_properties`` (the degraded element block)
+    gives the other facets between the seed cells that material's cohesive law; the bulk
+    stays the intact concrete here (the supporting solve has no per-cell material).
     """
     if confined:
         rings, maximum_region_expansions = 0, 0
@@ -379,6 +415,11 @@ def run_network_on_structure(structure, screening, *, gf_j_m2, tensile_strength_
     seeds = _seed_cells(original, screening, seed_rows)
     if not len(seeds):
         raise ValueError("Screening source rows do not identify native wall cells")
+    # The degraded band is the initial seed set (original cell ids); region growth never degrades more.
+    degraded_cells = np.array(seeds, dtype=np.int64) if damaged_properties is not None else None
+    damaged_law = (LinearModeICohesiveLaw(float(damaged_properties["tensile_strength_pa"]),
+                                          float(damaged_properties["cohesive_fracture_energy_j_m2"]))
+                   if damaged_properties is not None else None)
     loads = structure.loads
     unit_weight = float(loads.water_density_kg_m3) * abs(float(loads.gravity_z_m_s2))
     inlets = upstream_inlet_edges(original)
@@ -417,7 +458,12 @@ def run_network_on_structure(structure, screening, *, gf_j_m2, tensile_strength_
             maximum_solves=maximum_solves)
         water = NetworkWater(float(loads.upstream_surface_z_m), unit_weight, inlets, 1e-9,
                              scale_with_load_factor=True) if len(inlets) else None
-        network = CohesiveNetwork.from_split(prepared.split, elasticity=elasticity, law=law, options=options,
+        face_laws, lift_mask, damaged_mask = _facet_laws(prepared.split, law, lift_joints, damaged_law, degraded_cells)
+        if lift_mask is not None:
+            record["lift_joint_faces"] = int(lift_mask.sum())
+        if damaged_mask is not None:
+            record["damaged_joint_faces"] = int(damaged_mask.sum())
+        network = CohesiveNetwork.from_split(prepared.split, elasticity=elasticity, law=face_laws, options=options,
                                              problem_at=problem, water=water, should_stop=should_stop,
                                              progress=progress)
         progress("solving the cohesive network under proportional loading")
@@ -448,7 +494,10 @@ def run_network_on_structure(structure, screening, *, gf_j_m2, tensile_strength_
     else:
         return result, prepared, {"attempts": attempts, "status": "candidate_region_exceeded",
                                   "message": "Wall facets outside the candidate region still reach f_t"}
-    region["design_load"] = design_load_state(result, law)
+    # Margins are reported against the weakest bond present.
+    reference_law = (min(face_laws.laws, key=lambda item: item.tensile_strength_pa)
+                     if isinstance(face_laws, FacetCohesiveLaws) and not face_laws.uniform else law)
+    region["design_load"] = design_load_state(result, reference_law)
     if float(overload_factor) > result.load_factor and not region["design_load"]["opened_faces"]:
         result, region["overload"] = continue_overload(network, result, float(overload_factor),
                                                        float(overload_increment), progress)
@@ -638,6 +687,24 @@ def screening_bound(screening, tensile_strength_pa, relative_tolerance):
     return float(screening["peak_principal_stress_pa"]) < float(tensile_strength_pa) * (1 - relative_tolerance)
 
 
+def _bounds_apply(screening, overload_factor) -> bool:
+    """Whether a design-load no-initiation bound may skip the network solve.
+
+    It may not when the submission demands a solve regardless of intact
+    stress: an explicit enabled element selection force-seeds cohesive
+    candidates (crack base / selected regions must be solved and must yield
+    the candidate state the authoritative Aster stage consumes), and an
+    overload search (maximum_overload_factor > 1) probes beyond the design
+    load the bound is valid for.
+    """
+    if overload_factor > 1:
+        return False
+    selection = screening.get("selection")
+    if not isinstance(selection, dict) or selection.get("enabled") is False:
+        return True
+    return not selection.get("selected_source_rows")
+
+
 def _write_state(output, result, prepared, water_head, unit_weight, intact_stress=None, cracked_stress=None):
     if __package__:
         from .fracture_faces import write_surface_state
@@ -678,7 +745,7 @@ def _write_state(output, result, prepared, water_head, unit_weight, intact_stres
 
 def prepare_and_run(configuration: Path, model_directory: Path, screening_output: Path, output: Path, *,
                     job_id: str, maximum_volume_change: float, rings: int = 2,
-                    maximum_candidate_faces: int = 20000, maximum_solves: int = 5000) -> dict:
+                    maximum_candidate_faces: int = 100000, maximum_solves: int = 5000) -> dict:
     """Verify the confirmed screening, then solve or bound the automatic cracking outcome."""
     if __package__:
         from .run import submitted_structure, write_json
@@ -735,7 +802,7 @@ def prepare_and_run(configuration: Path, model_directory: Path, screening_output
             "screening_overstressed_cells": int(screening["overstressed_cells"]),
             "limitations": LIMITATIONS, "engineering_validated": False,
         }
-        if screening_bound(screening, strength, tolerance):
+        if screening_bound(screening, strength, tolerance) and _bounds_apply(screening, overload_factor):
             summary.update({
                 "outcome": "no_damage_initiated", "load_factor": 1.0,
                 "outcome_basis": "intact screening bound: linear proportional loading and peak principal stress "
@@ -753,7 +820,8 @@ def prepare_and_run(configuration: Path, model_directory: Path, screening_output
                       if same_mesh else None)
             if facets is not None:
                 summary["intact_facet_screening"] = facets
-        if facets is not None and facets["bounds_initiation"]:
+        if (facets is not None and facets["bounds_initiation"]
+                and _bounds_apply(screening, overload_factor)):
             summary.update({
                 "outcome": "no_damage_initiated", "load_factor": 1.0,
                 "outcome_basis": "intact facet bound: linear proportional loading and every interior wall facet "
@@ -788,17 +856,29 @@ def prepare_and_run(configuration: Path, model_directory: Path, screening_output
             else:
                 seed_rows = facets["critical_source_rows"] if facets else None
             structure = submitted_structure(Path(configuration), Path(model_directory))
+            lift = selection.get("lift_joints") if selection is not None else None
+            if lift is not None:
+                summary["lift_joints"] = {key: value for key, value in lift.items() if key != "source_faces"}
+            damaged_properties = (config.get("damage_selection") or {}).get("damaged_element_properties") \
+                if selection is not None and seed_rows else None
+            if damaged_properties is not None:
+                summary["damaged_element_properties"] = damaged_properties
+            weakest = min([strength] + ([float(lift["tensile_strength_pa"])] if lift is not None else [])
+                          + ([float(damaged_properties["tensile_strength_pa"])] if damaged_properties is not None else []))
             result, prepared, region = run_network_on_structure(
                 structure, screening, gf_j_m2=float(energy), tensile_strength_pa=strength,
                 relative_tolerance=tolerance, maximum_volume_change=maximum_volume_change, rings=rings,
                 maximum_candidate_faces=maximum_candidate_faces, maximum_solves=maximum_solves,
-                progress=progress, seed_rows=seed_rows, confined=confined, overload_factor=overload_factor)
+                progress=progress, seed_rows=seed_rows, confined=confined, overload_factor=overload_factor,
+                lift_joints=lift, damaged_properties=damaged_properties)
             design, overload = region.pop("design_load", None), region.pop("overload", None)
             summary["candidate_region"] = region
             if design is not None:
                 summary["design_load"] = design
                 summary["overload"] = overload
-                summary["verdict"] = crack_verdict(design, overload, strength)
+                # The question is whether the weakest bond cracked, so the verdict's strength is
+                # the weakest law's; the intact value stays in the summary.
+                summary["verdict"] = crack_verdict(design, overload, weakest)
             if result is None:
                 summary.update({"outcome": region["status"], "outcome_basis": region["message"]})
             else:
@@ -821,7 +901,15 @@ def prepare_and_run(configuration: Path, model_directory: Path, screening_output
                             prepared.split, structure.three_body_config["material"],
                             result.intact_displacement_m, result.displacement_m)
                         summary["stress_comparison"] = comparison
-                    summary["opening_assessment"] = opening_assessment(result, law, comparison)
+                    weakest_block = min(
+                        [(strength, float(energy))]
+                        + ([(float(lift["tensile_strength_pa"]), float(lift["cohesive_fracture_energy_j_m2"]))]
+                           if lift is not None else [])
+                        + ([(float(damaged_properties["tensile_strength_pa"]),
+                             float(damaged_properties["cohesive_fracture_energy_j_m2"]))]
+                           if damaged_properties is not None else []))
+                    summary["opening_assessment"] = opening_assessment(
+                        result, LinearModeICohesiveLaw(*weakest_block), comparison)
                     surface = _write_state(output, result, prepared, float(loads.upstream_surface_z_m),
                                            float(loads.water_density_kg_m3) * abs(float(loads.gravity_z_m_s2)),
                                            intact, cracked)
@@ -849,7 +937,7 @@ def main(argv=None):
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--maximum-volume-change", type=float, required=True)
     parser.add_argument("--neighbour-rings", type=int, default=2)
-    parser.add_argument("--maximum-candidate-faces", type=int, default=20000)
+    parser.add_argument("--maximum-candidate-faces", type=int, default=100000)
     parser.add_argument("--maximum-solves", type=int, default=5000)
     arguments = parser.parse_args(argv)
     summary = prepare_and_run(arguments.config, arguments.model, arguments.screening, arguments.output,

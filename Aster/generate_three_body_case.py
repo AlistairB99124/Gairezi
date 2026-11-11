@@ -169,12 +169,14 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
     if "hydraulic_loads" in mesh_manifest:
         from Aster.hydraulic_loads import validate_settings, render_uplift
         settings = validate_settings(mesh_manifest["hydraulic_loads"])
-        with np.load(arrays_path, allow_pickle=False) as stored:
-            uplift_code, uplift_report = render_uplift(
-                {key: stored[key] for key in stored.files}, upstream_surface_z, tailwater_elevation_m, water_gradient)
+        uplift_report = {"mode": "none", "resultant_n": [0., 0., 0.]}
+        if settings["base_uplift"] != "none":
+            with np.load(arrays_path, allow_pickle=False) as stored:
+                uplift_code, uplift_report = render_uplift(
+                    {key: stored[key] for key in stored.files}, upstream_surface_z, tailwater_elevation_m, water_gradient)
         inputs["hydraulic_loads"] = dict(settings=settings, uplift=uplift_report,
                                         crack_water="inactive in intact elastic baseline")
-        uplift_excitation = "_F(CHARGE=UPLIFT),"
+        uplift_excitation = "_F(CHARGE=UPLIFT)," if uplift_code else ""
 
     comm = f'''# 01_three_body_baseline.comm - Code_Aster linear-elastic cross-check of the
 # CANONICAL Elmer wall+foundation+bedrock model (Elmer.three_body_solver;

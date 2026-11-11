@@ -90,3 +90,67 @@ class LinearModeICohesiveLaw:
         stored = .5 * traction * opening
         dissipated = .5 * strength * maximum
         return ModeIResponse(traction, tangent, stored, dissipated, history)
+
+
+class FacetCohesiveLaws:
+    """Per-facet assignment of linear Mode-I laws (e.g. intact concrete vs weak lift joints).
+
+    ``laws`` is a tuple of LinearModeICohesiveLaw and ``law_index`` one law index per
+    facet. The strength/critical-opening/fracture-energy properties are arrays over the
+    facets so vectorised callers broadcast naturally; ``law_for`` serves the per-facet
+    response loop. ``wrap`` accepts a plain law and spreads it over ``count`` facets so
+    single-material callers are unchanged.
+    """
+
+    def __init__(self, laws, law_index):
+        laws = tuple(laws)
+        if not laws or any(not isinstance(law, LinearModeICohesiveLaw) for law in laws):
+            raise ValueError("FacetCohesiveLaws needs at least one LinearModeICohesiveLaw")
+        index = np.asarray(law_index)
+        if index.ndim != 1 or index.dtype.kind not in "iu" or (len(index) and (index.min() < 0 or index.max() >= len(laws))):
+            raise ValueError("law_index must be a 1-D integer array of valid law indices")
+        self.laws = laws
+        self.law_index = index.astype(np.int64)
+        self.law_index.setflags(write=False)
+        self.tensile_strength_pa = np.array([law.tensile_strength_pa for law in laws])[self.law_index]
+        self.fracture_energy_j_m2 = np.array([law.fracture_energy_j_m2 for law in laws])[self.law_index]
+        self.critical_opening_m = np.array([law.critical_opening_m for law in laws])[self.law_index]
+        for array in (self.tensile_strength_pa, self.fracture_energy_j_m2, self.critical_opening_m):
+            array.setflags(write=False)
+
+    @classmethod
+    def wrap(cls, law, count: int) -> "FacetCohesiveLaws":
+        if isinstance(law, cls):
+            if len(law.law_index) != count:
+                raise ValueError("Per-facet laws do not match the interface pair count")
+            return law
+        return cls((law,), np.zeros(int(count), dtype=np.int64))
+
+    @property
+    def count(self) -> int:
+        return len(self.law_index)
+
+    @property
+    def uniform(self) -> bool:
+        return len(self.laws) == 1
+
+    @property
+    def reference(self) -> LinearModeICohesiveLaw:
+        """The law of facet 0's material when uniform; the first law otherwise."""
+        return self.laws[0]
+
+    def law_for(self, index: int) -> LinearModeICohesiveLaw:
+        return self.laws[self.law_index[index]]
+
+    def subset(self, ids) -> "FacetCohesiveLaws":
+        return FacetCohesiveLaws(self.laws, self.law_index[np.asarray(ids)])
+
+    def summary(self) -> dict:
+        counts = np.bincount(self.law_index, minlength=len(self.laws))
+        return {
+            "materials": [{"tensile_strength_pa": law.tensile_strength_pa,
+                           "fracture_energy_j_m2": law.fracture_energy_j_m2,
+                           "critical_opening_m": law.critical_opening_m,
+                           "facets": int(counts[i])} for i, law in enumerate(self.laws)],
+            "uniform": self.uniform,
+        }

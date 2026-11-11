@@ -20,8 +20,10 @@ Known modelling differences are reported, not hidden: ``CZM_LIN_REG`` uses a
 mixed-mode jump norm (FEniCSx is mode I with tied tangential response), it is
 an intrinsic law with a stiff initial penalty (FEniCSx is rigid until
 initiation), Aster evaluates joint traction at integration points (FEniCSx
-initiates on the larger one-cell facet stress). Historical/default cases have
-no crack-face water pressure. Isolated hydraulic campaigns opt in through the
+initiates on the larger one-cell facet stress). Historical cases without the
+explicit crack_water_pressure setting retain dry cracks. New configurations
+can enable reservoir-connected opened-crack pressure without uplift.
+Isolated hydraulic campaigns opt in through the
 mesh manifest, adding undrained base uplift and reservoir-connected crack water
 with a converged active set at each explicit accepted load instant.
 """
@@ -30,8 +32,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -49,9 +53,15 @@ STATUS_NAME = "aster_cohesive_status.json"
 SPLIT_ARRAYS_NAME = "three_body_mesh_arrays.npz"
 MESH_MANIFEST_NAME = "mesh_manifest.json"
 CASE_NAME = "case.comm"
+RUN_ASTER_EXIT_MARKER = "EXECUTION_CODE_ASTER_EXIT_"
 # Initial joint stiffness = factor * E / h, so the pre-initiation joint compliance
 # is a 0.1 % perturbation of the surrounding concrete over one element.
 JOINT_PENALTY_FACTOR = 1000.0
+# DEFI_MATERIAU / JOINT_MECA_RUPT catalogue bounds on PENA_RUPTURE (Cata/Commands/defi_materiau.py).
+LIFT_PENA_RUPTURE_MIN = 1e-12
+LIFT_PENA_RUPTURE_MAX = 10.0
+# A Mohr-Coulomb joint has no cohesive elastic branch: any opening beyond this counts as open.
+FRICTION_OPENING_LIMIT_M = 1e-9
 FIRST_LOAD_FACTOR = 0.5
 LOAD_INCREMENT = 0.1
 # Friction solves climb in fine targets first: every completed STAT_NON_LINE target is
@@ -553,7 +563,11 @@ def load_factors(summary: dict) -> list[float]:
     load factor ~0.23 and lost every converged equilibrium with it."""
     final = max(1.0, float(summary.get("load_factor") or 1.0),
                 float(summary.get("maximum_overload_factor") or 1.0))
-    friction = summary.get("damaged_joint_friction") is not None
+    lift = (summary.get("material_assignment") or {}).get("joint_properties") or {}
+    friction = summary.get("damaged_joint_friction") is not None or lift.get("law") == "JOINT_MECA_FROT"
+    if summary.get("crack_water_pressure") is True:
+        return [0.01, *[round(value * .025, 10) for value in range(1, int(round(final / .025)) + 1)
+                        if value * .025 < final - 1e-9], final]
     factors = [FRICTION_FINE_INCREMENT if friction else FIRST_LOAD_FACTOR]
     while factors[-1] < final - 1e-9:
         increment = (FRICTION_FINE_INCREMENT if friction and factors[-1] < FRICTION_FINE_LIMIT - 1e-9
@@ -594,6 +608,66 @@ def joint_parameters(arrays: dict, faces: np.ndarray, summary: dict, concrete_e_
         "mean_facet_edge_m": h,
         "concrete_youngs_modulus_pa": float(concrete_e_pa),
         "concrete_poissons_ratio": float(concrete_nu),
+    }
+
+
+def vertical_joint_strength(critical_opening_m: float, fracture_energy_j_m2: float) -> float:
+    """Tensile strength giving the target critical opening: w_c = 2 G_F / f_t, so f_t = 2 G_F / w_c."""
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value) and value > 0
+               for value in (critical_opening_m, fracture_energy_j_m2)):
+        raise CorroborationError("Vertical joint critical opening and fracture energy must be finite and positive")
+    return 2.0 * float(fracture_energy_j_m2) / float(critical_opening_m)
+
+
+def save_split_arrays(output_dir: Path, split: dict) -> None:
+    """Write the split mesh arrays; the MED converter reads every group flag from this file."""
+    np.savez(output_dir / SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
+
+
+def vertical_crack_facets(coordinates_m: np.ndarray, faces: np.ndarray, peak_xyz_m, band_m: float,
+                          max_normal_deviation_deg: float) -> np.ndarray:
+    """Boolean mask over ``faces`` on the radial vertical plane through the tensile peak.
+
+    The arch is centred on the origin, so the plane contains the z-axis and the peak's radial
+    direction and passes through the origin. Its normal is the horizontal tangent at the peak.
+    A facet qualifies when it is near-vertical, its normal lies along that tangent, and its
+    centroid is within ``band_m`` of the plane.
+    """
+    from FEniCSx.lift_joints import facet_unit_normals
+    if not 0 < float(max_normal_deviation_deg) < 90:
+        raise CorroborationError("Vertical joint max_normal_deviation_deg must lie in (0, 90)")
+    if not np.isfinite(band_m) or band_m <= 0:
+        raise CorroborationError("Vertical joint band half-width must be finite and positive")
+    faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    if not len(faces):
+        return np.zeros(0, dtype=bool)
+    coordinates = np.asarray(coordinates_m, dtype=float)
+    peak = np.asarray(peak_xyz_m, dtype=float)
+    radius = float(np.hypot(peak[0], peak[1]))
+    if radius <= 0:
+        raise CorroborationError("The tensile peak lies on the arch axis, so the radial plane is undefined")
+    tangent = np.array([-peak[1], peak[0], 0.0]) / radius
+    normals = facet_unit_normals(coordinates, faces)
+    angle = math.radians(float(max_normal_deviation_deg))
+    vertical = np.abs(normals[:, 2]) <= math.sin(angle) + 1e-12
+    along = np.abs(normals @ tangent) >= math.cos(angle) - 1e-12
+    centroids = coordinates[faces].mean(axis=1)
+    within = np.abs((centroids - peak) @ tangent) <= float(band_m)
+    return vertical & along & within
+
+
+def vertical_joint_settings(config: dict) -> dict | None:
+    """Return the enabled ``damage_selection.vertical_joint`` block of the source configuration, or None."""
+    selection = config.get("damage_selection")
+    block = selection.get("vertical_joint") if isinstance(selection, dict) else None
+    if not block or not block.get("enabled", True):
+        return None
+    band = block.get("band_m")
+    return {
+        "critical_opening_m": float(block["critical_opening_m"]),
+        "fracture_energy_j_m2": float(block["fracture_energy_j_m2"]),
+        "max_normal_deviation_deg": float(block.get("max_normal_deviation_deg", 15.0)),
+        "band_m": None if band is None else float(band),
     }
 
 
@@ -642,6 +716,111 @@ def friction_joint_parameters(friction: dict, stiffness_pa_per_m: float) -> dict
             "k_t_pa_per_m": float(stiffness_pa_per_m) / JOINT_PENALTY_FACTOR}
 
 
+def lift_joint_parameters(joint_properties: dict, stiffness_pa_per_m: float,
+                          neighbour_stiffness_pa_per_m: float | None = None) -> dict:
+    """Aster parameters for weak construction (lift) joints (R7.01.25).
+
+    ``stiffness_pa_per_m`` is the shared mesh penalty (1000 E/h) and
+    ``neighbour_stiffness_pa_per_m`` the stiffness E/h of the volume elements beside the
+    joint (default: the penalty / 1000). U2.05.07 4.1.2: "the initial stiffness of the joint
+    elements must be greater than the stiffness of the neighbouring volume elements"; a softer
+    joint is an elastic layer that sheds its load before it can reach its strength.
+
+    JOINT_MECA_FROT (Mohr-Coulomb friction with contact): K_N is the mesh penalty, K_T the
+    regularised E/h used for the damaged friction joints, MU the configured coefficient and
+    ADHESION = MU * f_t, so the cone's apex R_t = c / MU is the configured tensile strength.
+    The law is perfectly plastic: it does not lose that tensile capacity after opening
+    (R7.01.25 1.2.2), so a poorly bonded surface should be given a small strength. It is the
+    law that lets the plane slide; the fracture energy is not used.
+
+    JOINT_MECA_RUPT (cohesive rupture with contact, no slip limit): linear elastic to
+    SIGM_MAX, then linear softening with slope -K_N / PENA_RUPTURE, full separation at
+    SIGM_MAX (1 + PENA_RUPTURE) / K_N, so Gf = SIGM_MAX^2 (1 + PENA_RUPTURE) / (2 K_N)
+    (ssnp162b). The catalogue caps PENA_RUPTURE at 10, so K_N follows from the strength and
+    energy at that cap, K_N = SIGM_MAX^2 (1 + 10) / (2 Gf); when that would exceed the mesh
+    penalty the penalty is kept and PENA_RUPTURE solved instead. A fracture energy so large
+    that K_N would fall below the neighbouring elements' stiffness is refused: this law
+    cannot dissipate it without becoming a soft layer."""
+    f_t = joint_properties.get("tensile_strength_pa")
+    g_f = joint_properties.get("cohesive_fracture_energy_j_m2")
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value) and value > 0
+               for value in (f_t, g_f, stiffness_pa_per_m)):
+        raise CorroborationError("Lift joint strength, fracture energy and joint stiffness must be finite and positive")
+    alpha = joint_properties.get("alpha", 1.0)
+    contact = joint_properties.get("pena_contact", 1.0)
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not 0 <= float(alpha) <= 2:
+        raise CorroborationError("Lift joint ALPHA must lie in [0, 2]")
+    if isinstance(contact, bool) or not isinstance(contact, (int, float)) or not float(contact) > 0:
+        raise CorroborationError("Lift joint PENA_CONTACT must be positive")
+    law = joint_properties.get("law", "JOINT_MECA_RUPT")
+    f_t, g_f, penalty = float(f_t), float(g_f), float(stiffness_pa_per_m)
+    neighbour = (penalty / JOINT_PENALTY_FACTOR if neighbour_stiffness_pa_per_m is None
+                 else float(neighbour_stiffness_pa_per_m))
+    if not np.isfinite(neighbour) or neighbour <= 0:
+        raise CorroborationError("Neighbouring element stiffness must be finite and positive")
+    if law == "JOINT_MECA_FROT":
+        mu = joint_properties.get("friction_coefficient")
+        if (isinstance(mu, bool) or not isinstance(mu, (int, float)) or not np.isfinite(mu)
+                or not 1e-3 <= float(mu) <= 10.):
+            raise CorroborationError("Lift joint friction coefficient must lie in [0.001, 10]")
+        return {
+            "law": "JOINT_MECA_FROT",
+            "tensile_strength_pa": f_t,
+            "friction_coefficient": float(mu),
+            "adhesion_pa": float(mu) * f_t,
+            "fracture_energy_j_m2": 0.0,
+            "fracture_energy_note": "not used: JOINT_MECA_FROT is perfectly plastic (no softening)",
+            "k_n_pa_per_m": penalty,
+            # As for the damaged friction joints: E/h regularises stick-slip, the normal
+            # penalty stays stiff.
+            "k_t_pa_per_m": penalty / JOINT_PENALTY_FACTOR,
+            "stiffness_basis": "shared mesh penalty (normal) and neighbouring element stiffness (tangential)",
+            "mesh_penalty_pa_per_m": penalty,
+            "neighbour_stiffness_pa_per_m": neighbour,
+            # A friction joint has no cohesive elastic branch; any opening beyond the
+            # hydraulic tolerance counts as open.
+            "elastic_limit_opening_m": FRICTION_OPENING_LIMIT_M,
+            "critical_opening_m": None,
+        }
+    if law != "JOINT_MECA_RUPT":
+        raise CorroborationError("Lift joint law must be JOINT_MECA_RUPT or JOINT_MECA_FROT")
+    k_n = f_t ** 2 * (1.0 + LIFT_PENA_RUPTURE_MAX) / (2.0 * g_f)
+    pena_rupture = LIFT_PENA_RUPTURE_MAX
+    stiffness_basis = "joint strength and fracture energy at the catalogue PENA_RUPTURE cap"
+    if k_n < neighbour:
+        limit = f_t ** 2 * (1.0 + LIFT_PENA_RUPTURE_MAX) / (2.0 * neighbour)
+        raise CorroborationError(
+            f"JOINT_MECA_RUPT cannot dissipate Gf = {g_f:g} J/m2 at f_t = {f_t:g} Pa without a joint softer "
+            f"than its neighbouring elements (K_N {k_n:.4g} Pa/m < E/h {neighbour:.4g} Pa/m; Code_Aster "
+            f"U2.05.07 4.1.2). The largest fracture energy this law can carry here is {limit:.3g} J/m2. "
+            "Lower lift_joints.cohesive_fracture_energy_j_m2 or use the JOINT_MECA_FROT law.")
+    if k_n > penalty:
+        k_n = penalty
+        pena_rupture = 2.0 * penalty * g_f / f_t ** 2 - 1.0
+        stiffness_basis = "shared mesh penalty (the joint energy would need a stiffer K_N)"
+        if not pena_rupture > 0:
+            raise CorroborationError(
+                f"JOINT_MECA_RUPT needs PENA_RUPTURE > 0 but Gf={g_f:g}, f_t={f_t:g} and K_N={k_n:.6g} give "
+                f"{pena_rupture:.6g}: the elastic opening f_t/K_N already exceeds the critical opening 2Gf/f_t")
+    if not LIFT_PENA_RUPTURE_MIN <= pena_rupture <= LIFT_PENA_RUPTURE_MAX:
+        raise CorroborationError(f"JOINT_MECA_RUPT PENA_RUPTURE {pena_rupture:.6g} is outside the catalogue range")
+    return {
+        "law": "JOINT_MECA_RUPT",
+        "tensile_strength_pa": f_t,
+        "fracture_energy_j_m2": g_f,
+        "k_n_pa_per_m": float(k_n),
+        "k_t_pa_per_m": float(k_n),
+        "stiffness_basis": stiffness_basis,
+        "mesh_penalty_pa_per_m": penalty,
+        "neighbour_stiffness_pa_per_m": neighbour,
+        "pena_rupture": float(pena_rupture),
+        "pena_contact": float(contact),
+        "alpha": float(alpha),
+        "elastic_limit_opening_m": f_t / float(k_n),
+        "critical_opening_m": 2.0 * g_f / f_t,
+    }
+
+
 def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], steps_path: Path,
                          status_path: Path, tie_pairs: int = 0,
                          interpolation: dict | None = None) -> str:
@@ -673,51 +852,112 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
         "        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n"))
     assignment = joint.get("material_assignment")
     friction_law = joint.get("damaged_friction")
-    if has_joints and assignment is not None and friction_law is not None:
-        comm = comm.replace(_ANCHORS["chmat"], (
-            "FROT_MAT = DEFI_MATERIAU(\n"
-            f"    JOINT_MECA_FROT=_F(K_N={friction_law['k_n_pa_per_m']:.12g}, "
-            f"K_T={friction_law['k_t_pa_per_m']:.12g},\n"
-            f"                       MU={friction_law['friction_coefficient']:.12g}, "
-            f"ADHESION={friction_law['adhesion_pa']:.12g}),\n"
-            ")\n"
-            "# Doc R7.01.25 JOINT_MECA_FROT: Mohr-Coulomb joint with contact. Pre-cracked damaged\n"
-            "# joints carry compression and friction but no tension or cohesive softening; the\n"
-            "# intact joints keep the CZM_LIN_REG law built from the intact concrete.\n\n"
-            + _ANCHORS["chmat"]))
-        groups = ""
-        if joint["damaged_joint_count"]:
-            groups += "        _F(GROUP_MA='DAMAGED_JOINTS', MATER=FROT_MAT),\n"
-        if joint["damaged_joint_count"] < joint["candidate_face_count"]:
-            groups += "        _F(GROUP_MA='INTACT_JOINTS', MATER=JOINT_MAT),\n"
-        comm = comm.replace("        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n", groups)
-    elif has_joints and assignment is not None:
+    lift_law = joint.get("lift_joint")
+    lift_frictional = lift_law is not None and lift_law.get("law") == "JOINT_MECA_FROT"
+    any_friction = joint.get("damaged_friction") is not None or lift_frictional
+    lift_count = int(joint.get("lift_joint_count", 0))
+    damaged_count = int(joint.get("damaged_joint_count", 0))
+    vertical_count = int(joint.get("vertical_joint_count", 0))
+    intact_count = int(joint.get("candidate_face_count", 0)) - lift_count - damaged_count - vertical_count
+    if has_joints and assignment is not None:
+        # Four facet classes: LIFT_JOINTS (weak construction joint, JOINT_MECA_RUPT),
+        # DAMAGED_JOINTS (facets of degraded elements: their CZM or Mohr-Coulomb friction),
+        # VERTICAL_JOINTS (CZM on the radial plane through the tensile peak) and INTACT_JOINTS
+        # (the intact concrete's CZM). JOINT_MAT already carries the summary law, i.e. the
+        # degraded material's CZM when elements are degraded.
+        materials = ""
+        if lift_frictional:
+            materials += (
+                "LIFT_MAT = DEFI_MATERIAU(\n"
+                f"    JOINT_MECA_FROT=_F(K_N={lift_law['k_n_pa_per_m']:.12g}, K_T={lift_law['k_t_pa_per_m']:.12g},\n"
+                f"                       MU={lift_law['friction_coefficient']:.12g}, "
+                f"ADHESION={lift_law['adhesion_pa']:.12g}),\n"
+                ")\n"
+                "# Doc R7.01.25 JOINT_MECA_FROT: weak construction (lift) joint as a Mohr-Coulomb joint with\n"
+                "# contact. |tau| <= ADHESION - MU sigma_n; the cone's apex ADHESION / MU = "
+                f"{lift_law['tensile_strength_pa']:.6g} Pa is the\n"
+                "# configured tensile strength (perfectly plastic: not lost after opening). The plane can slide.\n\n")
+        elif lift_law is not None:
+            materials += (
+                "LIFT_MAT = DEFI_MATERIAU(\n"
+                f"    JOINT_MECA_RUPT=_F(K_N={lift_law['k_n_pa_per_m']:.12g}, K_T={lift_law['k_t_pa_per_m']:.12g},\n"
+                f"                       SIGM_MAX={lift_law['tensile_strength_pa']:.12g}, "
+                f"PENA_RUPTURE={lift_law['pena_rupture']:.12g},\n"
+                f"                       PENA_CONTACT={lift_law['pena_contact']:.12g}, ALPHA={lift_law['alpha']:.12g}),\n"
+                ")\n"
+                "# Doc R7.01.25 JOINT_MECA_RUPT: weak construction (lift) joint. Cohesive rupture at\n"
+                "# SIGM_MAX with linear softening -K_N/PENA_RUPTURE, full separation at\n"
+                f"# SIGM_MAX (1 + PENA_RUPTURE) / K_N = {lift_law['critical_opening_m']:.6g} m = 2 Gf / f_t\n"
+                f"# (Gf = {lift_law['fracture_energy_j_m2']:.6g} J/m2); contact penalty PENA_CONTACT * K_N;\n"
+                "# ALPHA sets how the shear stiffness decays with opening. No Coulomb slip limit.\n\n")
+        if friction_law is not None:
+            materials += (
+                "FROT_MAT = DEFI_MATERIAU(\n"
+                f"    JOINT_MECA_FROT=_F(K_N={friction_law['k_n_pa_per_m']:.12g}, "
+                f"K_T={friction_law['k_t_pa_per_m']:.12g},\n"
+                f"                       MU={friction_law['friction_coefficient']:.12g}, "
+                f"ADHESION={friction_law['adhesion_pa']:.12g}),\n"
+                ")\n"
+                "# Doc R7.01.25 JOINT_MECA_FROT: Mohr-Coulomb joint with contact. Pre-cracked damaged\n"
+                "# joints carry compression and friction but no tension or cohesive softening.\n\n")
         original = joint["intact_joint"]
-        comm = comm.replace(_ANCHORS["chmat"], (
+        materials += (
             "INTACT_JOINT_MAT = DEFI_MATERIAU(\n"
             f"    ELAS=_F(E={original['concrete_youngs_modulus_pa']:.12g}, NU={original['concrete_poissons_ratio']:.12g}),\n"
             f"    RUPT_FRAG=_F(GC={original['fracture_energy_j_m2']:.12g}, SIGM_C={original['tensile_strength_pa']:.12g}, "
             f"PENA_ADHERENCE={original['pena_adherence']:.12g}, PENA_CONTACT=1.0),\n"
-            ")\n" + _ANCHORS["chmat"]))
+            ")\n"
+            "# The intact joints keep the CZM_LIN_REG law built from the intact concrete.\n\n")
+        if vertical_count:
+            vertical = joint["vertical_joint"]
+            materials += (
+                "VERTICAL_JOINT_MAT = DEFI_MATERIAU(\n"
+                f"    ELAS=_F(E={vertical['concrete_youngs_modulus_pa']:.12g}, NU={vertical['concrete_poissons_ratio']:.12g}),\n"
+                f"    RUPT_FRAG=_F(GC={vertical['fracture_energy_j_m2']:.12g}, SIGM_C={vertical['tensile_strength_pa']:.12g}, "
+                f"PENA_ADHERENCE={vertical['pena_adherence']:.12g}, PENA_CONTACT=1.0),\n"
+                ")\n"
+                f"# Radial vertical crack path through the tensile peak: critical opening "
+                f"{vertical['critical_opening_m']:.6g} m = 2 Gf / f_t (f_t calibrated, not measured).\n\n")
+        comm = comm.replace(_ANCHORS["chmat"], materials + _ANCHORS["chmat"])
         groups = ""
-        if joint["damaged_joint_count"]:
-            groups += "        _F(GROUP_MA='DAMAGED_JOINTS', MATER=JOINT_MAT),\n"
-        if joint["damaged_joint_count"] < joint["candidate_face_count"]:
+        if lift_count:
+            groups += "        _F(GROUP_MA='LIFT_JOINTS', MATER=LIFT_MAT),\n"
+        if damaged_count:
+            groups += ("        _F(GROUP_MA='DAMAGED_JOINTS', MATER=FROT_MAT),\n" if friction_law is not None
+                       else "        _F(GROUP_MA='DAMAGED_JOINTS', MATER=JOINT_MAT),\n")
+        if vertical_count:
+            groups += "        _F(GROUP_MA='VERTICAL_JOINTS', MATER=VERTICAL_JOINT_MAT),\n"
+        if intact_count > 0:
             groups += "        _F(GROUP_MA='INTACT_JOINTS', MATER=INTACT_JOINT_MAT),\n"
         comm = comm.replace("        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n", groups)
     opening_threshold = repr(joint.get("elastic_limit_opening_m", 0.))
     friction_cells = "None"
+    lift_cells = "None"
     if assignment is not None:
+        parents = interpolation["joint_parent_faces"]
+        damaged_faces = np.asarray(interpolation["damaged_joint_faces"], dtype=bool)[parents]
+        lift_faces = (np.asarray(interpolation["lift_joint_faces"], dtype=bool)[parents]
+                      if "lift_joint_faces" in interpolation else np.zeros_like(damaged_faces))
+        vertical_faces = (np.asarray(interpolation["vertical_joint_faces"], dtype=bool)[parents]
+                          if "vertical_joint_faces" in interpolation else np.zeros_like(damaged_faces))
         # Friction joints have no cohesive elastic limit; any opening beyond the
         # hydraulic tolerance counts as open.
-        damaged_limit = 1e-9 if friction_law is not None else joint["elastic_limit_opening_m"]
-        thresholds = np.where(interpolation["damaged_joint_faces"][interpolation["joint_parent_faces"]],
-                              damaged_limit, joint["intact_joint"]["elastic_limit_opening_m"])
+        damaged_limit = FRICTION_OPENING_LIMIT_M if friction_law is not None else joint["elastic_limit_opening_m"]
+        vertical_limit = joint["vertical_joint"]["elastic_limit_opening_m"] if vertical_count else 0.
+        thresholds = np.where(lift_faces, lift_law["elastic_limit_opening_m"] if lift_law is not None else 0.,
+                              np.where(vertical_faces, vertical_limit,
+                                       np.where(damaged_faces, damaged_limit,
+                                                joint["intact_joint"]["elastic_limit_opening_m"])))
         opening_threshold = "np.asarray(" + repr(thresholds.tolist()) + ")"
-        if friction_law is not None:
-            mask = interpolation["damaged_joint_faces"][interpolation["joint_parent_faces"]]
-            friction_cells = "np.asarray(" + repr([bool(value) for value in mask]) + ")"
-    if assignment is not None and assignment["selected_source_rows"]:
+        # Mohr-Coulomb cells: the damaged friction joints and a frictional lift plane share
+        # JOINT_MECA_FROT's internal variables; a rupture lift plane has its own mapping.
+        frictional = ((damaged_faces if friction_law is not None else np.zeros_like(damaged_faces))
+                      | (lift_faces if lift_frictional else np.zeros_like(lift_faces)))
+        if frictional.any():
+            friction_cells = "np.asarray(" + repr([bool(value) for value in frictional]) + ")"
+        if lift_law is not None and not lift_frictional:
+            lift_cells = "np.asarray(" + repr([bool(value) for value in lift_faces]) + ")"
+    if assignment is not None and assignment["selected_source_rows"] and assignment.get("properties") is not None:
         properties = assignment["properties"]
         comm = comm.replace(_ANCHORS["chmat"], (
             "DAMAGED_MAT = DEFI_MATERIAU(\n"
@@ -729,11 +969,17 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
     targets = ", ".join(f"{value:.10g}" for value in factors)
     if not has_joints:
         comport_joints = ""
-    elif friction_law is not None:
+    elif assignment is not None:
         comport_joints = ""
-        if joint["damaged_joint_count"]:
-            comport_joints += "    _F(RELATION='JOINT_MECA_FROT', GROUP_MA='DAMAGED_JOINTS'),\n"
-        if joint["damaged_joint_count"] < joint["candidate_face_count"]:
+        if lift_count:
+            comport_joints += (f"    _F(RELATION='{lift_law['law']}', GROUP_MA='LIFT_JOINTS'),\n")
+        if damaged_count:
+            comport_joints += ("    _F(RELATION='JOINT_MECA_FROT', GROUP_MA='DAMAGED_JOINTS'),\n"
+                               if friction_law is not None else
+                               "    _F(RELATION='CZM_LIN_REG', GROUP_MA='DAMAGED_JOINTS'),\n")
+        if vertical_count:
+            comport_joints += "    _F(RELATION='CZM_LIN_REG', GROUP_MA='VERTICAL_JOINTS'),\n"
+        if intact_count > 0:
             comport_joints += "    _F(RELATION='CZM_LIN_REG', GROUP_MA='INTACT_JOINTS'),\n"
     else:
         comport_joints = "    _F(RELATION='CZM_LIN_REG', GROUP_MA='JOINTS'),\n"
@@ -775,19 +1021,22 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
     # constant gravity cannot be eased by time-step subdivision. Ramping gravity to full
     # by load factor 0.05 keeps compression ahead of shear at every instant and stays
     # subdividable; every solve target (the first is also 0.05) carries full self-weight.
-    gravity_excit = ("    _F(CHARGE=GRAVITE, FONC_MULT=GRAVITY_RAMP),\n" if friction_law is not None
+    gravity_excit = ("    _F(CHARGE=GRAVITE, FONC_MULT=GRAVITY_RAMP),\n" if any_friction
                      else "    _F(CHARGE=GRAVITE, FONC_MULT=RAMP),\n")
     gravity_ramp = ("GRAVITY_RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 0.05, 1.0), "
-                    "PROL_DROITE='CONSTANT')\n" if friction_law is not None else "")
+                    "PROL_DROITE='CONSTANT')\n" if any_friction else "")
+    # Softening laws (friction stick-slip, lift-joint rupture of many facets at once) need the
+    # line search: a full tangent Newton step over a snap-through diverges from iteration 0.
     line_search = ("\n        RECH_LINEAIRE=_F(METHODE='MIXTE', ITER_LINE_MAXI=3),"
-                   if friction_law is not None else "")
-    # Friction steps empirically converge by iteration ~30 or oscillate forever on toggling
-    # faces; a 100-iteration budget made every failed bite cost ~30 wall-clock minutes
-    # before DECOUPE was allowed to subdivide. 40 keeps margin over the observed
-    # convergence tail while making failures 2.5x cheaper.
+                   if any_friction or lift_law is not None else "")
+    # Friction and lift-joint steps empirically converge by iteration ~30 or oscillate
+    # forever on toggling faces; a 100-iteration budget made every failed bite cost ~30
+    # wall-clock minutes before DECOUPE was allowed to subdivide. 40 keeps margin over the
+    # observed convergence tail while making failures 2.5x cheaper.
+    toggling_law = friction_law if friction_law is not None else lift_law
     convergence = (f"CONVERGENCE=_F(ITER_GLOB_MAXI=40, "
-                   f"RESI_GLOB_MAXI={friction_law['residual_tolerance_n']:.6g}),"
-                   if friction_law is not None else
+                   f"RESI_GLOB_MAXI={toggling_law['residual_tolerance_n']:.6g}),"
+                   if toggling_law is not None else
                    "CONVERGENCE=_F(ITER_GLOB_MAXI=30, RESI_GLOB_RELA=1.0e-6),")
     comm += f'''{gravity_ramp}RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 100.0, 100.0), PROL_DROITE='LINEAIRE')
 # Every load is scaled by the load factor (= INST), as in the FEniCSx proportional ramp.
@@ -798,6 +1047,9 @@ TARGETS = [{targets}]
 JOINT_CELLS = list(MAIL.getCells('JOINTS')) if {has_joints!r} else []
 # Per-joint-cell mask of Mohr-Coulomb friction cells (None = all cohesive).
 FRICTION_CELLS = {friction_cells}
+# Per-joint-cell mask of JOINT_MECA_RUPT lift-joint cells (None = none).
+LIFT_CELLS = {lift_cells}
+LIFT_GF = {(lift_law or {}).get('fracture_energy_j_m2', 0.0)!r}
 
 
 def joint_component(field, component):
@@ -813,6 +1065,22 @@ def joint_component(field, component):
     return peak
 
 
+def joint_gauss(field, component):
+    values, description = field.toSimpleFieldOnCells().getValuesWithDescription(
+        [component], ['JOINTS'])
+    return np.asarray(values, dtype=float), np.asarray(description[0], dtype=np.int64)
+
+
+def joint_mean(values, cells):
+    # Mean over each joint cell's Gauss points: plane resultants need means, not peaks.
+    index = {{cell: row for row, cell in enumerate(JOINT_CELLS)}}
+    rows = np.array([index[cell] for cell in cells.tolist()], dtype=np.int64)
+    total, count = np.zeros(len(JOINT_CELLS)), np.zeros(len(JOINT_CELLS))
+    np.add.at(total, rows, values)
+    np.add.at(count, rows, 1.0)
+    return total / np.maximum(count, 1.0)
+
+
 def nodal_displacement(field):
     result = np.full((MAIL.getNumberOfNodes(), 3), np.nan)
     for column, component in enumerate(('DX', 'DY', 'DZ')):
@@ -822,7 +1090,8 @@ def nodal_displacement(field):
 
 
 history = {{"load_factor": [], "damage_state": [], "normal_jump_m": [], "normal_traction_pa": [],
-           "dissipated_energy_j_m2": []}}
+           "dissipated_energy_j_m2": [], "mean_normal_traction_pa": [], "mean_tangential_traction_pa": [],
+           "sliding": [], "cumulative_slip_m": []}}
 status = {{"schema_version": 1, "status": "running", "targets": TARGETS, "converged_load_factors": [],
           "joint_cells": len(JOINT_CELLS), "started_at": time.time()}}
 
@@ -875,18 +1144,44 @@ for target in TARGETS:
     history["load_factor"].append(target)
     # CZM_LIN_REG: V3=INDIENDO (damage), V5=DISSIP, V7=SAUT_N.
     # JOINT_MECA_FROT: V2=INDIPLAS (sliding), V5=INDIOUV (open), V7=SAUT_N.
+    # JOINT_MECA_RUPT (lib64/aster/code_aster/Behaviours/joint_meca_rupt.py, 20 variables;
+    # documented in share/aster/tests/ssnp162b.comm): V1=SEUILDEP, V2=INDIDISS,
+    # V3=INDIENDN (0 sain, 1 endommagé, 2 cassé), V4=PCENERDI (% normal damage),
+    # V5=INDIENDT, V6=PCENDOT, V7=SAUT_N. V3/V7 therefore share CZM_LIN_REG's slots; the
+    # law has no DISSIP variable so dissipated energy is rebuilt from V4 and the joint Gf.
     damage = joint_component(vari, 'V3')
     dissipated = joint_component(vari, 'V5')
+    sliding_flag = np.zeros(len(damage))
+    slip = np.zeros(len(damage))
     if FRICTION_CELLS is not None and len(damage):
         opened = joint_component(vari, 'V5')
         sliding = joint_component(vari, 'V2')
         damage = np.where(FRICTION_CELLS,
                           np.where(opened > 0.5, 2.0, np.where(sliding > 0.5, 1.0, 0.0)), damage)
         dissipated = np.where(FRICTION_CELLS, 0.0, dissipated)
+        # JOINT_MECA_FROT (R7.01.25 3.3): V1 = cumulative plastic tangential displacement,
+        # V2 = sliding indicator.
+        sliding_flag = np.where(FRICTION_CELLS, (sliding > 0.5).astype(float), 0.0)
+        slip = np.where(FRICTION_CELLS, joint_component(vari, 'V1'), 0.0)
+    if LIFT_CELLS is not None and len(damage):
+        # PCENERDI is the fraction of the normal softening branch consumed; the linear
+        # softening dissipates Gf * fraction up to full separation.
+        fraction = np.clip(joint_component(vari, 'V4'), 0.0, 1.0)
+        dissipated = np.where(LIFT_CELLS, LIFT_GF * fraction, dissipated)
     history["damage_state"].append(damage)
     history["normal_jump_m"].append(joint_component(vari, 'V7'))
     history["dissipated_energy_j_m2"].append(dissipated)
     history["normal_traction_pa"].append(joint_component(sief, 'SIGN'))
+    if JOINT_CELLS:
+        normal_gauss, gauss_cells = joint_gauss(sief, 'SIGN')
+        shear_gauss = np.hypot(joint_gauss(sief, 'SITX')[0], joint_gauss(sief, 'SITY')[0])
+        history["mean_normal_traction_pa"].append(joint_mean(normal_gauss, gauss_cells))
+        history["mean_tangential_traction_pa"].append(joint_mean(shear_gauss, gauss_cells))
+    else:
+        history["mean_normal_traction_pa"].append(np.empty(0))
+        history["mean_tangential_traction_pa"].append(np.empty(0))
+    history["sliding"].append(sliding_flag)
+    history["cumulative_slip_m"].append(slip)
     if len(history["load_factor"]) == 1:
         first_depl = nodal_displacement(RESU.getField('DEPL', last))
     status["converged_load_factors"].append(target)
@@ -918,23 +1213,42 @@ FIN()
         metadata = joint["hydraulic_loads"]
         runtime_source = Path(hydraulic_loads.__file__).read_text(encoding="utf-8")
         archive = steps_path.parent.parent / SPLIT_ARRAYS_NAME
+        plane_uplift = metadata.get("lift_plane_uplift") or {}
+        pore = ""
+        if plane_uplift.get("mode", "none") != "none":
+            # Pore pressure inside the lift plane (closed faces); wet faces keep the full head.
+            pore = (f", pore_faces=np.asarray(hydraulic_arrays['lift_joint_faces'], dtype=bool), "
+                    f"downstream_z={float(plane_uplift['downstream_z_m'])!r}")
         comm = comm.replace("RESU = None\n", (
             f"exec(compile({runtime_source!r}, 'hydraulic_loads.py', 'exec'))\n"
             f"hydraulic_settings = {settings!r}\n"
             f"with np.load({_comm_string(archive.resolve())}, allow_pickle=False) as stored:\n"
             "    hydraulic_arrays = {key: stored[key] for key in stored.files}\n"
             f"crack_water = CrackWater(hydraulic_arrays, {metadata['upstream_z_m']!r}, "
-            f"{metadata['gradient_pa_per_m']!r}, hydraulic_settings['opening_tolerance_m'])\n"
+            f"{metadata['gradient_pa_per_m']!r}, hydraulic_settings['opening_tolerance_m']{pore})\n"
+            "status['lift_plane_uplift'] = crack_water.pore_report\n"
             f"hydraulic_uplift_resultant = np.asarray({metadata['uplift']['resultant_n']!r})\n"
+            f"HYDRAULIC_OPENING_LIMIT = {opening_threshold}\n"
+            "def hydraulic_open_faces(result):\n"
+            "    if result is None:\n"
+            "        return np.zeros(len(hydraulic_arrays['penta6_joints']), dtype=bool)\n"
+            "    if not JOINT_CELLS:\n"
+            "        return np.empty(0, dtype=bool)\n"
+            "    field = result.getField('VARI_ELGA', result.getLastIndex())\n"
+            "    damage = joint_component(field, 'V3')\n"
+            "    jump = joint_component(field, 'V7')\n"
+            "    if FRICTION_CELLS is not None:\n"
+            "        opened = joint_component(field, 'V5')\n"
+            "        damage = np.where(FRICTION_CELLS, np.where(opened > 0.5, 2., 0.), damage)\n"
+            "    return ((damage >= 1. - 1e-9) & (jump > HYDRAULIC_OPENING_LIMIT)).reshape(-1, 3).any(axis=1)\n"
             "hydraulic_history = []\nhydraulic_masks = []\nRESU = None\n"))
         start = comm.index("    try:\n        if RESU is None:")
         end = comm.index("    reached = target\n", start)
         comm = comm[:start] + hydraulic_loads.COUPLED_SOLVE + comm[end:]
-        start = comm.index("    times = DEFI_LIST_INST(")
-        end = comm.index("    options = dict(", start)
-        comm = comm[:start] + (
-            "    times = DEFI_LIST_REEL(DEBUT=reached, INTERVALLE=_F(JUSQU_A=target, NOMBRE=1))\n"
-        ) + comm[end:]
+        # The hydraulic trials keep the DEFI_LIST_INST / DECOUPE sub-stepping: each trial is a
+        # fresh STAT_NON_LINE whose last archived instant is still the target, and chaining via
+        # ETAT_INIT(INST=reached) is unaffected by archived sub-instants. Without it one
+        # divergent Newton step (softening snap-through of many joints) ended the whole run.
         comm = comm.replace('    status["converged_load_factors"].append(target)',
                             '    status["hydraulic_steps"] = hydraulic_history\n'
                             '    status["converged_load_factors"].append(target)')
@@ -983,6 +1297,8 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     ties = len(split["arrays"]["tie_node_pairs"])
     integrate_joint_faces(split)
     assignment = summary.get("material_assignment")
+    lift_properties = assignment.get("joint_properties") if isinstance(assignment, dict) else None
+    degraded = assignment is not None and assignment.get("properties") is not None
     if assignment is not None:
         selected_rows = np.asarray(assignment["selected_source_rows"], dtype=np.int64)
         volume_rows = split["arrays"]["source_cell_rows"]
@@ -992,18 +1308,46 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
                 or selected[concrete_count:].any()
                 or np.any(~np.isin(split["arrays"]["concrete_body_ids"][selected[:concrete_count]], (1, 3)))):
             raise CorroborationError("Damaged material assignment must match exact selected wall/foundation source cells")
-        split["arrays"]["damaged_cells"] = selected
-        selected_faces = {tuple(sorted(face)) for cell in arrays["tetra4_concrete"][selected[:concrete_count]]
-                          for face in (cell[[0, 1, 2]], cell[[0, 1, 3]], cell[[0, 2, 3]], cell[[1, 2, 3]])}
-        split["arrays"]["damaged_joint_faces"] = np.array(
-            [tuple(sorted(face)) in selected_faces for face in faces], dtype=bool)
+    # Three facet classes. Lift facets (the recorded near-horizontal planes) take JOINT_MECA_RUPT;
+    # the remaining facets between degraded elements take the degraded-material CZM (or
+    # friction); everything else is intact. A lift facet is never also a damaged facet.
+    lift_faces = np.zeros(len(faces), dtype=bool)
+    if lift_properties is not None:
+        with np.load(fenicsx_output / "cohesive_state.npz") as state:
+            if "lift_joint_faces" not in state.files:
+                raise CorroborationError("Lift joints are configured but the prepared candidates carry no lift facet mask")
+            lift_faces = np.asarray(state["lift_joint_faces"], dtype=bool)
+        if lift_faces.shape != (len(faces),) or not lift_faces.any():
+            raise CorroborationError("The lift facet mask does not match the candidate facets or selects none")
+        if int(lift_faces.sum()) != int(lift_properties.get("lift_joint_facets", -1)):
+            raise CorroborationError("The lift facet mask disagrees with the screening's lift-joint facet count")
+        from FEniCSx.lift_joints import facet_unit_normals
+        limit = math.cos(math.radians(float(lift_properties["max_normal_deviation_deg"]))) - 1e-12
+        if np.any(np.abs(facet_unit_normals(arrays["nodes"], faces[lift_faces])[:, 2]) < limit):
+            raise CorroborationError("A recorded lift-joint facet is not near-horizontal in the Aster mesh")
+    if assignment is not None:
+        split["arrays"]["lift_joint_faces"] = lift_faces
+        if degraded:
+            split["arrays"]["damaged_cells"] = selected
+            selected_faces = {tuple(sorted(face)) for cell in arrays["tetra4_concrete"][selected[:concrete_count]]
+                              for face in (cell[[0, 1, 2]], cell[[0, 1, 3]], cell[[0, 2, 3]], cell[[1, 2, 3]])}
+            split["arrays"]["damaged_joint_faces"] = np.array(
+                [tuple(sorted(face)) in selected_faces for face in faces], dtype=bool) & ~lift_faces
+        else:
+            split["arrays"]["damaged_cells"] = np.zeros(len(split["arrays"]["source_cell_rows"]), dtype=bool)
+            split["arrays"]["damaged_joint_faces"] = np.zeros(len(faces), dtype=bool)
     output_dir.mkdir(parents=True, exist_ok=True)
     baseline_manifest = json.loads((baseline_dir / MESH_MANIFEST_NAME).read_text(encoding="utf-8"))
     manifest = split_manifest(baseline_manifest, split)
+    if summary.get("crack_water_pressure") is True:
+        from Aster.hydraulic_loads import CRACK_WATER_SETTINGS
+        if "hydraulic_loads" in manifest and manifest["hydraulic_loads"] != CRACK_WATER_SETTINGS:
+            raise CorroborationError("Crack-water-only configuration conflicts with hydraulic campaign settings")
+        manifest["hydraulic_loads"] = dict(CRACK_WATER_SETTINGS)
     degradation = summary.get("support_degradation")
     if degradation is not None:
         degradation = apply_support_degradation(manifest, split["arrays"], degradation)
-    np.savez(output_dir / SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
+    save_split_arrays(output_dir, split)
     manifest_path = output_dir / MESH_MANIFEST_NAME
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     base_comm, base_inputs = render_comm(mesh_manifest_path=manifest_path)
@@ -1011,27 +1355,41 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     friction = summary.get("damaged_joint_friction")
     if friction is not None and assignment is None:
         raise CorroborationError("Damaged joint friction requires a damaged material assignment")
+    if friction is not None and not degraded:
+        raise CorroborationError("Damaged joint friction requires degraded element properties")
     law_summary = summary
+    source_concrete = json.loads(
+        Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))["material"]["concrete"]
     if friction is not None:
-        original_concrete = json.loads(
-            Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))["material"]["concrete"]
+        original_concrete = source_concrete
         # The damaged joints use Mohr-Coulomb friction; the CZM parameters then
         # describe the intact joints and must not be derived from the (possibly
         # strengthless) damaged properties.
         law_summary = {**summary, "tensile_strength_pa": original_concrete["tensile_strength_pa"],
                        "fracture_energy_j_m2": original_concrete["cohesive_fracture_energy_j_m2"]}
     joint = joint_parameters(arrays, faces, law_summary, concrete["youngs_modulus_pa"], concrete["poissons_ratio"])
+    # A handful of marginal joint faces (friction stick-slip, or lift joints at the
+    # elastic/softening and open/closed thresholds) toggle forever at machine precision,
+    # so those solves converge on an absolute residual scaled by the structure weight;
+    # RESI_GLOB_RELA normalises by the largest nodal load and is unreachable while the
+    # faces flip. Dam-scale runs plateau at ~1e-4 of self-weight (a 0.01% imbalance
+    # localised at the toggling faces; the lift-joint run cycled at 2e-4 relative with
+    # a 21 N absolute residual), so that is the acceptance level.
+    corners = np.asarray(arrays["nodes"], dtype=float)[np.asarray(arrays["tetra4_concrete"], dtype=np.int64)]
+    volume = float(np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])).sum() / 6.)
+    residual_tolerance_n = max(1e-4 * volume * float(source_concrete.get("density", 2400.)) * 9.81, 1.)
     if friction is not None:
         joint["damaged_friction"] = friction_joint_parameters(friction, joint["initial_stiffness_pa_per_m"])
-        # A handful of marginal friction faces toggle forever at machine precision, so the
-        # friction solve converges on an absolute residual scaled by the structure weight;
-        # RESI_GLOB_RELA normalises by the largest nodal load and is unreachable while
-        # those faces flip. Dam-scale runs plateau at ~1e-4 of self-weight (a 0.01%
-        # imbalance localised at the toggling faces), so that is the acceptance level.
-        corners = np.asarray(arrays["nodes"], dtype=float)[np.asarray(arrays["tetra4_concrete"], dtype=np.int64)]
-        volume = float(np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])).sum() / 6.)
-        density = float(original_concrete.get("density", 2400.))
-        joint["damaged_friction"]["residual_tolerance_n"] = max(1e-4 * volume * density * 9.81, 1.)
+        joint["damaged_friction"]["residual_tolerance_n"] = residual_tolerance_n
+    if lift_properties is not None:
+        # ``joint`` is the CZM of the summary (degraded-material values when elements are
+        # degraded, else the intact concrete's); the lift planes take their own law. The
+        # neighbouring element stiffness is E/h over the lift facets themselves, the same
+        # measure the element selection checks before any solve is spent.
+        from FEniCSx.lift_joints import mean_facet_edge
+        neighbour = float(concrete["youngs_modulus_pa"]) / mean_facet_edge(arrays["nodes"], faces[lift_faces])
+        joint["lift_joint"] = lift_joint_parameters(lift_properties, joint["initial_stiffness_pa_per_m"], neighbour)
+        joint["lift_joint"]["residual_tolerance_n"] = residual_tolerance_n
     joint["has_joints"] = bool(len(faces))
     joint["stop_overload_on_opening"] = summary.get("status") == "prepared_aster_candidates"
     joint["material_assignment"] = assignment
@@ -1041,6 +1399,13 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
             "upstream_z_m": base_inputs["upstream_water_surface_z_m"],
             "gradient_pa_per_m": base_inputs["water_pressure_gradient_pa_per_m"],
         }
+    if lift_properties is not None and lift_properties.get("uplift", "none") != "none":
+        if "hydraulic_loads" not in joint:
+            raise CorroborationError("Lift-plane uplift requires crack_water_pressure (the coupled hydraulic solve)")
+        joint["hydraulic_loads"]["lift_plane_uplift"] = {
+            "mode": lift_properties["uplift"],
+            "downstream_z_m": float(base_inputs["tailwater_elevation_m"]),
+        }
     if assignment is not None:
         config = json.loads(Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))
         original = config["material"]["concrete"]
@@ -1049,7 +1414,30 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
                             "fracture_energy_j_m2": original["cohesive_fracture_energy_j_m2"]},
             concrete["youngs_modulus_pa"], concrete["poissons_ratio"])
         joint["damaged_joint_count"] = int(split["arrays"]["damaged_joint_faces"].sum())
+        joint["lift_joint_count"] = int(split["arrays"]["lift_joint_faces"].sum())
         joint["candidate_face_count"] = len(faces)
+        vertical_cfg = vertical_joint_settings(config)
+        vertical = np.zeros(len(faces), dtype=bool)
+        if vertical_cfg is not None:
+            peak = summary.get("peak_location_m")
+            if peak is None:
+                raise CorroborationError("The vertical joint path needs the tensile peak (peak_location_m) from screening")
+            band = (vertical_cfg["band_m"] if vertical_cfg["band_m"] is not None
+                    else joint["intact_joint"]["mean_facet_edge_m"])
+            vertical = (vertical_crack_facets(arrays["nodes"], faces, peak, band,
+                                              vertical_cfg["max_normal_deviation_deg"])
+                        & ~np.asarray(split["arrays"]["lift_joint_faces"], dtype=bool)
+                        & ~np.asarray(split["arrays"]["damaged_joint_faces"], dtype=bool))
+            if not vertical.any():
+                raise CorroborationError("No facets lie on the vertical crack plane through the tensile peak")
+            strength = vertical_joint_strength(vertical_cfg["critical_opening_m"], vertical_cfg["fracture_energy_j_m2"])
+            joint["vertical_joint"] = joint_parameters(
+                arrays, faces[vertical], {"tensile_strength_pa": strength,
+                                          "fracture_energy_j_m2": vertical_cfg["fracture_energy_j_m2"]},
+                concrete["youngs_modulus_pa"], concrete["poissons_ratio"])
+        joint["vertical_joint_count"] = int(vertical.sum())
+        split["arrays"]["vertical_joint_faces"] = vertical
+        save_split_arrays(output_dir, split)
     factors = load_factors(summary)
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
@@ -1118,7 +1506,8 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
             text = text.replace(_comm_string(path), repr(wsl_path(path)))
         arrays_path = (output_dir / SPLIT_ARRAYS_NAME).resolve()
         text = text.replace(_comm_string(arrays_path), repr(wsl_path(arrays_path)))
-        text = text.replace("SOLVEUR=_F(METHODE='MULT_FRONT')", "SOLVEUR=_F(METHODE='MUMPS')")
+        text = text.replace("SOLVEUR=_F(METHODE='MULT_FRONT')", "SOLVEUR=_F(METHODE='MUMPS', NPREC=12)")
+        text = text.replace("SOLVEUR=_F(METHODE='MUMPS')", "SOLVEUR=_F(METHODE='MUMPS', NPREC=12)")
         case.write_text(text, encoding="utf-8")
         case_path, mesh_path = wsl_path(case), wsl_path(med_path)
     else:
@@ -1165,11 +1554,25 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
     status["runtime"] = "wsl" if runtime == "wsl" and os.name == "nt" else "native"
     # A comm-handled convergence stop writes status "stopped" and exits 0; Code_Aster still
     # prints the caught exception box, so the <EXCEPTION> scan must not reclassify it.
+    # run_aster always prints its exit marker, even after a solver error. A run that was still
+    # stepping and ends without it (and not through the time limit's 124/137) was killed from
+    # outside, e.g. its WSL session was shut down; that says nothing about the model.
+    interrupted = (status.get("status") == "running" and completed.returncode not in (0, 124, 137)
+                   and RUN_ASTER_EXIT_MARKER not in completed.stdout)
     if (completed.returncode != 0 or status.get("status") == "running"
             or ("<EXCEPTION>" in completed.stdout + completed.stderr
                 and status.get("status") != "stopped")):
         status["status"] = "failed"
         status["message"] = f"Code_Aster stopped unexpectedly (exit code {completed.returncode})"
+        if interrupted:
+            started = re.findall(r"ASTER_COHESIVE_STEP start load_factor=(\S+)", completed.stdout)
+            status["interrupted"] = True
+            status["message"] = (
+                "Code_Aster was terminated from outside"
+                + (f" while solving load factor {started[-1]}" if started else "")
+                + f" (exit code {completed.returncode}): its log ends mid-solve with no solver error. "
+                  "The process was killed or its WSL session was shut down or restarted (for example by "
+                  "a WSL update); this is not a model result - rerun the stage")
     return status
 
 
@@ -1213,6 +1616,234 @@ def _ratio(a: float, b: float) -> float | None:
     return None if b == 0 else float(a) / float(b)
 
 
+def joint_class_summary(mask, areas, initiated, opened, separated, traction, jump, strength_pa, law) -> dict:
+    """Final state of one joint class (lift / damaged / intact).
+
+    ``traction`` and ``jump`` are (steps, facets) peaks; the class peak is over the whole run.
+    ``utilisation`` is the largest tension the class saw over its tensile strength: far
+    below 1 with no initiated faces means the class never took load.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    peak = float(traction[:, mask].max())
+    return {
+        "law": law,
+        "faces": int(mask.sum()),
+        "area_m2": float(areas[mask].sum()),
+        "initiated_faces": int(initiated[mask].sum()),
+        "opened_faces": int(opened[mask].sum()),
+        "separated_faces": int(separated[mask].sum()),
+        "peak_normal_traction_pa": peak,
+        "tensile_strength_pa": None if strength_pa is None else float(strength_pa),
+        "utilisation": (None if not strength_pa else float(max(peak, 0.) / float(strength_pa))),
+        "peak_opening_m": float(max(0., jump[:, mask].max())),
+    }
+
+
+def lift_plane_sliding(factors, areas, normal, shear, sliding, slip, jump, lift_law) -> dict:
+    """Shear demand against Mohr-Coulomb capacity on the lift plane, per converged step.
+
+    ``normal`` (tension positive) and ``shear`` (magnitude) are facet means of the joint
+    tractions; the joint carries the effective stress because water pressure is applied
+    on its two lips as external forces. For JOINT_MECA_FROT the facet capacity is
+    max(c - mu * sigma_n, 0) and ``mobilisation`` = sum(|tau| A) / sum(capacity A): 1 means
+    the whole plane is at its friction limit. The demand sums shear magnitudes, so it is an
+    upper bound on the shear resultant when shear directions differ across the plane.
+    JOINT_MECA_RUPT has no slip limit; the friction coefficient the plane would need to
+    carry its shear by friction alone is reported instead.
+    """
+    areas = np.asarray(areas, dtype=float)
+    total = float(areas.sum())
+    frictional = lift_law.get("law") == "JOINT_MECA_FROT"
+    mu, cohesion = (float(lift_law["friction_coefficient"]), float(lift_law["adhesion_pa"])) if frictional \
+        else (None, None)
+    rows = []
+    for i, factor in enumerate(factors):
+        compression = float((np.maximum(-normal[i], 0.) * areas).sum())
+        demand = float((shear[i] * areas).sum())
+        row = {
+            "load_factor": float(factor),
+            "normal_compression_n": compression,
+            "shear_demand_n": demand,
+            "tension_area_fraction": float(areas[normal[i] > 0].sum() / total),
+            "open_area_fraction": float(areas[jump[i] > FRICTION_OPENING_LIMIT_M].sum() / total),
+            "required_friction_coefficient": demand / compression if compression > 0 else None,
+        }
+        if frictional:
+            capacity = float((np.maximum(cohesion - mu * normal[i], 0.) * areas).sum())
+            row["shear_capacity_n"] = capacity
+            row["mobilisation"] = demand / capacity if capacity > 0 else None
+            row["sliding_area_fraction"] = (None if sliding is None
+                                            else float(areas[sliding[i] > 0.5].sum() / total))
+            row["peak_cumulative_slip_m"] = None if slip is None else float(slip[i].max())
+        rows.append(row)
+    return {
+        "law": lift_law.get("law"),
+        "friction_coefficient": mu,
+        "adhesion_pa": cohesion,
+        "area_m2": total,
+        "definition": ("facet-mean joint tractions (effective stress); demand = sum of shear magnitudes x area "
+                       "(an upper bound on the resultant); " +
+                       ("capacity = sum of max(c - mu sigma_n, 0) x area; mobilisation 1 = the whole plane at "
+                        "its friction limit" if frictional else
+                        "the law has no slip limit, so only the friction coefficient the plane would need is given")),
+        "steps": rows,
+        "final": rows[-1] if rows else None,
+    }
+
+
+def unjointed_overstress(points, wall, stress, joints, strength_pa) -> dict:
+    """Wall cells without any cohesive joint whose final principal tension exceeds the intact strength.
+
+    A cohesive model cracks only along the joints it was given (Code_Aster U2.05.07 3.1).
+    Tension above the strength in cells that have no joint on any face means the crack path
+    the structure wants lies outside the modelled one, and the result does not predict it.
+    """
+    wall = np.asarray(wall, dtype=np.int64)
+    scale = int(len(points)) + 1
+
+    def keys(triples):
+        ordered = np.sort(np.asarray(triples, dtype=np.int64).reshape(-1, 3), axis=1)
+        return (ordered[:, 0] * scale + ordered[:, 1]) * scale + ordered[:, 2]
+
+    joints = np.asarray(joints, dtype=np.int64).reshape(-1, 6)
+    lips = np.unique(np.concatenate((keys(joints[:, :3]), keys(joints[:, 3:])))) if len(joints) else np.empty(0, np.int64)
+    faces = keys(wall[:, _TET_FACES])
+    jointed = np.isin(faces, lips).reshape(len(wall), 4).any(axis=1)
+    principal = np.linalg.eigvalsh(0.5 * (stress + np.transpose(stress, (0, 2, 1))))[:, 2]
+    over = ~jointed & (principal > float(strength_pa))
+    corners = points[wall]
+    volumes = np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])) / 6.
+    report = {
+        "tensile_strength_pa": float(strength_pa),
+        "jointed_wall_cells": int(jointed.sum()),
+        "unjointed_wall_cells": int((~jointed).sum()),
+        "cells": int(over.sum()),
+        "volume_m3": float(volumes[over].sum()),
+        "peak_principal_stress_pa": None,
+        "peak_centroid_xyz_m": None,
+    }
+    if (~jointed).any():
+        candidates = np.flatnonzero(~jointed)
+        peak = int(candidates[np.argmax(principal[candidates])])
+        report["peak_principal_stress_pa"] = float(principal[peak])
+        report["peak_centroid_xyz_m"] = corners[peak].mean(axis=0).tolist()
+    report["note"] = (
+        f"{report['cells']} wall cells with no cohesive joint exceed the intact tensile strength at the final "
+        "state. They cannot crack in this model, so cracking outside the selected band is not predicted."
+        if report["cells"] else
+        "No wall cell without a cohesive joint exceeds the intact tensile strength at the final state.")
+    return report
+
+
+def displacement_attribution(first_u, final_u, intact_u, wall_nodes, factors, first_initiated: bool,
+                             proportional: bool, softening_sources: list[str]) -> dict:
+    """Split the displacement change into elastic softening and cracking.
+
+    While no joint has initiated the damaged model is linear, so its first step scaled to
+    the final load factor is the "softened but uncracked" response: the same softened
+    supports, materials and joint stiffness with no cracking. The difference to the final
+    state is what cracking added; the difference to the intact baseline is what the softened
+    inputs alone did. The split needs proportional loading (not the friction runs, whose
+    self-weight is applied first).
+    """
+    def peak(field):
+        return float(np.linalg.norm(field[wall_nodes], axis=1).max())
+
+    report = {
+        "final_peak_m": peak(final_u),
+        "intact_peak_m": None if intact_u is None else peak(intact_u),
+        "softened_uncracked_peak_m": None,
+        "elastic_softening_change_m": None,
+        "cracking_change_m": None,
+        "softening_sources": list(softening_sources),
+    }
+    if proportional and not first_initiated:
+        softened = first_u * (factors[-1] / factors[0])
+        report["softened_uncracked_peak_m"] = peak(softened)
+        report["cracking_change_m"] = peak(final_u - softened)
+        if intact_u is not None:
+            report["elastic_softening_change_m"] = peak(softened - intact_u)
+        report["basis"] = (f"first converged step (load factor {factors[0]:g}, no joint initiated) scaled "
+                           f"linearly to {factors[-1]:g}; changes are the largest wall-node difference between fields")
+    elif intact_u is not None:
+        report["total_change_m"] = peak(final_u - intact_u)
+        report["basis"] = (
+            ("self-weight is applied before the water in friction runs, so the first step cannot be scaled; "
+             if not proportional else "a joint had already initiated at the first step; ")
+            + "only the total change from the intact baseline is available"
+            + ("" if softening_sources else
+               " (no elastic softening is configured, so that total is the effect of the joints)"))
+    return report
+
+
+def assessment_notes(report: dict) -> list[str]:
+    """Plain-language findings for the results view: what each joint class did, the sliding
+    margin of the lift plane, where the displacement change came from, and where the model
+    could not crack. Each note is one self-contained sentence or two."""
+    notes = []
+    names = {"lift": "Lift joints", "damaged": "Joints between degraded elements", "intact": "Intact-concrete joints"}
+    for key, label in names.items():
+        item = (report.get("joint_classes") or {}).get(key)
+        if item is None:
+            continue
+        strength, utilisation = item["tensile_strength_pa"], item["utilisation"]
+        text = (f"{label} ({item['law']}, {item['faces']} faces, {item['area_m2']:.4g} m2): "
+                f"{item['initiated_faces']} initiated, {item['opened_faces']} opened, "
+                f"{item['separated_faces']} fully separated; largest opening {item['peak_opening_m'] * 1e3:.3g} mm")
+        if strength:
+            text += (f"; highest tension {max(item['peak_normal_traction_pa'], 0.) / 1e3:.4g} kPa, "
+                     f"{utilisation:.1%} of the {strength / 1e3:.4g} kPa strength")
+            if item["initiated_faces"] == 0 and utilisation < 0.5:
+                text += ". These joints never approached their strength: they were not loaded in tension"
+        notes.append(text + ".")
+    sliding = (report.get("lift_plane_sliding") or {}).get("final")
+    if sliding is not None:
+        law = report["lift_plane_sliding"]["law"]
+        if sliding.get("mobilisation") is not None:
+            text = (f"Lift plane sliding ({law}, friction coefficient {report['lift_plane_sliding']['friction_coefficient']:g}): "
+                    f"shear demand {sliding['shear_demand_n'] / 1e6:.4g} MN against a friction capacity of "
+                    f"{sliding['shear_capacity_n'] / 1e6:.4g} MN, mobilisation {sliding['mobilisation']:.2f} "
+                    "(1 means the whole plane is at its friction limit)")
+            if sliding.get("sliding_area_fraction") is not None:
+                text += (f"; {sliding['sliding_area_fraction']:.0%} of the plane is sliding and "
+                         f"{sliding['open_area_fraction']:.0%} is open")
+            if sliding.get("peak_cumulative_slip_m") is not None:
+                text += f"; largest slip {sliding['peak_cumulative_slip_m'] * 1e3:.3g} mm"
+            notes.append(text + ".")
+        elif law == "JOINT_MECA_FROT":
+            notes.append(f"Lift plane sliding ({law}): the plane has no friction capacity left at the final state "
+                         f"({sliding['open_area_fraction']:.0%} of it is open), so it carries no shear.")
+        elif sliding.get("required_friction_coefficient") is not None:
+            notes.append(f"Lift plane shear ({law} has no slip limit): the plane carries {sliding['shear_demand_n'] / 1e6:.4g} MN "
+                         f"of shear under {sliding['normal_compression_n'] / 1e6:.4g} MN of compression, which friction "
+                         f"alone could carry only with a coefficient of {sliding['required_friction_coefficient']:.2f}.")
+    attribution = report.get("displacement_attribution")
+    if attribution is not None:
+        final, intact = attribution["final_peak_m"], attribution["intact_peak_m"]
+        text = f"Peak wall displacement {final * 1e3:.4g} mm"
+        if intact is not None:
+            text += f" (intact dam at the same load: {intact * 1e3:.4g} mm)"
+        if attribution.get("cracking_change_m") is not None:
+            text += (f". Cracking changed the displacement field by at most {attribution['cracking_change_m'] * 1e3:.3g} mm")
+            if attribution.get("elastic_softening_change_m") is not None:
+                text += (f"; the softened inputs alone, before any cracking, changed it by "
+                         f"{attribution['elastic_softening_change_m'] * 1e3:.3g} mm")
+        elif attribution.get("total_change_m") is not None:
+            text += (f". The largest change from the intact dam is {attribution['total_change_m'] * 1e3:.3g} mm; "
+                     "it could not be split into softening and cracking for this run")
+        if attribution["softening_sources"]:
+            text += ". Elastic softening configured: " + "; ".join(attribution["softening_sources"])
+        notes.append(text + ".")
+    overstress = report.get("unjointed_overstress")
+    if overstress is not None and overstress["cells"]:
+        notes.append(
+            f"{overstress['cells']} wall cells outside the jointed band ({overstress['volume_m3']:.4g} m3) exceed the "
+            f"intact tensile strength of {overstress['tensile_strength_pa'] / 1e6:.4g} MPa at the final state, up to "
+            f"{overstress['peak_principal_stress_pa'] / 1e6:.4g} MPa. They have no cohesive joint and cannot crack in "
+            "this model, so cracking there is not predicted and the result is not a crack-path prediction.")
+    return notes
+
+
 def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     inputs = json.loads((output_dir / "case_inputs.json").read_text(encoding="utf-8"))
     joint = inputs["joint"]
@@ -1249,10 +1880,17 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         report["differences_from_fenicsx"] = [
             note for note in report["differences_from_fenicsx"]
             if "water" not in note.lower() and "uplift" not in note.lower()]
+        uplift = joint["hydraulic_loads"]["settings"]["base_uplift"] != "none"
+        plane_uplift = (joint["hydraulic_loads"].get("lift_plane_uplift") or {}).get("mode", "none") != "none"
+        if plane_uplift:
+            report["lift_plane_uplift"] = status.get("lift_plane_uplift")
         report["differences_from_fenicsx"].append(
-            "Isolated hydraulic study: undrained heel-to-toe uplift and reservoir-connected opened "
-            "crack-face pressure are active in Aster; historical supporting baselines have neither. "
-            "Small-strain facet active-set pressure is not a coupled flow/permeability model.")
+            "Aster applies reservoir-connected opened crack-face pressure"
+            + (" and undrained heel-to-toe uplift." if uplift else "; base uplift is disabled.")
+            + (" The lift plane's closed faces carry a pore pressure linear from the reservoir head upstream "
+               "to the tailwater head downstream." if plane_uplift else "")
+            + " Small-strain hydrostatic active-set pressure assumes instantaneous reservoir head, "
+            "not coupled flow/permeability or transient drainage; supporting loads may differ.")
     if not steps_path.is_file():
         report.update(status="failed", steps=[])
         return report
@@ -1265,8 +1903,14 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         damage = np.asarray(steps["damage_state"], dtype=float).reshape(len(factors), native_faces)
         jump = np.asarray(steps["normal_jump_m"], dtype=float).reshape(len(factors), native_faces)
         traction = np.asarray(steps["normal_traction_pa"], dtype=float).reshape(len(factors), native_faces)
+        # Gauss-point means and friction state (absent in runs made before they were recorded).
+        extras = {name: (np.asarray(steps[name], dtype=float).reshape(len(factors), native_faces)
+                         if name in steps.files else None)
+                  for name in ("mean_normal_traction_pa", "mean_tangential_traction_pa", "sliding",
+                               "cumulative_slip_m")}
     if (jump.shape != damage.shape or traction.shape != damage.shape
             or not all(np.isfinite(values).all() for values in (factors, damage, jump, traction))
+            or any(values is not None and not np.isfinite(values).all() for values in extras.values())
             or np.any(np.diff(factors) <= 0)):
         raise CorroborationError("Aster converged step fields are non-finite, unordered or inconsistent")
     if inputs.get("joint_integration") == "three_HEXA8_FPG4_patches_exact_P1_trace":
@@ -1278,6 +1922,11 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         # Report peaks over each original candidate facet, not invented extra crack faces.
         damage, jump, traction = (values.reshape(len(factors), len(areas), 3).max(axis=2)
                                   for values in (damage, jump, traction))
+        # The three patches of a facet have equal area, so facet means are patch means.
+        for name, reduce in (("mean_normal_traction_pa", np.mean), ("mean_tangential_traction_pa", np.mean),
+                             ("sliding", np.max), ("cumulative_slip_m", np.max)):
+            if extras[name] is not None:
+                extras[name] = reduce(extras[name].reshape(len(factors), len(areas), 3), axis=2)
         report["facet_state_definition"] = (
             "Peak over three FPG4 quadrilateral patches per original facet; initiated/opened areas "
             "are the areas of candidate facets touched, not fully separated surface areas.")
@@ -1285,13 +1934,61 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         raise CorroborationError("Aster joint results do not match the FEniCSx candidate facets")
     initiated = damage >= 1.0 - 1e-9
     opening_limit = joint["elastic_limit_opening_m"]
+    lift_law = joint.get("lift_joint")
+    lift_faces = damaged_faces = None
     if inputs.get("material_assignment") is not None:
         with np.load(output_dir / SPLIT_ARRAYS_NAME) as arrays:
-            opening_limit = np.where(arrays["damaged_joint_faces"], opening_limit,
-                                     joint["intact_joint"]["elastic_limit_opening_m"])
+            damaged_faces = np.asarray(arrays["damaged_joint_faces"], dtype=bool)
+            lift_faces = (np.asarray(arrays["lift_joint_faces"], dtype=bool) if "lift_joint_faces" in arrays.files
+                          else np.zeros_like(damaged_faces))
+        friction = joint.get("damaged_friction") is not None
+        opening_limit = np.where(
+            lift_faces, lift_law["elastic_limit_opening_m"] if lift_law is not None else 0.,
+            np.where(damaged_faces, FRICTION_OPENING_LIMIT_M if friction else opening_limit,
+                     joint["intact_joint"]["elastic_limit_opening_m"]))
+        if lift_law is not None:
+            degraded = inputs["material_assignment"].get("properties") is not None
+            report["lift_joints"] = {
+                **lift_law,
+                "lift_joint_faces": int(lift_faces.sum()),
+                "lift_joint_area_m2": float(areas[lift_faces].sum()),
+                "elements": ("the selected band's elements carry the degraded material; the other facets "
+                             "between them take its cohesive law" if degraded else
+                             "intact concrete everywhere; only the lift-plane joint law is weakened"),
+                "limitation": (
+                    "JOINT_MECA_FROT is perfectly plastic: the plane can slide and open, but its tensile "
+                    "capacity (ADHESION / MU) and adhesion are not lost afterwards, so give a poorly bonded "
+                    "surface a small strength (R7.01.25 1.2.2)"
+                    if lift_law["law"] == "JOINT_MECA_FROT" else
+                    "JOINT_MECA_RUPT keeps an opening-dependent elastic shear stiffness after "
+                    "rupture and has no Coulomb slip limit, so sliding on the open joint is "
+                    "not predicted (use the JOINT_MECA_FROT law for sliding)"),
+            }
         report["material_assignment"] = inputs["material_assignment"]
     opened = initiated & (jump > opening_limit * (1.0 + 1e-6))
     separated = damage >= 2.0 - 1e-9
+    if damaged_faces is not None and len(areas):
+        # Which class of joint did what: a weak plane that never approaches its strength was
+        # bypassed, however many other facets initiated.
+        strengths = {"lift": lift_law["tensile_strength_pa"] if lift_law is not None else None,
+                     "damaged": (None if joint.get("damaged_friction") is not None
+                                 else joint["tensile_strength_pa"]),
+                     "intact": joint["intact_joint"]["tensile_strength_pa"]}
+        laws = {"lift": lift_law["law"] if lift_law is not None else None,
+                "damaged": "JOINT_MECA_FROT" if joint.get("damaged_friction") is not None else "CZM_LIN_REG",
+                "intact": "CZM_LIN_REG"}
+        report["joint_classes"] = {
+            name: joint_class_summary(mask, areas, initiated[-1], opened[-1], separated[-1], traction, jump,
+                                      strengths[name], laws[name])
+            for name, mask in (("lift", lift_faces), ("damaged", damaged_faces),
+                               ("intact", ~lift_faces & ~damaged_faces)) if mask.any()}
+        if lift_law is not None and lift_faces.any() and extras["mean_tangential_traction_pa"] is not None:
+            report["lift_plane_sliding"] = lift_plane_sliding(
+                factors, areas[lift_faces], extras["mean_normal_traction_pa"][:, lift_faces],
+                extras["mean_tangential_traction_pa"][:, lift_faces],
+                None if extras["sliding"] is None else extras["sliding"][:, lift_faces],
+                None if extras["cumulative_slip_m"] is None else extras["cumulative_slip_m"][:, lift_faces],
+                jump[:, lift_faces], lift_law)
     step_rows = [{
         "load_factor": float(factor),
         "initiated_faces": int(initiated[i].sum()),
@@ -1307,9 +2004,10 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     linear_estimate = None
     if len(areas) and not initiated[0].any() and traction[0].max() > 0:
         strengths = np.full(len(areas), joint["tensile_strength_pa"], dtype=float)
-        if inputs.get("material_assignment") is not None:
-            with np.load(output_dir / SPLIT_ARRAYS_NAME) as arrays:
-                strengths[~arrays["damaged_joint_faces"]] = joint["intact_joint"]["tensile_strength_pa"]
+        if damaged_faces is not None:
+            strengths[~damaged_faces & ~lift_faces] = joint["intact_joint"]["tensile_strength_pa"]
+            if lift_law is not None:
+                strengths[lift_faces] = lift_law["tensile_strength_pa"]
         positive = traction[0] > 0
         linear_estimate = float(np.min(factors[0] * strengths[positive] / traction[0, positive]))
 
@@ -1332,22 +2030,29 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     )
     if (not complete and status.get("status") == "stopped"
             and status.get("stopped_at_load_factor") is not None):
-        # The solver found equilibria up to reached_load_factor and then none: in a
-        # static analysis that is the structure's capacity, not a software failure.
+        # Newton stopped converging. That may be the structure's capacity, or the solver
+        # failing to step past a local softening event: Code_Aster's cohesive-zone notice
+        # (U2.05.07 4.3) calls load control essential for these laws and this solve has none.
+        # Without an independent force balance the stop is reported, not called a failure.
         reached, target = float(factors[-1]), float(status["stopped_at_load_factor"])
+        last = step_rows[-1]
         report["outcome"] = "capacity_limit"
         report["capacity_assessment"] = {
             "reached_load_factor": reached,
             "failed_load_factor": target,
-            "last_converged_state": step_rows[-1],
+            "last_converged_state": last,
+            "established": False,
+            "basis": "Newton non-convergence after time-step subdivision; no load control, no independent force balance",
             "message": (
-                f"The damaged dam has no static equilibrium above {reached:.0%} of the design "
-                f"reservoir load. Code_Aster converged every load step up to {reached:g} and then "
-                f"found no equilibrium between {reached:g} and {target:g} despite repeated time-step "
-                "subdivision. In a static analysis this means the structure cannot carry that load: "
-                "the configured damage brings the dam to failure before full reservoir load. "
-                f"The last stable state (load factor {reached:g}, "
-                f"{step_rows[-1]['initiated_faces']} initiated joints) is archived and viewable."),
+                f"Code_Aster converged every load step up to load factor {reached:g} and then did not converge "
+                f"between {reached:g} and {target:g} despite repeated time-step subdivision. This is not, by "
+                "itself, evidence that the dam fails there: softening joint laws can stop a Newton solve at a "
+                "local snap-back that the structure would pass, and this solve has no load control to step "
+                f"through one. At the last converged state {last['initiated_faces']} joints had initiated, "
+                f"{last['separated_faces']} had fully separated and the largest opening was "
+                f"{last['peak_opening_m'] * 1e3:.3g} mm. Treat {reached:g} as the highest load this model "
+                "reached; a capacity claim needs the sliding assessment or a force balance on the failing "
+                "surface to support it. The last converged state is archived and viewable."),
         }
     report["opening_assessment"] = {
         "peak_opening_m": step_rows[-1]["peak_opening_m"],
@@ -1370,6 +2075,8 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
             source_ids = arrays["source_node_ids"].copy()
             damaged_wall = (arrays["damaged_cells"][:len(wall_mask)][wall_mask]
                             if "damaged_cells" in arrays else np.zeros(len(wall), dtype=bool))
+            joint_lips = (np.asarray(arrays["penta6_joints"], dtype=np.int64) if "penta6_joints" in arrays
+                          else np.empty((0, 6), dtype=np.int64))
         with np.load(displacement_path) as fields:
             coordinates, first_u, final_u = fields["coordinates"], fields["first"], fields["final"]
         if (first_u.shape != nodes.shape or final_u.shape != nodes.shape
@@ -1380,7 +2087,8 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         e_pa, nu = joint["concrete_youngs_modulus_pa"], joint["concrete_poissons_ratio"]
         final_stress = wall_cell_stress(nodes, wall, final_u, e_pa, nu)
         assignment = inputs.get("material_assignment")
-        if assignment is not None:
+        if assignment is not None and "properties" in assignment:
+            # Degraded elements only; lift joints leave every element intact concrete.
             properties = assignment["properties"]
             final_stress[damaged_wall] = wall_cell_stress(
                 nodes, wall[damaged_wall], final_u, properties["youngs_modulus"], properties["poisson_ratio"])
@@ -1404,7 +2112,10 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                 if not np.allclose(baseline["coordinates_m"][valid][first][positions], nodes[physical], atol=1e-9, rtol=0.):
                     raise CorroborationError("Intact baseline coordinates do not match selected-material result")
             comparison["intact"] = _stress_summary(nodes, wall, wall_cell_stress(nodes, wall, intact_u, e_pa, nu), intact_u)
-            comparison["intact_definition"] = "original concrete Aster baseline scaled to final load factor; differences include selected material changes and cracking"
+            comparison["intact_definition"] = (
+                "original concrete Aster baseline scaled to final load factor; differences include "
+                + ("selected material changes and cracking" if "properties" in assignment
+                   else "lift-joint cracking only (every element keeps the intact concrete)"))
             np.savez(displacement_path, coordinates=coordinates, first=first_u, final=final_u, intact=intact_u)
         elif not initiated[0].any():
             # Before initiation the joints are linear, so the bonded state scales with the load.
@@ -1415,6 +2126,27 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
             comparison["intact_definition"] = (
                 f"bonded joints, same mesh and loads: the elastic load-factor {factors[0]:g} state scaled linearly")
         report["stress_comparison"] = comparison
+        # Where the model cannot crack although the stress says it would.
+        intact_strength = (joint["intact_joint"]["tensile_strength_pa"] if "intact_joint" in joint
+                           else joint["tensile_strength_pa"])
+        report["unjointed_overstress"] = unjointed_overstress(nodes, wall, final_stress, joint_lips, intact_strength)
+        # How much of the displacement change is elastic softening and how much is cracking.
+        sources = []
+        degradation = inputs.get("support_degradation") or {}
+        if isinstance(degradation.get("interface_scale"), (int, float)) and degradation["interface_scale"] < 1:
+            sources.append(f"wall/foundation seat springs scaled by {degradation['interface_scale']:g}")
+        if (assignment is not None and assignment.get("properties") is not None
+                and float(assignment["properties"]["youngs_modulus"]) < float(e_pa)):
+            sources.append(f"selected elements' Young's modulus {float(assignment['properties']['youngs_modulus']):.4g} Pa "
+                           f"(intact {float(e_pa):.4g} Pa)")
+        if lift_law is not None and lift_law["k_n_pa_per_m"] < lift_law["mesh_penalty_pa_per_m"]:
+            sources.append(f"lift-joint normal stiffness {lift_law['k_n_pa_per_m']:.4g} Pa/m (as compliant as "
+                           f"{float(e_pa) / lift_law['k_n_pa_per_m']:.3g} m of concrete)")
+        proportional = joint.get("damaged_friction") is None and not (
+            lift_law is not None and lift_law.get("law") == "JOINT_MECA_FROT")
+        report["displacement_attribution"] = displacement_attribution(
+            first_u, final_u, intact_u if assignment is not None else None, np.unique(wall), factors,
+            bool(initiated[0].any()), proportional, sources)
         report.update(cracked)
         report["peak_scope"] = "wall"
         report["mesh_nodes"] = len(nodes)
@@ -1434,7 +2166,7 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         # damaged cells' assigned material, so ParaView shows post-cracking stresses.
         all_concrete = np.asarray(export_arrays["tetra4_concrete"], dtype=np.int64)
         all_stress = wall_cell_stress(nodes, all_concrete, final_u, e_pa, nu)
-        if assignment is not None and "damaged_cells" in export_arrays:
+        if assignment is not None and "properties" in assignment and "damaged_cells" in export_arrays:
             damaged_all = np.asarray(export_arrays["damaged_cells"], dtype=bool)[:len(all_concrete)]
             properties = assignment["properties"]
             all_stress[damaged_all] = wall_cell_stress(
@@ -1457,6 +2189,7 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                        "using each cell's assigned material (damaged or intact)",
         }
 
+    report["assessment_notes"] = assessment_notes(report)
     if preparation_only:
         report["corroboration"] = {
             "verdict": "not_available",
@@ -1486,7 +2219,7 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         )
     corroboration["verdict"], corroboration["message"] = _verdict(corroboration, complete)
     wet = float((summary.get("network") or {}).get("wet_area_m2") or 0.0)
-    if wet > 0:
+    if wet > 0 and "hydraulic_loads" not in joint:
         corroboration["message"] += (f" FEniCSx applied reservoir water on {wet:.3g} m2 of open crack; "
                                      "Aster has no crack-face water, so this part is not corroborated.")
     report["corroboration"] = corroboration
@@ -1527,6 +2260,10 @@ def run(baseline_dir: Path, fenicsx_output: Path, output_dir: Path, time_limit_s
     status = solve(output_dir, time_limit_s)
     print("[3/3] Comparing with FEniCSx ...", flush=True)
     report = postprocess(output_dir, fenicsx_output, status)
+    if (inputs["joint"].get("hydraulic_loads", {}).get("settings", {}).get("base_uplift") == "none"
+            and report.get("status") == "completed"):
+        from Aster.hydraulic_loads import validate_crack_water_evidence
+        validate_crack_water_evidence(report)
     report["runtime_s"] = time.time() - started
     inputs["case_sha256"] = file_hash(output_dir / CASE_NAME)
     (output_dir / "case_inputs.json").write_text(json.dumps(inputs, indent=2) + "\n", encoding="utf-8")

@@ -139,8 +139,21 @@ def convert(npz_path: Path, med_path: Path) -> None:
             group.setName("DAMAGED_ELEMENTS")
             volume_group_arrays.append(group)
     if "damaged_joint_faces" in data and "hexa8_joints" in data:
-        for selected, name in ((True, "DAMAGED_JOINTS"), (False, "INTACT_JOINTS")):
-            mask = data["damaged_joint_faces"][data["joint_parent_faces"]] == selected
+        # Four joint classes: weak lift planes (JOINT_MECA_RUPT), facets of degraded elements
+        # (damaged-material CZM or friction), the vertical crack path through the tensile peak
+        # (CZM) and intact facets. Lift and damaged facets are never vertical or each other.
+        damaged = np.asarray(data["damaged_joint_faces"], dtype=bool)
+        lift = (np.asarray(data["lift_joint_faces"], dtype=bool) if "lift_joint_faces" in data
+                else np.zeros_like(damaged))
+        vertical = (np.asarray(data["vertical_joint_faces"], dtype=bool) if "vertical_joint_faces" in data
+                    else np.zeros_like(damaged))
+        if (lift.shape != damaged.shape or vertical.shape != damaged.shape or np.any(lift & damaged)
+                or np.any(vertical & (lift | damaged))):
+            raise ValueError("Lift and vertical joint facets must match the candidate facets and be mutually distinct")
+        classes = ((lift, "LIFT_JOINTS"), (damaged, "DAMAGED_JOINTS"), (vertical, "VERTICAL_JOINTS"),
+                   (~lift & ~damaged & ~vertical, "INTACT_JOINTS"))
+        for selected, name in classes:
+            mask = selected[data["joint_parent_faces"]]
             ids = np.flatnonzero(mask) + len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"])
             if len(ids):
                 group = mc.DataArrayInt.New(ids.tolist())

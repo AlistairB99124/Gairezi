@@ -11,8 +11,8 @@ from pathlib import Path
 import numpy as np
 
 from automatic_cracking import (
-    ACCEPTED_OUTCOMES, NativeNetworkProblem, candidate_region, cell_max_principal_stress, crack_verdict,
-    maximum_overload_factor,
+    ACCEPTED_OUTCOMES, NativeNetworkProblem, _bounds_apply, _facet_laws, candidate_region, cell_max_principal_stress,
+    crack_verdict, maximum_overload_factor,
     interior_wall_facet_normal_stress, isotropic_elasticity, opening_assessment, prepare_and_run,
     region_candidate_faces, region_cell_stresses, run_network_on_structure, screening_bound,
     screening_facet_bound, stress_comparison,
@@ -95,6 +95,37 @@ def write_archives(directory, stress):
              geometry_cells=np.array([[0, 1, 2, 3], [0, 1, 2, 4]]))
     return {name: hashlib.sha256((intact / name).read_bytes()).hexdigest()
             for name in ("intact_cell_stress.npz", "native_inputs.npz")}
+
+
+class FacetLawTests(unittest.TestCase):
+    """Three facet classes: lift planes, facets between degraded cells, intact."""
+
+    class Split:
+        # Five candidate faces; adjacent original cells 0..4 with 0,1,2 degraded.
+        source_faces = np.array([[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]])
+        parent_cell_ids = np.arange(5)
+        adjacent_cells = np.array([[0, 1], [1, 2], [0, 2], [2, 3], [3, 4]])
+
+    def test_lift_then_damaged_then_intact(self):
+        intact = LinearModeICohesiveLaw(2e6, 100.0)
+        damaged = LinearModeICohesiveLaw(1e6, 50.0)
+        lift = {"source_faces": [[0, 1, 2]], "tensile_strength_pa": 2e5, "cohesive_fracture_energy_j_m2": 10.0}
+        laws, lift_mask, damaged_mask = _facet_laws(self.Split, intact, lift, damaged, np.array([0, 1, 2]))
+        self.assertEqual(lift_mask.tolist(), [True, False, False, False, False])
+        self.assertEqual(damaged_mask.tolist(), [False, True, True, False, False])
+        self.assertEqual(np.asarray(laws.tensile_strength_pa).tolist(), [2e5, 1e6, 1e6, 2e6, 2e6])
+
+    def test_elements_only_and_lift_only(self):
+        intact = LinearModeICohesiveLaw(2e6, 100.0)
+        damaged = LinearModeICohesiveLaw(1e6, 50.0)
+        laws, lift_mask, damaged_mask = _facet_laws(self.Split, intact, None, damaged, np.array([0, 1, 2]))
+        self.assertIsNone(lift_mask)
+        self.assertEqual(damaged_mask.tolist(), [True, True, True, False, False])
+        lift = {"source_faces": [[0, 1, 2]], "tensile_strength_pa": 2e5, "cohesive_fracture_energy_j_m2": 10.0}
+        laws, lift_mask, damaged_mask = _facet_laws(self.Split, intact, lift)
+        self.assertEqual(int(lift_mask.sum()), 1)
+        self.assertIsNone(damaged_mask)
+        self.assertEqual(_facet_laws(self.Split, intact, None), (intact, None, None))
 
 
 class RegionTests(unittest.TestCase):
@@ -341,6 +372,48 @@ class RunnerTests(unittest.TestCase):
         for value in (0.5, 11, True):
             with self.assertRaises(ValueError):
                 maximum_overload_factor({"damage_selection": {"maximum_overload_factor": value}})
+
+    def test_bound_shortcuts_defer_to_explicit_selection_and_overload(self):
+        bound = {"peak_principal_stress_pa": 1.0e6}
+        # No selection, design load only: the linearity bound applies.
+        self.assertTrue(_bounds_apply(bound, 1.0))
+        # Overload search probes beyond the design load the bound is valid for.
+        self.assertFalse(_bounds_apply(bound, 3.0))
+        # An enabled selection force-seeds candidates: the solve must run.
+        selected = {**bound, "selection": {"selected_source_rows": [4, 5]}}
+        self.assertFalse(_bounds_apply(selected, 1.0))
+        # A disabled selection is the control run: the bound may still apply.
+        control = {**bound, "selection": {"enabled": False, "selected_source_rows": []}}
+        self.assertTrue(_bounds_apply(control, 1.0))
+        # An enabled selection that selected nothing has nothing to force.
+        empty = {**bound, "selection": {"selected_source_rows": []}}
+        self.assertTrue(_bounds_apply(empty, 1.0))
+
+    def test_runner_attempts_mesh_work_when_a_selection_exists_despite_low_peak(self):
+        config = {"material": {"concrete": {"tensile_strength_pa": 2e6, "cohesive_fracture_energy_j_m2": 400.}}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(json.dumps(config))
+            screening_dir = root / "screening"
+            screening_dir.mkdir()
+            # Peak far below f_t, but an enabled selection demands the solve.
+            screening = {"source_job_id": "job", "peak_principal_stress_pa": 1.05e6, "overstressed_cells": 0,
+                         "tensile_strength_pa": 2e6, "relative_tolerance": 1e-3,
+                         "selection": {"selected_source_rows": [1, 2, 3], "selected_cells": 3,
+                                       "max_damage_count": None}}
+            (screening_dir / "screening.json").write_text(json.dumps(screening))
+            import hashlib
+            (screening_dir / "manifest.json").write_text(json.dumps({
+                "status": "completed_automatic_screening", "source_job_id": "job",
+                "config_digest": config_digest(config),
+                "screening_sha256": hashlib.sha256((screening_dir / "screening.json").read_bytes()).hexdigest()}))
+            # The runner must NOT stop at the no-initiation bound; it proceeds
+            # to real mesh work, which fails here only because no model exists.
+            with self.assertRaises(BaseException):
+                prepare_and_run(root / "config.json", root / "missing-model", screening_dir, root / "out",
+                                job_id="job", maximum_volume_change=1e-12)
+            manifest = json.loads((root / "out" / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "failed_automatic_cracking")
 
     def test_runner_writes_bound_outcome_without_mesh_work(self):
         config = {"material": {"concrete": {"tensile_strength_pa": 2e6, "cohesive_fracture_energy_j_m2": 400.}}}

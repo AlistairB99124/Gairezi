@@ -44,7 +44,26 @@ BEDROCK_ANALYSIS_MODES = {"full_volume", "elastic_layer"}
 # Automatic element selection (see FEniCSx/automatic_screening.select_damage_cells).
 DAMAGE_SELECTION_KEYS = {"max_damage_count", "maximum_overload_factor", "damaged_element_properties",
                          "damaged_joint_friction", "crack_base", "enabled", "support_degradation",
-                         "crack_thickness"}
+                         "crack_thickness", "crack_water_pressure", "lift_joints", "vertical_joint"}
+# Vertical crack path on the radial plane through the tensile peak (Aster/automatic_cohesive
+# vertical_crack_facets). fracture_energy_j_m2 and critical_opening_m set the CZM_LIN_REG law;
+# its tensile strength f_t = 2 G_F / w_c is then a calibration, not a material measurement.
+VERTICAL_JOINT_KEYS = {"fracture_energy_j_m2", "critical_opening_m"}
+VERTICAL_JOINT_OPTIONAL_KEYS = {"enabled", "max_normal_deviation_deg", "band_m"}
+# Weak construction (lift) joints: the near-horizontal facets between selected cells get a
+# weakened joint law (FEniCSx/lift_joints.py, Aster/automatic_cohesive.lift_joint_parameters).
+# May be combined with damaged_element_properties (degraded elements plus a weak lift plane).
+# Laws: JOINT_MECA_RUPT (tensile rupture, no slip limit) or JOINT_MECA_FROT (Mohr-Coulomb
+# friction; adhesion = friction_coefficient * tensile_strength_pa so the configured tensile
+# strength is the cone's apex). plane_elevation_m places the weak plane at a pour elevation
+# instead of the peak-stress band; uplift applies pore pressure inside the plane.
+LIFT_JOINT_KEYS = {"tensile_strength_pa", "cohesive_fracture_energy_j_m2"}
+LIFT_JOINT_OPTIONAL_KEYS = {"max_normal_deviation_deg", "include_base_contact", "law", "alpha", "pena_contact",
+                            "friction_coefficient", "plane_elevation_m", "uplift"}
+LIFT_JOINT_LAWS = {"JOINT_MECA_RUPT", "JOINT_MECA_FROT"}
+LIFT_JOINT_UPLIFT_MODES = {"none", "linear_upstream_to_downstream"}
+LIFT_JOINT_DEFAULTS = {"max_normal_deviation_deg": 15.0, "include_base_contact": False,
+                       "law": "JOINT_MECA_RUPT", "alpha": 1.0, "pena_contact": 1.0, "uplift": "none"}
 # Proportional overload search beyond the design load (FEniCSx/automatic_cracking.maximum_overload_factor).
 MAXIMUM_OVERLOAD_FACTOR = 10.0
 # One cohesive facet needs both owner cells, so fewer than two cells can never crack.
@@ -710,7 +729,8 @@ class _ConfigValidator:
                     self.issue("outputs.cracking_risk", "must be true when a crack is defined in cracking")
                 elif not cracks and outputs["cracking_risk"] and not (
                         isinstance(root.get("damage_selection"), dict)
-                        and root["damage_selection"].get("damaged_element_properties") is not None):
+                        and (root["damage_selection"].get("damaged_element_properties") is not None
+                             or root["damage_selection"].get("lift_joints") is not None)):
                     self.issue("outputs.cracking_risk", "must be false when cracking defines no crack")
         if "crack_simulations" in root:
             self.validate_cracks(root["crack_simulations"])
@@ -733,6 +753,7 @@ class _ConfigValidator:
                         self.issue("fracture_debug.compare_with_no_bedrock", "requires a bonded foundation/bedrock interface")
         if "damage_selection" in root:
             self.validate_damage_selection(root["damage_selection"])
+            self.warn_damage_selection(root)
         if "bedrock_analysis" in root:
             self.validate_bedrock_analysis(root["bedrock_analysis"], root)
         return self.issues
@@ -778,6 +799,9 @@ class _ConfigValidator:
             # False = control run: nothing is selected and automatic cracking has no candidates.
             if type(selection["enabled"]) is not bool:
                 self.issue("damage_selection.enabled", "must be a boolean")
+        if selection is not None and "crack_water_pressure" in selection:
+            if type(selection["crack_water_pressure"]) is not bool:
+                self.issue("damage_selection.crack_water_pressure", "must be a boolean")
         if selection is not None and "crack_base" in selection:
             path = "damage_selection.crack_base"
             if type(selection["crack_base"]) is not bool:
@@ -825,6 +849,10 @@ class _ConfigValidator:
                     adhesion = self.field_number(friction, "adhesion_pa", path)
                     if adhesion is not None and adhesion < 0:
                         self.issue(f"{path}.adhesion_pa", "must be at least 0")
+        if selection is not None and selection.get("lift_joints") is not None:
+            self.validate_lift_joints(selection)
+        if selection is not None and selection.get("vertical_joint") is not None:
+            self.validate_vertical_joint(selection)
         if selection is not None and selection.get("support_degradation") is not None:
             # Scenario boundary-condition degradation applied only in the cracked solve
             # (Aster/automatic_cohesive.apply_support_degradation).
@@ -849,6 +877,111 @@ class _ConfigValidator:
                             self.issue(f"{abutment_path}.fraction", "must be at most 0.5")
                         if abutment.get("end") not in ("positive", "negative"):
                             self.issue(f"{abutment_path}.end", "must be 'positive' or 'negative'")
+
+    def validate_vertical_joint(self, selection: Mapping[str, object]) -> None:
+        """Vertical crack path through the tensile peak (radial plane, CZM_LIN_REG joints)."""
+        path = "damage_selection.vertical_joint"
+        joints = self.object(selection["vertical_joint"], path, VERTICAL_JOINT_KEYS,
+                             optional=VERTICAL_JOINT_OPTIONAL_KEYS)
+        if joints is None:
+            return
+        self.field_number(joints, "fracture_energy_j_m2", path, positive=True)
+        self.field_number(joints, "critical_opening_m", path, positive=True)
+        if "band_m" in joints and joints["band_m"] is not None:
+            self.field_number(joints, "band_m", path, positive=True)
+        if "max_normal_deviation_deg" in joints:
+            deviation = self.field_number(joints, "max_normal_deviation_deg", path, positive=True)
+            if deviation is not None and deviation >= 90:
+                self.issue(f"{path}.max_normal_deviation_deg", "must be below 90")
+
+    def validate_lift_joints(self, selection: Mapping[str, object]) -> None:
+        """Weak construction (lift) joints on the near-horizontal facets of the selected band.
+
+        Combines with ``damaged_element_properties``: the band's elements then carry the
+        degraded material and the other facets between them its cohesive law (or friction),
+        while the lift planes take the weak joint law."""
+        path = "damage_selection.lift_joints"
+        if selection.get("max_damage_count") is not None:
+            self.issue(path, "requires max_damage_count to be null (lift planes come from the band selection)")
+        joints = self.object(selection["lift_joints"], path, LIFT_JOINT_KEYS, optional=LIFT_JOINT_OPTIONAL_KEYS)
+        if joints is None:
+            return
+        self.field_number(joints, "tensile_strength_pa", path, positive=True)
+        self.field_number(joints, "cohesive_fracture_energy_j_m2", path, positive=True)
+        deviation = self.field_number(joints, "max_normal_deviation_deg", path, positive=True)
+        if deviation is not None and deviation >= 90:
+            self.issue(f"{path}.max_normal_deviation_deg", "must be less than 90")
+        if "include_base_contact" in joints and type(joints["include_base_contact"]) is not bool:
+            # Informational only: the wall/foundation seat is a spring layer, so no joint is
+            # inserted there. It no longer requires support_degradation: softening the seat
+            # lets the heel lift at the seat instead of opening the lift plane.
+            self.issue(f"{path}.include_base_contact", "must be a boolean")
+        law = joints.get("law", LIFT_JOINT_DEFAULTS["law"])
+        if "law" in joints and law not in LIFT_JOINT_LAWS:
+            self.issue(f"{path}.law", f"must be one of {sorted(LIFT_JOINT_LAWS)}")
+        # R7.01.25 / ssnp162: ALPHA 0 = tangential rupture at opening, 1 = with normal rupture, 2 = none.
+        alpha = self.field_number(joints, "alpha", path, nonnegative=True)
+        if alpha is not None and alpha > 2:
+            self.issue(f"{path}.alpha", "must be between 0 and 2")
+        self.field_number(joints, "pena_contact", path, positive=True)
+        # JOINT_MECA_FROT (R7.01.25 1.2.2): Mohr-Coulomb cone with apex R_t = c / mu, so the
+        # adhesion is mu * tensile_strength_pa. The catalogue requires MU >= 1e-3.
+        coefficient = self.field_number(joints, "friction_coefficient", path, positive=True)
+        if coefficient is not None and not 1e-3 <= coefficient <= 10:
+            self.issue(f"{path}.friction_coefficient", "must be between 0.001 and 10")
+        if law == "JOINT_MECA_FROT" and "friction_coefficient" not in joints:
+            self.issue(f"{path}.friction_coefficient", "is required for the JOINT_MECA_FROT law")
+        if law != "JOINT_MECA_FROT" and "friction_coefficient" in joints:
+            self.issue(f"{path}.friction_coefficient", "applies only to the JOINT_MECA_FROT law")
+        if "plane_elevation_m" in joints:
+            # A pour plane is at one elevation, bank to bank; it replaces the peak/base band.
+            self.field_number(joints, "plane_elevation_m", path)
+            if selection.get("crack_base") is True:
+                self.issue(f"{path}.plane_elevation_m", "cannot be combined with crack_base (both set the band elevation)")
+        if "uplift" in joints:
+            if joints["uplift"] not in LIFT_JOINT_UPLIFT_MODES:
+                self.issue(f"{path}.uplift", f"must be one of {sorted(LIFT_JOINT_UPLIFT_MODES)}")
+            elif joints["uplift"] != "none" and selection.get("crack_water_pressure") is not True:
+                # The uplift rides the coupled crack-water solve (Aster/hydraulic_loads.CrackWater).
+                self.issue(f"{path}.uplift", "requires damage_selection.crack_water_pressure to be true")
+
+    def warn_damage_selection(self, root: Mapping[str, object]) -> None:
+        """Non-fatal modelling warnings for a valid damage selection (see Gairezi/taking_a_breath.md)."""
+        selection = root.get("damage_selection")
+        if not isinstance(selection, dict):
+            return
+        material = root.get("material")
+        concrete = material.get("concrete") if isinstance(material, dict) else None
+        joints = selection.get("lift_joints")
+        degradation = selection.get("support_degradation")
+        scale = degradation.get("interface_scale") if isinstance(degradation, dict) else None
+
+        def number(source, key):
+            value = source.get(key) if isinstance(source, dict) else None
+            return float(value) if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                                    and math.isfinite(value) and value > 0) else None
+
+        if isinstance(joints, dict) and isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale < 1:
+            self.warn("damage_selection.support_degradation.interface_scale",
+                      "softens the wall/foundation seat springs, which carry tension: the heel can lift at the "
+                      "seat instead of opening the lift joints, and the softer seat alone increases displacement. "
+                      "Leave the seat unscaled when testing a lift joint.")
+
+        def opening(source):
+            strength, energy = number(source, "tensile_strength_pa"), number(source, "cohesive_fracture_energy_j_m2")
+            return None if strength is None or energy is None else 2.0 * energy / strength
+
+        intact = opening(concrete)
+        for path, block in (("damage_selection.damaged_element_properties", selection.get("damaged_element_properties")),
+                            ("damage_selection.lift_joints", joints)):
+            if path.endswith("lift_joints") and isinstance(block, dict) and block.get("law") == "JOINT_MECA_FROT":
+                continue  # the friction law does not use the fracture energy
+            weakened = opening(block)
+            if intact is not None and weakened is not None and weakened > intact * (1 + 1e-9):
+                self.warn(f"{path}.cohesive_fracture_energy_j_m2",
+                          f"gives a full-separation opening 2 Gf / ft of {weakened * 1e3:.3g} mm, larger than the "
+                          f"intact concrete's {intact * 1e3:.3g} mm: the weakened bond starts yielding earlier but "
+                          "holds on for longer. A poorly bonded surface has low strength and low fracture energy.")
 
     def validate_fracture_debug(self, value: object) -> None:
         """Optional per-job overrides of FEniCSx/fracture_defaults.json (and Aster softening).

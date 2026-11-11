@@ -28,14 +28,14 @@ if __package__:
     from . import sparse_direct
     from .cohesive_contact import (CohesiveInterface, CohesiveOptions, InterfaceState, ReservoirCrackWater,
                                    solve_cohesive_equilibrium, solve_wet_cohesive_equilibrium)
-    from .cohesive_mode_i import LinearModeICohesiveLaw
+    from .cohesive_mode_i import FacetCohesiveLaws, LinearModeICohesiveLaw
     from .fracture_faces import PairedCrackFaces, bonded_node_representatives
     from .fracture_topology import NodeStarPatchResolver, SplitTetrahedra, split_interior_wall_faces
 else:
     import sparse_direct
     from cohesive_contact import (CohesiveInterface, CohesiveOptions, InterfaceState, ReservoirCrackWater,
                                   solve_cohesive_equilibrium, solve_wet_cohesive_equilibrium)
-    from cohesive_mode_i import LinearModeICohesiveLaw
+    from cohesive_mode_i import FacetCohesiveLaws, LinearModeICohesiveLaw
     from fracture_faces import PairedCrackFaces, bonded_node_representatives
     from fracture_topology import NodeStarPatchResolver, SplitTetrahedra, split_interior_wall_faces
 
@@ -153,10 +153,14 @@ class CohesiveNetwork:
     cannot be condensed and are rejected.
     """
 
+    # Warm-start the strength-crossing search from the previous crossing (see run()).
+    # Exposed so tests can compare against the plain [low, target] bisection baseline.
+    warm_start = True
+
     def __init__(self, coordinates_m, cells, region_ids, candidate_faces, *, elasticity, law,
                  options: NetworkOptions, problem_at, water: NetworkWater = None,
                  should_stop=None, patch_resolver=None, split=None, progress=None):
-        if not isinstance(law, LinearModeICohesiveLaw):
+        if not isinstance(law, (LinearModeICohesiveLaw, FacetCohesiveLaws)):
             raise ValueError("Explicit LinearModeICohesiveLaw is required")
         if not isinstance(options, NetworkOptions):
             raise ValueError("Explicit NetworkOptions are required")
@@ -166,7 +170,9 @@ class CohesiveNetwork:
                                                drop_fully_tied=True) if split is None else split
         self.faces = self.split.faces
         self.count = len(self.faces.minus)
-        self.law = law
+        # Per-candidate-face laws (a uniform law wraps to one material over every face).
+        self.face_laws = FacetCohesiveLaws.wrap(law, self.count)
+        self.law = self.face_laws.reference
         self.options = options
         self.problem_at = problem_at
         self.water = water
@@ -227,12 +233,22 @@ class CohesiveNetwork:
                       in enumerate(zip(interface.minus_nodes, interface.plus_nodes))}
             lookup.update({(b, a): pair for (a, b), pair in list(lookup.items())})
             face_pairs = np.full((self.count, 3), -1)
+            # A vertex pair shared by faces of different materials is bonded by the weaker one.
+            pair_law = np.full(interface.count, -1, dtype=np.int64)
+            strengths = np.array([law.tensile_strength_pa for law in self.face_laws.laws])
             for face in ids:
                 for vertex in range(3):
                     a, b = int(minus[face, vertex]), int(plus[face, vertex])
                     if a != b:
-                        face_pairs[face, vertex] = lookup[(a, b)]
-            topology.update({"interface": interface, "faces": faces, "face_ids": ids, "face_pairs": face_pairs})
+                        pair = lookup[(a, b)]
+                        face_pairs[face, vertex] = pair
+                        candidate = int(self.face_laws.law_index[face])
+                        if pair_law[pair] < 0 or strengths[candidate] < strengths[pair_law[pair]]:
+                            pair_law[pair] = candidate
+            if np.any(pair_law < 0):
+                raise _Stop("unsupported_geometry", "An interface pair belongs to no candidate face")
+            topology.update({"interface": interface, "faces": faces, "face_ids": ids, "face_pairs": face_pairs,
+                             "pair_laws": FacetCohesiveLaws(self.face_laws.laws, pair_law)})
         if len(self._reduction_cache) > 8:
             self._reduction_cache.clear()
         self._reduction_cache[key] = topology
@@ -332,7 +348,7 @@ class CohesiveNetwork:
                     float(factor) if self.water.scale_with_load_factor else 1.)
                 if unit_weight <= 0:
                     result = solve_cohesive_equilibrium(K, f, fixed_r, prescribed_r, interface, mapping,
-                                                        self.law, committed, options=self.options.cohesive)
+                                                        topology["pair_laws"], committed, options=self.options.cohesive)
                 else:
                     water = ReservoirCrackWater(
                         float(self.water.head_elevation_m), unit_weight,
@@ -340,7 +356,7 @@ class CohesiveNetwork:
                         float(self.water.closure_tolerance_m))
                     try:
                         result = solve_wet_cohesive_equilibrium(
-                            K, f, fixed_r, prescribed_r, interface, topology["faces"], mapping, self.law,
+                            K, f, fixed_r, prescribed_r, interface, topology["faces"], mapping, topology["pair_laws"],
                             committed, options=self.options.cohesive, water=water)
                     except ValueError as error:
                         raise _Stop("unsupported_hydraulics", f"Crack water access is not representable: {error}") from error
@@ -356,7 +372,7 @@ class CohesiveNetwork:
         split_displacement = (topology["projection"] @ displacement)
         stress = facet_normal_stress(self.stress_operator, split_displacement)
         bonded_stress = np.where(initiated, -np.inf, stress)
-        ratio = float(np.max(bonded_stress, initial=-np.inf) / self.law.tensile_strength_pa) \
+        ratio = float(np.max(bonded_stress / self.face_laws.tensile_strength_pa, initial=-np.inf)) \
             if (~initiated).any() else None
         face_opening = np.zeros(self.count)
         face_stress = stress.copy()
@@ -436,6 +452,9 @@ class CohesiveNetwork:
         low, target = float(start_factor), float(end_factor)
         self._target_factor = target if progress_target is None else float(progress_target)
         self._accepted_factor = low
+        # Warm-start state for the strength-crossing search (see the bisection below).
+        # None on the first macro-step so it reproduces the plain [low, target] bisection.
+        self._warm_step = None
         if progress_target is None or self._run_started is None:
             self._run_started = time.monotonic()
         rounds = 0
@@ -458,6 +477,53 @@ class CohesiveNetwork:
                           "cohesive_dissipated_energy_j": trial["report"].get("cohesive_dissipated_energy_j", 0.),
                           "elastic_energy_j": trial["report"].get("elastic_energy_j")})
 
+        probe = 0
+
+        def locate_crossing():
+            """Find the next strength crossing in (low, target] and return (factor, trial).
+
+            After the first macro-step the crossing creeps up only slightly, yet the
+            plain [low, target] bisection restarts from upper=target every step and
+            spends ~7-9 solves walking back down to it (the bulk of a large run's cost).
+            This warm-starts the upper bound from the previous crossing's step, galloping
+            up only as far as needed before bisecting a tight bracket. Subcritical probes
+            are accepted exactly like subcritical bisection midpoints, so accepted load
+            factors stay monotonic and the located crossing (hence the initiated set and
+            final equilibrium) is unchanged to tolerance. The pre-bisection target solve
+            has already proved `target` is supercritical, so the fallback bracket is valid.
+            """
+            nonlocal probe, low
+            lower, upper = low, target
+            if self.warm_start and self._warm_step is not None:
+                guess, step = min(target, lower + self._warm_step), self._warm_step
+                while guess < target:
+                    probe += 1
+                    self._stage = f"strength-crossing bisection {probe}"
+                    trial = self.solve(guess, initiated, history)
+                    if trial["ratio"] is None or abs(trial["ratio"] - 1) <= tolerance:
+                        return guess, trial
+                    if trial["ratio"] < 1:
+                        accept(trial, "subcritical")
+                        lower = low = guess
+                        step *= 2
+                        guess = min(target, lower + step)
+                    else:
+                        upper = guess
+                        break
+            for _ in range(self.options.maximum_bisections):
+                probe += 1
+                self._stage = f"strength-crossing bisection {probe}"
+                factor = .5 * (lower + upper)
+                trial = self.solve(factor, initiated, history)
+                if abs(trial["ratio"] - 1) <= tolerance:
+                    return factor, trial
+                if trial["ratio"] < 1:
+                    accept(trial, "subcritical")
+                    lower = low = factor
+                else:
+                    upper = factor
+            raise _Stop("nonconvergence", "Initiation bisection did not resolve the strength crossing")
+
         try:
             while True:
                 self._stage = "target load"
@@ -465,25 +531,14 @@ class CohesiveNetwork:
                 if trial["ratio"] is None or trial["ratio"] <= 1 + tolerance:
                     accept(trial, "target_reached")
                     break
-                lower, upper = low, target
-                for bisection in range(self.options.maximum_bisections):
-                    self._stage = f"strength-crossing bisection {bisection + 1}"
-                    factor = .5 * (lower + upper)
-                    trial = self.solve(factor, initiated, history)
-                    if abs(trial["ratio"] - 1) <= tolerance:
-                        break
-                    if trial["ratio"] < 1:
-                        accept(trial, "subcritical")
-                        lower = low = factor
-                    else:
-                        upper = factor
-                else:
-                    raise _Stop("nonconvergence", "Initiation bisection did not resolve the strength crossing")
+                probe = 0
+                crossing_start = low
+                factor, trial = locate_crossing()
                 while True:
                     rounds += 1
                     if rounds > self.options.maximum_initiation_rounds:
                         raise _Stop("resource_limit", "Initiation round limit reached")
-                    ratios = np.where(initiated, -np.inf, trial["stress"] / self.law.tensile_strength_pa)
+                    ratios = np.where(initiated, -np.inf, trial["stress"] / self.face_laws.tensile_strength_pa)
                     ready = np.flatnonzero(ratios >= 1 - tolerance)
                     if not len(ready):
                         raise _Stop("nonconvergence", "Overstressed state has no initiable facet")
@@ -495,6 +550,9 @@ class CohesiveNetwork:
                     if trial["ratio"] is None or trial["ratio"] <= 1 + tolerance:
                         break
                 accept(trial, "initiation")
+                # Seed the next crossing search from this step (doubled, so one gallop
+                # usually brackets it); floored to stay strictly positive.
+                self._warm_step = max(2. * (factor - crossing_start), 1e-9 * max(target, 1.))
                 low = factor
             status = "no_damage_initiated" if not initiated.any() else "accepted_equilibrium"
             message = "Target load reached"
@@ -520,6 +578,7 @@ class CohesiveNetwork:
             "tensile_strength_pa": self.law.tensile_strength_pa,
             "fracture_energy_j_m2": self.law.fracture_energy_j_m2,
             "critical_opening_m": self.law.critical_opening_m,
+            **({} if self.face_laws.uniform else {"facet_laws": self.face_laws.summary()}),
             "patch_faces_added": int(patch_faces),
             "initiation_criterion": "bonded facet: max over the two adjacent P1 cells of n.sigma.n >= f_t",
             "tangential_response": self.options.cohesive.tangential_response,

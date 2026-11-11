@@ -17,6 +17,13 @@ from pathlib import Path
 import numpy as np
 from scipy import sparse
 
+if __package__:
+    from .lift_joints import (horizontal_plane_survey, lift_joint_facet_mask, lift_joint_report,
+                              lift_joint_settings)
+else:
+    from lift_joints import (horizontal_plane_survey, lift_joint_facet_mask, lift_joint_report,
+                             lift_joint_settings)
+
 WALL_REGION = 1
 FOUNDATION_REGION = 3
 SCREENING_VERSION = 3
@@ -251,7 +258,8 @@ def _validate_crack_thickness(crack_thickness) -> dict | None:
 
 def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, cells,
                           pairs, facet_stress_pa, critical, crack_base=False,
-                          crack_thickness=None) -> dict:
+                          crack_thickness=None, plane_z_m=None, plane_basis=None,
+                          plane_above_seat=False) -> dict:
     """Uncapped automatic selection: the peak-tension element's layer plus the layer below.
 
     The most tensioned wall element sets the elevation; the band spans that element
@@ -265,6 +273,18 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
     the band is the bottom two element layers, confined to the valley floor rather
     than spanning the dam bank to bank.
 
+    When the peak layer is itself the bottom wall layer (no wall cell in the layer
+    below), the band is the peak layer plus the layer *above*: the plane below the peak
+    is the wall/foundation seat (a spring interface, not a wall-wall facet), so taking
+    the layer above keeps one horizontal wall-wall plane inside the band - the first
+    construction joint above the foundation (``band_shifted_above_seat``).
+
+    ``plane_z_m`` (a horizontal mesh plane's elevation) overrides both rules: the band is
+    exactly the element layer below and the layer above that plane, bank to bank.
+    ``plane_basis`` says where the plane came from (a configured pour elevation, or the
+    plane under the peak-tension element's layer) and ``plane_above_seat`` records that the
+    peak layer was the bottom wall layer, so the plane above it was taken.
+
     ``crack_thickness`` = {"elements": N, "from": "upstream"|"downstream"} limits the
     band's radial depth: the wall faces and mean radial element size are measured
     from the band itself, the thickness is divided into max_x element-sized steps,
@@ -275,12 +295,25 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
     centroid_z = corner_z.mean(axis=1)
     heights = corner_z[wall].max(axis=1) - corner_z[wall].min(axis=1)
     band_height = float(heights.mean())
-    if crack_base:
+    is_wall = regions == WALL_REGION
+    shifted_up = False
+    if plane_z_m is not None:
+        # The member window [centre - 1.5h, centre + 0.5h] is then [plane - h, plane + h].
+        centre = float(plane_z_m) + 0.5 * band_height
+        shifted_up = bool(plane_above_seat)
+    elif crack_base:
         # Bottom of band = lowest wall corner; the usual member window
         # [centre - 1.5h, centre + 0.5h] then spans exactly the bottom two layers.
         centre = float(corner_z[wall].min()) + 1.5 * band_height
     else:
         centre = float(centroid_z[wall[int(np.argmax(principal))]])
+        below = is_wall & (centroid_z < centre - band_height / 2) & (centroid_z >= centre - 1.5 * band_height)
+        if not below.any():
+            # The peak layer is the bottom wall layer: the plane below it is the seat (a
+            # spring interface, not a wall-wall facet), so the band takes the layer above
+            # instead and still contains one horizontal wall-wall lift plane.
+            centre += band_height
+            shifted_up = True
     member = ((centroid_z <= centre + band_height / 2)
               & (centroid_z >= centre - 1.5 * band_height)
               & np.isin(regions, (WALL_REGION, FOUNDATION_REGION)))
@@ -318,9 +351,18 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
                      else np.zeros(0, dtype=bool))
     inside, outside = critical_ids[facets_inside], critical_ids[~facets_inside]
     return {
-        "rule": ((("every wall and foundation cell whose centroid lies within two element heights "
+        "rule": (((f"every wall and foundation cell whose centroid lies within one element height of the "
+                   f"horizontal plane at z = {float(plane_z_m):g} m (the element layer below and the layer "
+                   f"above {plane_basis or 'the configured pour plane'}, bank to bank)")
+                  if plane_z_m is not None else
+                  ("every wall and foundation cell whose centroid lies within two element heights "
                    "above the lowest wall corner (the bottom two element layers at the base of the wall)")
                   if crack_base else
+                  ("every wall and foundation cell whose centroid lies between half an element height below and "
+                   "one and a half element heights above the peak-tension wall element's centroid elevation "
+                   "(the peak element's layer is the bottom wall layer, so the band is that layer plus the "
+                   "layer above, bank to bank; the seat below is the spring interface)")
+                  if shifted_up else
                   ("every wall and foundation cell whose centroid lies between one element height below and "
                    "half an element height above the peak-tension wall element's centroid elevation "
                    "(the peak element's layer plus the layer below, bank to bank)"))
@@ -328,6 +370,8 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
                     f"; radially limited to {thickness_report['effective_elements']} of "
                     f"{thickness_report['max_x_elements']} element-sized steps from the {thickness_report['from']} face")),
         "crack_base": bool(crack_base),
+        "band_shifted_above_seat": shifted_up,
+        "plane_z_m": None if plane_z_m is None else float(plane_z_m),
         "crack_thickness": thickness_report,
         "max_damage_count": None,
         "capped": False,
@@ -347,8 +391,12 @@ def _layer_band_selection(principal, wall, regions, source_rows, coordinates_m, 
 
 def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates_m, geometry_cells,
                  tensile_strength_pa, *, relative_tolerance: float, max_damage_count=None,
-                 crack_base=False, selection_enabled=True, crack_thickness=None) -> dict:
-    """Classify wall cells by max principal stress against f_t (tension positive)."""
+                 crack_base=False, selection_enabled=True, crack_thickness=None, lift_joints=None) -> dict:
+    """Classify wall cells by max principal stress against f_t (tension positive).
+
+    With ``lift_joints`` the selected band's near-horizontal interior facets are reported
+    as the weak construction-joint planes (``selection["lift_joints"]``); the band's cells
+    stay intact concrete."""
     stress = np.asarray(cell_stress_pa, dtype=float)
     regions = np.asarray(cell_region_tags)
     rows = np.asarray(source_cell_rows)
@@ -381,6 +429,9 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
     crack_thickness = _validate_crack_thickness(crack_thickness)
     if crack_thickness is not None and max_damage_count is not None:
         raise ValueError("crack_thickness requires max_damage_count to be null (band selection)")
+    lift_settings = lift_joint_settings(lift_joints) if lift_joints is not None else None
+    if lift_settings is not None and max_damage_count is not None:
+        raise ValueError("lift_joints require max_damage_count to be null (band selection)")
     wall = np.flatnonzero(regions == WALL_REGION)
     if not len(wall):
         raise ValueError("No wall-concrete cells are present in the native mesh")
@@ -395,6 +446,7 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
     peak = int(np.argmax(principal))
     order = np.argsort(-principal[over], kind="stable")
     over_ids = np.flatnonzero(over)[order]
+    survey = None
     pairs, one_sided, critical, facets = facet_check(coordinates, cells, regions, stress, tensile_strength_pa,
                                                      relative_tolerance)
     if not selection_enabled:
@@ -407,9 +459,51 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
             "selected_source_rows": [], "selected_wall_cells": 0, "selected_foundation_cells": 0,
         }
     elif max_damage_count is None:
+        plane_z = plane_basis = None
+        plane_above_seat = False
+        if lift_settings is not None:
+            faces, owners = _wall_faces(cells, regions)
+            layer_height = float((coordinates[cells[wall]][:, :, 2].max(axis=1)
+                                  - coordinates[cells[wall]][:, :, 2].min(axis=1)).mean())
+            survey = horizontal_plane_survey(coordinates, faces, owners, stress,
+                                             lift_settings["max_normal_deviation_deg"], layer_height)
+            levels = [plane["z_m"] for plane in survey]
+            if "plane_elevation_m" in lift_settings:
+                if crack_base:
+                    raise ValueError("lift_joints.plane_elevation_m cannot be combined with crack_base")
+                if not levels:
+                    raise ValueError("The wall has no horizontal interior facet planes for a lift joint")
+                requested = float(lift_settings["plane_elevation_m"])
+                plane_z = min(levels, key=lambda z: abs(z - requested))
+                plane_basis = "the configured pour plane"
+                if abs(plane_z - requested) > layer_height:
+                    raise ValueError(
+                        f"lift_joints.plane_elevation_m {requested:g} m is more than one element layer from the "
+                        f"nearest horizontal mesh plane (z = {plane_z:g} m); the wall's planes span "
+                        f"{levels[0]:g} to {levels[-1]:g} m")
+            elif not crack_base and levels:
+                # Snap the peak rule to a mesh plane so the band is exactly two layers whichever
+                # tetrahedron of the peak layer holds the peak: the plane under that layer, or
+                # the plane above it when the peak layer sits on the seat (a spring interface).
+                peak_z = float(centroids[peak][2])
+                under = [z for z in levels if z < peak_z]
+                plane_above_seat = not under
+                plane_z = max(under) if under else min(levels)
+                plane_basis = ("the plane over the peak-tension wall element's layer, which is the bottom wall "
+                               "layer (the seat below is the spring interface)" if plane_above_seat else
+                               "the plane under the peak-tension wall element's layer")
         selection = _layer_band_selection(principal, wall, regions, rows, coordinates, cells,
                                           pairs, one_sided, critical, crack_base=crack_base,
-                                          crack_thickness=crack_thickness)
+                                          crack_thickness=crack_thickness, plane_z_m=plane_z,
+                                          plane_basis=plane_basis, plane_above_seat=plane_above_seat)
+        if lift_settings is not None:
+            member = np.isin(rows, np.asarray(selection["selected_source_rows"], dtype=np.int64))
+            mask = lift_joint_facet_mask(coordinates, faces, owners, member,
+                                         lift_settings["max_normal_deviation_deg"])
+            selection["lift_joints"] = lift_joint_report(coordinates, faces, mask, lift_settings)
+            selection["lift_joints"]["source_faces"] = np.sort(faces[mask], axis=1).tolist()
+            if not mask.any():
+                raise ValueError("The selected band has no near-horizontal interior facets for lift joints")
     else:
         selection = select_damage_cells(pairs, one_sided, critical, rows, max_damage_count,
                                         coordinates_m=coordinates, tetrahedra=cells, regions=regions)
@@ -442,6 +536,8 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
         "facet_check": facets,
         # Automatic element selection: the cells automatic cracking seeds from (and, when capped, is confined to).
         "selection": selection,
+        # Intact demand on every horizontal plane (possible pour planes); None without lift joints.
+        "lift_plane_survey": survey,
         "is_final_crack_prediction": False,
         "solver_ready": False, "engineering_validated": False,
         "limitations": [
@@ -455,14 +551,14 @@ def screen_cells(cell_stress_pa, cell_region_tags, source_cell_rows, coordinates
 
 def screening_from_archives(intact_cell_stress: Path, native_inputs: Path, tensile_strength_pa: float,
                             *, relative_tolerance: float, max_damage_count=None, crack_base=False,
-                            selection_enabled=True, crack_thickness=None) -> dict:
+                            selection_enabled=True, crack_thickness=None, lift_joints=None) -> dict:
     with np.load(intact_cell_stress, allow_pickle=False) as stress, np.load(native_inputs, allow_pickle=False) as native:
         result = screen_cells(
             stress["cell_stress_pa"], stress["cell_region_tags"], stress["source_cell_rows"],
             native["coordinates_m"], native["geometry_cells"], tensile_strength_pa,
             relative_tolerance=relative_tolerance, max_damage_count=max_damage_count,
             crack_base=crack_base, selection_enabled=selection_enabled,
-            crack_thickness=crack_thickness)
+            crack_thickness=crack_thickness, lift_joints=lift_joints)
     result["native_archive_sha256"] = {
         "intact_cell_stress.npz": hashlib.sha256(Path(intact_cell_stress).read_bytes()).hexdigest(),
         "native_inputs.npz": hashlib.sha256(Path(native_inputs).read_bytes()).hexdigest(),
@@ -495,6 +591,12 @@ def crack_thickness(config: dict) -> dict | None:
     """The configured ``damage_selection.crack_thickness`` (None = full wall thickness)."""
     selection = config.get("damage_selection") if isinstance(config, dict) else None
     return selection.get("crack_thickness") if isinstance(selection, dict) else None
+
+
+def lift_joints(config: dict) -> dict | None:
+    """The configured ``damage_selection.lift_joints`` (None = no weak construction joints)."""
+    selection = config.get("damage_selection") if isinstance(config, dict) else None
+    return selection.get("lift_joints") if isinstance(selection, dict) else None
 
 
 def config_digest(config: dict) -> str:
@@ -562,7 +664,8 @@ def prepare_and_screen(configuration: Path, model_directory: Path, baseline_dire
                                          max_damage_count=max_damage_count(config),
                                          crack_base=crack_base(config),
                                          selection_enabled=selection_enabled(config),
-                                         crack_thickness=crack_thickness(config))
+                                         crack_thickness=crack_thickness(config),
+                                         lift_joints=lift_joints(config))
         energy = concrete.get("cohesive_fracture_energy_j_m2")
         result.update({
             "source_job_id": job_id,
@@ -575,6 +678,13 @@ def prepare_and_screen(configuration: Path, model_directory: Path, baseline_dire
                 else "absent from the configuration; automatic cracking cannot be submitted"),
             "maximum_volume_change": maximum_volume_change,
         })
+        if lift_joints(config) is not None:
+            result["material_assignment"] = {
+                "joint_properties": result["selection"]["lift_joints"],
+                "selected_source_rows": result["selection"]["selected_source_rows"],
+                "scope": ("weak construction-joint law on the selected band's near-horizontal facets; "
+                          "every element keeps the intact concrete"),
+            }
         write_json(output / "screening.json", result)
         manifest.update({"status": COMPLETED, "phase": None, "accepted_results": {"screening": "screening.json"},
                          "screening_sha256": hashlib.sha256((output / "screening.json").read_bytes()).hexdigest()})

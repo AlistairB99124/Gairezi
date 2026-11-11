@@ -26,13 +26,13 @@ from scipy import sparse
 
 if __package__:
     from . import sparse_direct
-    from .cohesive_mode_i import LinearModeICohesiveLaw, ModeIHistory
+    from .cohesive_mode_i import FacetCohesiveLaws, LinearModeICohesiveLaw, ModeIHistory
     from .fracture_faces import PairedCrackFaces
     from .fracture_water_access import water_access
     from .hydrostatic_load import triangle_pressure_weights
 else:
     import sparse_direct
-    from cohesive_mode_i import LinearModeICohesiveLaw, ModeIHistory
+    from cohesive_mode_i import FacetCohesiveLaws, LinearModeICohesiveLaw, ModeIHistory
     from fracture_faces import PairedCrackFaces
     from fracture_water_access import water_access
     from hydrostatic_load import triangle_pressure_weights
@@ -245,13 +245,13 @@ def _pair_rows(interface, mapping, directions):
     return rows
 
 
-def _cohesive_response(law, opening, committed, mask):
+def _cohesive_response(laws, opening, committed, mask):
     traction = np.zeros(len(opening))
     tangent = np.zeros(len(opening))
     stored = np.zeros(len(opening))
     maximum = np.array(committed, copy=True)
     for index in np.flatnonzero(mask):
-        response = law.response(max(float(opening[index]), 0.), ModeIHistory(committed[index]))
+        response = laws.law_for(index).response(max(float(opening[index]), 0.), ModeIHistory(committed[index]))
         traction[index] = response.tensile_traction_pa
         # The clamp makes traction constant for interpenetration; the active set then switches to contact.
         tangent[index] = response.tangent_pa_per_m if opening[index] >= 0 else 0.
@@ -326,12 +326,13 @@ def solve_cohesive_equilibrium(stiffness, load_n, fixed_dofs, prescribed_m,
     ``initiation_required``; the caller decides whether to bisect the load or
     initiate pairs. Failures raise instead of returning an unverified state.
     """
-    if not isinstance(interface, CohesiveInterface) or not isinstance(law, LinearModeICohesiveLaw):
+    if not isinstance(interface, CohesiveInterface) or not isinstance(law, (LinearModeICohesiveLaw, FacetCohesiveLaws)):
         raise ValueError("Explicit CohesiveInterface and LinearModeICohesiveLaw are required")
     if not isinstance(committed, InterfaceState) or committed.initiated.shape != (interface.count,):
         raise ValueError("Committed InterfaceState must match the interface")
     if not isinstance(options, CohesiveOptions):
         raise ValueError("Explicit CohesiveOptions are required")
+    laws = FacetCohesiveLaws.wrap(law, interface.count)
     mapping = np.asarray(source_to_dof)
     nodes = len(interface.coordinates_m)
     if (mapping.dtype.kind not in "iu" or mapping.shape != (nodes,)
@@ -362,7 +363,8 @@ def solve_cohesive_equilibrium(stiffness, load_n, fixed_dofs, prescribed_m,
     initiated = committed.initiated
     history = committed.maximum_opening_m
     tied_tangent = options.tangential_response == "tied"
-    strength = law.tensile_strength_pa
+    strength = laws.tensile_strength_pa
+    critical_opening = laws.critical_opening_m
     # A just-initiated, never-opened pair can still carry f_t in closure-free tension.
     closed_tension_cap = np.where(history > 0, 0., strength) * areas
 
@@ -425,7 +427,7 @@ def solve_cohesive_equilibrium(stiffness, load_n, fixed_dofs, prescribed_m,
             restarted |= restart_step
             newton_restarts += int(restart_step)
             previous_openings = (previous_openings + [opening])[-2:]
-            traction, tangent, _, _ = _cohesive_response(law, opening, history, cohesive)
+            traction, tangent, _, _ = _cohesive_response(laws, opening, history, cohesive)
             if restart_step:
                 traction = np.where(cohesive, 0., traction)
                 tangent = np.where(cohesive, 0., tangent)
@@ -458,7 +460,7 @@ def solve_cohesive_equilibrium(stiffness, load_n, fixed_dofs, prescribed_m,
         if not converged:
             raise RuntimeError("Cohesive Newton iteration limit reached; no equilibrium accepted")
         opening = np.asarray(normal_rows @ displacement).ravel()
-        traction, tangent, stored, trial_maximum = _cohesive_response(law, opening, history, cohesive)
+        traction, tangent, stored, trial_maximum = _cohesive_response(laws, opening, history, cohesive)
         constraint_force = -np.asarray(row_full.T @ multipliers).ravel()
         # Constraint force on the plus node, resolved per pair and component.
         pair_force = np.zeros((interface.count, 3))
@@ -489,13 +491,14 @@ def solve_cohesive_equilibrium(stiffness, load_n, fixed_dofs, prescribed_m,
         trial = InterfaceState(initiated, np.where(cohesive, trial_maximum, history))
         overstressed = bonded & (normal_traction > strength * (1 + options.initiation_relative_tolerance))
         status = np.where(bonded, "bonded", np.where(contact, "closed", np.where(
-            trial.maximum_opening_m >= law.critical_opening_m, "separated", "softening")))
+            trial.maximum_opening_m >= critical_opening, "separated", "softening")))
         reaction = np.zeros(size)
         reaction[fixed] = residual[fixed]
         cohesive_stored = float(np.sum(areas * np.where(cohesive, stored, 0.)))
         dissipated = float(np.sum(areas * np.where(
-            initiated, .5 * strength * np.minimum(trial.maximum_opening_m, law.critical_opening_m), 0.)))
+            initiated, .5 * strength * np.minimum(trial.maximum_opening_m, critical_opening), 0.)))
         bonded_traction = normal_traction[bonded]
+        reference = laws.reference
         return CohesiveEquilibrium(displacement, reaction, clean_opening, normal_traction, trial, status, {
             "status": "initiation_required" if overstressed.any() else "passed_cohesive_equilibrium",
             "active_set_iterations": active_iteration, "newton_iterations": newton_total, "newton_restarts": newton_restarts,
@@ -506,13 +509,14 @@ def solve_cohesive_equilibrium(stiffness, load_n, fixed_dofs, prescribed_m,
             "initiated_pairs": int(initiated.sum()), "closed_pairs": int((initiated & contact).sum()),
             "separated_pairs": int((status == "separated").sum()),
             "overstressed_bonded_pairs": int(overstressed.sum()),
-            "maximum_bonded_tensile_ratio": float(np.max(bonded_traction, initial=-np.inf) / strength)
+            "maximum_bonded_tensile_ratio": float(np.max(bonded_traction / strength[bonded], initial=-np.inf))
             if bonded.any() else None,
             "elastic_energy_j": float(.5 * displacement @ (matrix @ displacement)),
             "cohesive_stored_energy_j": cohesive_stored,
             "cohesive_dissipated_energy_j": dissipated,
-            "tensile_strength_pa": strength, "fracture_energy_j_m2": law.fracture_energy_j_m2,
-            "critical_opening_m": law.critical_opening_m,
+            "tensile_strength_pa": reference.tensile_strength_pa, "fracture_energy_j_m2": reference.fracture_energy_j_m2,
+            "critical_opening_m": reference.critical_opening_m,
+            **({} if laws.uniform else {"facet_laws": laws.summary()}),
             "tangential_response": options.tangential_response,
             "integration": "lumped vertex tributary area on affine paired lips",
             "initiation_criterion": "bonded tie normal traction >= f_t (reference normal, tension positive)",
@@ -705,7 +709,8 @@ def advance_with_initiation(problem_at, start_factor, end_factor, interface, sou
             if rounds > maximum_initiation_rounds:
                 raise RuntimeError("Initiation round limit reached; no state accepted")
             ready = np.flatnonzero(~result.trial_state.initiated & (
-                result.normal_traction_pa >= law.tensile_strength_pa * (1 - strength_band)))
+                result.normal_traction_pa >= FacetCohesiveLaws.wrap(law, interface.count).tensile_strength_pa
+                * (1 - strength_band)))
             if not len(ready):
                 raise RuntimeError("Overstressed state has no initiable pair; no state accepted")
             state = result.trial_state.initiate(ready)

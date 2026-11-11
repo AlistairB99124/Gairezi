@@ -2,6 +2,17 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "Aster: Run 2 mm selected-material cracking sweep",
+      "detail": "23 sequential hypothetical material cases from config.json; preserves supports and selection. Fresh evidence under cracking_sweeps\\runs.",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": ["-u", "-B", "-m", "cracking_sweeps.run_sweep", "--execute"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "runOptions": { "instanceLimit": 1 },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
       "label": "Elmer: Run combined solver",
       "type": "process",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",

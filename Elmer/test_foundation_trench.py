@@ -507,3 +507,69 @@ class StaircaseSourceTests(unittest.TestCase):
             z=points[list(cell),2]
             for joint in joints:
                 self.assertFalse(z.min()<joint-1e-8 and z.max()>joint+1e-8)
+
+
+class TerracedSeatSnapTests(unittest.TestCase):
+    """The staircase foundation must reproduce EVERY wall-seat face even where the
+    seat terraces (steps in z following the valley floor).
+
+    Regression: the roof elevation used to be rebuilt as (tops - depth) + depth,
+    which drifts ~1e-8 from the surveyed seat when the seat sits on a round(z, 8)
+    boundary. Because node() dedupes on round(z, 8), the drifted roof node no
+    longer coincides with the seat node, so those seat faces are orphaned - the
+    client-reported "Staircase foundation is missing N wall faces" at an
+    engineer-chosen width (e.g. 4.15 m)."""
+
+    def test_roof_layer_lands_on_the_seat_bit_for_bit(self):
+        # The surveyed valley-floor seat elevation that actually failed, sitting
+        # on a round(z, 8) rounding boundary.
+        seat_z = -26.914207445
+        for depth in (1.5221003, 1.5221070, 1.5221076):
+            with self.subTest(depth=depth):
+                # Old staircase formula rebuilt the roof up from a separate floor.
+                old_roof = (seat_z - depth) + depth
+                self.assertNotEqual(
+                    round(old_roof, 8), round(seat_z, 8),
+                    "chosen depth must exercise the round(z, 8) drift")
+                # Fixed formula measures the top layer (upper == 1.0) DOWN from
+                # the exact seat, so node() reuses the seat node.
+                upper = 1.0
+                fixed_roof = seat_z - (1.0 - upper) * depth
+                self.assertEqual(fixed_roof, seat_z)
+                self.assertEqual(round(fixed_roof, 8), round(seat_z, 8))
+
+    def _build(self, upstream, width, target):
+        from Elmer.regions.combined_structure import build_combined_structure
+        from Elmer.regions.tetrahedral import tetrahedralize_structure
+        from Elmer.three_body_diagnostic import survey_coordinates
+        from Elmer.foundation_trench import build_foundation
+        from Elmer.mesh_sizing import config_for_wall_element_size
+        (ROOT / "Thickness_tests").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="terraced-seat-", dir=ROOT / "Thickness_tests") as directory:
+            root = Path(directory)
+            config = load_config(ROOT / "config.json")
+            wall = config["geometry"]["wall"]
+            wall["upstream_radius_m"] = upstream
+            wall["radial_width_m"] = width
+            wall["centerline_radius_m"] = upstream - width / 2
+            wall["downstream_radius_m"] = upstream - width
+            config["geometry"]["target_wall_tetrahedral_elements"] = target
+            (root / "config.json").write_text(json.dumps(config))
+            structure = build_combined_structure(root, split_wall_joints=True)
+            structure.nodes = [tuple(p) for p in survey_coordinates(
+                np.asarray(structure.nodes), wall["centerline_radius_m"], 80.)]
+            mesh_config = config_for_wall_element_size(
+                load_config(root / "config.json"), structure.element_size_target_m)
+            return build_foundation(mesh_config, tetrahedralize_structure(structure))
+
+    def test_engineer_widths_and_radii_tile_completely(self):
+        # The engineer must be free to pick arbitrary widths/radii from the UI;
+        # every wall-seat node must snap to a foundation roof node.
+        for upstream, width in ((78.0, 4.2), (78.0, 4.15), (80.0, 4.1)):
+            with self.subTest(upstream=upstream, width=width):
+                foundation = self._build(upstream=upstream, width=width, target=120_000)
+                snap = foundation.report["wall_seat_node_snap"]
+                self.assertEqual(snap["unmatched_nodes"], 0)
+                self.assertEqual(snap["matched_nodes"], snap["wall_nodes"])
+                self.assertEqual(snap["matched_faces"], len(foundation.wall_faces))
+

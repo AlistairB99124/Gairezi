@@ -15,8 +15,9 @@ from Aster.automatic_cohesive import file_hash
 from FEniCSx.automatic_cracking import candidate_region, region_cell_stresses, region_candidate_faces
 from FEniCSx.automatic_cracking import maximum_overload_factor
 from FEniCSx.automatic_screening import (COMPLETED, config_digest, crack_base, crack_thickness,
-                                         max_damage_count, screen_cells, selection_enabled)
+                                         lift_joints, max_damage_count, screen_cells, selection_enabled)
 from FEniCSx.fracture_topology import split_interior_wall_faces
+from FEniCSx.lift_joints import lift_joint_settings
 
 PREPARED = "prepared_aster_candidates"
 BASELINE_FILES = ("mesh_manifest.json", "run_manifest.json", "three_body_mesh_arrays.npz",
@@ -84,20 +85,38 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                                   float(concrete["tensile_strength_pa"]),
                                   relative_tolerance=relative_tolerance, max_damage_count=max_damage_count(config),
                                   crack_base=crack_base(config), selection_enabled=selection_enabled(config),
-                                  crack_thickness=crack_thickness(config))
+                                  crack_thickness=crack_thickness(config), lift_joints=lift_joints(config))
             result.update(source_job_id=job_id, config_digest=manifest["config_digest"],
                           solver="code_aster", stress_association="raw P1 cell stress from accepted Aster displacement",
                           verified_baseline_source_sha256=hashes,
                           cohesive_fracture_energy_j_m2=concrete.get("cohesive_fracture_energy_j_m2"),
                           cohesive_fracture_energy_provenance="user-supplied; not independently verified",
                           configuration_sha256=file_hash(configuration))
+            if lift_joints(config) is not None and result["selection"].get("lift_joints") is not None:
+                # Fail here, before any solve is spent, if the lift-joint law cannot be given a
+                # joint at least as stiff as the elements beside it (same measure as native.prepare).
+                from Aster.automatic_cohesive import JOINT_PENALTY_FACTOR, CorroborationError, lift_joint_parameters
+                recorded = result["selection"]["lift_joints"]
+                neighbour = float(concrete["youngs_modulus"]) / float(recorded["mean_facet_edge_m"])
+                try:
+                    lift_joint_parameters(recorded, JOINT_PENALTY_FACTOR * neighbour, neighbour)
+                except CorroborationError as error:
+                    raise ValueError(str(error)) from error
             properties = (config.get("damage_selection") or {}).get("damaged_element_properties")
-            if properties is not None:
-                result["material_assignment"] = {
-                    "properties": properties,
-                    "selected_source_rows": result["selection"]["selected_source_rows"],
-                    "scope": "exact selected wall/foundation volume cells; baseline and unselected cells unchanged",
-                }
+            if properties is not None or lift_joints(config) is not None:
+                assignment = {"selected_source_rows": result["selection"]["selected_source_rows"]}
+                scope = []
+                if properties is not None:
+                    assignment["properties"] = properties
+                    scope.append("degraded material on the exact selected wall/foundation volume cells "
+                                 "(baseline and unselected cells unchanged)")
+                if lift_joints(config) is not None:
+                    assignment["joint_properties"] = result["selection"]["lift_joints"]
+                    scope.append("weak construction-joint law on the selected band's near-horizontal facets")
+                if properties is None:
+                    scope.append("every element keeps the intact concrete")
+                assignment["scope"] = "; ".join(scope)
+                result["material_assignment"] = assignment
             write_json(output / "screening.json", result)
             manifest.update(status=COMPLETED, screening_sha256=file_hash(output / "screening.json"))
         else:
@@ -149,21 +168,40 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                      if len(faces) else None)
             energy = concrete.get("cohesive_fracture_energy_j_m2")
             properties = (config.get("damage_selection") or {}).get("damaged_element_properties")
+            joints = lift_joints(config)
             if properties is not None:
                 energy = properties["cohesive_fracture_energy_j_m2"]
             if (isinstance(energy, bool) or not isinstance(energy, (int, float))
                     or not np.isfinite(energy) or energy <= 0):
                 raise ValueError("A positive supplied cohesive fracture energy is required")
+            lift_faces = None
+            if joints is not None:
+                # The screening recorded the lift planes as sorted source-node triples; the
+                # candidate faces are the same sorted triples, so membership is exact.
+                recorded = result["selection"].get("lift_joints")
+                if not isinstance(recorded, dict) or not recorded.get("source_faces"):
+                    raise ValueError("The Aster screening has no lift-joint facets although lift_joints are configured")
+                lift_settings = lift_joint_settings(joints)
+                planes = {tuple(face) for face in recorded["source_faces"]}
+                source_faces = (np.sort(np.asarray(split.source_faces, dtype=np.int64), axis=1)
+                                if split is not None else np.empty((0, 3), dtype=np.int64))
+                lift_faces = np.array([tuple(face) in planes for face in source_faces.tolist()], dtype=bool)
+                if int(lift_faces.sum()) != len(planes):
+                    raise ValueError(
+                        f"{int(lift_faces.sum())} candidate facets match the screening's {len(planes)} lift planes; "
+                        "the prepared candidates must contain every lift-joint facet")
             np.savez_compressed(output / "cohesive_state.npz",
                                 coordinates_m=split.coordinates_m if split is not None else coordinates,
                                 parent_node_ids=physical[split.parent_node_ids] if split is not None else physical,
                                 minus=split.faces.minus if split is not None else np.empty((0, 3), dtype=np.int64),
                                 plus=split.faces.plus if split is not None else np.empty((0, 3), dtype=np.int64),
-                                areas_m2=split.faces.areas if split is not None else np.empty(0))
+                                areas_m2=split.faces.areas if split is not None else np.empty(0),
+                                **({"lift_joint_faces": lift_faces} if lift_faces is not None else {}))
             result = {"status": PREPARED, "outcome": "candidates_prepared", "accepted": False,
                       "solver": "code_aster", "source_job_id": job_id,
                       "config_digest": manifest["config_digest"], "engineering_validated": False,
                       "screening_sha256": file_hash(screening / "screening.json"),
+                      "peak_location_m": result.get("peak_location_m"),
                       "baseline_sha256": hashes, "load_factor": 1.,
                       "maximum_overload_factor": overload_factor,
                       "tensile_strength_pa": float(concrete["tensile_strength_pa"]),
@@ -174,11 +212,25 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                                            if result["selection"].get("enabled") is False else
                                            "proportional maximum-overload screening; no eligible facets means native elastic steps")),
                       "outcome_basis": "Preparation only; native Aster nonlinear equilibrium is still required"}
-            if properties is not None:
-                result["material_assignment"] = {"properties": properties, "selected_source_rows": selected_rows.tolist(),
-                                                 "scope": "exact selected wall/foundation volume cells"}
-                result["tensile_strength_pa"] = properties["tensile_strength_pa"]
+            if properties is not None or joints is not None:
+                assignment = {"selected_source_rows": selected_rows.tolist()}
+                scope = []
+                if properties is not None:
+                    assignment["properties"] = properties
+                    scope.append("degraded material on the exact selected wall/foundation volume cells")
+                    result["tensile_strength_pa"] = properties["tensile_strength_pa"]
+                if joints is not None:
+                    assignment["joint_properties"] = {
+                        **recorded, "source_faces": None,
+                        **{key: lift_settings[key] for key in ("alpha", "pena_contact", "law")}}
+                    scope.append("weak construction-joint law on the selected band's near-horizontal facets")
+                    result["lift_joint_faces"] = int(lift_faces.sum())
+                if properties is None:
+                    scope.append("every element keeps the intact concrete")
+                assignment["scope"] = "; ".join(scope)
+                result["material_assignment"] = assignment
             friction = (config.get("damage_selection") or {}).get("damaged_joint_friction")
+            result["crack_water_pressure"] = (config.get("damage_selection") or {}).get("crack_water_pressure", False)
             if friction is not None:
                 if properties is None:
                     raise ValueError("damaged_joint_friction requires damaged_element_properties")

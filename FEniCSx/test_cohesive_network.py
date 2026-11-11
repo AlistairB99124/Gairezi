@@ -152,6 +152,44 @@ class CohesiveNetworkTests(unittest.TestCase):
         self.assertTrue(np.all(result.face_status == "separated"))
         self.assertAlmostEqual(result.report["cohesive_dissipated_energy_j"], GF * 1., delta=1e-9 * GF)
 
+    def test_per_facet_laws_initiate_only_the_weak_plane(self):
+        from FEniCSx.cohesive_mode_i import FacetCohesiveLaws
+        block = Block((1, 1, 4))
+        weak_plane, strong_plane = block.plane(2, .25), block.plane(2, .75)
+        candidates = np.vstack([weak_plane, strong_plane])
+        weak = LinearModeICohesiveLaw(FT / 10, GF / 10)  # same critical opening as the intact law
+        laws = FacetCohesiveLaws((LAW, weak), np.r_[np.ones(len(weak_plane), dtype=int),
+                                                   np.zeros(len(strong_plane), dtype=int)])
+        self.assertFalse(laws.uniform)
+        np.testing.assert_allclose(laws.tensile_strength_pa[:len(weak_plane)], FT / 10)
+        np.testing.assert_allclose(laws.critical_opening_m, LAW.critical_opening_m)
+        # Between the weak and intact strengths: only the lift plane can initiate.
+        delta = 3 * DELTA0 / 10
+        loading = Loading(block, delta)
+        result = CohesiveNetwork(block.coordinates, block.cells, block.regions, candidates,
+                                 elasticity=elasticity(), law=laws, options=options(), problem_at=loading).run()
+        self.assertEqual(result.status, "accepted_equilibrium", result.report["message"])
+        keys = [tuple(map(int, key)) for key in result.split.source_faces]
+        weak_ids = [keys.index(tuple(face)) for face in weak_plane.tolist()]
+        strong_ids = [keys.index(tuple(face)) for face in strong_plane.tolist()]
+        self.assertTrue(result.initiated[weak_ids].all())
+        self.assertFalse(result.initiated[strong_ids].any())
+        self.assertTrue(np.all(result.face_status[strong_ids] == "bonded"))
+        # The weak plane softens along its own law: force = (f_t/10)(1 - w / w_c) with the
+        # block's elastic stretch removed from the imposed displacement.
+        wc = weak.critical_opening_m
+        compliance = 1. / E
+        opening = (delta - compliance * FT / 10) / (1 - compliance * FT / 10 / wc)
+        expected = FT / 10 * max(1 - opening / wc, 0.)
+        self.assertAlmostEqual(loading.top_force(result.split, result.displacement_m), expected, delta=1e-6 * FT)
+        self.assertLess(np.max(result.face_normal_stress_pa[strong_ids]), FT)
+        self.assertEqual(result.report["facet_laws"]["materials"][1]["facets"], len(weak_plane))
+        # Mixing up the count is rejected rather than silently broadcast.
+        with self.assertRaises(ValueError):
+            CohesiveNetwork(block.coordinates, block.cells, block.regions, candidates, elasticity=elasticity(),
+                            law=FacetCohesiveLaws((LAW,), np.zeros(1, dtype=int)), options=options(),
+                            problem_at=loading)
+
     def test_bending_initiates_without_seeds_and_expands_minimal_patches(self):
         block = Block((4, 1, 2), (1., .25, 1.))
         theta = 2 * FT / (E * 1.)
@@ -251,6 +289,35 @@ class CohesiveNetworkTests(unittest.TestCase):
         self.assertTrue(result.wet_faces.all())
         force = loading.top_force(result.split, result.displacement_m)
         self.assertAlmostEqual(abs(force), unit_weight * (height - .5) * 1., delta=1e-6 * unit_weight * height)
+
+
+    def test_warm_start_matches_plain_bisection_with_fewer_solves(self):
+        # The strength-crossing search warm-starts the bracket from the previous
+        # crossing instead of re-bisecting [low, target] every macro-step (which
+        # dominates large runs). It must reach the identical equilibrium - same
+        # initiated set, load factor and dissipation - while never solving more,
+        # and strictly fewer on a multi-macro-step run.
+        block = Block((4, 1, 2), (1., .25, 1.))
+        theta = 2 * FT / (E * 1.)
+        candidates = block.plane(2, .5)
+        loading = Loading(block, .6 * DELTA0, rotation=16 * theta)
+
+        def solve(warm):
+            model = network(block, candidates, loading)
+            model.warm_start = warm
+            return model.run()
+
+        warm, plain = solve(True), solve(False)
+        self.assertEqual(warm.status, "accepted_equilibrium", warm.report["message"])
+        # At least two macro-steps, so the warm path (engaged only from step 2) runs.
+        self.assertGreaterEqual(len([s for s in warm.steps if s["event"] == "initiation"]), 2)
+        np.testing.assert_array_equal(warm.initiated, plain.initiated)
+        self.assertAlmostEqual(warm.load_factor, plain.load_factor, places=12)
+        self.assertAlmostEqual(warm.report["cohesive_dissipated_energy_j"],
+                               plain.report["cohesive_dissipated_energy_j"], delta=1e-9 * GF)
+        self.assertLess(warm.report["solves"], plain.report["solves"])
+        loads = [step["load_factor"] for step in warm.steps]
+        self.assertEqual(loads, sorted(loads))
 
 
 if __name__ == "__main__":

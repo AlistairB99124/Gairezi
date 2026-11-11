@@ -1,5 +1,15 @@
 # Dam Analysis Workbench - implementation plan
 
+## Version 1 scope (11 November 2026)
+
+Version 1 ends when the elastic baselines are complete: Elmer and FEniCSx as
+supporting solvers, Code_Aster as the authority. The crack assessment is
+descoped by agreement with the engineer. The cracking code and its tests stay,
+switched off unless the analysis host sets `CRACKING_ENABLED` (see the parent
+repository's README). The cracking sections below describe that switched-off
+work; `epilogue-plan.md` in the parent repository records what the last
+cracking run showed and the deferred plan for finding a 2 mm crack.
+
 ## Solver authority and required completion
 
 Code_Aster is the primary source of truth for the assessment, including wall
@@ -28,15 +38,27 @@ The isolated displacement campaign can enable native `hydraulic_loads` in its
 mesh manifest: undrained heel-to-toe uplift at the wall-side foundation boundary
 and hydrostatic pressure on reservoir-connected opened crack facets. Its new
 intact uplift baseline must solve and pass an equilibrium diagnostic before
-re-screening. Historical/default application configurations and saved results
-retain their original no-uplift/no-crack-water loads. This is a campaign-only
-hydraulic study, not a silent change to production numerical behavior.
+re-screening. Historical application configurations without the explicit
+`damage_selection.crack_water_pressure` switch retain their original
+no-uplift/no-crack-water loads. The checked-in configuration now opts in to
+reservoir-connected crack-water pressure for new app/API jobs and material
+sweeps, independently of uplift. The desktop/web cracking editor exposes this
+boolean; loading/saving must preserve it. This option never enables foundation
+uplift. The intact baseline remains dry; only initiated, opened crack facets
+connected to the reservoir through open submerged edges receive pressure.
+Elastic penalty compliance must not be interpreted as crack opening.
 
 Hydraulic active-set trials start from the last accepted mechanical history.
 Only stable pressure connectivity is accepted; rejected trials cannot commit
 irreversible damage. Hydraulic runs use explicit accepted load instants without
 unverified internal mechanical subdivisions. Reference-geometry facet pressure
 is a small-strain approximation, not transient flow or follower loading.
+Crack-water-only runs start at load factor 0.01, then 0.025, 0.05, ...;
+every accepted mechanical step must carry stable hydraulic diagnostics.
+Requested wet results without that evidence are rejected by the API and sweep,
+not silently accepted as dry. The report and Investigation disclose the actual
+hydraulic assumptions and history. Restart the API to load these code changes
+after any running jobs have finished; existing job snapshots are not modified.
 
 Elmer supplies the source mesh and elastic reference. FEniCSx and Code_Aster
 then run independent elastic baselines. A successful Elmer stage alone does
@@ -1467,6 +1489,7 @@ compatibility with the project's selected Python interpreter.
 | `GET /health` | API version, backend availability and prerequisite checks |
 | `GET /config/schema` | Current editable configuration schema and field capabilities |
 | `GET /config/default` | Read the repository's example/default configuration |
+| `GET /config/cracked` | Read the cracked-scenario preset (`cracked_config.json`): the default dam with a weak, frictional pour plane and uplift |
 | `POST /config/validate` | Validate a configuration; return errors, warnings and derived preview values |
 | `POST /jobs` | Submit the dam configuration as the JSON body; return HTTP 202 with job ID |
 | `GET /jobs` | List persisted local job history |
