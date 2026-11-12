@@ -4,11 +4,20 @@
 
 Version 1 ends when the elastic baselines are complete: Elmer and FEniCSx as
 supporting solvers, Code_Aster as the authority. The crack assessment is
-descoped by agreement with the engineer. The cracking code and its tests stay,
-switched off unless the analysis host sets `CRACKING_ENABLED` (see the parent
-repository's README). The cracking sections below describe that switched-off
-work; `epilogue-plan.md` in the parent repository records what the last
-cracking run showed and the deferred plan for finding a 2 mm crack.
+descoped by agreement with the engineer.
+
+Since 12 November 2026 `CRACKING_ENABLED` on the analysis host adds one stage
+after the baselines: the Code_Aster contact-joint stage, which follows
+Code_Aster's own dam-joint method (bundled test SSNP142) at the contact between
+the wall and the concrete foundation. Method, results and limits are in
+[aster_dam_baseline.md](../aster_dam_baseline.md); the flag is described in the
+parent repository's README. It is a proof of concept with generic joint values,
+not an engineering assessment.
+
+The cracking sections below describe the earlier method (crack location,
+FEniCSx and Code_Aster cracking, painted cracks). That method is retired: the
+flag no longer runs it, and its code and tests stay only as a record.
+`epilogue-plan.md` in the parent repository records what its last run showed.
 
 ## Solver authority and required completion
 
