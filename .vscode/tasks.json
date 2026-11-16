@@ -2,8 +2,8 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Aster: Run 2 mm selected-material cracking sweep",
-      "detail": "23 sequential hypothetical material cases from config.json; preserves supports and selection. Fresh evidence under cracking_sweeps\\runs.",
+      "label": "Cracking sweep: Run scenarios and update FEA_Matrix.xlsx",
+      "detail": "Elmer and Code_Aster baselines, then the Code_Aster contact joint, for every entry of cracking_sweeps\\scenarios.json; then writes cracking_sweeps\\FEA_Matrix.xlsx (close it in Excel first). About 15 minutes per scenario. Output under cracking_sweeps\\runs.",
       "type": "process",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "args": ["-u", "-B", "-m", "cracking_sweeps.run_sweep", "--execute"],

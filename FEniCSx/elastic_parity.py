@@ -54,7 +54,7 @@ def read_reference(structure, reference: Path):
     points = np.asarray(structure.nodes)
     node_regions = np.zeros(len(points), dtype=np.int32)
     for (kind, cell), region in zip(structure.cells, structure.region_ids):
-        if region not in (1, 2, 3):
+        if region not in (1, 2, 3, 4):  # 4 is the optional mortar fill
             raise ValueError(f"Unexpected structural region {region}")
         node_regions[list(cell)] |= 1 << (region - 1)
     source_centres = np.asarray([points[list(cell)].mean(axis=0) for _, cell in structure.cells])

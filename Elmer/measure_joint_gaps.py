@@ -15,7 +15,7 @@ import numpy as np
 from vtkmodules.util.numpy_support import vtk_to_numpy
 from vtkmodules.vtkIOXML import vtkXMLUnstructuredGridReader
 
-BODY_NAMES = {1: "wall", 2: "bedrock", 3: "foundation"}
+BODY_NAMES = {1: "wall", 2: "bedrock", 3: "foundation", 4: "mortar_fill"}
 JOINTS = {"wall_bedrock": (1, 2)}
 
 
@@ -97,6 +97,11 @@ def measure(result: Path, joint_levels_m: tuple[float, ...] = ()) -> dict[str, o
              if any(3 in sides for sides in by_location.values()) else JOINTS)
     if pairs is JOINTS:
         peak.pop("foundation")
+    if any(4 in sides for sides in by_location.values()):
+        # Optional mortar fill on the wall's steps: fill minus wall where they touch.
+        pairs = {**pairs, "wall_mortar": (4, 1)}
+    else:
+        peak.pop("mortar_fill")
     for name, (upper, lower) in pairs.items():
         gaps = np.array([
             upper_value - lower_value

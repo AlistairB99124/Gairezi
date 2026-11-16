@@ -27,6 +27,10 @@ FACE_GROUP_IDS = {
 # are semantic source IDs; boundary_id_map maps them to saved mesh/SIF IDs.
 FOUNDATION_REGION_ID = 3
 WALL_FOUNDATION_BOUNDARY_IDS = (17, 18)
+# Optional mortar fill on the wall's thickness steps (material.mortar): its own body, joined
+# to the wall by springs. 19 tags the wall faces it covers, 20 its own coincident faces.
+MORTAR_FILL_REGION_ID = 4
+WALL_MORTAR_BOUNDARY_IDS = (19, 20)
 FOUNDATION_BEDROCK_BOUNDARY_IDS = (11, 12)
 FIRST_WALL_JOINT_BOUNDARY_ID = 21
 MAX_WALL_JOINTS = 20

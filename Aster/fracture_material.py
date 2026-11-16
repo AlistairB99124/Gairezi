@@ -65,7 +65,7 @@ def material_contract(
         "P": p,
         "Q": 0.0,
         "REST_RIGI_FC": 0.9,
-        "COEF_RIGI_MINI": 0.0,
+        "COEF_RIGI_MINI": 1e-5,
     }
     if not 0 <= parameters["NU"] < .5:
         raise ValueError("ENDO_FISS_EXP requires 0 <= poisson_ratio < 0.5")

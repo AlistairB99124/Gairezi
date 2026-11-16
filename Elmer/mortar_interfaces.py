@@ -107,7 +107,7 @@ def split_planar_interfaces(points, boundaries, pairs):
     next_tag = FIRST_PLANAR_MORTAR_BOUNDARY_ID
     def location(face):
         return tuple(sorted(tuple(p) for p in np.round(points[list(face)],8)))
-    for name in ("foundation_bedrock","wall_foundation"):
+    for name in ("foundation_bedrock","wall_foundation","wall_mortar"):
         if name not in pairs:
             continue
         slave,master = pairs[name]

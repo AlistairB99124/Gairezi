@@ -1,140 +1,157 @@
-# Selected-material cracking sweep
+# Wall-geometry cracking sweep
 
-This is a hypothetical sensitivity experiment, not calibrated concrete or a dam
-safety assessment. It searches for **maximum local normal opening >= 2 mm at
-full design load (factor 1)**. It does not claim a connected 2 mm-wide crack,
-engineering validation, or guarantee that any scenario reaches the target.
+Runs the baselines and the contact-joint cracking stage for a list of wall geometries, then
+writes the results into `FEA_Matrix.xlsx`. It is a comparison of model variants, not an
+engineering assessment; the method and its limits are in
+[../aster_dam_baseline.md](../aster_dam_baseline.md).
 
-## Fixed baseline and scenario design
+## Files
 
-The runner snapshots `../config.json` at launch. It never edits that file.
-Every case retains its geometry, mesh, intact materials, loads, supports, selected
-cell identities and candidate facets. Only the selected material's E, tensile
-strength and fracture energy can change. Density, Poisson's ratio and compressive
-strength remain fixed. Selected foundation cells, if present, receive the same
-assigned properties as the selected wall cells.
+| File | What it is |
+|---|---|
+| `config.json` | The configuration every scenario starts from. |
+| `scenarios.json` | An array of overwrites of `config.json`, one per run. Runs are numbered from 1 in file order. |
+| `FEA_Matrix.xlsx` | The results table. Run *n* is row *n* + 2 of the `Sweep` sheet. |
+| `run_sweep.py` | The runner. |
+| `runs/` | One folder per sweep (not in git). |
 
-**The current config selects the base band and retains interface_scale = 0.01.**
-The user explicitly selected this baseline, including its 99% wall-foundation
-spring reduction. It is not the successful historical run with interface_scale=1.
-Changes subsequently made to the baseline are captured at the next launch.
-The runner requires cohesive selection enabled, no manual cracks or friction,
-and maximum_overload_factor=1.
+`../config.json` is not used for the scenarios, but the solver modules load it when they
+start, so it has to be a valid configuration. No file outside this folder is changed.
 
-With the current uncapped base-band selection, cells are selected geometrically,
-even if no intact facet exceeds the concrete tensile strength. The intact concrete
-strength still drives the overstress diagnostics, and capped selection uses the
-critical facets. These are distinct from the selected material's strength, which
-controls its cohesive resistance after assignment. This sweep does not lower the
-intact concrete strength to force a different selection.
+## Scenarios
 
-`scenarios.json` defines 23 ordered cases as factors relative to the baseline's
-selected material, not the intact concrete:
+A scenario is the part of `config.json` it replaces. Objects are merged key by key; a list
+or a value is replaced as a whole. Anything a scenario does not name keeps the value in
+`config.json`.
 
-| Family | Cases | Changes (with current selected E=35 GPa, ft=2 MPa, Gf=100 J/m2) |
-|---|---:|---|
-| A | 1 | Unchanged baseline control |
-| B | 6 | ft = 1.5, 1, 0.5, 0.2, 0.1, 0.02 MPa; E and Gf fixed |
-| C | 9 | ft = 1, 0.2, 0.02 MPa crossed with Gf = 50, 25, 10 J/m2 |
-| D | 3 | E = 17.5, 3.5, 0.35 GPa; ft and Gf fixed |
-| E | 4 | E = 3.5, 0.35 GPa crossed with ft = 0.2, 0.02 MPa; Gf=10 J/m2 |
+```json
+{
+    "geometry": {
+        "wall": {
+            "radial_width_m": 4.0,
+            "centerline_radius_m": 78.0,
+            "downstream_radius_m": 76.0,
+            "thickness_steps": [
+                { "top_z_m": -20.0, "radial_width_m": 4.5 }
+            ]
+        }
+    }
+}
+```
 
-B isolates initiation strength, C explores propagation resistance, D isolates
-bulk stiffness, and E explores combined severe degradation. The extremes are
-deliberately hypothetical bounds, not suggested measured material data.
-`2 Gf / ft` is the characteristic full-separation opening, **not an imposed or
-maximum equilibrium opening**. Making this quantity 2 mm does not force the dam
-to open 2 mm.
+Every scenario is checked with the project's configuration validator before anything
+starts, so a misplaced or misspelt key stops the sweep with the scenario's number.
+`thickness_steps` belongs inside `geometry.wall`. The sweep also refuses a scenario the
+contact-joint stage cannot run (no foundation, or a bedrock mode other than
+`elastic_layer`) and a wall with more than the two thickness steps the sheet has columns for.
+
+Runs 8 to 10 are runs 5 to 7 with a mortar fill on the steps: the same `geometry.wall` and a
+`material.mortar` block (see "Mortar fill on the steps" in [../README.md](../README.md)). The
+fill slopes the ledges of the stepped walls so they look smooth; it is a soft body of its
+own, not concrete. Its material values are placeholders.
+
+## What a run does
+
+For each scenario, one at a time, in its own folder `runs/<sweep>/scenario_NN/`:
+
+1. **Elmer baseline** (`Elmer.three_body_solver`).
+2. **Code_Aster elastic baseline** (`Aster.run_three_body_pipeline`).
+3. **Code_Aster contact joint** at the wall/foundation contact
+   (`Aster.dam_joint_baseline app`): dry joint, then water in the joint. Each of the two
+   solves is stopped after 10 minutes.
+
+These are the commands the app runs for a job with `CRACKING_ENABLED` set. The app's
+FEniCSx baseline is not run; the sheet does not use it.
+
+A stage that fails ends its scenario and the sweep goes on to the next one. Figures from the
+stages that did complete are kept.
+
+## The sheet
+
+When the scenarios are done, each run's row is replaced: run number, geometry, the Elmer and
+Code_Aster baseline figures (peak wall tension and compression in MPa, peak wall
+displacement in mm), the concrete volume of the wall and foundation (m3), and the cracking
+columns (largest opening of the contact in mm, peak wall tension, compression and
+displacement; dry and with water in the joint). The averages and the volume difference are
+formulas. The last column (AC, "Mortar fill / Volume (m^3)") is the volume of the mortar fill,
+or "-" for a wall without one; the fill is not part of the concrete volume. The column is
+added to a workbook that does not have it yet.
+
+- A figure a run did not produce is left empty. Nothing from an earlier sweep stays in a row
+  this sweep wrote.
+- Rows of runs that were not part of this sweep are left as they are.
+- The workbook as it was is copied to `runs/<sweep>/FEA_Matrix.before.xlsx` first.
+- A note below the table names the sweep and any runs that did not complete.
+- The workbook must be closed in Excel. This is checked before the first solver starts. If it
+  is open when the sweep ends, the results are kept and can be written later (see below).
 
 ## Launch
 
-In the Lamb or Gairezi workspace, run the VS Code task:
+VS Code task, in the Lamb or the Gairezi workspace:
 
-**Aster: Run 2 mm selected-material cracking sweep**
+**Cracking sweep: Run scenarios and update FEA_Matrix.xlsx**
 
-Alternatively, in PowerShell from Gairezi:
+Or in PowerShell from `Gairezi`:
 
 ```powershell
-# Write a fresh plan only; no solver processes:
+# Check the scenarios and write the plan only; no solver is started
 .\.venv\Scripts\python.exe -B -m cracking_sweeps.run_sweep
 
-# Launch a fresh, complete sequential campaign:
+# Run every scenario, then update the sheet
 .\.venv\Scripts\python.exe -u -B -m cracking_sweeps.run_sweep --execute
+
+# Run only scenarios 5 and 6; only their rows are written
+.\.venv\Scripts\python.exe -u -B -m cracking_sweeps.run_sweep --execute --only 5 6
+
+# Run only the three stepped walls with a mortar fill (rows 10 to 12 of the sheet)
+.\.venv\Scripts\python.exe -u -B -m cracking_sweeps.run_sweep --execute --only 8 9 10
+
+# Write the results of a finished sweep into the sheet, without solving
+.\.venv\Scripts\python.exe -B -m cracking_sweeps.run_sweep --update-sheet cracking_sweeps\runs\<sweep>
 ```
 
-Use the existing project environment and installed Elmer/Ubuntu WSL Code_Aster.
-Host preparation dependencies are listed in `../client_requirements.txt`,
-including SciPy for the shared preparation imports.
-Do not run app solver jobs or other campaigns concurrently: memory usage can be
-large. Keep the PC awake and powered. There is no 10-minute user-job cap; native
-Code_Aster stages retain the existing 30-day safeguard. Conversion helpers retain
-their normal limits. This campaign can take many hours and substantial disk space.
+`--config`, `--scenarios`, `--sheet` and `--output-root` point the sweep at other files.
 
-## Isolation, execution and outputs
+- **Time.** On the development machine one scenario of the default mesh took about 15
+  minutes through the app (Elmer 4, Code_Aster baseline 3, contact joint 8). Seven scenarios
+  are then somewhat under two hours. This is an estimate: a full sweep has not been timed.
+  The sweep of 12 November 2026 ran scenarios 1 to 7 in 110 minutes. Scenarios 8 to 10 have
+  not been run at the default mesh. With the fill, Elmer took 3.4 times as long on a coarse
+  mesh (168 s against 50 s), so their Elmer stage will be longer than 4 minutes; how much
+  longer at the default mesh is not known.
+- **Do not run app jobs or another sweep at the same time.** Each solver uses all cores.
+- **Disk.** A scenario on a coarse mesh (40,000 wall elements) left 61 MB. The default mesh
+  will leave several times that per scenario.
+- **Stopping.** Ctrl+C stops the running stage and its solver processes. Finished scenarios
+  stay in the sweep folder; `--update-sheet` writes them.
+- **Needs** the project's `.venv` (`../client_requirements.txt`, which now includes
+  `openpyxl`), Elmer, and Code_Aster in WSL.
 
-Every invocation creates a unique ignored `runs/<UTC timestamp>-<id>/` directory.
-There is no implicit resume or overwriting of past evidence.
+Exit code 0: every scenario completed and the sheet was written. 2: a scenario failed or
+the sheet could not be written. 1: the sweep was not started. 130: interrupted.
 
-1. Save baseline/configuration and all planned case configurations in `plan.json`.
-2. Execute one fresh isolated Elmer reference and Aster elastic baseline.
-3. Validate source hashes, finite displacement and physical node/cell identities
-   using existing Aster preparation. Screen and prepare candidates **once**.
-4. Copy the candidate archive for each material case; preserve physical selection,
-   baseline hashes and source config. Record derivative config and its independent
-   hash in `provenance.json`; do not present it as a new solved elastic baseline.
-5. Execute existing native cohesive solving and postprocessing sequentially.
-   The production load steps, convergence criteria and material laws are unchanged.
-6. Persist `sweep.json`, `results.csv` and each case's `result.json` after every case.
-   Per-case `case.log` and `aster/run/solver.live.log` retain detailed diagnostics;
-   native reports and ParaView artifacts remain with their cases.
-7. Stop after the first accepted full-design-load result reaches at least 2 mm
-   normal opening. Save that result before stopping; `sweep.json` records
-   `stop_reason` and the remaining `skipped_cases`.
+## Output of a sweep
 
-The intact baseline is reusable because selected-material overrides apply only
-after screening. No app jobs or historical files are read or modified. A completed
-baseline with a cross-solver comparison requiring verification is explicitly
-recorded as such; it is not engineering acceptance.
+`runs/<UTC time>-<id>/`:
 
-Only a completed, accepted, whole-model authoritative Aster report with native
-return code 0, finite nonnegative opening and final load factor 1 can reach the
-target. The comparison uses the unrounded opening in metres, not plotted
-exaggeration or wall displacement. `results.csv` reports opening in millimetres,
-initiation/opening/separation counts, touched facet area and wall displacement.
-Touched area is not necessarily fully separated area.
+| File | Content |
+|---|---|
+| `config.json`, `scenarios.json` | Copies of the inputs as they were at launch. |
+| `plan.json` | Every scenario with its full configuration. |
+| `progress.log` | One line per stage, and the contact-joint solver's progress. |
+| `results.json`, `results.csv` | The figures of every scenario, saved after each one. |
+| `scenario_NN/` | That scenario's `config.json`, the stage logs (`elmer.log`, `aster_baseline.log`, `joint_opening.log`), solver output and `result.json`. |
+| `FEA_Matrix.before.xlsx` | The workbook before this sweep wrote to it. |
 
-Numerical failures are retained and the next material case is attempted. A failed
-A control is conspicuous in the summary: later cases are exploratory scenarios,
-not a validated comparison to a converged cracked control. Shared-reference
-corruption or reference/preparation failure aborts the sweep. Cancellation stops
-the campaign and preserves completed evidence. There is no automatic weakening,
-tolerance relaxation, support change or overload. A large opening in a failed,
-partial or unaccepted solve does not trigger the early stop.
-Exit code 2 means at least one case failed; no hits with all cases converged is
-a valid completed sweep, not a claim that the 2 mm target was achieved.
+## Tests
 
-If no accepted scenario reaches 2 mm, these bounds have not demonstrated that
-target. Non-convergence is not evidence of physical failure or a 2 mm crack.
-Post-peak load-path control, mesh sensitivity and physical calibration would be
-separate follow-up studies.
+```powershell
+.\.venv\Scripts\python.exe -B -m unittest cracking_sweeps.test_run_sweep
+```
 
-## Hydraulic loading scope
+They use stand-ins for the solvers and take a few seconds.
 
-This config-based sweep retains external upstream/downstream hydrostatic pressure
-and crest surcharge. The baseline now explicitly enables
-`damage_selection.crack_water_pressure`: native Aster applies paired hydrostatic
-forces inside actually initiated, opened facets connected to the reservoir
-through open, submerged edges. Elastic penalty compliance alone is not a crack.
-Only stable hydraulic/mechanical active sets are accepted; missing wet-solve
-evidence cannot count as a target hit. Each new sweep snapshots this setting.
+## Earlier content of this folder
 
-Foundation uplift remains **off**. Reducing interface spring stiffness is not
-uplift pressure. Missing/false `crack_water_pressure` preserves historical dry
-behavior; `fracture_debug.crack_water_pressure_factor` is not this Aster switch.
-The intact baseline remains dry because no internal crack is open.
-
-Wet runs start at load factor 0.01, then 0.025, 0.05, ... to full design load,
-with no internal mechanical subdivisions that bypass pressure updates. This
-uses instantaneous reservoir head and small-strain reference geometry, not
-transient flow, permeability, drainage, entrapped water or follower pressure.
-There is no silent fallback to a dry solve if pressure coupling fails.
+Until 12 November 2026 this folder held a sweep of the retired selected-material cracking
+method (23 material cases). That runner and its scenarios are in the git history.

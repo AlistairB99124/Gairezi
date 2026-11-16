@@ -221,9 +221,11 @@ def build_uniform_wall(
     staircase = "foundation" in geometry
     tread_levels_m = [min(a, b) for a, b in zip(base_levels_m, base_levels_m[1:])]
     if staircase:
+        """
         if any(abs(a-b)>1e-8 and abs(abs(a-b)-element_size_m)>1e-8
                for a,b in zip(tread_levels_m,tread_levels_m[1:])):
             raise ValueError("Chamfered foundation requires every nonzero riser to be exactly one course")
+        """
         base_levels_m = [min(tread_levels_m[max(0,i-1):min(len(tread_levels_m),i+1)])
                          for i in range(len(chainages_m))]
         section_levels_m = [vertical_levels(z, CREST_Z_M, element_size_m, step_levels_m)

@@ -148,6 +148,18 @@ reservoir; every run completed in four to six minutes.
 - The factor of 100 is a test value. How the parts of a stepped wall are connected in the
   model is `geometry.wall.joint_support` in `config.json`; whether a real stepped wall would
   have a construction joint there is for the engineer.
+- The same geometry was then run through the app as one bonded wall (`joint_support` model
+  `bonded`), with tapered step ends (`step_end_taper_ratio` 1), job `9db37ee2...`
+  (**measured**): elastic baseline 9.65 mm and 1.24 MPa; dry joint 1.13 mm opening, 1.47 MPa
+  peak wall tension, 10.85 mm displacement, which agrees with the test above. Water in the
+  joint, run from the command line on the same job after the correction below: 1.49 mm,
+  1.59 MPa, 11.57 mm.
+- In that app job the water-in-joint case was refused before solving, so the stage failed
+  after the dry case. The rule for joint water read the wall's steps from the downstream
+  face and did not allow for tapered step ends. It now reads the downstream edge from the
+  contact itself, one radial strip of the contact mesh at a time. On runs 5 to 7 the two
+  rules give the same pressure at every cell to within 2e-6 Pa, and on the tapered job
+  Code_Aster's joint pressure matches the formula at every cell (**measured**).
 
 Checks made for the stepped walls (**measured**, run 5):
 
@@ -277,6 +289,12 @@ the app's behaviour are described in the parent repository's README.
   concrete foundation, with the bedrock meshed as a volume, or with the no-bedrock
   comparison.
 - The desktop shows the two cases beside the elastic baseline on the Comparison tab.
+- A wall with a mortar fill on its steps (`material.mortar`, see "Mortar fill on the steps"
+  in [README.md](./README.md)) keeps the fill as a body of its own in both cases. The springs
+  that tie it to the wall face stay linear springs, as the springs between the parts of a
+  stepped wall do; the joint law is on the wall/foundation contact only. Wall stress and
+  wall displacement exclude the fill, and it is not cooled in a cooling case. The case
+  reports list it (`mortar_fill`).
 
 Checked through the API on 12 November 2026, on a copy of job `3a64965e...` in a separate
 job store (**measured**):
@@ -408,8 +426,14 @@ In rough order of value. Each should stay inside the 20-minute limit.
   the manual's parameter table were read directly.
 - Other geometries: only the seven of the sweep in section 4 and one 2 m wall through the
   app have been run. Water in the joint is implemented for a wall on a circular arc, of
-  uniform thickness or with thickness steps at fixed elevations.
-- A stepped wall has not been run through the app since stepped walls were added, only
-  from the command line.
+  uniform thickness or with a contact meshed in radial strips from the upstream to the
+  downstream face (the stepped walls of this project, with or without tapered step ends).
+- A stepped wall at the default mesh has completed only the dry case through the app. Its
+  water-in-joint case has been run from the command line only (the sweep of section 4). On
+  13 November 2026 a stepped wall with a mortar fill completed both cases through the API on
+  a coarse mesh (40,000 wall elements): 0.927 mm dry and 1.261 mm with water in the joint,
+  against 0.940 and 1.272 mm for the same wall without the fill (**measured**).
+- The mortar fill has been run on a coarse mesh only, with placeholder material values. Its
+  tie to the wall cannot open, so the fill coming away from the wall is not modelled.
 - The temperature load: see the list at the end of section 9. The expansion coefficient is
   the generic value for concrete as I recall it from design codes; I did not open a source.

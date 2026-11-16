@@ -218,19 +218,17 @@ and closed otherwise cycle the Newton residual.
   cohesive laws) a stop may be a local snap-back rather than the structure's capacity.
 - `assessment_notes`: the same findings as sentences, shown in the app's results view.
 
-`cracking_sweeps/run_sweep.py` varies `tensile_strength_pa`/`cohesive_fracture_energy_j_m2`
-by factors and `alpha`/`friction_coefficient` as absolute values (`scenarios.json`); with
-both blocks configured each case's factors are keyed by block, and a derivative may never
-drop a block. The shipped cases pair each strength factor with an energy factor of that
-factor squared or less, which keeps a rupture joint's stiffness from falling.
+`cracking_sweeps/run_sweep.py` no longer varies these lift-joint and degraded-element
+properties: since 12 November 2026 it runs the wall-geometry sweep of the contact-joint
+stage (see `cracking_sweeps/README.md`). The material sweep it replaced is in the git history.
 
 Tests: `FEniCSx/test_lift_joints.py` and the lift cases in `test_automatic_screening`
 (from `FEniCSx`), `FacetLawTests` in `test_automatic_cracking`, `FEniCSx.test_cohesive_network`,
 `Aster.test_automatic_preparation`, `Aster.test_hydraulic_loads`,
 `Aster.test_automatic_cohesive` (`ReportDiagnosticsTests`, and the real Code_Aster fixtures
 `test_lift_joint_plane_cracks_and_postprocesses` and
-`test_frictional_lift_plane_carries_uplift_as_effective_stress`),
-`Elmer.test_model_config` and `cracking_sweeps.test_run_sweep`.
+`test_frictional_lift_plane_carries_uplift_as_effective_stress`) and
+`Elmer.test_model_config`.
 
 Every network solve covers the whole dam (Max Damage Count limits the
 candidate facets, not the system size). `sparse_direct.py` solves systems of
@@ -1220,6 +1218,8 @@ The canonical mesh has wall = 1 and bedrock = 2, plus concrete foundation = 3 wh
 The configured bedrock support model controls the wall/bedrock seat: bonded meshes use shared-node faces, while spring-supported seats use the opposing boundary tags 11 and 12 and the configured x/y/z stiffnesses. Rock-bottom support uses tag 10; outer rock boundaries use tags 13?16. Elastic reports use wall_connection and wall_bedrock_connection. Wall headline stress peaks remain wall-only; bedrock and optional foundation peaks are reported separately in `body_stress`.
 
 For a foundation source, the mesh importer verifies dimensions, body IDs, interface connectivity, spring tags and stiffness against the submitted configuration and diagnostic. `geometry.foundation.support` is required and never inherits wall-joint settings. Spring-connected `wall_foundation` uses `geometry.foundation.support.spring_n_per_m3`; `foundation_bedrock` uses `geometry.bedrock.support.spring_n_per_m3`. Spring-connected interfaces require their opposing tagged faces and duplicated nodes. Bonded interfaces require matching exposed faces with shared nodes, and their spring coefficients are inactive. Legacy spring sources use tags 17/18 and 11/12 respectively. Exact-plane spring sources declare nested `spring_pairs[logical].faces[plane]` semantic tag pairs, resolved through `boundary_id_map`; the first plane retains the legacy tags and further planes use tags >=1000. The importer checks unique tags, configured logical coefficients, body membership, triangle counts, plane metadata and coplanarity. Each plane multiplier is eliminated independently before summing operators, including at shared riser/tread nodes; pooling plane projectors before elimination is a different discretisation. Reports retain logical interface names, with per-plane details under `faces` and `grouping: exact_plane`. Wall thickness-block joint pairs are retained. Reports preserve foundation metadata and set `wall_bedrock_connection` to `not_in_contact`; the two configured foundation connections are reported independently. Exposed untagged foundation faces are traction-free, as for bedrock. Without a foundation, the existing wall/bedrock support and damage behavior is unchanged.
+
+An optional mortar fill on the wall's thickness steps (`material.mortar`, "Mortar fill on the steps" in ../README.md) is body 4 in the saved mesh. It needs the foundation and the elastic-layer bedrock mode. It has its own nodes and its own material (density, stiffness and Poisson ratio from `material.mortar`), is never damageable, and is joined to the wall by the grouped spring pair `wall_mortar` (legacy tags 19 wall side and 20 fill side, coefficients `material.mortar.bond_spring_n_per_m3`), assembled like the other spring interfaces. The importer checks the body ID, the cell count and the material against the diagnostic and the submitted configuration, and that the fill shares no node with another body. Wall headline peaks and `maximum_wall_displacement_m` stay wall-only. Tests: `python3 -B -m unittest test_mortar_fill` from this directory inside WSL.
 
 ## Near-planar chamfer interfaces
 
