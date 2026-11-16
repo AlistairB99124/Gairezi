@@ -32,7 +32,7 @@ ROOT = HERE.parent
 # Code_Aster's export needs a finite limit; the app gives its elastic baseline the same one.
 ASTER_BASELINE_TIME_LIMIT_S = 30 * 24 * 3600
 # Limit of each of the two contact-joint solves, as in the app.
-JOINT_SOLVE_LIMIT_S = 600
+JOINT_SOLVE_LIMIT_S = 7200
 JOINT_CASES = (("dry", "dry"), ("water", "water_in_joint"))
 FIGURES = ("tension_mpa", "compression_mpa", "displacement_mm")
 

@@ -19,7 +19,7 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
-    parser.add_argument("--time-limit-s", type=int, default=1800)
+    parser.add_argument("--time-limit-s", type=int, default=7200)
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
     case_path = output_dir / "case.comm"

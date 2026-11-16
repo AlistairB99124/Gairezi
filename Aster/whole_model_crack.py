@@ -254,9 +254,11 @@ def _write(path: Path, payload: dict) -> None:
 def export_file(directory: Path, threads: int, memory_mib: int, time_limit_s: int) -> Path:
     def linux(name):
         return wsl_path(directory / name)
+    cpu_time_limit_s = max(int(time_limit_s) * max(1, int(threads)), 3600) if time_limit_s is not None else 7200
+            
     export = directory / "crack.export"
     export.write_bytes((
-        f"P time_limit {time_limit_s}\nP memory_limit {memory_mib}\nP mpi_nbcpu 1\nP ncpus {threads}\n"
+        f"P time_limit {cpu_time_limit_s}\nP memory_limit {memory_mib}\nP mpi_nbcpu 1\nP ncpus {threads}\n"
         f"F comm {wsl_path(CASE)} D 1\nF libr {linux('inputs.json')} D 91\nF mmed {linux('mesh.med')} D 20\n"
         f"F libr {linux('quadratic_discrete.npz')} D 92\n"
         f"F libr {linux('native_crack.json')} R 90\nF libr {linux('damage_history.npz')} R 89\n"

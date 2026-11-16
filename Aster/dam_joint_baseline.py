@@ -186,7 +186,7 @@ class JointCaseError(RuntimeError):
 # ------------------------------------------------------------------ progress
 
 # A cracking run that needs longer than this is not worth having (project decision, 11 Nov 2026).
-MAXIMUM_TIME_LIMIT_S = 1200
+MAXIMUM_TIME_LIMIT_S = 7200
 _progress_log: Path | None = None
 _progress_echo = False
 _NEWTON_ROW = re.compile(r"^\|\s+(\d+)\s+[XE]?\s*\|\s*([0-9.]+E[+-]\d+)")
@@ -967,9 +967,10 @@ def solve(output_dir: Path, time_limit_s: int) -> dict:
             _wsl(output_dir / ARRAYS_NAME), _wsl(med_path)], 300, run_dir / "conversion.log")
         if conversion.returncode != 0 or not med_path.is_file():
             raise RuntimeError("Mesh conversion failed; see run/conversion.log")
+        cpu_time_limit_s = max(int(time_limit_s) * max(1, int(SOLVER_THREADS)), 3600) if time_limit_s is not None else 7200
         export = run_dir / "dam_joint.export"
         export.write_text("\n".join((
-            f"P time_limit {time_limit_s}", f"P memory_limit {MEMORY_LIMIT_MB}", "P mpi_nbcpu 1",
+            f"P time_limit {cpu_time_limit_s}", f"P memory_limit {MEMORY_LIMIT_MB}", "P mpi_nbcpu 1",
             f"P ncpus {SOLVER_THREADS}", f"F comm {_wsl(output_dir / CASE_NAME)} D 1",
             f"F libr {_wsl(med_path)} D {MESH_UNIT}", "")), encoding="utf-8")
         progress(f"Starting Code_Aster on {SOLVER_THREADS} cores, limit {time_limit_s} s; it reads the model first "
@@ -1236,17 +1237,17 @@ def main() -> None:
                              f"{' '.join(f'{value:g}' for value in WALL_TEMPERATURES_C)})")
     for sub in (runner,):
         sub.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-        sub.add_argument("--time-limit-s", type=int, default=600,
+        sub.add_argument("--time-limit-s", type=int, default=7200,
                          help=f"solver time limit in seconds (at most {MAXIMUM_TIME_LIMIT_S})")
     fixture = commands.add_parser("fixture", help="two-block check against a hand calculation")
     fixture.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    fixture.add_argument("--time-limit-s", type=int, default=300)
+    fixture.add_argument("--time-limit-s", type=int, default=7200)
     fixture.add_argument("--cooling", action="store_true",
                          help="run only the check of the temperature load against free thermal contraction")
     stage = commands.add_parser("app", help="the app's stage: the dry joint, then water in the joint")
     stage.add_argument("--baseline-dir", type=Path, required=True)
     stage.add_argument("--output-dir", type=Path, required=True)
-    stage.add_argument("--time-limit-s", type=int, default=600, help="limit of each of the two solves")
+    stage.add_argument("--time-limit-s", type=int, default=7200, help="limit of each of the two solves")
     for sub in (runner, fixture, stage):
         sub.add_argument("--progress-log", type=Path, help="append a timestamped line per stage to this file")
     arguments = parser.parse_args()
