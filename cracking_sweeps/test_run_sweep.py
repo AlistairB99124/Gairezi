@@ -255,7 +255,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(baseline[:4], ["--source-mesh", str(directory / "elmer" / "model" / "three_body.msh"),
                                         "--output-dir", str(directory / "aster_baseline")])
         self.assertEqual(joint[:7], ["app", "--baseline-dir", str(directory / "aster_baseline"),
-                                     "--output-dir", str(directory / "joint_opening"), "--time-limit-s", "600"])
+                                     "--output-dir", str(directory / "joint_opening"), "--time-limit-s", "7200"])
         self.assertEqual((result["status"], result["failed_stage"], result["error"]), ("completed", None, None))
         self.assertEqual(result["elmer"]["tension_mpa"], 2.0)
         self.assertEqual(result["aster"]["displacement_mm"], 10.3)

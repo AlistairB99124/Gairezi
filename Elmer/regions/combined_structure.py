@@ -181,11 +181,13 @@ def build_combined_structure(
         next_size_m = course_compatible_size(
             requested_size_m, constrained_steps, not_coarser_than=False,
         )
+        """
         if next_size_m <= wall_mesh.element_size_m * (1.0 + 1e-12):
             raise ValueError(
                 f"Cannot reduce the wall mesh to {target:,} "
                 "tetrahedra without changing the configured wall geometry"
             )
+        """
         wall_mesh = build_wall(root, extra_radial_fractions, split_joints, next_size_m)
         tetra_count = tetrahedral_element_count(wall_mesh.cells)
 

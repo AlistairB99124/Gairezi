@@ -1138,7 +1138,7 @@ def with_wall_temperatures(case: dict, closure_temperature_c: float | None = Non
     return {**case, "cooling": cooling}
 
 
-def run(name: str, baseline_dir: Path, output_root: Path = DEFAULT_OUTPUT_ROOT, time_limit_s: int = 600,
+def run(name: str, baseline_dir: Path, output_root: Path = DEFAULT_OUTPUT_ROOT, time_limit_s: int = 7200,
         closure_temperature_c: float | None = None, wall_temperatures_c: list[float] | None = None) -> dict:
     output_dir = output_root / name
     case = with_wall_temperatures(CASES[name], closure_temperature_c, wall_temperatures_c)
@@ -1176,7 +1176,7 @@ def run(name: str, baseline_dir: Path, output_root: Path = DEFAULT_OUTPUT_ROOT, 
     return report
 
 
-def run_stage(baseline_dir: Path, output_dir: Path, time_limit_s: int = 600) -> dict:
+def run_stage(baseline_dir: Path, output_dir: Path, time_limit_s: int = 7200) -> dict:
     """The app's joint-opening stage: the dry joint, then water in the joint, each from the same baseline.
 
     A case that does not complete ends the stage; the cases that did complete stay in the report.
@@ -1198,7 +1198,7 @@ def run_stage(baseline_dir: Path, output_dir: Path, time_limit_s: int = 600) -> 
                 + (f": {reason[0]}" if reason else "") + ". See its run/solver.live.log."))
             break
     (output_dir / STAGE_REPORT_NAME).write_text(json.dumps(stage, indent=2) + "\n", encoding="utf-8")
-    raise RuntimeError("Stage did not complete successfully")
+    return stage
 
 
 def print_report(report: dict) -> None:

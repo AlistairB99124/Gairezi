@@ -249,17 +249,11 @@ MODELE = AFFE_MODELE(
 # DIS_T covers both wall joints, the wall/foundation interface and all
 # exterior normal-spring matrices.
 
-CONCRETE_MAT = DEFI_MATER_GC(
-    ENDO_LOCA_TC=_F(
-        CODIFICATION='ESSAI',
-        E={concrete["youngs_modulus_pa"]:.12g},
-        NU={concrete["poissons_ratio"]:.12g},
-        FT=0.5e6,               # Caps solid concrete tension at 0.5 MPa
-        FC=30.0e6,              # 30 MPa compressive strength
-        SIGM_COMP_SEUIL=15.0e6, # Compressive damage threshold (~0.5 * FC)
-        GF=150.0,               # Fracture energy (N/m)
-        DIST_FISSURE=1.0,       # Average element size (1.0 m) for fracture energy regularization
-        COEF_ECRO_TRAC=1.5,     # Mandatory tensile softening shape factor
+CONCRETE_MAT = DEFI_MATERIAU(
+    ELAS=_F(
+        E={concrete.youngs_modulus_pa:.12g},
+        NU={concrete.poissons_ratio:.12g},
+        RHO={concrete.density_kg_m3:.12g},
     ),
 )
 
