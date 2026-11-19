@@ -748,70 +748,243 @@ class SteppedWallTests(unittest.TestCase):
         self.assertNotIn("internal_wall_joints", record)
 
 
-class SteppedJointWaterTests(unittest.TestCase):
-    """Water in the joint under a wall that is thicker below a step: the downstream edge moves out."""
+def with_fill(arrays: dict, z_low: float, z_high: float) -> dict:
+    """The wall with a mortar fill tied to its downstream face between two heights.
+
+    The fill has its own nodes on the wall face (coincident with the wall's) and one more node per
+    tied triangle, set back from the face; it is tied to the wall by one spring pair per face node.
+    """
+    nodes = arrays["nodes"]
+    covered = arrays["tri3_downstream"]
+    height = nodes[covered][:, :, 2]
+    covered = covered[(height >= z_low - 1e-9).all(axis=1) & (height <= z_high + 1e-9).all(axis=1)]
+    face_nodes = np.unique(covered)
+    copy = np.arange(len(nodes))
+    copy[face_nodes] = len(nodes) + np.arange(len(face_nodes))
+    apex = len(nodes) + len(face_nodes) + np.arange(len(covered))
+    fill = np.column_stack([copy[covered], apex])
+    points = np.vstack([nodes, nodes[face_nodes], nodes[covered].mean(axis=1) + [0.3, 0.0, 0.0]])
+    corners = points[fill]
+    negative = np.linalg.det(corners[:, 1:] - corners[:, :1]) < 0
+    fill[negative] = fill[negative][:, [0, 2, 1, 3]]
+    pairs = np.column_stack([face_nodes, copy[face_nodes]])
+    stack = lambda key, rows: np.concatenate([arrays[key], rows])  # noqa: E731
+    remaining = arrays["tri3_downstream"]
+    remaining = remaining[~(np.isin(remaining, face_nodes).all(axis=1)
+                            & (nodes[remaining][:, :, 2] >= z_low - 1e-9).all(axis=1)
+                            & (nodes[remaining][:, :, 2] <= z_high + 1e-9).all(axis=1))]
+    return dict(
+        arrays, nodes=points, tetra4_mortar=fill,
+        tri3_downstream=np.concatenate([remaining, fill[:, [0, 1, 3]], fill[:, [1, 2, 3]], fill[:, [0, 2, 3]]]),
+        joint_slave_tri3=stack("joint_slave_tri3", covered), joint_master_tri3=stack("joint_master_tri3", copy[covered]),
+        joint_coefficients_n_per_m3=stack("joint_coefficients_n_per_m3", np.full((len(covered), 3), 1.25e9)),
+        seg2_wall_foundation_springs=stack("seg2_wall_foundation_springs", pairs),
+        wall_foundation_tributary_area_m2=stack("wall_foundation_tributary_area_m2", np.full(len(pairs), 0.25)),
+        interface_stiffness_n_per_m=stack("interface_stiffness_n_per_m", np.full((len(pairs), 3), 0.25 * 1.25e9)),
+        interface_names=stack("interface_names", np.array(["wall_mortar/side_wall_0000"] * len(pairs))),
+        source_node_ids=np.arange(len(points), dtype=np.int64))
+
+
+class MortarFillTests(unittest.TestCase):
+    """A mortar fill on the wall's steps is a body of its own, tied to the wall face it covers by springs."""
 
     def setUp(self):
-        angles = np.linspace(0.2, 1.2, 9)
-        ring = lambda radius, z: np.column_stack([10 + radius * np.cos(angles), -5 + radius * np.sin(angles),  # noqa: E731
-                                                  np.full(len(angles), z)])
-        # Upstream at 80 m. Downstream at 76 m above z = -5 and at 75 m below it, with a ledge between.
-        self.nodes = np.vstack([ring(80.0, 0.0), ring(80.0, -10.0), ring(76.0, 0.0), ring(76.0, -5.0),
-                                ring(75.0, -5.0), ring(75.0, -10.0), ring(77.0, -2.0), ring(75.5, -8.0)])
-        strip = lambda top, bottom: np.array([[top + i, top + i + 1, bottom + i] for i in range(8)]  # noqa: E731
-                                             + [[top + i + 1, bottom + i + 1, bottom + i] for i in range(8)])
-        self.arrays = {"nodes": self.nodes, "tri3_upstream": strip(0, 9),
-                       "tri3_downstream": np.vstack([strip(18, 27), strip(27, 36), strip(36, 45)])}
-        # Contact cells: one above the step (radius 77) and one below it (radius 75.5).
-        self.cells = np.array([[54, 55, 56, 54, 55, 56], [63, 64, 65, 63, 64, 65]])
-        self.at = lambda radius, z: [10 + radius * np.cos(0.7), -5 + radius * np.sin(0.7), z]
+        self.arrays = fixture.fixture_arrays(across=4, along=2, wall_layers=4, block_layers=1)
+        self.filled = with_fill(self.arrays, 2.0, 4.0)
+        self.ties = len(self.filled["seg2_wall_foundation_springs"]) - len(self.arrays["seg2_wall_foundation_springs"])
+        self.tied_triangles = len(self.filled["joint_slave_tri3"]) - len(self.arrays["joint_slave_tri3"])
 
-    def test_the_downstream_radius_follows_the_steps(self):
-        position = djb.arch_position(self.arrays, self.cells)
-        self.assertEqual(position["kind"], "radial_stepped")
-        np.testing.assert_allclose(position["centre_xy_m"], [10.0, -5.0], atol=1e-6)
+    def test_the_fixture_has_a_fill_on_part_of_the_downstream_face(self):
+        self.assertEqual((self.tied_triangles, self.ties), (8, 9))
+        self.assertEqual(len(self.filled["tetra4_mortar"]), 8)
+        self.assertFalse(np.isin(self.filled["tetra4_mortar"], self.filled["tetra4_concrete"]).any())
+
+    def test_joint_cells_stay_on_the_foundation_contact(self):
+        wall, other, on_foundation = djb.contact_sides(self.filled)
+        self.assertEqual(int(on_foundation.sum()), len(self.arrays["joint_slave_tri3"]))
+        self.assertEqual(int((~on_foundation).sum()), self.tied_triangles)
+        np.testing.assert_array_equal(djb.joint_cells(self.filled), djb.joint_cells(self.arrays))
+        joined = djb.with_joints(self.filled)
+        self.assertEqual(djb.configured_stiffness(joined), fixture.JOINT_STIFFNESS_PA_PER_M)
+        self.assertEqual(int(joined["joint_on_mortar_fill"].sum()), self.tied_triangles)
+        self.assertFalse((joined["joint_on_mortar_fill"] & joined["joint_on_foundation"]).any())
+
+    def test_a_tied_face_whose_other_side_is_no_known_body_is_refused(self):
+        unknown = {key: value for key, value in self.filled.items() if key != "tetra4_mortar"}
+        with self.assertRaisesRegex(djb.JointCaseError, "not a face of a wall tetrahedron"):
+            djb.contact_sides(unknown)
+        # Wall on one side and fill on the other must hold for the whole triangle.
+        mixed = dict(self.filled, joint_master_tri3=self.filled["joint_master_tri3"].copy())
+        mixed["joint_master_tri3"][-1, 0] = self.filled["joint_slave_tri3"][-1, 0]
+        with self.assertRaisesRegex(djb.JointCaseError, "do not coincide|not a face of a wall tetrahedron"):
+            djb.contact_sides(mixed)
+
+    def test_only_the_springs_tying_the_fill_stay_in_the_mesh(self):
+        joined = djb.with_joints(self.filled)
+        self.assertEqual(int(joined["internal_wall_joint_pairs"]), self.ties)
+        self.assertEqual(int(joined["mortar_fill_tie_pairs"]), self.ties)
+        np.testing.assert_array_equal(joined["seg2_wall_foundation_springs"],
+                                      self.filled["seg2_wall_foundation_springs"][-self.ties:])
+        self.assertEqual(set(joined["interface_names"].tolist()), {"wall_mortar/side_wall_0000"})
+        np.testing.assert_array_equal(joined["tetra4_mortar"], self.filled["tetra4_mortar"])
+        self.assertEqual(len(djb.internal_joint_spring_lines(joined)), 1)
+        self.assertIn("VALE=(312500000, 312500000, 312500000)),", djb.internal_joint_spring_lines(joined)[0])
+
+    def test_written_case_reports_the_fill_apart_from_joints_between_wall_parts(self):
+        manifest = {"bedrock_analysis_mode": "elastic_layer", "groups": {"MORTAR": {"volume_m3": 1.5}}}
+        material = {"material": {"mortar": {"density_kg_m3": 2200.0}}}
+        with tempfile.TemporaryDirectory() as directory:
+            record = djb.write_case(Path(directory), self.filled, manifest, fixture.fixture_base_comm(self.filled),
+                                    fixture.fixture_loads(), fixture.fixture_case(False, "JOINT_MECA_FROT"), material)
+            comm = (Path(directory) / djb.CASE_NAME).read_text(encoding="utf-8")
+            ReportTests.write_results(Path(directory))
+            report = djb.summarise(Path(directory))
+        self.assertNotIn("internal_wall_joints", record)
+        fill = record["mortar_fill"]
+        self.assertEqual((fill["cells"], fill["tie_triangles"], fill["tie_spring_pairs"], fill["volume_m3"]),
+                         (8, self.tied_triangles, self.ties, 1.5))
+        self.assertEqual(fill["material"], {"density_kg_m3": 2200.0})
+        self.assertIn("excluded from wall stress", fill["treatment"])
+        self.assertEqual(report["mortar_fill"], fill)
+        self.assertEqual(comm.count("CARA='K_T_D_L'"), 1)
+        self.assertEqual(record["joint_cell_count"], len(self.arrays["joint_slave_tri3"]))
+        # A stepped wall in parts and a fill: each is reported with its own count.
+        both = with_fill(split_wall(self.arrays, 2.0), 2.0, 4.0)
+        with tempfile.TemporaryDirectory() as directory:
+            record = djb.write_case(Path(directory), both, manifest, fixture.fixture_base_comm(both),
+                                    fixture.fixture_loads(), fixture.fixture_case(False, "JOINT_MECA_FROT"), material)
+        self.assertEqual(record["internal_wall_joints"]["spring_pairs"], 15)
+        self.assertEqual(record["internal_wall_joints"]["contact_triangles"], 16)
+        self.assertEqual(record["mortar_fill"]["tie_triangles"], 8)
+        self.assertEqual(record["mortar_fill"]["tie_spring_pairs"], 9)
+        # A wall without a fill reports none.
+        with tempfile.TemporaryDirectory() as directory:
+            record = djb.write_case(Path(directory), self.arrays, {}, fixture.fixture_base_comm(self.arrays),
+                                    fixture.fixture_loads(), fixture.fixture_case(False, "JOINT_MECA_FROT"))
+        self.assertNotIn("mortar_fill", record)
+
+    def test_wall_results_leave_the_fill_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            djb.write_case(Path(directory), self.filled, {}, fixture.fixture_base_comm(self.filled),
+                           fixture.fixture_loads(), fixture.fixture_case(False, "JOINT_MECA_FROT"))
+            ReportTests.write_results(Path(directory))
+            with np.load(Path(directory) / djb.STEPS_NAME) as stored:
+                data = {key: stored[key] for key in stored.files}
+            plain = djb.summarise(Path(directory))
+            # A large movement and stress on fill nodes only must not reach any wall result.
+            fill_nodes = np.unique(self.filled["tetra4_mortar"])
+            data["displacement_m"][:, fill_nodes] = 5.0
+            if "stress_pa" in data:
+                data["stress_pa"][fill_nodes] = 9.0e9
+            np.savez(Path(directory) / djb.STEPS_NAME, **data)
+            moved = djb.summarise(Path(directory))
+        for before, after in zip(plain["levels"], moved["levels"]):
+            self.assertEqual(before["maximum_wall_displacement_m"], after["maximum_wall_displacement_m"])
+            self.assertEqual(before["largest_opening_m"], after["largest_opening_m"])
+        self.assertEqual(plain.get("final_wall_stress"), moved.get("final_wall_stress"))
+
+
+class SteppedJointWaterTests(unittest.TestCase):
+    """Water in the joint under a wall of varying thickness: the contact's own downstream edge is used."""
+
+    CENTRE = np.array([10.0, -5.0])
+    LINES = np.linspace(0.2, 1.2, 9)  # radial lines of the contact mesh; eight strips between them
+    # Downstream radius of each strip: the wall is 5 m thick in the valley and 4 m on the abutments.
+    INNER = (76.0, 76.0, 76.0, 75.0, 75.0, 75.0, 76.0, 76.0)
+
+    def at(self, angle: float, radius: float, z: float) -> list[float]:
+        return [self.CENTRE[0] + radius * np.cos(angle), self.CENTRE[1] + radius * np.sin(angle), z]
+
+    def mesh(self, inner=INNER):
+        nodes, index = [], {}
+
+        def node(angle: float, radius: float, z: float) -> int:
+            key = (round(angle, 9), round(radius, 9), round(z, 9))
+            if key not in index:
+                index[key] = len(nodes)
+                nodes.append(self.at(angle, radius, z))
+            return index[key]
+
+        def quads(grid: list[list[int]]) -> list[list[int]]:
+            return [triangle for a, b in zip(grid, grid[1:]) for i in range(len(a) - 1)
+                    for triangle in ([a[i], a[i + 1], b[i]], [a[i + 1], b[i + 1], b[i]])]
+
+        contact, upstream, downstream = [], [], []
+        for strip, radius in enumerate(inner):
+            z = -8.0 if radius < 75.5 else -2.0
+            left, right = self.LINES[strip], self.LINES[strip + 1]
+            radii = np.linspace(radius, 80.0, 5)
+            contact += quads([[node(left, r, z) for r in radii], [node(right, r, z) for r in radii]])
+            upstream += quads([[node(left, 80.0, z), node(left, 80.0, 0.0)], [node(right, 80.0, z), node(right, 80.0, 0.0)]])
+            downstream += quads([[node(left, radius, z), node(left, radius, 0.0)], [node(right, radius, z), node(right, radius, 0.0)]])
+        cells = np.array(contact)
+        arrays = {"nodes": np.array(nodes), "tri3_upstream": np.array(upstream), "tri3_downstream": np.array(downstream)}
+        return arrays, np.hstack([cells, cells])
+
+    def test_each_strip_ends_at_its_own_downstream_edge(self):
+        arrays, cells = self.mesh()
+        position = djb.arch_position(arrays, cells)
+        self.assertEqual(position["kind"], "radial_strips")
+        np.testing.assert_allclose(position["centre_xy_m"], self.CENTRE, atol=1e-6)
         self.assertAlmostEqual(position["upstream_radius_m"], 80.0, places=6)
-        self.assertEqual([band["above_z_m"] for band in position["bands"]], [-5.0, None])
-        np.testing.assert_allclose([band["downstream_radius_m"] for band in position["bands"]], [76.0, 75.0], atol=1e-6)
-        points = np.array([self.at(80.0, -2.0), self.at(78.0, -2.0), self.at(76.0, -2.0),      # above the step: 4 m thick
-                           self.at(80.0, -8.0), self.at(77.5, -8.0), self.at(75.0, -8.0),      # below it: 5 m thick
-                           self.at(76.0, -5.0), self.at(76.0, -5.0 - 1e-3)])                   # at the step, and just under
+        self.assertAlmostEqual(position["downstream_radius_m"], 76.0, places=6)
+        self.assertEqual(len(position["changes"]), 2)
+        np.testing.assert_allclose([change["downstream_radius_m"] for change in position["changes"]], [75.0, 76.0], atol=1e-6)
+        # The changes are at the radial lines between strips 2/3 and 5/6.
+        reference = np.arctan2(position["reference_direction"][1], position["reference_direction"][0])
+        np.testing.assert_allclose([reference + change["angle_rad"] for change in position["changes"]],
+                                   [self.LINES[3], self.LINES[6]], atol=1e-6)
+        middle = lambda strip: (self.LINES[strip] + self.LINES[strip + 1]) / 2  # noqa: E731
+        points = np.array([
+            self.at(middle(0), 80.0, -2.0), self.at(middle(0), 78.0, -2.0), self.at(middle(0), 76.0, -2.0),  # 4 m thick
+            self.at(middle(4), 80.0, -8.0), self.at(middle(4), 77.5, -8.0), self.at(middle(4), 75.0, -8.0),  # 5 m thick
+            self.at(middle(7), 78.0, -2.0),                                                                  # 4 m again
+            self.at(self.LINES[3] - 0.01, 78.0, -2.0), self.at(self.LINES[3] + 0.01, 77.5, -8.0)])           # beside a change
         # Reservoir at 0 m, tailwater at -6 m.
         pressure = djb.joint_pressure(position, 9810.0, 0.0, -6.0, points)
         np.testing.assert_allclose(pressure, [
             19620.0, 9810.0, 0.0,
             78480.0, (78480.0 + 19620.0) / 2, 19620.0,
-            0.0, 0.2 * 9810.0 * 5.001], rtol=1e-6, atol=1e-3)  # the tailwater is below both of the last two
+            9810.0,
+            9810.0, (78480.0 + 19620.0) / 2], rtol=1e-6, atol=1e-3)
 
     def test_the_formula_is_arithmetic_code_aster_can_evaluate_point_by_point(self):
-        position = djb.arch_position(self.arrays, self.cells)
-        expression = djb.position_expression(position)
-        self.assertIn("* (Z > -5.000001)", expression)
+        arrays, cells = self.mesh()
+        expression = djb.position_expression(djb.arch_position(arrays, cells))
+        self.assertEqual(expression.count("atan2("), 2)
         self.assertNotIn(" if ", expression)
         import math
-        scalar = lambda point: eval(expression, {"sqrt": math.sqrt, "min": min, "max": max,  # noqa: E731
+        scalar = lambda point: eval(expression, {"sqrt": math.sqrt, "atan2": math.atan2, "min": min, "max": max,  # noqa: E731
                                                  "X": point[0], "Y": point[1], "Z": point[2]})
-        self.assertAlmostEqual(scalar(self.at(78.0, -2.0)), 0.5, places=6)
-        self.assertAlmostEqual(scalar(self.at(77.5, -8.0)), 0.5, places=6)
-        self.assertAlmostEqual(scalar(self.at(74.0, -8.0)), 1.0, places=6)
+        self.assertAlmostEqual(scalar(self.at(0.25, 78.0, -2.0)), 0.5, places=6)
+        self.assertAlmostEqual(scalar(self.at(0.7, 77.5, -8.0)), 0.5, places=6)
+        self.assertAlmostEqual(scalar(self.at(0.7, 74.0, -8.0)), 1.0, places=6)
+        self.assertAlmostEqual(scalar(self.at(1.15, 81.0, -2.0)), 0.0, places=6)
 
-    def test_three_parts_and_shapes_that_are_not_steps(self):
-        three = djb._downstream_radius({"bands": [{"above_z_m": -20.0, "downstream_radius_m": 76.0},
-                                                  {"above_z_m": -25.0, "downstream_radius_m": 75.5},
-                                                  {"above_z_m": None, "downstream_radius_m": 75.0}]},
-                                       np.array([0.0, -20.0, -20.1, -25.0, -25.1, -29.0]))
-        np.testing.assert_allclose(three, [76.0, 76.0, 75.5, 75.5, 75.0, 75.0])
-        # A contact that reaches further downstream than the wall above it does not fit the steps.
-        outside = np.array([[63, 64, 65, 63, 64, 65]])  # at radius 75.5, moved up beside the 4 m part
-        moved = dict(self.arrays, nodes=self.nodes.copy())
-        moved["nodes"][63:66, 2] = -2.0
-        with self.assertRaisesRegex(djb.JointCaseError, "uniform thickness or with thickness steps"):
-            djb.arch_position(moved, outside)
-        # A downstream face that leans is not a step.
-        leaning = dict(self.arrays, nodes=self.nodes.copy())
-        leaning["nodes"][36:45, 2] = -6.0
+    def test_a_step_whose_end_is_set_back_moves_the_change_with_it(self):
+        # As with a tapered step end: the thick part stops one strip earlier on one side.
+        arrays, cells = self.mesh(inner=(76.0, 76.0, 76.0, 76.0, 75.0, 75.0, 76.0, 76.0))
+        position = djb.arch_position(arrays, cells)
+        reference = np.arctan2(position["reference_direction"][1], position["reference_direction"][0])
+        np.testing.assert_allclose([reference + change["angle_rad"] for change in position["changes"]],
+                                   [self.LINES[4], self.LINES[6]], atol=1e-6)
+
+    def test_a_contact_that_is_not_in_radial_strips_is_refused(self):
+        # A contact that stops short of the downstream face.
+        arrays, cells = self.mesh()
+        short = arrays["nodes"][cells[:, :3]]
+        keep = (np.linalg.norm(short[..., :2] - self.CENTRE, axis=2) > 76.5).all(axis=1)
+        with self.assertRaisesRegex(djb.JointCaseError, "uniform thickness or with a contact meshed in radial strips"):
+            djb.arch_position(arrays, cells[keep])
+        # A strip with no contact cells.
+        angle = np.arctan2(*(short.mean(axis=1)[:, 1::-1] - self.CENTRE[::-1]).T)
         with self.assertRaisesRegex(djb.JointCaseError, "does not fit"):
-            djb.arch_position(leaning, self.cells)
+            djb.arch_position(arrays, cells[(angle < self.LINES[2]) | (angle > self.LINES[3])])
+        # A cell that crosses a radial line.
+        crossing = cells.copy()
+        crossing[0, [0, 3]] = cells[-1, 0]
+        with self.assertRaisesRegex(djb.JointCaseError, "does not fit"):
+            djb.arch_position(arrays, crossing)
 
 
 class BundledTestLogTests(unittest.TestCase):

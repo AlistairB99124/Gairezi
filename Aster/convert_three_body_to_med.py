@@ -114,6 +114,10 @@ def convert(npz_path: Path, med_path: Path) -> None:
         (mc.NORM_TETRA4, data["tetra4_concrete"], "CONCRETE"),
         (mc.NORM_TETRA4, data["tetra4_bedrock"], "BEDROCK"),
     ]
+    # Optional mortar fill: its own group after concrete and bedrock, so their cell indices stay.
+    mortar_count = len(data["tetra4_mortar"]) if "tetra4_mortar" in data else 0
+    if mortar_count:
+        volume_blocks.append((mc.NORM_TETRA4, data["tetra4_mortar"], "MORTAR"))
     # Both native joint types sort after TETRA4 in MED order, preserving body indices.
     if "hexa8_joints" in data and len(data["hexa8_joints"]):
         volume_blocks.append((mc.NORM_HEXA8, data["hexa8_joints"], "JOINTS"))
@@ -154,7 +158,7 @@ def convert(npz_path: Path, med_path: Path) -> None:
                    (~lift & ~damaged & ~vertical, "INTACT_JOINTS"))
         for selected, name in classes:
             mask = selected[data["joint_parent_faces"]]
-            ids = np.flatnonzero(mask) + len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"])
+            ids = np.flatnonzero(mask) + len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"]) + mortar_count
             if len(ids):
                 group = mc.DataArrayInt.New(ids.tolist())
                 group.setName(name)

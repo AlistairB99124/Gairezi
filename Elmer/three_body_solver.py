@@ -147,6 +147,8 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
     if wall_only:
         report["bedrock_analysis"] = diagnostic["elastic_layer_support"]
         report["engineering_validated"] = False
+    if "mortar_fill" in diagnostic:
+        report["mortar_fill"] = diagnostic["mortar_fill"]
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Reporting result: {reporting_result}", flush=True)
     return report

@@ -1522,13 +1522,16 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
     for name in (STEPS_NAME, STATUS_NAME, STEPS_NAME.replace(".npz", "_displacement.npz"),
                  STEPS_NAME.replace(".npz", "_hydraulic.npz")):
         (run_dir / name).unlink(missing_ok=True)
+
     export_path = run_dir / "aster_cohesive.export"
+    cpu_time_limit_s = max(int(time_limit_s) * max(1, int(SOLVER_THREADS)), 3600) if time_limit_s is not None else 7200
     export_path.write_text("\n".join([
-        *([f"P time_limit {int(time_limit_s)}"] if time_limit_s is not None else []),
+        f"P time_limit {int(cpu_time_limit_s)}",
         f"P memory_limit {int(memory_limit_mb)}",
         "P mpi_nbcpu 1",
         # run_aster overrides OMP_NUM_THREADS with the export's ncpus (default 1);
         # without this line the whole nonlinear solve factorizes single-threaded.
+        
         f"P ncpus {SOLVER_THREADS}",
         f"F comm {case_path} D 1",
         f"F libr {mesh_path} D {MESH_UNIT}",

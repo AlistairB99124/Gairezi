@@ -15,10 +15,12 @@ import numpy as np
 
 from .bedrock_preview import configured_rock_mesh, survey_coordinates
 from .model_config import (
-    bedrock_analysis_mode, foundation_support, load_config, rock_outer_support, validate_config,
+    bedrock_analysis_mode, foundation_support, load_config, mortar_fill, rock_outer_support, validate_config,
     wall_joint_support,
 )
-from .regions.model_groups import joint_boundary_ids
+from .regions.model_groups import (
+    FACE_GROUP_IDS, MORTAR_FILL_REGION_ID, WALL_MORTAR_BOUNDARY_IDS, joint_boundary_ids,
+)
 from .regions.combined_structure import build_combined_structure, write_combined_gmsh
 from .mesh_sizing import config_for_wall_element_size
 from .regions.tetrahedral import _CELL_FACES, tetrahedralize_structure
@@ -324,11 +326,38 @@ def prepare(
             [tuple(seat_index[n] for n in face) for tag, face in concrete.boundaries if tag == 1],
             stream_margin_m, bank_margin_m, bottom_z_m,
         )
+    fill = None
+    fill_definition = mortar_fill(config)
+    if fill_definition is not None:
+        # validate_config limits the fill to a bonded wall on a foundation with the elastic-layer support.
+        from .regions.mortar_fill import build_mortar_fill
+        fill = build_mortar_fill(fill_definition, concrete.nodes, concrete.boundaries)
+    if fill is not None:
+        offset = len(concrete.nodes)
+        convert = lambda face: tuple(offset + int(n) for n in face)
+        covered = set(fill.wall_faces)
+        wall_side, fill_side = WALL_MORTAR_BOUNDARY_IDS
+        concrete = replace(
+            concrete, nodes=concrete.nodes + [tuple(float(v) for v in p) for p in fill.points],
+            cells=concrete.cells + [(4, convert(cell)) for cell in fill.tetrahedra],
+            region_ids=concrete.region_ids + [MORTAR_FILL_REGION_ID] * len(fill.tetrahedra),
+            boundaries=[(wall_side if row in covered else tag, face)
+                        for row, (tag, face) in enumerate(concrete.boundaries)]
+            + [(fill_side, convert(face)) for face in fill.tie_faces]
+            # The sloped face replaces the wall faces it covers as the surface the tailwater acts on.
+            + [(FACE_GROUP_IDS["DOWNSTREAM"], convert(face)) for face in fill.slope_faces]
+            + [(FACE_GROUP_IDS["OTHER_EXTERIOR"], convert(face)) for face in fill.end_faces],
+        )
+        pairs = {**pairs, "wall_mortar": WALL_MORTAR_BOUNDARY_IDS}
+        stiffness = {**stiffness, "wall_mortar": dict(fill_definition["bond_spring_n_per_m3"])}
     if bedrock_analysis_mode(config) == "elastic_layer":
         return _prepare_elastic_layer(
             output, config, concrete, solver_concrete, foundation, bonded_foundation,
             joint_list, joint_levels_text, mesh_sizing, pairs, stiffness,
+            fill=fill, fill_definition=fill_definition,
         )
+    if fill is not None:
+        raise ValueError("The mortar fill requires the elastic-layer bedrock mode")
     rock_points, rock_blocks, geometry = rock.points, rock.blocks, rock.report
     bonded_seat = joints == "spring" and bonded_bedrock
     stiffness = {name: value for name, value in stiffness.items() if name in pairs}
@@ -652,7 +681,7 @@ def elastic_layer_groups(tensors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _prepare_elastic_layer(
     output: Path, config: dict, concrete, solver_concrete, foundation, bonded_foundation: bool,
     joint_list: list[dict], joint_levels_text: str, mesh_sizing: dict, pairs: dict,
-    stiffness: dict,
+    stiffness: dict, *, fill=None, fill_definition: dict | None = None,
 ) -> dict:
     """Write a concrete-only Elmer source with face-wise elastic-layer springs.
 
@@ -706,6 +735,19 @@ def _prepare_elastic_layer(
         '\nBody 2\n    Target Bodies(1) = 2\n    Name = "FoundationBody"\n    Equation = 1\n'
         '    Material = 1\n    Body Force = 1\nEnd\n'
     )
+    if fill is not None:
+        # ElmerGrid numbers the saved bodies 1 (wall), 3 (foundation), 4 (fill) as 1, 2, 3.
+        text += (
+            '\nBody 3\n    Target Bodies(1) = 3\n    Name = "MortarFillBody"\n    Equation = 1\n'
+            '    Material = 2\n    Body Force = 2\nEnd\n'
+            '\nMaterial 2\n    Name = "MortarFill"\n'
+            f'    Youngs Modulus = Real {fill_definition["youngs_modulus"]:.12g}\n'
+            f'    Poisson Ratio = Real {fill_definition["poisson_ratio"]:.12g}\n'
+            f'    Density = Real {fill_definition["density"]:.12g}\nEnd\n'
+            '\nBody Force 2\n'
+            f'    Stress Bodyforce 3 = Real {fill_definition["density"] * config["loads"]["gravity"] + 0.:.12g}\n'
+            'End\n'
+        )
     if solver_stiffness:
         text = text.replace(
             "    Variable DOFs = 3\n",
@@ -786,12 +828,27 @@ def _prepare_elastic_layer(
             f"; wall blocks joined at z={joint_levels_text} m by directional springs "
             f"from {WALL_JOINT_SOURCE}"
         )
+    fill_report = {}
+    if fill is not None:
+        joint_note += "; mortar fill on the wall's steps joined to the wall by material.mortar.bond_spring_n_per_m3"
+        fill_report = {"mortar_fill": {
+            **fill.report,
+            "material": {key: fill_definition[key] for key in ("density", "youngs_modulus", "poisson_ratio")},
+            "bond_spring_n_per_m3": dict(fill_definition["bond_spring_n_per_m3"]),
+            "connection": "own nodes; linear springs to the wall faces it covers (they carry tension and shear)",
+            "reporting": "excluded from wall stress, wall displacement and concrete volume",
+            "engineering_validated": False,
+        }}
     report = {
+        **fill_report,
         "foundation": foundation_report,
         "foundation_bedrock_connection": "elastic_layer",
         "wall_foundation_connection": "bonded" if bonded_foundation else "spring",
         "assumptions": [
             wall_foundation_note,
+            *(["mortar fill on the wall's thickness steps: a separate soft body joined to the wall by linear "
+               "springs; its sloped face carries the tailwater pressure of the wall faces it covers"]
+              if fill is not None else []),
             "concrete foundation retained; no bedrock volume or rock self-weight settlement",
             *support_report["limitations"],
             "wall-only stress reporting and damage region",
@@ -806,6 +863,7 @@ def _prepare_elastic_layer(
             **({} if bonded_foundation else {
                 "wall_foundation": "geometry.foundation.support.spring_n_per_m3",
             }),
+            **({"wall_mortar": "material.mortar.bond_spring_n_per_m3"} if fill is not None else {}),
         },
         "spring_pairs": {
             name: value if isinstance(value, dict) else list(value)
@@ -816,8 +874,9 @@ def _prepare_elastic_layer(
         "nodes": len(nodes),
         "cells_by_body": dict(Counter(concrete.region_ids)),
         "mesh_sizing": mesh_sizing,
-        "solver_body_ids": {"wall": WALL_BODY, "foundation": 2},
-        "source_body_ids": {"wall": WALL_BODY, "foundation": 3},
+        "solver_body_ids": {"wall": WALL_BODY, "foundation": 2, **({"mortar_fill": 3} if fill is not None else {})},
+        "source_body_ids": {"wall": WALL_BODY, "foundation": 3,
+                            **({"mortar_fill": MORTAR_FILL_REGION_ID} if fill is not None else {})},
         "boundary_id_map": boundary_map,
         "rock_outer_support": {"model": "elastic_layer"},
         "elastic_layer_support": support_report,

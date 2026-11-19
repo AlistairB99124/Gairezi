@@ -61,7 +61,8 @@ def reporting_region(mesh, distance_m: float = 5., *, wall_only: bool = False):
     if not math.isfinite(distance_m) or distance_m <= 0:
         raise ValueError("Reporting distance must be finite and positive")
     labels = mesh.GetCellData().GetArray("GeometryIds")
-    if labels is None or not set(np.unique(vtk_to_numpy(labels))).issubset({1, 2, 3}):
+    # 4 is the optional mortar fill on the wall's steps; it is never part of the reported concrete.
+    if labels is None or not set(np.unique(vtk_to_numpy(labels))).issubset({1, 2, 3, 4}):
         raise ValueError("Expected attributed concrete cells (wall=1, foundation=3)")
     concrete = select_body(mesh, 1, 1)
     if not concrete.GetNumberOfCells():

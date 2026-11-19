@@ -727,5 +727,109 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(context.exception.issues[0].path, "")
 
 
+MORTAR = {"density": 2200.0, "youngs_modulus": 3.5e8, "poisson_ratio": 0.2,
+          "bond_spring_n_per_m3": {"x": 1.25e9, "y": 1.25e9, "z": 1.25e9}}
+STEPS = [{"top_z_m": -20.0, "radial_width_m": 4.5}, {"top_z_m": -25.0, "radial_width_m": 5.0}]
+
+
+class MortarFillConfigTests(unittest.TestCase):
+    """Optional material.mortar: a sloped fill on the wall's thickness steps."""
+
+    def setUp(self) -> None:
+        self.payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        wall = self.payload["geometry"]["wall"]
+        wall.update(radial_width_m=4.0, centerline_radius_m=78.0, downstream_radius_m=76.0,
+                    thickness_steps=copy.deepcopy(STEPS), joint_support={"model": "bonded"})
+        wall.pop("step_end_taper_ratio", None)
+        self.payload["bedrock_analysis"] = {"mode": "elastic_layer"}
+        self.payload["material"]["mortar"] = copy.deepcopy(MORTAR)
+
+    def issues(self) -> dict[str, str]:
+        with self.assertRaises(ConfigurationValidationError) as context:
+            validate_config(self.payload)
+        return {issue.path: issue.message for issue in context.exception.issues}
+
+    def test_a_stepped_bonded_wall_with_mortar_is_valid(self):
+        from Elmer.model_config import mortar_fill
+        self.assertIs(validate_config(self.payload), self.payload)
+        fill = mortar_fill(self.payload)
+        self.assertEqual({key: fill[key] for key in ("density", "youngs_modulus", "poisson_ratio")},
+                         {"density": 2200.0, "youngs_modulus": 3.5e8, "poisson_ratio": 0.2})
+        self.assertEqual(fill["slope_run_per_rise"], 0.1)  # the default: 1 in 10
+        self.assertEqual(fill["bond_spring_n_per_m3"], {"x": 1.25e9, "y": 1.25e9, "z": 1.25e9})
+        self.assertEqual(fill["steps"], [
+            {"top_z_m": -20.0, "run_m": 0.5, "rise_m": 5.0, "wall_face_radius_m": 76.0,
+             "ledge_edge_radius_m": 75.5, "limit_z_m": 0.0},
+            {"top_z_m": -25.0, "run_m": 0.5, "rise_m": 5.0, "wall_face_radius_m": 75.5,
+             "ledge_edge_radius_m": 75.0, "limit_z_m": -20.0}])
+
+    def test_without_the_block_or_without_steps_there_is_no_fill(self):
+        from Elmer.model_config import collect_warnings, mortar_fill
+        del self.payload["material"]["mortar"]
+        validate_config(self.payload)
+        self.assertIsNone(mortar_fill(self.payload))
+        # With the block but no steps the configuration stays valid, with a warning.
+        self.payload["material"]["mortar"] = copy.deepcopy(MORTAR)
+        self.payload["geometry"]["wall"]["thickness_steps"] = []
+        validate_config(self.payload)
+        self.assertIsNone(mortar_fill(self.payload))
+        self.assertIn(("material.mortar", "has no effect without geometry.wall.thickness_steps"),
+                      [(warning.path, warning.message) for warning in collect_warnings(self.payload)])
+        # A step that does not widen the wall leaves no ledge to fill.
+        self.payload["geometry"]["wall"]["thickness_steps"] = [{"top_z_m": -20.0, "radial_width_m": 4.0}]
+        validate_config(self.payload)
+        self.assertIsNone(mortar_fill(self.payload))
+
+    def test_the_slope_can_be_set(self):
+        from Elmer.model_config import mortar_fill
+        self.payload["material"]["mortar"]["slope_run_per_rise"] = 0.2
+        validate_config(self.payload)
+        self.assertEqual([step["rise_m"] for step in mortar_fill(self.payload)["steps"]], [2.5, 2.5])
+
+    def test_values_that_make_no_sense_are_refused(self):
+        mortar = self.payload["material"]["mortar"]
+        mortar.update(density=0, youngs_modulus=-1, poisson_ratio=0.5, slope_run_per_rise=0, colour="grey")
+        mortar["bond_spring_n_per_m3"]["z"] = 0
+        del mortar["bond_spring_n_per_m3"]["x"]
+        issues = self.issues()
+        for path in ("material.mortar.density", "material.mortar.youngs_modulus", "material.mortar.poisson_ratio",
+                     "material.mortar.slope_run_per_rise", "material.mortar.colour",
+                     "material.mortar.bond_spring_n_per_m3.z", "material.mortar.bond_spring_n_per_m3.x"):
+            self.assertIn(path, issues)
+        self.assertEqual(issues["material.mortar.colour"], "is not a supported field")
+        del self.payload["material"]["mortar"]["bond_spring_n_per_m3"]
+        self.assertEqual(self.issues()["material.mortar.bond_spring_n_per_m3"], "is required")
+
+    def test_a_fill_that_does_not_fit_is_refused(self):
+        # 1 in 50: the 0.5 m step at -25 m would need 25 m, but the wall face above it ends at -20 m.
+        self.payload["material"]["mortar"]["slope_run_per_rise"] = 0.02
+        message = self.issues()["material.mortar.slope_run_per_rise"]
+        self.assertIn("the fill on the step at z = -25 m would rise to z = 0 m, above the step at z = -20 m", message)
+        self.assertIn("use at least 0.1", message)
+        # The upper step would pass the crest.
+        self.payload["geometry"]["wall"]["thickness_steps"] = [STEPS[0]]
+        self.payload["material"]["mortar"]["slope_run_per_rise"] = 0.02
+        self.assertIn("would rise to z = 5 m, above the crest; use at least 0.025",
+                      self.issues()["material.mortar.slope_run_per_rise"])
+        # Exactly reaching the step above is allowed.
+        self.payload["geometry"]["wall"]["thickness_steps"] = copy.deepcopy(STEPS)
+        self.payload["material"]["mortar"]["slope_run_per_rise"] = 0.1
+        validate_config(self.payload)
+
+    def test_configurations_the_first_version_does_not_support_are_refused(self):
+        wall = self.payload["geometry"]["wall"]
+        wall["joint_support"] = {"model": "spring", "spring_n_per_m3": {"x": 1e9, "y": 1e9, "z": 1e9}}
+        self.assertIn("requires a wall cast in one piece", self.issues()["material.mortar"])
+        wall["joint_support"] = {"model": "bonded"}
+        wall["step_end_taper_ratio"] = 1.0
+        self.assertIn("not supported together with geometry.wall.step_end_taper_ratio", self.issues()["material.mortar"])
+        del wall["step_end_taper_ratio"]
+        self.payload["bedrock_analysis"] = {"mode": "full_volume"}
+        self.assertIn("requires bedrock_analysis.mode 'elastic_layer'", self.issues()["material.mortar"])
+        self.payload["bedrock_analysis"] = {"mode": "elastic_layer"}
+        del self.payload["geometry"]["foundation"]
+        self.assertIn("requires geometry.foundation", self.issues()["material.mortar"])
+
+
 if __name__ == "__main__":
     unittest.main()

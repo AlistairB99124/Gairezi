@@ -80,7 +80,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-mesh", type=Path)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--time-limit-s", type=int, default=1800)
+    parser.add_argument("--time-limit-s", type=int, default=7200)
     parser.add_argument("--runtime", choices=("native", "wsl"), default="native")
     args = parser.parse_args()
     report = run_pipeline(args.source_mesh, args.output_dir, args.time_limit_s, args.runtime)

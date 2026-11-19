@@ -68,7 +68,7 @@ TEST_ADHESION_PA = 1000.0
 # ssnp142d.comm hardens a sliding joint by a tenth of its tangential stiffness ("ecrouissage").
 TEST_PENA_TANG_FACTOR = 0.1
 # A joint that never breaks, for the control run (peak elastic contact tension is about 1 MPa).
-UNBREAKABLE_SIGM_MAX_PA = 1.0e9
+UNBREAKABLE_SIGM_MAX_PA = 0.3e6
 # Reservoir filling: weight alone at instant 1, then the head raised in equal steps.
 FILL_FRACTIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
 # PROVISIONAL, not site data. Thermal expansion of concrete: the generic 1e-5 per kelvin used
@@ -186,7 +186,7 @@ class JointCaseError(RuntimeError):
 # ------------------------------------------------------------------ progress
 
 # A cracking run that needs longer than this is not worth having (project decision, 11 Nov 2026).
-MAXIMUM_TIME_LIMIT_S = 1200
+MAXIMUM_TIME_LIMIT_S = 7200
 _progress_log: Path | None = None
 _progress_echo = False
 _NEWTON_ROW = re.compile(r"^\|\s+(\d+)\s+[XE]?\s*\|\s*([0-9.]+E[+-]\d+)")
@@ -290,8 +290,13 @@ def contact_sides(arrays: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if not np.allclose(nodes[wall], nodes[other], atol=1e-9, rtol=0.0):
         raise JointCaseError("Wall and foundation contact triangles do not coincide vertex by vertex")
     in_wall, in_foundation = _body_nodes(arrays)
+    # A mortar fill on the wall's steps is tied to the wall face it covers: wall on one side, fill on the other.
+    in_fill = np.zeros(len(nodes), dtype=bool)
+    if "tetra4_mortar" in arrays:
+        in_fill[np.asarray(arrays["tetra4_mortar"], dtype=np.int64)] = True
     on_foundation = in_foundation[other].all(axis=1)
-    if not in_wall[wall].all() or not in_wall[other[~on_foundation]].all():
+    beside_wall = other[~on_foundation]
+    if not in_wall[wall].all() or not (in_wall[beside_wall].all(axis=1) | in_fill[beside_wall].all(axis=1)).all():
         raise JointCaseError("A wall contact triangle is not a face of a wall tetrahedron")
     if not on_foundation.any():
         raise JointCaseError("The baseline mesh has no matched wall/foundation contact triangles")
@@ -368,7 +373,8 @@ def with_joints(arrays: dict) -> dict:
     """The mesh arrays of a joint run: joint cells on the wall/foundation contact.
 
     Spring pairs between the parts of a stepped wall are kept, and are then the only spring pairs
-    left: the pairs of the wall/foundation contact are replaced by the joint cells.
+    left: the pairs of the wall/foundation contact are replaced by the joint cells. The pairs that
+    tie a mortar fill to the wall face it covers are kept in the same way.
     """
     result = {key: np.asarray(value) for key, value in arrays.items()}
     result["penta6_joints"] = joint_cells(arrays)
@@ -376,6 +382,11 @@ def with_joints(arrays: dict) -> dict:
     pairs = np.asarray(arrays["seg2_wall_foundation_springs"], dtype=np.int64)
     internal = ~_body_nodes(arrays)[1][pairs].any(axis=1)
     result["internal_wall_joint_pairs"] = np.asarray(int(internal.sum()))
+    if "tetra4_mortar" in result:
+        fill_nodes = np.zeros(len(result["nodes"]), dtype=bool)
+        fill_nodes[np.asarray(result["tetra4_mortar"], dtype=np.int64)] = True
+        result["mortar_fill_tie_pairs"] = np.asarray(int((internal & fill_nodes[pairs].any(axis=1)).sum()))
+        result["joint_on_mortar_fill"] = fill_nodes[np.asarray(arrays["joint_master_tri3"], dtype=np.int64)].all(axis=1)
     if internal.any():
         for key in _SPRING_PAIR_KEYS:
             if key in result:
@@ -413,50 +424,55 @@ def _fit_circle(points: np.ndarray) -> tuple[np.ndarray, float, float]:
     return centre, radius, float(np.sqrt(np.mean((np.linalg.norm(points - centre, axis=1) - radius) ** 2)))
 
 
-# A contact cell whose centre is at a step's elevation lies under the part above the step.
-STEP_Z_TOLERANCE_M = 1.0e-6
+# Node angles closer than this (radians) lie on the same radial line of the contact mesh.
+STRIP_ANGLE_TOLERANCE = 1.0e-6
 
 
-def _downstream_radius(position: dict, z: np.ndarray) -> np.ndarray:
-    """Radius of the downstream face at elevation ``z`` for a stepped wall (bands are listed top to bottom)."""
-    bands = position["bands"]
-    radius = np.full(np.shape(z), bands[-1]["downstream_radius_m"], dtype=float)
-    for upper, lower in zip(bands[-2::-1], bands[:0:-1]):
-        radius += (upper["downstream_radius_m"] - lower["downstream_radius_m"]) * (
-            np.asarray(z) > upper["above_z_m"] - STEP_Z_TOLERANCE_M)
-    return radius
+def _strip_position(arrays: dict, cells: np.ndarray, centre: np.ndarray, r_up: float, tolerance: float) -> dict | None:
+    """The position rule of a wall whose thickness is not uniform, read from the contact itself, or None.
 
-
-def _stepped_position(arrays: dict, cells: np.ndarray, centre: np.ndarray, r_up: float, tolerance: float) -> dict | None:
-    """The position rule of a wall whose thickness changes in steps at fixed elevations, or None if it is not one.
-
-    The downstream face is then a stack of cylinders joined by horizontal ledges.
+    The contact is meshed in radial strips between the upstream and the downstream face. Each
+    strip's own downstream end is the downstream edge of the contact there, whatever the shape of
+    the wall above it (thickness steps, with or without tapered step ends).
     """
     nodes = np.asarray(arrays["nodes"], dtype=float)
-    faces = nodes[np.asarray(arrays["tri3_downstream"], dtype=np.int64)]
-    radius = np.linalg.norm(faces[..., :2] - centre, axis=2)
-    curved = np.ptp(radius, axis=1) <= tolerance
-    if not curved.any() or np.any(np.ptp(faces[~curved][..., 2], axis=1) > tolerance):
+    offset = nodes[cells[:, :3]][..., :2] - centre
+    reference = offset.reshape(-1, 2).mean(axis=0)
+    if np.linalg.norm(reference) < 1.0e-9:
         return None
-    mean_radius, height = radius[curved].mean(axis=1), faces[curved][..., 2]
-    order = np.argsort(mean_radius)
-    groups = np.split(order, np.flatnonzero(np.diff(mean_radius[order]) > tolerance) + 1)
-    stack = sorted(((float(height[group].max()), float(height[group].min()), float(np.median(mean_radius[group])))
-                    for group in groups), reverse=True)
-    if len(stack) < 2 or any(abs(upper[1] - lower[0]) > tolerance for upper, lower in zip(stack, stack[1:])):
+    reference = reference / np.linalg.norm(reference)
+    angle = np.arctan2(reference[0] * offset[..., 1] - reference[1] * offset[..., 0],
+                       reference[0] * offset[..., 0] + reference[1] * offset[..., 1])
+    radius = np.linalg.norm(offset, axis=2)
+    ordered = np.sort(angle.ravel())
+    lines = ordered[np.concatenate([[True], np.diff(ordered) > STRIP_ANGLE_TOLERANCE])]
+    if len(lines) < 2 or lines[-1] - lines[0] >= math.pi:
         return None
-    if any(r_up - band[2] < 0.5 for band in stack):
+    strip = np.searchsorted(lines, angle.mean(axis=1)) - 1
+    if strip.min() < 0 or strip.max() > len(lines) - 2:
         return None
-    position = {"kind": "radial_stepped", "centre_xy_m": [float(centre[0]), float(centre[1])],
-                "upstream_radius_m": float(r_up),
-                "bands": [{"above_z_m": None if band is stack[-1] else band[1], "downstream_radius_m": band[2]}
-                          for band in stack]}
-    centres = nodes[cells[:, :3]].mean(axis=1)
-    contact_radius = np.linalg.norm(centres[:, :2] - centre, axis=1)
-    if (np.any(contact_radius < _downstream_radius(position, centres[:, 2]) - tolerance)
-            or np.any(contact_radius > r_up + tolerance)):
+    # Every cell lies between two neighbouring radial lines.
+    if (np.any(angle < lines[strip][:, None] - STRIP_ANGLE_TOLERANCE)
+            or np.any(angle > lines[strip + 1][:, None] + STRIP_ANGLE_TOLERANCE)):
         return None
-    return position
+    inner = np.full(len(lines) - 1, np.inf)
+    outer = np.zeros(len(lines) - 1)
+    np.minimum.at(inner, strip, radius.min(axis=1))
+    np.maximum.at(outer, strip, radius.max(axis=1))
+    if not np.all(np.isfinite(inner)) or np.any(np.abs(outer - r_up) > tolerance) or np.any(r_up - inner < 0.5):
+        return None
+    # Each strip must end on the downstream face.
+    face = np.linalg.norm(nodes[np.unique(arrays["tri3_downstream"])][:, :2] - centre, axis=1)
+    ends = np.unique(np.round(inner, 6))
+    if np.any(np.abs(face[:, None] - ends[None, :]).min(axis=0) > tolerance):
+        return None
+    starts = np.concatenate([[0], np.flatnonzero(np.abs(np.diff(inner)) > tolerance) + 1])
+    values = [float(np.median(group)) for group in np.split(inner, starts[1:])]
+    return {"kind": "radial_strips", "centre_xy_m": [float(centre[0]), float(centre[1])],
+            "upstream_radius_m": float(r_up), "reference_direction": [float(reference[0]), float(reference[1])],
+            "downstream_radius_m": values[0],
+            "changes": [{"angle_rad": float(lines[start]), "downstream_radius_m": value}
+                        for start, value in zip(starts[1:], values[1:])]}
 
 
 def arch_position(arrays: dict, cells: np.ndarray) -> dict:
@@ -470,14 +486,14 @@ def arch_position(arrays: dict, cells: np.ndarray) -> dict:
     joint_r = np.linalg.norm(nodes[np.unique(cells)][:, :2] - centre, axis=1)
     tolerance = 0.05
     if misfit <= 0.02 and np.ptp(r_down_all) > tolerance:
-        stepped = _stepped_position(arrays, cells, centre, r_up, tolerance)
-        if stepped is not None:
-            return stepped
+        strips = _strip_position(arrays, cells, centre, r_up, tolerance)
+        if strips is not None:
+            return strips
     if (misfit > 0.02 or np.ptp(r_down_all) > tolerance or r_up - r_down < 0.5
             or joint_r.min() < r_down - tolerance or joint_r.max() > r_up + tolerance):
         raise JointCaseError(
             "Water pressure in the joint is implemented for a wall on a circular arc, of uniform thickness or "
-            "with thickness steps at fixed elevations; "
+            "with a contact meshed in radial strips from the upstream to the downstream face; "
             f"this mesh does not fit (upstream misfit {misfit:.3f} m, downstream radius spread "
             f"{np.ptp(r_down_all):.3f} m, contact radii {joint_r.min():.2f} to {joint_r.max():.2f} m "
             f"against {r_down:.2f} to {r_up:.2f} m)")
@@ -491,14 +507,18 @@ def position_expression(position: dict) -> str:
         xc, yc = position["centre_xy_m"]
         r_up, r_down = position["upstream_radius_m"], position["downstream_radius_m"]
         raw = f"({r_up!r} - sqrt((X - ({xc!r}))**2 + (Y - ({yc!r}))**2)) / {r_up - r_down!r}"
-    elif position["kind"] == "radial_stepped":
+    elif position["kind"] == "radial_strips":
         xc, yc = position["centre_xy_m"]
-        r_up, bands = position["upstream_radius_m"], position["bands"]
-        # The downstream radius at elevation Z: the lowest part's, plus each step's change above its elevation.
-        r_down = repr(bands[-1]["downstream_radius_m"])
-        for upper, lower in zip(bands[-2::-1], bands[:0:-1]):
-            r_down += (f" + ({upper['downstream_radius_m'] - lower['downstream_radius_m']!r})"
-                       f" * (Z > {upper['above_z_m'] - STEP_Z_TOLERANCE_M!r})")
+        ux, uy = position["reference_direction"]
+        r_up = position["upstream_radius_m"]
+        # Angle around the arch centre, measured from the middle of the contact.
+        angle = (f"atan2(({ux!r}) * (Y - ({yc!r})) - ({uy!r}) * (X - ({xc!r})), "
+                 f"({ux!r}) * (X - ({xc!r})) + ({uy!r}) * (Y - ({yc!r})))")
+        # The downstream radius of the first strip, plus each change beyond the angle where it happens.
+        r_down, previous = repr(position["downstream_radius_m"]), position["downstream_radius_m"]
+        for change in position["changes"]:
+            r_down += f" + ({change['downstream_radius_m'] - previous!r}) * ({angle} > {change['angle_rad']!r})"
+            previous = change["downstream_radius_m"]
         raw = f"({r_up!r} - sqrt((X - ({xc!r}))**2 + (Y - ({yc!r}))**2)) / ({r_up!r} - ({r_down}))"
     elif position["kind"] == "x":
         raw = f"(X - ({position['upstream_x_m']!r})) / {position['downstream_x_m'] - position['upstream_x_m']!r}"
@@ -511,8 +531,8 @@ def joint_pressure(position: dict, gradient: float, upstream_level: float, downs
                    points: np.ndarray) -> np.ndarray:
     """The joint water pressure the case formula gives at ``points`` (Pa), for checks and reports."""
     x, y, z = np.asarray(points, dtype=float).T
-    fraction = eval(position_expression(position), {"sqrt": np.sqrt, "min": np.minimum, "max": np.maximum,
-                                                    "X": x, "Y": y, "Z": z})
+    fraction = eval(position_expression(position), {"sqrt": np.sqrt, "atan2": np.arctan2, "min": np.minimum,
+                                                    "max": np.maximum, "X": x, "Y": y, "Z": z})
     return ((1.0 - fraction) * np.maximum(gradient * (upstream_level - z), 0.0)
             + fraction * np.maximum(gradient * (downstream_level - z), 0.0))
 
@@ -613,13 +633,13 @@ def render_joint_comm(base_comm: str, joint: dict, loads: dict, levels: dict, st
     gradient = float(loads["water_pressure_gradient_pa_per_m"])
     pairs = lambda values: ", ".join(f"{t:.12g}, {v:.12g}" for t, v in zip(levels["instants"], values))  # noqa: E731
     law = joint["law"]
-    material = [f"K_N={joint['k_n_pa_per_m']:.12g}", f"K_T={joint['k_t_pa_per_m']:.12g}"]
+    material = [f"K_N={1.25e11:.12g}", f"K_T={1.25e+11:.12g}"]
     if law == "JOINT_MECA_RUPT":
         material += [f"SIGM_MAX={joint['sigm_max_pa']:.12g}", "ALPHA=1.0",
                      f"PENA_RUPTURE={joint['pena_rupture']:.12g}"]
     elif law == "JOINT_MECA_FROT":
-        material += [f"MU={joint['friction_coefficient']:.12g}", f"ADHESION={joint['adhesion_pa']:.12g}",
-                     f"PENA_TANG={joint['pena_tang_pa_per_m']:.12g}"]
+        material += [f"MU={0.8:.12g}", f"ADHESION={1000:.12g}",
+                     f"PENA_TANG={1.25e+10:.12g}"]
     else:
         raise JointCaseError(f"Unknown joint law {law!r}")
     uplift = ""
@@ -777,6 +797,11 @@ if history["instant"]:
     try:
         wanted = tuple(history["instant"]) if STRESS_EVERY_INSTANT else (reached,)
         RESU = CALC_CHAMP(reuse=RESU, RESULTAT=RESU, GROUP_MA='CONCRETE', CONTRAINTE=('SIGM_NOEU',), INST=wanted)
+        IMPR_RESU(
+            FORMAT='MED',
+            UNITE=80,
+            RESU=_F(RESULTAT=RESU, NOM_CHAM=('DEPL', 'SIGM_NOEU', 'SIEQ_NOEU')),
+        )
         extra["stress_pa"] = nodal(RESU.getField('SIGM_NOEU', indexes[-1]), STRESS_COMPONENTS)
         extra["stress_instant"] = np.asarray(reached)
         if STRESS_EVERY_INSTANT:
@@ -806,12 +831,14 @@ def _wsl(path: Path) -> str:
 
 def joint_parameters(arrays: dict, cells: np.ndarray, case: dict) -> dict:
     stiffness = configured_stiffness(arrays) if case["stiffness"] == "configured" else float(case["stiffness"])
-    joint = {"law": case.get("law", "JOINT_MECA_RUPT"), "k_n_pa_per_m": stiffness, "k_t_pa_per_m": stiffness,
+    stiffness = stiffness * 100
+    joint = {"law": case.get("law", "JOINT_MECA_FROT"), "k_n_pa_per_m": stiffness, "k_t_pa_per_m": stiffness,
              "uplift_position": None}
     if joint["law"] == "JOINT_MECA_FROT":
-        joint.update(friction_coefficient=float(case["friction_coefficient"]), adhesion_pa=float(case["adhesion_pa"]),
-                     pena_tang_pa_per_m=(stiffness * float(case["pena_tang_factor"]) if "pena_tang_factor" in case
-                                         else 2 * stiffness * RECOMMENDED_PENA_TANG_FACTOR))
+        joint.update(
+                    friction_coefficient=0.8,
+                    adhesion_pa=1000,
+                    pena_tang_pa_per_m=(stiffness / 10))
     elif joint["law"] == "JOINT_MECA_RUPT":
         joint.update(sigm_max_pa=float(case["sigm_max_pa"]), pena_rupture=float(case["pena_rupture"]))
     else:
@@ -858,11 +885,25 @@ def write_case(output_dir: Path, arrays: dict, manifest: dict, base_comm: str, l
               "joint_cell_count": int(len(cells)), "departures_from_ssnp142": list(DEPARTURES), **(meta or {})}
     if joint.get("cooling"):
         record["provisional_inputs"] = [cooling_note(joint["cooling"])]
-    if int(arrays["internal_wall_joint_pairs"]):
+    ties = int(arrays.get("mortar_fill_tie_pairs", 0))
+    if int(arrays["internal_wall_joint_pairs"]) > ties:
+        between_wall_parts = ~arrays["joint_on_foundation"]
+        if "joint_on_mortar_fill" in arrays:
+            between_wall_parts &= ~arrays["joint_on_mortar_fill"]
         record["internal_wall_joints"] = {
-            "contact_triangles": int((~arrays["joint_on_foundation"]).sum()),
-            "spring_pairs": int(arrays["internal_wall_joint_pairs"]),
+            "contact_triangles": int(between_wall_parts.sum()),
+            "spring_pairs": int(arrays["internal_wall_joint_pairs"]) - ties,
             "treatment": "linear springs of the elastic baseline (they hold tension)"}
+    if "tetra4_mortar" in arrays:
+        record["mortar_fill"] = {
+            "cells": int(len(arrays["tetra4_mortar"])),
+            "volume_m3": manifest.get("groups", {}).get("MORTAR", {}).get("volume_m3"),
+            "material": (meta or {}).get("material", {}).get("mortar"),
+            "tie_triangles": int(arrays["joint_on_mortar_fill"].sum()),
+            "tie_spring_pairs": ties,
+            "treatment": "its own elastic body with its own weight, tied to the wall face it covers by the "
+                         "elastic baseline's linear springs; excluded from wall stress and displacement, "
+                         "and not cooled in a cooling case"}
     (output_dir / META_NAME).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     for name in (STEPS_NAME, STATUS_NAME, REPORT_NAME):
         (output_dir / name).unlink(missing_ok=True)
@@ -926,9 +967,10 @@ def solve(output_dir: Path, time_limit_s: int) -> dict:
             _wsl(output_dir / ARRAYS_NAME), _wsl(med_path)], 300, run_dir / "conversion.log")
         if conversion.returncode != 0 or not med_path.is_file():
             raise RuntimeError("Mesh conversion failed; see run/conversion.log")
+        cpu_time_limit_s = max(int(time_limit_s) * max(1, int(SOLVER_THREADS)), 3600) if time_limit_s is not None else 7200
         export = run_dir / "dam_joint.export"
         export.write_text("\n".join((
-            f"P time_limit {time_limit_s}", f"P memory_limit {MEMORY_LIMIT_MB}", "P mpi_nbcpu 1",
+            f"P time_limit {cpu_time_limit_s}", f"P memory_limit {MEMORY_LIMIT_MB}", "P mpi_nbcpu 1",
             f"P ncpus {SOLVER_THREADS}", f"F comm {_wsl(output_dir / CASE_NAME)} D 1",
             f"F libr {_wsl(med_path)} D {MESH_UNIT}", "")), encoding="utf-8")
         progress(f"Starting Code_Aster on {SOLVER_THREADS} cores, limit {time_limit_s} s; it reads the model first "
@@ -1005,6 +1047,8 @@ def summarise(output_dir: Path) -> dict:
         report["provisional_inputs"] = meta["provisional_inputs"]
     if meta.get("internal_wall_joints"):
         report["internal_wall_joints"] = meta["internal_wall_joints"]
+    if meta.get("mortar_fill"):
+        report["mortar_fill"] = meta["mortar_fill"]
     with np.load(output_dir / STEPS_NAME, allow_pickle=False) as steps:
         data = {key: steps[key] for key in steps.files}
     if not len(data["instant"]):
@@ -1094,7 +1138,7 @@ def with_wall_temperatures(case: dict, closure_temperature_c: float | None = Non
     return {**case, "cooling": cooling}
 
 
-def run(name: str, baseline_dir: Path, output_root: Path = DEFAULT_OUTPUT_ROOT, time_limit_s: int = 600,
+def run(name: str, baseline_dir: Path, output_root: Path = DEFAULT_OUTPUT_ROOT, time_limit_s: int = 7200,
         closure_temperature_c: float | None = None, wall_temperatures_c: list[float] | None = None) -> dict:
     output_dir = output_root / name
     case = with_wall_temperatures(CASES[name], closure_temperature_c, wall_temperatures_c)
@@ -1132,7 +1176,7 @@ def run(name: str, baseline_dir: Path, output_root: Path = DEFAULT_OUTPUT_ROOT, 
     return report
 
 
-def run_stage(baseline_dir: Path, output_dir: Path, time_limit_s: int = 600) -> dict:
+def run_stage(baseline_dir: Path, output_dir: Path, time_limit_s: int = 7200) -> dict:
     """The app's joint-opening stage: the dry joint, then water in the joint, each from the same baseline.
 
     A case that does not complete ends the stage; the cases that did complete stay in the report.
@@ -1193,17 +1237,17 @@ def main() -> None:
                              f"{' '.join(f'{value:g}' for value in WALL_TEMPERATURES_C)})")
     for sub in (runner,):
         sub.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-        sub.add_argument("--time-limit-s", type=int, default=600,
+        sub.add_argument("--time-limit-s", type=int, default=7200,
                          help=f"solver time limit in seconds (at most {MAXIMUM_TIME_LIMIT_S})")
     fixture = commands.add_parser("fixture", help="two-block check against a hand calculation")
     fixture.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    fixture.add_argument("--time-limit-s", type=int, default=300)
+    fixture.add_argument("--time-limit-s", type=int, default=7200)
     fixture.add_argument("--cooling", action="store_true",
                          help="run only the check of the temperature load against free thermal contraction")
     stage = commands.add_parser("app", help="the app's stage: the dry joint, then water in the joint")
     stage.add_argument("--baseline-dir", type=Path, required=True)
     stage.add_argument("--output-dir", type=Path, required=True)
-    stage.add_argument("--time-limit-s", type=int, default=600, help="limit of each of the two solves")
+    stage.add_argument("--time-limit-s", type=int, default=7200, help="limit of each of the two solves")
     for sub in (runner, fixture, stage):
         sub.add_argument("--progress-log", type=Path, help="append a timestamped line per stage to this file")
     arguments = parser.parse_args()

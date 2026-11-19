@@ -677,6 +677,80 @@ The new tension peak is at the valley bottom (chainage about 106, z -29).
 Foundation and bedrock peaks were unchanged. This is a single linear-elastic
 comparison, not a mesh-convergence study or design verification.
 
+### Mortar fill on the steps
+
+Optional `material.mortar` puts a sloped fill on each ledge a thickness step
+leaves on the downstream face, so a stepped wall looks smooth. It is for
+appearance; the wall and its steps are unchanged.
+
+```json
+"material": {
+  "mortar": {
+    "density": 2200.0,
+    "youngs_modulus": 3.5e8,
+    "poisson_ratio": 0.2,
+    "bond_spring_n_per_m3": { "x": 1.25e9, "y": 1.25e9, "z": 1.25e9 },
+    "slope_run_per_rise": 0.1
+  }
+}
+```
+
+These values are placeholders, not data for a mortar. `slope_run_per_rise`
+is optional (default 0.1, 1 horizontal in 10 vertical): a 0.5 m step gets a
+fill rising 5 m against the wall face above it.
+
+- **What it is in the model.** A body of its own (tag 4 in `three_body.msh`;
+  wall 1, bedrock 2, foundation 3) with its own material and weight. Its cells
+  sit on the wall's mesh courses, so the wall mesh is the same with and
+  without it. The top of the fill snaps down to a mesh course; the built slope
+  is in `diagnostic.json` (`mortar_fill.steps[].built_slope_run_per_rise`).
+- **How it is held.** It has its own nodes and is tied to the wall face and
+  ledge it covers by springs of `bond_spring_n_per_m3` (spring pair
+  `wall_mortar`, boundary tags 19 wall side and 20 fill side). It does not
+  share nodes with the wall, so wall stresses are not averaged with the
+  fill's. The springs hold tension: the fill cannot come away.
+- **Loads.** The sloped face takes over as downstream face (tailwater where
+  submerged); the faces it covers are no longer loaded.
+- **Reporting.** Wall peaks, wall displacement and the concrete volume exclude
+  the fill. Its volume is reported apart (`mortar_fill.volume_m3`).
+- **Solvers.** Elmer, the Code_Aster elastic baseline (group `MORTAR`,
+  material `MORTAR_MAT`), the Code_Aster contact-joint stage (the tie springs
+  are kept as linear springs) and FEniCSx read the same body and tie.
+- **Refused.** `material.mortar` with spring wall joints
+  (`joint_support.model: "spring"`), with `step_end_taper_ratio`, without a
+  foundation, with a bedrock mode other than `elastic_layer`, or with a slope
+  so flat that the fill would pass the step above or the crest. On a wall
+  without thickness steps it is accepted with a warning and has no effect.
+- **Not modelled.** Cracking or debonding of the fill, temperature, durability.
+
+Pictures of the downstream face and a section, without and with the fill:
+
+```powershell
+.\.venv\Scripts\python.exe -m Elmer.mortar_fill_pictures --config <config.json> --output <folder> --name option5 --label "Option 5"
+```
+
+Check on option 5 of the sweep (4 m wall, 4.5 m below z = -20, 5 m below
+z = -25) at a coarse mesh (40,000 wall elements, about 1.7 m), without and
+with the fill (172.9 m3):
+
+| Wall figure | Without | With | Change |
+| --- | --- | --- | --- |
+| Elmer peak tension (MPa) | 1.418 | 1.414 | -0.3% |
+| Elmer peak compression (MPa) | 3.185 | 3.192 | +0.2% |
+| Elmer peak displacement (mm) | 9.903 | 9.913 | +0.1% |
+| Code_Aster elastic peak tension (MPa) | 0.898 | 0.895 | -0.3% |
+| Contact joint, largest opening, dry (mm) | 0.940 | 0.927 | -1.4% |
+| Contact joint, largest opening, water in joint (mm) | 1.272 | 1.261 | -0.9% |
+
+The Code_Aster vertical support reaction rose by the fill's weight
+(3,731.9 kN) to five figures. FEniCSx reproduced Elmer's displacements to
+0.009% with the fill, as without it. This is one coarse comparison, not a
+mesh-convergence study or design verification. Not verified: the same at the
+default mesh. On this coarse mesh FEniCSx's stress-agreement gate (0.01%)
+fails with and without the fill (0.016%); default-mesh jobs without a fill
+pass it at about 0.006%. Elmer took 168 s with the fill against 50 s without
+it at this mesh, so expect a longer Elmer stage.
+
 ## Three-body bedrock geometry review (Elmer scope)
 
 **The legacy combined solver result contains only the wall.** Its

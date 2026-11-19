@@ -97,7 +97,11 @@ def diagnostics(mesh_dir: Path, full_displacement: np.ndarray) -> dict:
         config = json.loads(Path(manifest["source_config"]).read_text())
         force, moment = np.zeros(3), np.zeros(3)
         energy = 0.
-        for key, material in (("tetra4_concrete", "concrete"), ("tetra4_bedrock", "bedrock")):
+        has_mortar = "tetra4_mortar" in data.files and len(data["tetra4_mortar"])
+        solids = (data["tetra4_concrete"] if not has_mortar
+                  else np.vstack((data["tetra4_concrete"], data["tetra4_mortar"])))
+        for key, material in (("tetra4_concrete", "concrete"), ("tetra4_bedrock", "bedrock"),
+                              *((("tetra4_mortar", "mortar"),) if has_mortar else ())):
             values = config["material"][material]
             cells = data[key]
             part, volume = volume_energy(points, cells, full_displacement,
@@ -111,7 +115,8 @@ def diagnostics(mesh_dir: Path, full_displacement: np.ndarray) -> dict:
         for key, name in (("tri3_upstream", "UpstreamHydrostaticPressure"),
                           ("tri3_downstream", "DownstreamTailwater"), ("tri3_crest", None)):
             values = manifest["source_pressures"][name] if name else {}
-            faces = outward_faces(points, data[key], data["tetra4_concrete"])
+            # With a mortar fill the downstream face is partly the fill's sloped face.
+            faces = outward_faces(points, data[key], solids)
             f, m = pressure_resultant(points, faces, values.get("surface_z_m", 0.),
                                       values.get("gradient_pa_per_m", 0.),
                                       None if name else manifest["source_crest_pressure_pa"])

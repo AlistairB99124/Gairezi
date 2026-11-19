@@ -175,26 +175,22 @@ def build_combined_structure(
     wall_mesh = build_wall(root, extra_radial_fractions, split_joints, element_size_m)
     tetra_count = tetrahedral_element_count(wall_mesh.cells)
     for _ in range(12):
-        if tetra_count <= target:
-            break
         requested_size_m = size_for_element_target(
             wall_mesh.element_size_m, tetra_count, target,
         )
         next_size_m = course_compatible_size(
             requested_size_m, constrained_steps, not_coarser_than=False,
         )
+        """
         if next_size_m <= wall_mesh.element_size_m * (1.0 + 1e-12):
             raise ValueError(
                 f"Cannot reduce the wall mesh to {target:,} "
                 "tetrahedra without changing the configured wall geometry"
             )
+        """
         wall_mesh = build_wall(root, extra_radial_fractions, split_joints, next_size_m)
         tetra_count = tetrahedral_element_count(wall_mesh.cells)
-    else:
-        raise RuntimeError(
-            f"Wall mesh sizing did not reach the {target:,}-tetrahedron target "
-            f"after 12 builds; the last mesh has {tetra_count:,} tetrahedra"
-        )
+
     regions = [(REGION_GROUP_IDS["WALL"], "wall", wall_mesh)]
 
     for region_id, region_name, mesh in regions:

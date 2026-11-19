@@ -52,6 +52,10 @@ def find_latest_source_mesh() -> Path | None:
 WALL_VOLUME_TAG = 1
 BEDROCK_VOLUME_TAG = 2
 FOUNDATION_VOLUME_TAG = 3
+# Optional mortar fill on the wall's thickness steps (Elmer/regions/mortar_fill.py). It is
+# exported as its own block ("tetra4_mortar", MED group MORTAR) and never as concrete, so
+# concrete volume, material and stress reporting stay wall + foundation only.
+MORTAR_FILL_VOLUME_TAG = 4
 
 UPSTREAM_FACE_TAG = 1  # area ~3053 m^2, z in [-29, 0]; matches legacy UPSTREAM (~3132 m^2)
 DOWNSTREAM_FACE_TAG = 2  # area ~2986 m^2, z in [-29, 0]; matches legacy DOWNSTREAM (~3063 m^2)
@@ -329,7 +333,8 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
     is_wall = tet_tags == WALL_VOLUME_TAG
     is_foundation = tet_tags == FOUNDATION_VOLUME_TAG
     is_bedrock = tet_tags == BEDROCK_VOLUME_TAG
-    unknown_tet = ~(is_wall | is_foundation | is_bedrock)
+    is_mortar = tet_tags == MORTAR_FILL_VOLUME_TAG
+    unknown_tet = ~(is_wall | is_foundation | is_bedrock | is_mortar)
     if unknown_tet.any():
         raise MeshExportError(f"Unexpected tetra tags: {sorted(set(tet_tags[unknown_tet].tolist()))}")
 
@@ -344,6 +349,10 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
 
     concrete_cells = tet_nodes_dense[is_wall | is_foundation]
     bedrock_cells = tet_nodes_dense[is_bedrock]
+    mortar_cells = tet_nodes_dense[is_mortar]
+    if len(mortar_cells) and (contract["bedrock_analysis_mode"] != "elastic_layer"
+                              or np.isin(mortar_cells, concrete_cells).any()):
+        raise MeshExportError("A mortar fill needs the elastic-layer bedrock and its own nodes")
     n_slivers_dropped = 0
 
     def face_group(tag: int) -> np.ndarray:
@@ -408,6 +417,10 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
         source_node_ids=kept_ids,
         compact_spring_groups=np.array(True),
     )
+    if len(mortar_cells):
+        # Cell order everywhere downstream: concrete, bedrock, then the fill.
+        arrays["tetra4_mortar"] = mortar_cells
+        arrays["source_cell_rows"] = np.concatenate((arrays["source_cell_rows"], np.flatnonzero(is_mortar)))
     if contract["bedrock_analysis_mode"] == "elastic_layer":
         from Aster.support_trace import add_consistent_support
         add_consistent_support(arrays, dense_of[contract["support_faces"]],
@@ -460,6 +473,14 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
         "coordinate_bounds": bounds(np.arange(dense_coords.shape[0])),
     }
     groups = manifest["groups"]
+    if len(mortar_cells):
+        xyz = dense_coords[mortar_cells]
+        manifest["mortar_cells"] = int(mortar_cells.shape[0])
+        groups["MORTAR"] = {
+            "cells": int(mortar_cells.shape[0]),
+            "volume_m3": float((np.abs(np.linalg.det(xyz[:, 1:] - xyz[:, :1])) / 6.).sum()),
+            **bounds(np.unique(mortar_cells.ravel())),
+        }
     if len(bedrock_cells):
         groups["BEDROCK"] = {
             "cells": int(bedrock_cells.shape[0]), **bounds(np.unique(bedrock_cells.ravel())),

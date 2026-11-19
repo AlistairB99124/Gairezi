@@ -66,7 +66,8 @@ def verify(output_dir: Path) -> dict:
                 np.einsum("ni,nij->nj", arrays["support_interpolation_weights"],
                           arrays["nodes"][arrays["support_interpolation_parents"]]), rtol=0., atol=1e-9):
             raise ValueError("Support quadrature coordinates differ from their P1 traces")
-        for key, tags in (("tetra4_concrete", (1, 3)), ("tetra4_bedrock", (2,))):
+        for key, tags in (("tetra4_concrete", (1, 3)), ("tetra4_bedrock", (2,)),
+                          *((("tetra4_mortar", (4,)),) if "tetra4_mortar" in arrays.files else ())):
             if not np.array_equal(arrays["source_node_ids"][arrays[key]], source_cells[np.isin(source_tags, tags)]):
                 raise ValueError("Exported volume topology differs from source")
         points, displacement, _, cells = parse_vtu(source.parent / "results" / "three_body_results_t0001.pvtu")
@@ -109,7 +110,8 @@ def verify(output_dir: Path) -> dict:
     comparison_path = output_dir / "comparison_report.json"
     comparison = json.loads(comparison_path.read_text())
     checks = {
-        "source_volume_cell_count": len(source_cells) == manifest["concrete_cells"] + manifest["bedrock_cells"],
+        "source_volume_cell_count": len(source_cells) == (
+            manifest["concrete_cells"] + manifest["bedrock_cells"] + manifest.get("mortar_cells", 0)),
         "force_balance": aster_diagnostics["relative_force_balance_error"] <= .02,
         "moment_balance": aster_diagnostics["relative_moment_balance_error"] <= .02,
         "energy_comparison": energy_difference <= .02,

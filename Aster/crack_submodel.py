@@ -327,6 +327,7 @@ def run(dam_config: Path, prepared_seed: Path, baseline_fields: Path, output_roo
         "converter_sha256": file_hash(CONVERTER),
     }
     _write(directory / "manifest.json", manifest)
+    _write(directory / "material.json", material_contract(config))
     started = time.monotonic()
     try:
         prepared = json.loads(prepared_seed.read_text(encoding="utf-8"))

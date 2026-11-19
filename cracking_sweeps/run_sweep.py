@@ -1,243 +1,250 @@
-"""Isolated, sequential selected-material sweep targeting 2 mm normal opening."""
+"""Wall-geometry sweep: the baselines and the contact-joint cracking stage for every scenario.
+
+Each entry of ``scenarios.json`` is an overwrite of ``config.json`` (both beside this file).
+For every scenario, in order and one at a time, the sweep runs what the app runs for a job:
+
+1. the Elmer baseline,
+2. the Code_Aster elastic baseline,
+3. the Code_Aster contact joint at the wall/foundation contact: dry, then with water in the joint.
+
+When the scenarios are done it writes one row per scenario into ``FEA_Matrix.xlsx``.
+Nothing here is an engineering assessment; see ``../aster_dam_baseline.md``.
+"""
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
+from copy import copy, deepcopy
 import csv
 from datetime import datetime, timezone
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import re
 import shutil
 import signal
 import subprocess
 import sys
-import traceback
+import time
 import uuid
 
-ROOT = Path(__file__).resolve().parents[1]
-# Legacy degraded-element sweeps vary the selected material; lift-joint sweeps vary the
-# weak construction-joint law. alpha (JOINT_MECA_RUPT, in [0, 2]) and friction_coefficient
-# (JOINT_MECA_FROT, in [0.001, 10]) are absolute values, not factors.
-VARIABLES = {"youngs_modulus", "tensile_strength_pa", "cohesive_fracture_energy_j_m2"}
-LIFT_JOINT_VARIABLES = {"tensile_strength_pa", "cohesive_fracture_energy_j_m2"}
-LIFT_JOINT_ABSOLUTE = {"alpha": (0.0, 2.0), "friction_coefficient": (1e-3, 10.0)}
-NATIVE_TIME_LIMIT_S = 30 * 24 * 3600
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+# Code_Aster's export needs a finite limit; the app gives its elastic baseline the same one.
+ASTER_BASELINE_TIME_LIMIT_S = 30 * 24 * 3600
+# Limit of each of the two contact-joint solves, as in the app.
+JOINT_SOLVE_LIMIT_S = 7200
+JOINT_CASES = (("dry", "dry"), ("water", "water_in_joint"))
+FIGURES = ("tension_mpa", "compression_mpa", "displacement_mm")
+
+# ---- layout of the "Sweep" sheet of FEA_Matrix.xlsx
+SHEET_NAME = "Sweep"
+FIRST_ROW = 3
+LAST_COLUMN = 29  # AC
+SHEET_STEPS = 2  # the sheet has columns for two thickness steps
+EXPECTED_HEADERS = {"A2": "#", "B2": "Width", "E2": "Width", "F2": "Height", "I2": "Upstream", "J2": "Elmer",
+                    "K2": "Aster", "L2": "Ave", "S2": "Volume (m^3)", "U1": "Cracking Opening (mm)", "U2": "Dry",
+                    "AB2": "Water"}
+GEOMETRY_COLUMNS = {"width_m": "B", "foundation_depth_m": "C", "foundation_side_margin_m": "D",
+                    "upstream_radius_m": "I"}
+STEP_COLUMNS = (("E", "F"), ("G", "H"))
+# Result figure -> (Elmer column, Aster column, column of their average)
+BASELINE_COLUMNS = {"tension_mpa": ("J", "K", "L"), "compression_mpa": ("M", "N", "O"),
+                    "displacement_mm": ("P", "Q", "R")}
+VOLUME_COLUMN, VOLUME_DIFFERENCE_COLUMN = "S", "T"
+# Cracking figure -> (dry column, water column)
+CRACKING_COLUMNS = {"opening_mm": ("U", "V"), "tension_mpa": ("W", "X"), "compression_mpa": ("Y", "Z"),
+                    "displacement_mm": ("AA", "AB")}
+NOTE_COLUMN = "U"
+# Volume of the mortar fill on the wall's steps (material.mortar); "-" for a wall without one. The
+# column is added to a workbook that does not have it yet.
+MORTAR_VOLUME_COLUMN = "AC"
+MORTAR_HEADERS = {"AC1": "Mortar fill", "AC2": "Volume (m^3)"}
 
 
-def read_json(path: Path) -> dict:
+class SweepError(ValueError):
+    """The sweep cannot be defined or its workbook cannot be written as asked."""
+
+
+def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def write_json(path: Path, value: dict) -> None:
+def write_json(path: Path, value) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
-def file_hash(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+def finite(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def positive(value: object) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and value > 0)
+# ------------------------------------------------------------------ scenarios
+
+def merge(base, overwrite):
+    """``base`` with ``overwrite`` applied: objects are merged key by key, anything else is replaced."""
+    if isinstance(base, dict) and isinstance(overwrite, dict):
+        merged = dict(base)
+        for key, value in overwrite.items():
+            merged[key] = merge(base[key], value) if key in base else deepcopy(value)
+        return merged
+    return deepcopy(overwrite)
 
 
-def _valid_friction(friction) -> bool:
-    if friction is None:
-        return True
-    return (isinstance(friction, dict)
-            and isinstance(friction.get("friction_coefficient"), (int, float))
-            and not isinstance(friction.get("friction_coefficient"), bool)
-            and friction.get("friction_coefficient") > 0
-            and isinstance(friction.get("adhesion_pa", 0.), (int, float))
-            and friction.get("adhesion_pa", 0.) >= 0)
+def sheet_geometry(config: dict) -> dict:
+    """What the sheet records of a scenario's geometry."""
+    wall, foundation = config["geometry"]["wall"], config["geometry"]["foundation"]
+    steps = wall.get("thickness_steps") or []
+    if len(steps) > SHEET_STEPS:
+        raise SweepError(f"the sheet has columns for {SHEET_STEPS} thickness steps; this wall has {len(steps)}")
+    from Elmer.model_config import mortar_fill
+
+    fill = mortar_fill(config)
+    return {"width_m": wall["radial_width_m"], "foundation_depth_m": foundation["depth_m"],
+            "foundation_side_margin_m": foundation["side_margin_m"], "upstream_radius_m": wall["upstream_radius_m"],
+            "steps": [{"width_m": step["radial_width_m"], "top_z_m": step["top_z_m"]} for step in steps],
+            # None unless material.mortar is given and the wall has a step for it to sit on.
+            "mortar_fill": None if fill is None else {"slope_run_per_rise": fill["slope_run_per_rise"]}}
 
 
-def define_cases(config: dict, specification: dict) -> list[dict]:
-    from Elmer.model_config import validate_config
+def define_scenarios(config: dict, overwrites: object) -> list[dict]:
+    """One validated configuration per entry of ``overwrites``, numbered from 1 in file order."""
+    from Elmer.model_config import ConfigurationValidationError, validate_config
 
-    validate_config(config)
-    if (specification.get("schema_version") != 1
-            or specification.get("required_load_factor") != 1.0
-            or specification.get("target_peak_normal_opening_m") != 0.002):
-        raise ValueError("This sweep requires schema 1 and a 2 mm target at design load 1")
-    selection = config.get("damage_selection", {})
-    if (selection.get("enabled") is not True
-            or selection.get("maximum_overload_factor", 1.0) != 1.0
-            or not _valid_friction(selection.get("damaged_joint_friction"))
-            or config.get("cracking")):
-        raise ValueError("Sweep requires enabled cohesive selection, no manual cracks, and no overload")
-    lift = selection.get("lift_joints")
-    properties = selection.get("damaged_element_properties")
-    # Which blocks may vary, with their factor variables and absolute-valued keys.
-    blocks = {}
-    if isinstance(lift, dict):
-        blocks["lift_joints"] = (LIFT_JOINT_VARIABLES, LIFT_JOINT_ABSOLUTE)
-    if isinstance(properties, dict):
-        blocks["damaged_element_properties"] = (VARIABLES, {})
-    if not blocks:
-        raise ValueError("Baseline must define lift_joints and/or selected damaged-material properties")
-    definitions = specification.get("cases")
-    if not isinstance(definitions, list) or not definitions:
-        raise ValueError("At least the unmodified baseline control is required")
-
-    def apply(name, derivative, block, factors):
-        variables, absolute = blocks[block]
-        if not isinstance(factors, dict) or set(factors) - variables - set(absolute):
-            raise ValueError(f"{name}: only {sorted(variables | set(absolute))} of {block} may vary")
-        assigned = derivative["damage_selection"][block]
-        baseline_values = selection[block]
-        for key, factor in factors.items():
-            if key in absolute:
-                low, high = absolute[key]
-                if (isinstance(factor, bool) or not isinstance(factor, (int, float))
-                        or not math.isfinite(factor) or not low <= factor <= high):
-                    raise ValueError(f"{name}: {key} must lie in [{low:g}, {high:g}]")
-                if key == "friction_coefficient" and baseline_values.get("law") != "JOINT_MECA_FROT":
-                    raise ValueError(f"{name}: friction_coefficient needs a baseline with the JOINT_MECA_FROT lift law")
-                assigned[key] = factor
-                continue
-            if not positive(factor) or factor > 1:
-                raise ValueError(f"{name}: factors must be finite in (0, 1]")
-            assigned[key] = baseline_values[key] * factor
-
-    cases = []
-    seen = set()
-    for definition in definitions:
-        name, factors = definition["id"], definition["factors"]
-        if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,79}", name)
-                or name in seen):
-            raise ValueError(f"Unsafe or duplicate case ID: {name!r}")
-        if not isinstance(factors, dict):
-            raise ValueError(f"{name}: factors must be an object")
-        derivative = deepcopy(config)
-        nested = set(factors) & {"lift_joints", "damaged_element_properties"}
-        if nested:
-            # Both blocks present: factors are keyed by block.
-            if set(factors) - nested:
-                raise ValueError(f"{name}: mix of block-keyed and flat factors")
-            for block in nested:
-                if block not in blocks:
-                    raise ValueError(f"{name}: the baseline has no {block} to vary")
-                apply(name, derivative, block, factors[block])
-            block = "+".join(sorted(nested))
-        elif factors:
-            if len(blocks) != 1:
-                raise ValueError(f"{name}: with lift joints and degraded elements both configured, "
-                                 "key the factors by block (lift_joints / damaged_element_properties)")
-            block = next(iter(blocks))
-            apply(name, derivative, block, factors)
-        else:
-            block = "+".join(sorted(blocks))
-        validate_config(derivative)
-        cases.append({"id": name, "factors": factors, "config": derivative, "block": block})
-        seen.add(name)
-    if cases[0]["factors"]:
-        raise ValueError("First case must be the unchanged baseline control")
-    return cases
+    try:
+        validate_config(config)
+    except ConfigurationValidationError as error:
+        raise SweepError(f"config.json: {error}") from None
+    if not isinstance(overwrites, list) or not overwrites:
+        raise SweepError("scenarios.json must be a non-empty array of overwrites of config.json")
+    scenarios = []
+    for number, overwrite in enumerate(overwrites, start=1):
+        label = f"scenario {number}"
+        if not isinstance(overwrite, dict):
+            raise SweepError(f"{label}: must be an object")
+        derived = merge(config, overwrite)
+        try:
+            validate_config(derived)
+        except ConfigurationValidationError as error:
+            raise SweepError(f"{label}: {error}") from None
+        # What the contact-joint stage needs; the app blocks the stage for anything else.
+        if derived["geometry"].get("foundation") is None:
+            raise SweepError(f"{label}: the contact joint is placed between the wall and a concrete foundation; "
+                             "this configuration has no foundation")
+        if (derived.get("bedrock_analysis") or {}).get("mode") != "elastic_layer":
+            raise SweepError(f"{label}: the contact-joint stage is implemented for the elastic-layer bedrock mode")
+        try:
+            geometry = sheet_geometry(derived)
+        except SweepError as error:
+            raise SweepError(f"{label}: {error}") from None
+        scenarios.append({"number": number, "id": f"scenario_{number:02d}", "overwrite": overwrite,
+                          "geometry": geometry, "config": derived})
+    return scenarios
 
 
-def classify_report(report: dict, target_m: float = 0.002) -> dict:
-    if not isinstance(report, dict):
-        raise ValueError("Native report must be a JSON object")
-    steps = report.get("steps") or []
-    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
-        raise ValueError("Native report steps must be an array of objects")
-    final = steps[-1] if steps else {}
-    opening = final.get("peak_opening_m")
-    reached = final.get("load_factor")
-    valid_opening = (isinstance(opening, (int, float)) and not isinstance(opening, bool)
-                     and math.isfinite(opening) and opening >= 0)
-    full_load = (positive(reached) and math.isclose(reached, 1., rel_tol=0., abs_tol=1e-9)
-                 and positive(report.get("reached_load_factor"))
-                 and math.isclose(report["reached_load_factor"], 1., rel_tol=0., abs_tol=1e-9))
-    accepted = (report.get("accepted") is True and report.get("status") == "completed"
-                and report.get("solve_status") == "completed" and report.get("returncode") == 0
-                and report.get("assessment_authority") == "code_aster"
-                and report.get("analysis_scope") == "whole_model" and full_load and valid_opening)
-    return {
-        "status": ("target_reached" if opening >= target_m else "converged_below_target")
-        if accepted else "incomplete_or_failed",
-        "target_reached": bool(accepted and opening >= target_m),
-        "accepted_full_design_load": accepted,
-        "reached_load_factor": reached,
-        "peak_normal_opening_mm": opening * 1000 if valid_opening else None,
-        "initiated_faces": final.get("initiated_faces"),
-        "opened_faces": final.get("opened_faces"),
-        "separated_faces": final.get("separated_faces"),
-        "opened_facet_area_m2": final.get("opened_area_m2"),
-        "maximum_wall_displacement_mm": (
-            report["maximum_wall_displacement_m"] * 1000
-            if positive(report.get("maximum_wall_displacement_m")) else None),
-        "error": None if accepted else (
-            report.get("solve_message") or "No accepted, finite whole-model equilibrium at design load 1"),
-    }
+def describe(geometry: dict) -> str:
+    steps = "".join(f", {step['width_m']:g} m below z = {step['top_z_m']:g} m" for step in geometry["steps"])
+    fill = geometry.get("mortar_fill")
+    slope = "" if not fill else f", mortar fill on the steps at 1 in {1 / fill['slope_run_per_rise']:g}"
+    return f"wall {geometry['width_m']:g} m{steps}{slope}"
 
 
-def materialize_case(case: dict, directory: Path, prepared: Path, baseline_config: Path) -> Path:
-    directory.mkdir()
-    candidate = directory / "candidate"
-    shutil.copytree(prepared, candidate)
-    config_path = directory / "config.json"
-    write_json(config_path, case["config"])
-    summary = read_json(candidate / "summary.json")
-    assignment = summary.get("material_assignment")
-    if assignment is None or not assignment.get("selected_source_rows"):
-        raise ValueError("Sweep requires a nonempty fixed selected region")
-    selection = case["config"]["damage_selection"]
-    # Every block the derivative carries is re-applied; the fixed selection never changes.
-    if "lift_joints" in selection:
-        if "joint_properties" not in assignment:
-            raise ValueError("Lift-joint sweep requires candidates prepared with lift joints")
-        joints = selection["lift_joints"]
-        assignment["joint_properties"].update(
-            {key: joints[key] for key in ("tensile_strength_pa", "cohesive_fracture_energy_j_m2", "alpha",
-                                          "pena_contact", "law", "friction_coefficient", "uplift") if key in joints},
-            critical_opening_m=2.0 * joints["cohesive_fracture_energy_j_m2"] / joints["tensile_strength_pa"])
-        if joints.get("law") == "JOINT_MECA_FROT":
-            # The Mohr-Coulomb cone's apex stays at the (varied) tensile strength.
-            assignment["joint_properties"]["adhesion_pa"] = (
-                joints["friction_coefficient"] * joints["tensile_strength_pa"])
-    elif "joint_properties" in assignment:
-        raise ValueError("Candidates were prepared with lift joints the derivative no longer configures")
-    if "damaged_element_properties" in selection:
-        if "properties" not in assignment:
-            raise ValueError("Degraded-element sweep requires candidates prepared with damaged_element_properties")
-        assignment["properties"] = deepcopy(selection["damaged_element_properties"])
-        # The degraded facets' CZM follows the degraded material; the lift law travels separately.
-        summary.update(tensile_strength_pa=assignment["properties"]["tensile_strength_pa"],
-                       fracture_energy_j_m2=assignment["properties"]["cohesive_fracture_energy_j_m2"])
-    elif "properties" in assignment:
-        raise ValueError("Candidates were prepared with degraded elements the derivative no longer configures")
-    provenance = {
-        "baseline_config_sha256": file_hash(baseline_config),
-        "derivative_config_sha256": file_hash(config_path),
-        "fixed_candidate_state_sha256": file_hash(prepared / "cohesive_state.npz"),
-        "fixed_screening_sha256": file_hash(prepared / "screening.json")
-        if (prepared / "screening.json").exists() else summary["screening_sha256"],
-        "case_id": case["id"], "factors": case["factors"],
-        "baseline_reuse": "Unmodified intact baseline and selection; selected properties changed after screening",
-        "config_digest_scope": "Original solved baseline; derivative config is separately hashed, not a new elastic solve",
-        "engineering_validated": False,
-    }
-    summary["sweep_provenance"] = provenance
-    write_json(candidate / "summary.json", summary)
-    manifest = read_json(candidate / "manifest.json")
-    manifest.update(summary_sha256=file_hash(candidate / "summary.json"), sweep_provenance=provenance)
-    write_json(candidate / "manifest.json", manifest)
-    write_json(directory / "provenance.json", provenance)
-    return candidate
+# ------------------------------------------------------------------ results of one scenario
 
+def elmer_figures(report_path: Path) -> dict:
+    report = read_json(report_path)
+    stress = report["stress_analysis"]
+    return _figures(stress["max_tensile_principal_stress_pa"]["value_pa"],
+                    stress["max_compressive_principal_stress_pa"]["value_pa"],
+                    report["stress_bodies"]["wall"]["maximum_displacement_m"], "Elmer report")
+
+
+def aster_figures(baseline_dir: Path) -> dict:
+    """Wall peaks of a completed Code_Aster elastic baseline, read from the pipeline's own files as the app does.
+
+    Also writes ``aster_baseline_report.json``, which the app writes for its jobs and from which
+    the contact-joint stage takes the elastic figures it reports beside its own.
+    """
+    manifest = read_json(baseline_dir / "run_manifest.json")
+    if manifest.get("status") != "completed":
+        raise ValueError(f"The Code_Aster elastic solve did not complete ({manifest.get('status')})")
+    comparison = read_json(baseline_dir / "comparison_report.json")
+    wall = comparison["regions"]["wall"]
+    tension, compression = wall["aster_tension_pa"]["value_pa"], wall["aster_compression_pa"]["value_pa"]
+    displacement = wall.get("aster_maximum_displacement_m")
+    figures = _figures(tension, compression, displacement, "Code_Aster baseline comparison")
+    write_json(baseline_dir / "aster_baseline_report.json", {
+        "schema_version": 1, "solver": "code_aster", "written_by": "cracking_sweeps.run_sweep",
+        "maximum_principal_tensile_stress_pa": tension, "maximum_principal_compressive_stress_pa": compression,
+        "maximum_wall_displacement_m": displacement, "peak_scope": "wall",
+        "baseline_verified": comparison.get("baseline_verified") is True,
+        "comparison_status": comparison.get("status")})
+    return figures
+
+
+def _figures(tension_pa, compression_pa, displacement_m, source: str) -> dict:
+    if not all(finite(value) for value in (tension_pa, compression_pa, displacement_m)):
+        raise ValueError(f"The {source} has no finite stress and displacement figures")
+    return {"tension_mpa": tension_pa / 1e6, "compression_mpa": compression_pa / 1e6,
+            "displacement_mm": displacement_m * 1e3}
+
+
+def concrete_volume_m3(baseline_dir: Path) -> float:
+    """Volume of the wall and foundation tetrahedra of the Code_Aster baseline mesh."""
+    import numpy as np
+
+    with np.load(baseline_dir / "three_body_mesh_arrays.npz", allow_pickle=False) as arrays:
+        corners = arrays["nodes"][arrays["tetra4_concrete"]]
+    volume = float(np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])).sum() / 6.0)
+    if not math.isfinite(volume) or volume <= 0:
+        raise ValueError("The baseline mesh has no concrete volume")
+    return volume
+
+
+def mortar_volume_m3(baseline_dir: Path) -> float | None:
+    """Volume of the mortar fill tetrahedra of the Code_Aster baseline mesh; None for a model without a fill.
+
+    The fill is its own body and is not part of concrete_volume_m3.
+    """
+    import numpy as np
+
+    with np.load(baseline_dir / "three_body_mesh_arrays.npz", allow_pickle=False) as arrays:
+        if "tetra4_mortar" not in arrays.files or not len(arrays["tetra4_mortar"]):
+            return None
+        corners = arrays["nodes"][arrays["tetra4_mortar"]]
+    volume = float(np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])).sum() / 6.0)
+    if not math.isfinite(volume) or volume <= 0:
+        raise ValueError("The baseline mesh has a mortar fill without volume")
+    return volume
+
+
+def joint_figures(joint_dir: Path) -> tuple[dict, str | None]:
+    """Figures at full reservoir of each contact-joint case that reached it, and why the stage failed (if it did)."""
+    report = read_json(joint_dir / "joint_opening_report.json")
+    figures = {}
+    for label, key in JOINT_CASES:
+        case = report["cases"].get(key) or {}
+        levels = case.get("levels") or []
+        stress = case.get("final_wall_stress")
+        if case.get("status") != "completed" or not levels or levels[-1].get("fill_fraction") != 1.0 or not stress:
+            continue
+        level = levels[-1]
+        figures[label] = {"opening_mm": level["largest_opening_m"] * 1e3,
+                          **_figures(stress["maximum_principal_tensile_stress_pa"],
+                                     stress["maximum_principal_compressive_stress_pa"],
+                                     level["maximum_wall_displacement_m"], f"contact-joint report ({key})"),
+                          "opened_share": level["opened_share"]}
+    failure = None
+    if report.get("status") != "completed" or len(figures) != len(JOINT_CASES):
+        failure = str(report.get("message") or "The contact-joint stage did not complete both cases")
+    return figures, failure
+
+
+# ------------------------------------------------------------------ running
 
 def run_module(module: str, arguments: list[str], log: Path, allowed_codes: tuple[int, ...] = (0,)) -> int:
+    """Run one stage as its own process, with its output in ``log``; Ctrl+C stops its whole process tree."""
     command = [sys.executable, "-u", "-B", "-m", module, *arguments]
-    print(f"Running {module}; log: {log}", flush=True)
     with log.open("w", encoding="utf-8") as stream:
         stream.write(subprocess.list2cmdline(command) + "\n")
         stream.flush()
@@ -266,170 +273,321 @@ def run_module(module: str, arguments: list[str], log: Path, allowed_codes: tupl
             process.wait()
             raise
     if code not in allowed_codes:
-        raise RuntimeError(f"{module} exited {code}; see {log}")
+        raise RuntimeError(f"{module} exited with code {code}; see {log}")
     return code
 
 
-def prepare_reference(run: Path) -> tuple[Path, Path]:
-    from Aster.automatic_preparation import baseline_inventory
+def say(run: Path, message: str) -> None:
+    line = f"{time.strftime('%H:%M:%S')}  {message}"
+    print(line, flush=True)
+    with (run / "progress.log").open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
 
-    run_module("Elmer.three_body_solver", [
-        "--config-root", str(run), "--output-dir", str(run / "elmer"),
-        "--report-path", str(run / "elmer_report.json"),
-    ], run / "elmer.log")
-    baseline = run / "baseline"
-    pipeline_code = run_module("Aster.run_three_body_pipeline", [
-        "--source-mesh", str(run / "elmer" / "model" / "three_body.msh"),
-        "--output-dir", str(baseline), "--runtime", "wsl" if os.name == "nt" else "native",
-        "--time-limit-s", str(NATIVE_TIME_LIMIT_S),
-    ], run / "baseline.log", allowed_codes=(0, 2))
-    baseline_inventory(baseline, run / "config.json", run / "elmer" / "model")
-    write_json(run / "baseline_status.json", {
-        "status": "completed", "pipeline_exit_code": pipeline_code,
-        "comparison_requires_verification": pipeline_code == 2, "engineering_validated": False,
-    })
-    if pipeline_code == 2:
-        print("Baseline completed; cross-solver comparison requires verification (see baseline.log).", flush=True)
-    shared = ["--config", str(run / "config.json"), "--model", str(run / "elmer" / "model"),
-              "--baseline", str(baseline), "--job-id", run.name, "--relative-tolerance", "0.001"]
-    run_module("Aster.automatic_preparation", [*shared, "--output", str(run / "screening")],
-               run / "screening.log")
-    prepared = run / "prepared"
-    run_module("Aster.automatic_preparation", [
-        *shared, "--screening", str(run / "screening"), "--output", str(prepared),
-    ], run / "preparation.log")
-    if read_json(prepared / "summary.json").get("status") != "prepared_aster_candidates":
-        raise ValueError("Native candidate preparation did not complete")
-    return baseline, prepared
+
+def run_scenario(run: Path, scenario: dict, runner=None) -> dict:
+    """Run the three stages of one scenario in its own directory; a failed stage ends the scenario.
+
+    Figures of the stages that did complete are kept, so a row can still show its baselines.
+    ``runner`` stands in for run_module in tests.
+    """
+    runner = runner or run_module
+    directory = run / scenario["id"]
+    directory.mkdir()
+    write_json(directory / "config.json", scenario["config"])
+    baseline, joint = directory / "aster_baseline", directory / "joint_opening"
+    result = {"number": scenario["number"], "id": scenario["id"], "geometry": scenario["geometry"],
+              "status": "running", "failed_stage": None, "error": None, "seconds": {},
+              "elmer": None, "aster": None, "concrete_volume_m3": None, "mortar_volume_m3": None, "cracking": {}}
+
+    def elmer() -> None:
+        runner("Elmer.three_body_solver", [
+            "--config-root", str(directory), "--output-dir", str(directory / "elmer"),
+            "--report-path", str(directory / "elmer_report.json")], directory / "elmer.log")
+        result["elmer"] = elmer_figures(directory / "elmer_report.json")
+
+    def aster_baseline() -> None:
+        # As the app does, the baseline is judged by its report: exit code 2 only says that the
+        # comparison against Elmer still requires verification.
+        runner("Aster.run_three_body_pipeline", [
+            "--source-mesh", str(directory / "elmer" / "model" / "three_body.msh"), "--output-dir", str(baseline),
+            "--time-limit-s", str(ASTER_BASELINE_TIME_LIMIT_S), "--runtime", "wsl" if os.name == "nt" else "native",
+        ], directory / "aster_baseline.log", allowed_codes=(0, 2))
+        result["aster"] = aster_figures(baseline)
+        result["concrete_volume_m3"] = concrete_volume_m3(baseline)
+        result["mortar_volume_m3"] = mortar_volume_m3(baseline)
+        if (result["mortar_volume_m3"] is None) != (scenario["geometry"].get("mortar_fill") is None):
+            raise ValueError("The baseline mesh and the scenario disagree on whether the wall has a mortar fill")
+
+    def joint_opening() -> None:
+        # Exit code 2 means a case did not complete; the report says which, and why.
+        runner("Aster.dam_joint_baseline", [
+            "app", "--baseline-dir", str(baseline), "--output-dir", str(joint),
+            "--time-limit-s", str(JOINT_SOLVE_LIMIT_S), "--progress-log", str(run / "progress.log"),
+        ], directory / "joint_opening.log", allowed_codes=(0, 2))
+        result["cracking"], failure = joint_figures(joint)
+        if failure:
+            raise RuntimeError(failure)
+
+    for stage, label, action in (("elmer", "Elmer baseline", elmer),
+                                 ("aster_baseline", "Code_Aster elastic baseline", aster_baseline),
+                                 ("joint_opening", "Code_Aster contact joint (dry, then water in the joint)",
+                                  joint_opening)):
+        say(run, f"Scenario {scenario['number']}: {label} started")
+        started = time.monotonic()
+        try:
+            action()
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+            result["seconds"][stage] = round(time.monotonic() - started, 1)
+            reason = str(error).strip().splitlines()
+            result.update(status="failed", failed_stage=stage,
+                          error=f"{type(error).__name__}: {reason[0] if reason else ''}")
+            say(run, f"Scenario {scenario['number']}: {label} FAILED after {result['seconds'][stage]:.0f} s: "
+                     f"{result['error']} (log: {directory / (stage + '.log')})")
+            break
+        result["seconds"][stage] = round(time.monotonic() - started, 1)
+        say(run, f"Scenario {scenario['number']}: {label} finished in {result['seconds'][stage]:.0f} s")
+    else:
+        result["status"] = "completed"
+    write_json(directory / "result.json", result)
+    return result
 
 
 def save_results(run: Path, state: dict) -> None:
-    write_json(run / "sweep.json", state)
-    fields = ("case_id", "block", "status", "target_reached", "accepted_full_design_load",
-              "youngs_modulus_pa", "tensile_strength_pa", "fracture_energy_j_m2",
-              "lift_tensile_strength_pa", "lift_fracture_energy_j_m2", "alpha",
-              "peak_normal_opening_mm", "reached_load_factor", "initiated_faces", "opened_faces",
-              "separated_faces", "opened_facet_area_m2", "maximum_wall_displacement_mm", "error")
+    write_json(run / "results.json", state)
+    fields = ["number", "wall", "status", "failed_stage", "error"]
+    fields += [f"{solver}_{figure}" for solver in ("elmer", "aster") for figure in FIGURES]
+    fields += ["concrete_volume_m3", "mortar_volume_m3"]
+    fields += [f"cracking_{label}_{figure}" for figure in CRACKING_COLUMNS for label, _ in JOINT_CASES]
     temporary = run / "results.csv.tmp"
     with temporary.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(state["results"])
+        for result in state["results"]:
+            row = {"number": result["number"], "wall": describe(result["geometry"]), "status": result["status"],
+                   "failed_stage": result["failed_stage"], "error": result["error"],
+                   "concrete_volume_m3": result["concrete_volume_m3"],
+                   "mortar_volume_m3": result.get("mortar_volume_m3")}
+            for solver in ("elmer", "aster"):
+                for figure in FIGURES:
+                    row[f"{solver}_{figure}"] = (result[solver] or {}).get(figure)
+            for figure in CRACKING_COLUMNS:
+                for label, _ in JOINT_CASES:
+                    row[f"cracking_{label}_{figure}"] = (result["cracking"].get(label) or {}).get(figure)
+            writer.writerow(row)
     temporary.replace(run / "results.csv")
 
 
-def execute(run: Path, cases: list[dict], candidate_root: Path | None = None) -> dict:
-    candidate_root = candidate_root or ROOT / "candidate"
-    state = {"status": "running", "target_peak_normal_opening_m": .002,
-             "required_load_factor": 1., "engineering_validated": False,
-             "results": [], "active_case": None}
+def execute(run: Path, scenarios: list[dict], sheet: Path | None, runner=None) -> dict:
+    """Run the scenarios one after the other, then write the sheet. Results are saved after every scenario."""
+    state = {"status": "running", "run": run.name, "engineering_validated": False, "sheet": None, "results": []}
     save_results(run, state)
     try:
-        baseline, prepared = prepare_reference(run)
-        immutable = {path: file_hash(path) for directory in (baseline, prepared, run / "screening")
-                     for path in directory.iterdir() if path.is_file()}
-        immutable[run / "config.json"] = file_hash(run / "config.json")
-        for case in cases:
-            for path, digest in immutable.items():
-                if file_hash(path) != digest:
-                    raise ValueError(f"Shared reference changed during sweep: {path}")
-            state["active_case"] = case["id"]
+        for scenario in scenarios:
+            say(run, f"=== Scenario {scenario['number']} of the {len(scenarios)} to run: {describe(scenario['geometry'])}")
+            state["results"].append(run_scenario(run, scenario, runner))
             save_results(run, state)
-            print(f"Starting {case['id']}", flush=True)
-            directory = run / "cases" / case["id"]
-            candidate = materialize_case(case, directory, prepared, run / "config.json")
-            selection = case["config"]["damage_selection"]
-            lift, elements = selection.get("lift_joints") or {}, selection.get("damaged_element_properties") or {}
-            result = {"case_id": case["id"], "block": case["block"],
-                      "youngs_modulus_pa": elements.get("youngs_modulus"),
-                      "tensile_strength_pa": elements.get("tensile_strength_pa"),
-                      "fracture_energy_j_m2": elements.get("cohesive_fracture_energy_j_m2"),
-                      "lift_tensile_strength_pa": lift.get("tensile_strength_pa"),
-                      "lift_fracture_energy_j_m2": lift.get("cohesive_fracture_energy_j_m2"),
-                      "alpha": lift.get("alpha")}
-            try:
-                code = run_module("Aster.automatic_cohesive", [
-                    "--baseline-dir", str(baseline), "--fenicsx-output", str(candidate),
-                    "--output-dir", str(directory / "aster"),
-                ], directory / "case.log", allowed_codes=(0, 2))
-                report = read_json(directory / "aster" / "aster_cohesive_report.json")
-                if (case["config"]["damage_selection"].get("crack_water_pressure") is True
-                        and report.get("status") == "completed"):
-                    from Aster.hydraulic_loads import validate_crack_water_evidence
-                    validate_crack_water_evidence(report)
-                result.update(classify_report(report))
-                if code != 0 and result["accepted_full_design_load"]:
-                    raise ValueError("Native exit code contradicts the accepted report")
-            except (OSError, ValueError, RuntimeError) as error:
-                result.update(status="execution_failed", target_reached=False,
-                              accepted_full_design_load=False, error=f"{type(error).__name__}: {error}")
-                print(f"{case['id']}: {result['error']}", file=sys.stderr, flush=True)
-            write_json(directory / "result.json", result)
-            state["results"].append(result)
-            state["active_case"] = None
-            save_results(run, state)
-            print(f"{case['id']}: {result['status']}; opening_mm={result.get('peak_normal_opening_mm')}", flush=True)
-            if result["target_reached"]:
-                candidate_root.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(directory / "config.json", candidate_root / "config.json")
-                print(f"Copied successful config from {case['id']} to {candidate_root / 'config.json'}", flush=True)
-                print("Accepted 2 mm target reached at full design load; stopping the sweep.", flush=True)
-                break
-        hits = [row["case_id"] for row in state["results"] if row["target_reached"]]
-        failures = [row["case_id"] for row in state["results"] if not row["accepted_full_design_load"]]
-        state.update(status="completed_with_failures" if failures else "completed",
-                     target_cases=hits, failed_cases=failures,
-                     stop_reason="target_reached" if hits else "cases_exhausted",
-                     skipped_cases=[case["id"] for case in cases[len(state["results"]):]])
+        failed = [result["number"] for result in state["results"] if result["status"] != "completed"]
+        state.update(status="completed_with_failures" if failed else "completed", failed_scenarios=failed)
     except KeyboardInterrupt:
         state["status"] = "interrupted"
+        save_results(run, state)
         raise
-    except (OSError, ValueError, RuntimeError):
-        state.update(status="failed", error=traceback.format_exc())
-        raise
-    finally:
+    save_results(run, state)
+    if sheet is not None:
+        try:
+            state["sheet"] = update_sheet(sheet, state["results"], run)
+            say(run, f"Wrote runs {', '.join(str(number) for number in state['sheet']['rows_written'])} to {sheet}")
+        except (SweepError, OSError) as error:
+            state["sheet"] = {"error": str(error)}
+            say(run, f"The sheet was NOT updated: {error}. Results are in {run / 'results.json'}; "
+                     f"write them later with --update-sheet {run}")
         save_results(run, state)
     return state
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT / "config.json")
-    parser.add_argument("--scenarios", type=Path, default=Path(__file__).with_name("scenarios.json"))
-    parser.add_argument("--output-root", type=Path, default=Path(__file__).with_name("runs"))
-    parser.add_argument("--execute", action="store_true", help="Launch solvers; otherwise materialize a plan only")
-    args = parser.parse_args()
-    config, specification = read_json(args.config), read_json(args.scenarios)
-    cases = define_cases(config, specification)
+# ------------------------------------------------------------------ the workbook
+
+def _load_sheet(path: Path):
+    import openpyxl
+
+    if not path.is_file():
+        raise SweepError(f"{path} does not exist")
+    try:
+        workbook = openpyxl.load_workbook(path)
+    except PermissionError:
+        raise SweepError(f"{path} cannot be read; close it in Excel") from None
+    if SHEET_NAME not in workbook.sheetnames:
+        raise SweepError(f"{path} has no sheet named '{SHEET_NAME}'")
+    sheet = workbook[SHEET_NAME]
+    wrong = [f"{cell} is {sheet[cell].value!r}, expected {text!r}" for cell, text in EXPECTED_HEADERS.items()
+             if str(sheet[cell].value or "").strip() != text]
+    if wrong:
+        raise SweepError(f"{path}: the '{SHEET_NAME}' sheet does not have the expected columns ({'; '.join(wrong)})")
+    return workbook, sheet
+
+
+def check_sheet(path: Path) -> None:
+    """Fail before any solver starts if the workbook cannot be written when the sweep ends."""
+    _load_sheet(path)
+    try:
+        with path.open("r+b"):
+            pass
+    except PermissionError:
+        raise SweepError(f"{path} is open in another program; close it before starting the sweep") from None
+
+
+def update_sheet(path: Path, results: list[dict], run: Path) -> dict:
+    """Write one row per result into the sheet, replacing what the row held; other rows are left as they are.
+
+    A figure a scenario did not produce is left empty, so nothing from an earlier sweep stays
+    in a row that this sweep wrote. The workbook as it was is copied into ``run`` first.
+    """
+    workbook, sheet = _load_sheet(path)
+    if not results:
+        raise SweepError("There are no results to write")
+    template = {column: sheet.cell(FIRST_ROW, column) for column in range(1, LAST_COLUMN + 1)}
+    # The mortar-fill column takes its look from the concrete volume column in a workbook that does not have it yet.
+    for cell, text in MORTAR_HEADERS.items():
+        if sheet[cell].value is None:
+            sheet[cell].value = text
+            like = sheet[f"{VOLUME_COLUMN}{sheet[cell].row}"]
+            if not sheet[cell].has_style and like.has_style:
+                sheet[cell]._style = copy(like._style)
+    if not template[LAST_COLUMN].has_style:
+        template[LAST_COLUMN] = sheet[f"{VOLUME_COLUMN}{FIRST_ROW}"]
+
+    def put(row: int, column: str, value) -> None:
+        cell = sheet[f"{column}{row}"]
+        if not cell.has_style and template[cell.column].has_style:
+            cell._style = copy(template[cell.column]._style)
+        cell.value = None if value is None else value if isinstance(value, (str, int)) else round(float(value), 3)
+
+    for result in results:
+        row = FIRST_ROW + result["number"] - 1
+        for column in range(1, LAST_COLUMN + 1):
+            sheet.cell(row, column).value = None
+        geometry = result["geometry"]
+        put(row, "A", result["number"])
+        for key, column in GEOMETRY_COLUMNS.items():
+            put(row, column, geometry[key])
+        for index, (width_column, height_column) in enumerate(STEP_COLUMNS):
+            step = geometry["steps"][index] if index < len(geometry["steps"]) else None
+            put(row, width_column, step["width_m"] if step else "-")
+            put(row, height_column, step["top_z_m"] if step else "-")
+        for figure, (elmer_column, aster_column, average_column) in BASELINE_COLUMNS.items():
+            elmer, aster = (result["elmer"] or {}).get(figure), (result["aster"] or {}).get(figure)
+            put(row, elmer_column, elmer)
+            put(row, aster_column, aster)
+            put(row, average_column, None if elmer is None or aster is None
+                else f"=AVERAGE({elmer_column}{row}:{aster_column}{row})")
+        volume = result["concrete_volume_m3"]
+        put(row, VOLUME_COLUMN, None if volume is None else int(round(volume)))
+        put(row, VOLUME_DIFFERENCE_COLUMN, None if volume is None
+            else f"={VOLUME_COLUMN}{row}-${VOLUME_COLUMN}${FIRST_ROW}")
+        for figure, columns in CRACKING_COLUMNS.items():
+            for (label, _), column in zip(JOINT_CASES, columns):
+                put(row, column, (result["cracking"].get(label) or {}).get(figure))
+        # "-" for a wall without a fill; empty when a wall with a fill did not get as far as its volume.
+        fill_volume = result.get("mortar_volume_m3")
+        put(row, MORTAR_VOLUME_COLUMN, round(fill_volume, 1) if fill_volume is not None
+            else None if geometry.get("mortar_fill") else "-")
+
+    written = sorted(result["number"] for result in results)
+    last_row = FIRST_ROW + max(written) - 1
+    # The note sits below the table; an earlier one is replaced.
+    for row in range(FIRST_ROW, sheet.max_row + 1):
+        value = sheet[f"{NOTE_COLUMN}{row}"].value
+        if isinstance(value, str) and value.startswith("Cracking columns:"):
+            sheet[f"{NOTE_COLUMN}{row}"].value = None
+    data_rows = [row for row in range(FIRST_ROW, sheet.max_row + 1) if sheet.cell(row, 1).value is not None]
+    note_row = max(data_rows + [last_row]) + 2
+    failed = [result["number"] for result in results if result["status"] != "completed"]
+    sheet[f"{NOTE_COLUMN}{note_row}"].value = (
+        "Cracking columns: Code_Aster contact joint at the wall/foundation contact, full reservoir. "
+        "Dry = no water in the joint; Water = water pressure in the joint. Opening = largest opening of the "
+        "contact. Generic joint values; not an engineering assessment. "
+        + ("Mortar fill = soft fill sloping the wall's steps, a body of its own with placeholder material values; "
+           "it is not concrete and is not in the Volume column. "
+           if any(result["geometry"].get("mortar_fill") for result in results) else "") +
+        f"Runs {', '.join(str(number) for number in written)} written by cracking_sweeps.run_sweep, sweep {run.name}"
+        + (f"; runs {', '.join(str(number) for number in failed)} did not complete, their empty cells have no result"
+           if failed else "") + ".")
+    backup = run / f"{path.stem}.before{path.suffix}"
+    if not backup.exists():
+        shutil.copy2(path, backup)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        workbook.save(temporary)
+        temporary.replace(path)
+    except PermissionError:
+        temporary.unlink(missing_ok=True)
+        raise SweepError(f"{path} is open in another program; close it") from None
+    return {"path": str(path), "rows_written": written, "backup": str(backup), "note_row": note_row}
+
+
+# ------------------------------------------------------------------ command line
+
+def main(arguments: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", type=Path, default=HERE / "config.json", help="the configuration the scenarios overwrite")
+    parser.add_argument("--scenarios", type=Path, default=HERE / "scenarios.json", help="array of overwrites, one per run")
+    parser.add_argument("--sheet", type=Path, default=HERE / "FEA_Matrix.xlsx", help="workbook to update when the sweep ends")
+    parser.add_argument("--output-root", type=Path, default=HERE / "runs")
+    parser.add_argument("--only", type=int, nargs="+", metavar="NUMBER",
+                        help="run only these scenarios (numbered from 1); only their rows are written")
+    parser.add_argument("--execute", action="store_true", help="start the solvers; without it only the plan is written")
+    parser.add_argument("--update-sheet", type=Path, metavar="SWEEP_DIRECTORY",
+                        help="no solving: write the results of a finished sweep directory into the workbook")
+    args = parser.parse_args(arguments)
+    try:
+        if args.update_sheet is not None:
+            results = read_json(args.update_sheet / "results.json")["results"]
+            outcome = update_sheet(args.sheet, results, args.update_sheet.resolve())
+            print(f"Wrote runs {', '.join(str(number) for number in outcome['rows_written'])} to {args.sheet}")
+            return 0
+        scenarios = define_scenarios(read_json(args.config), read_json(args.scenarios))
+        if args.only:
+            unknown = sorted(set(args.only) - {scenario["number"] for scenario in scenarios})
+            if unknown:
+                raise SweepError(f"--only: there is no scenario {', '.join(str(number) for number in unknown)}; "
+                                 f"scenarios.json has {len(scenarios)}")
+            scenarios = [scenario for scenario in scenarios if scenario["number"] in set(args.only)]
+        if args.execute:
+            check_sheet(args.sheet)
+    except (SweepError, OSError, json.JSONDecodeError, KeyError) as error:
+        print(f"Sweep not started: {error}", file=sys.stderr)
+        return 1
     args.output_root.mkdir(parents=True, exist_ok=True)
     name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     run = (args.output_root / name).resolve()
     run.mkdir()
-    (run / "cases").mkdir()
-    write_json(run / "config.json", config)
-    write_json(run / "scenarios.json", specification)
-    write_json(run / "plan.json", {
-        "status": "defined", "source_config": str(args.config.resolve()),
-        "source_config_sha256": file_hash(args.config), "snapshot_sha256": file_hash(run / "config.json"),
-        "target_peak_normal_opening_m": .002, "required_load_factor": 1.,
-        "selection_policy": "Screen once from the unchanged baseline; reuse exact cells/facets for every case",
-        "fixed_support_degradation": config["damage_selection"].get("support_degradation"),
-        "fixed_crack_base": config["damage_selection"].get("crack_base", False),
-        "crack_water_pressure": config["damage_selection"].get("crack_water_pressure", False),
-        "engineering_validated": False, "cases": cases,
-    })
-    print(f"Sweep directory: {run}\nDefined {len(cases)} cases; target >= 2 mm at load factor 1.", flush=True)
+    shutil.copy2(args.config, run / "config.json")
+    shutil.copy2(args.scenarios, run / "scenarios.json")
+    write_json(run / "plan.json", {"status": "defined", "source_config": str(args.config.resolve()),
+                                   "source_scenarios": str(args.scenarios.resolve()),
+                                   "sheet": str(args.sheet.resolve()), "engineering_validated": False,
+                                   "scenarios": scenarios})
+    print(f"Sweep directory: {run}")
+    for scenario in scenarios:
+        print(f"  {scenario['number']}: {describe(scenario['geometry'])}")
     if not args.execute:
-        print("Plan only: no solvers launched. Add --execute to run a fresh campaign.", flush=True)
+        print("Plan only: no solver was started. Add --execute to run the sweep.")
         return 0
-    state = execute(run, cases)
-    print(f"Finished: {state['status']}; target cases: {state['target_cases']}; results: {run / 'results.csv'}")
-    return 2 if state["failed_cases"] else 0
+    state = execute(run, scenarios, args.sheet)
+    for result in state["results"]:
+        cracking = result["cracking"]
+        opening = " / ".join(f"{cracking[label]['opening_mm']:.3f}" if label in cracking else "-" for label, _ in JOINT_CASES)
+        print(f"  {result['number']}: {describe(result['geometry'])}: {result['status']}"
+              + (f" at {result['failed_stage']}" if result["failed_stage"] else "")
+              + f"; opening dry / water {opening} mm")
+    print(f"Finished: {state['status']}; results: {run / 'results.json'}")
+    sheet_failed = isinstance(state["sheet"], dict) and "error" in state["sheet"]
+    return 2 if state["status"] != "completed" or sheet_failed else 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("Sweep interrupted; completed evidence retained.", file=sys.stderr)
+        print("Sweep interrupted; finished scenarios are kept in the sweep directory.", file=sys.stderr)
         raise SystemExit(130)

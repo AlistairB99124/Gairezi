@@ -33,7 +33,27 @@ def rock_support_report(structure) -> dict:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from Elmer.model_config import bedrock_analysis_mode, foundation_support
+from Elmer.model_config import bedrock_analysis_mode, foundation_support, mortar_fill
+
+# Optional mortar fill on the wall's thickness steps: its own body, tied to the wall face it covers.
+MORTAR_FILL_REGION_ID = 4
+WALL_MORTAR_TAGS = (19, 20)
+
+
+def source_mortar_fill(config, diagnostic):
+    """The fill recorded by the source model, checked against the submitted configuration, or None."""
+    recorded = diagnostic.get("mortar_fill")
+    configured = mortar_fill(config)
+    if recorded is None and configured is None:
+        return None
+    if recorded is None or configured is None:
+        raise ValueError("Source mortar fill differs from the submitted configuration")
+    material = config["material"]["mortar"]
+    if (recorded.get("material") != {key: material[key] for key in ("density", "youngs_modulus", "poisson_ratio")}
+            or recorded.get("bond_spring_n_per_m3") != material["bond_spring_n_per_m3"]
+            or type(recorded.get("tetrahedra")) is not int or recorded["tetrahedra"] <= 0):
+        raise ValueError("Source mortar fill material differs from material.mortar")
+    return recorded
 
 # Wall (1) may crack; bedrock (2) and optional concrete foundation (3) stay intact.
 DAMAGE_REGION_IDS = (1,)
@@ -105,9 +125,14 @@ def source_foundation(config, diagnostic, wall_joints):
     if not isinstance(metadata, dict) or any(metadata.get(key) != value for key, value in foundation.items()):
         raise ValueError("Source foundation dimensions differ from geometry.foundation")
     layer_mode = bedrock_analysis_mode(config) == "elastic_layer"
+    fill = source_mortar_fill(config, diagnostic)
+    if fill is not None and not layer_mode:
+        raise ValueError("A mortar fill needs the elastic-layer bedrock")
     expected_body_ids = {"wall": 1, "foundation": 3} if layer_mode else {
         "wall": 1, "bedrock": 2, "foundation": 3,
     }
+    if fill is not None:
+        expected_body_ids["mortar_fill"] = MORTAR_FILL_REGION_ID
     if source_body_ids != expected_body_ids:
         raise ValueError("Source foundation body tags differ from the submitted configuration")
     geometry = config["geometry"]
@@ -124,6 +149,7 @@ def source_foundation(config, diagnostic, wall_joints):
                 **({} if bonded else {"wall_foundation": [17, 18]}),
                 **({} if not bedrock_spring else {"foundation_bedrock": [11, 12]}),
                 **{joint["name"]: list(joint["tags"]) for joint in wall_joints},
+                **({} if fill is None else {"wall_mortar": list(WALL_MORTAR_TAGS)}),
     }
     declared = diagnostic.get("spring_pairs")
     if not isinstance(declared, dict) or set(declared) != set(expected):
@@ -138,6 +164,10 @@ def source_foundation(config, diagnostic, wall_joints):
                     "spring_n_per_m3": geometry["bedrock"]["support"]["spring_n_per_m3"],
                 }]),
                 *wall_joints,
+                *([] if fill is None else [{
+                    "name": "wall_mortar", "tags": WALL_MORTAR_TAGS,
+                    "spring_n_per_m3": config["material"]["mortar"]["bond_spring_n_per_m3"],
+                }]),
     ]
     if diagnostic.get("interface_stiffness_n_per_m3") != {
                 pair["name"]: pair["spring_n_per_m3"]
@@ -154,7 +184,7 @@ def source_foundation(config, diagnostic, wall_joints):
             parts = [(None, declaration, None)]
         else:
             faces, planes = declaration.get("faces"), declaration.get("planes")
-            if (name not in ("wall_foundation", "foundation_bedrock")
+            if (name not in ("wall_foundation", "foundation_bedrock", "wall_mortar")
                     or declaration.get("grouping") not in ("exact_plane", "near_planar")
                     or declaration.get("legacy_tags") != expected[name]
                     or not isinstance(faces, dict) or not faces or not isinstance(planes, dict)
@@ -279,7 +309,8 @@ def validate_foundation_faces(nodes, boundaries, body_nodes, pairs):
         if pair.get("spring_n_per_m3") is None:
             continue
         logical = pair["name"].split("/")[0]
-        regions = {"wall_foundation": (1, 3), "foundation_bedrock": (3, 2)}.get(logical, (1, 1))
+        regions = {"wall_foundation": (1, 3), "foundation_bedrock": (3, 2),
+                   "wall_mortar": (1, MORTAR_FILL_REGION_ID)}.get(logical, (1, 1))
         reference = None
         for tag, region in zip(pair["tags"], regions, strict=True):
             faces = by_tag.get(tag, [])
@@ -377,6 +408,11 @@ def load_structure(config_path: Path, model: Path, structure):
     foundation, pairs = source_foundation(config, diagnostic, wall_joints)
     layer_mode = bedrock_analysis_mode(config) == "elastic_layer"
     body_ids = (1, 3) if layer_mode else (1, 2, 3) if foundation is not None else (1, 2)
+    fill = source_mortar_fill(config, diagnostic)
+    if fill is not None:
+        if foundation is None:
+            raise ValueError("A mortar fill needs the concrete foundation")
+        body_ids = (*body_ids, MORTAR_FILL_REGION_ID)
     mesh_path = model / "three_body.msh"
     source = meshio.read(mesh_path)
     cells, regions, boundaries = [], [], []
@@ -397,6 +433,12 @@ def load_structure(config_path: Path, model: Path, structure):
                  if tag == region for node in cell}
         for region in body_ids
     }
+    if fill is not None:
+        # The fill has its own nodes everywhere; it meets the wall only through its bond springs.
+        if (regions.count(MORTAR_FILL_REGION_ID) != fill["tetrahedra"]
+                or any(body_nodes[MORTAR_FILL_REGION_ID] & body_nodes[region]
+                       for region in body_ids if region != MORTAR_FILL_REGION_ID)):
+            raise ValueError("Source mortar fill cells or nodes differ from the diagnostic")
     if not layer_mode:
         shared_seat = body_nodes[1] & body_nodes[2]
         if bool(shared_seat) != bonded_seat:
@@ -440,6 +482,7 @@ def load_structure(config_path: Path, model: Path, structure):
     result.wall_joints = wall_joints
     result.foundation = foundation
     result.spring_pairs = pairs
+    result.mortar_fill = fill
     joint_tags = {
         tag for joint in (pairs or wall_joints)
         if joint["spring_n_per_m3"] is not None for tag in joint["tags"]
@@ -499,6 +542,12 @@ def load_structure(config_path: Path, model: Path, structure):
         **connection_report(result),
         "wall_connection": wall_connection,
         "wall_joints": wall_joints,
+        **({} if fill is None else {"mortar_fill": {
+            "body_id": MORTAR_FILL_REGION_ID, "tetrahedra": fill["tetrahedra"], "volume_m3": fill["volume_m3"],
+            "material": fill["material"], "bond_spring_n_per_m3": fill["bond_spring_n_per_m3"],
+            "role": "own elastic body with its own weight, tied to the wall by its bond springs; "
+                    "excluded from wall stress and displacement",
+        }}),
         "sha256": {name: hashlib.sha256((model / name).read_bytes()).hexdigest()
                    for name in ("three_body.msh", "config.json", "diagnostic.json")},
     }
@@ -549,7 +598,10 @@ def materials(imported, structure):
     fields = {}
     for key in ("density", "youngs_modulus", "poisson_ratio"):
         field = fem.Function(space, name=key)
-        for tag, name in ((1, "concrete"), (2, "bedrock"), (3, "concrete")):
+        bodies = [(1, "concrete"), (2, "bedrock"), (3, "concrete")]
+        if "mortar" in config["material"]:
+            bodies.append((MORTAR_FILL_REGION_ID, "mortar"))
+        for tag, name in bodies:
             cells = imported.cell_tags.find(tag)
             field.x.array[space.dofmap.list[cells, 0]] = config["material"][name][key]
         field.x.scatter_forward()

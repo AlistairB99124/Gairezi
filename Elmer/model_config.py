@@ -89,6 +89,13 @@ CRACK_SEED_FACES = {"upstream", "downstream"}
 CRACK_OPENING_RANGE_M = (0.001, 0.01)
 CRACK_BUFFER_MAX_M = 2.0
 MATERIAL_KEYS = {"density", "youngs_modulus", "poisson_ratio", "tensile_strength_pa"}
+# Optional mortar fill on the wall's thickness steps (Elmer/regions/mortar_fill.py): a sloped,
+# soft body that sits on each step's ledge against the wall face above it. It is its own body,
+# joined to the wall by bond_spring_n_per_m3 (global x/y/z, N/m^3). slope_run_per_rise is the
+# horizontal run of the sloped face per unit of height: 0.1 is 1 in 10.
+MORTAR_KEYS = {"density", "youngs_modulus", "poisson_ratio", "bond_spring_n_per_m3"}
+MORTAR_OPTIONAL_KEYS = {"slope_run_per_rise"}
+DEFAULT_MORTAR_SLOPE_RUN_PER_RISE = 0.1
 RADIUS_KEYS = {"radial_width_m", "upstream_radius_m", "centerline_radius_m", "downstream_radius_m"}
 SUPPORT_KEYS = {"model", "material", "spring_n_per_m3"}
 CRACK_KEYS = {
@@ -334,6 +341,64 @@ class _ConfigValidator:
                     "is retained in configuration; the bedrock volume is generated only for "
                     "the unsolved geometry preview and is not part of the solver mesh, so "
                     "these properties do not affect the analysis.",
+                )
+
+    def validate_mortar(self, value: object, root: Mapping[str, object]) -> None:
+        """Optional mortar fill on the wall's thickness steps; see MORTAR_KEYS."""
+        path = "material.mortar"
+        values = self.object(value, path, MORTAR_KEYS, MORTAR_OPTIONAL_KEYS)
+        if values is None:
+            return
+        self.field_number(values, "density", path, positive=True)
+        self.field_number(values, "youngs_modulus", path, positive=True)
+        poisson = self.field_number(values, "poisson_ratio", path)
+        if poisson is not None and not -1 < poisson < 0.5:
+            self.issue(f"{path}.poisson_ratio", "must lie between -1 and 0.5")
+        slope = self.field_number(values, "slope_run_per_rise", path, positive=True)
+        if "slope_run_per_rise" not in values:
+            slope = DEFAULT_MORTAR_SLOPE_RUN_PER_RISE
+        if "bond_spring_n_per_m3" in values:
+            springs = self.object(values["bond_spring_n_per_m3"], f"{path}.bond_spring_n_per_m3", VECTOR_KEYS)
+            if springs is not None:
+                for axis in ("x", "y", "z"):
+                    # A zero spring would leave the fill free to drift.
+                    self.field_number(springs, axis, f"{path}.bond_spring_n_per_m3", positive=True)
+
+        geometry = root.get("geometry")
+        wall = geometry.get("wall") if isinstance(geometry, Mapping) else None
+        if not isinstance(wall, Mapping):
+            return
+        if not wall.get("thickness_steps"):
+            # As step_end_taper_ratio: inert without steps, so one config can serve stepped and plain walls.
+            self.warn(path, "has no effect without geometry.wall.thickness_steps")
+            return
+        joints = wall.get("joint_support")
+        if isinstance(joints, Mapping) and joints.get("model") == "spring":
+            self.issue(path, "requires a wall cast in one piece: geometry.wall.joint_support.model must be 'bonded'")
+        if "step_end_taper_ratio" in wall:
+            self.issue(path, "is not supported together with geometry.wall.step_end_taper_ratio")
+        if "foundation" not in geometry:
+            self.issue(path, "requires geometry.foundation")
+        analysis = root.get("bedrock_analysis")
+        if not isinstance(analysis, Mapping) or analysis.get("mode") != "elastic_layer":
+            self.issue(path, "requires bedrock_analysis.mode 'elastic_layer'")
+        if slope is None or slope <= 0:
+            return
+        try:
+            bands = wall_thickness_steps(wall)
+        except (KeyError, TypeError, ValueError):
+            return  # the wall itself is reported elsewhere
+        for (limit_z, above_width), (top_z, width) in zip(bands, bands[1:]):
+            run = width - above_width
+            if not (math.isfinite(run) and math.isfinite(top_z) and math.isfinite(limit_z)) or run <= 1e-9:
+                continue
+            # The fill stands against the wall face above its step, which ends at the next step up or the crest.
+            if top_z + run / slope > limit_z + 1e-9 and limit_z > top_z:
+                above = "the crest" if limit_z == 0 else f"the step at z = {limit_z:g} m"
+                self.issue(
+                    f"{path}.slope_run_per_rise",
+                    f"the fill on the step at z = {top_z:g} m would rise to z = {top_z + run / slope:g} m, "
+                    f"above {above}; use at least {run / (limit_z - top_z):.4g}",
                 )
 
     def validate_rock_outer_support(self, value: object, path: str) -> None:
@@ -695,7 +760,10 @@ class _ConfigValidator:
                 # The wall spans the chainages where rock lies below the crest (z = 0).
                 self.issue("geometry.bedrock.contours", "must dip below the crest elevation (z = 0)")
 
-        self.validate_material(self.object(root.get("material"), "material", CONFIG_KEYS["material"]))
+        material = self.object(root.get("material"), "material", CONFIG_KEYS["material"], {"mortar"})
+        self.validate_material(material)
+        if material is not None and "mortar" in material:
+            self.validate_mortar(material["mortar"], root)
 
         loads = self.object(root.get("loads"), "loads", CONFIG_KEYS["loads"])
         load_numbers: dict[str, float | None] = {}
@@ -1111,6 +1179,39 @@ def tapered_wall_downstream_radius_at(wall: Mapping[str, object], z: float, seat
         if z < top_z:
             width = max(width, min(step_width, width + float(ratio) * max(0.0, top_z - seat_z)))
     return float(wall["upstream_radius_m"]) - width
+
+
+def mortar_fill(config: Mapping[str, object]) -> dict[str, object] | None:
+    """The configured mortar fill on the wall's thickness steps, or None.
+
+    None when material.mortar is absent or the wall has no step that leaves a ledge. Each
+    step gives the ledge it sits on (top_z_m, between ledge_edge_radius_m and
+    wall_face_radius_m) and the height it rises against the wall face above (rise_m, before
+    the mesh snaps it to a wall course); limit_z_m is where that wall face ends.
+    """
+    mortar = config["material"].get("mortar")  # type: ignore[union-attr]
+    if mortar is None:
+        return None
+    wall = config["geometry"]["wall"]  # type: ignore[index]
+    bands = wall_thickness_steps(wall)
+    if len(bands) < 2:
+        return None
+    slope = float(mortar.get("slope_run_per_rise", DEFAULT_MORTAR_SLOPE_RUN_PER_RISE))
+    upstream = float(wall["upstream_radius_m"])
+    steps = [
+        {"top_z_m": top_z, "run_m": width - above_width, "rise_m": (width - above_width) / slope,
+         "wall_face_radius_m": upstream - above_width, "ledge_edge_radius_m": upstream - width,
+         "limit_z_m": limit_z}
+        for (limit_z, above_width), (top_z, width) in zip(bands, bands[1:]) if width - above_width > 1e-9
+    ]
+    if not steps:
+        return None
+    return {
+        "density": float(mortar["density"]), "youngs_modulus": float(mortar["youngs_modulus"]),
+        "poisson_ratio": float(mortar["poisson_ratio"]), "slope_run_per_rise": slope,
+        "bond_spring_n_per_m3": {axis: float(mortar["bond_spring_n_per_m3"][axis]) for axis in ("x", "y", "z")},
+        "steps": steps,
+    }
 
 
 def foundation_support(config: dict) -> dict:

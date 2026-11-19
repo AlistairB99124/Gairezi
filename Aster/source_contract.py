@@ -63,8 +63,12 @@ def audit_source_materials(source_mesh: Path) -> dict:
     if reduced:
         diagnostic = json.loads((model / "diagnostic.json").read_text(encoding="utf-8"))
         solver_ids = diagnostic["solver_body_ids"]
-        if solver_ids.get("wall") != 1 or set(solver_ids) - {"wall", "foundation"}:
+        if solver_ids.get("wall") != 1 or set(solver_ids) - {"wall", "foundation", "mortar_fill"}:
             raise ValueError("Invalid reduced concrete solver body mapping")
+        mortar = "mortar_fill" in solver_ids
+        if mortar and (solver_ids.get("foundation") != 2 or solver_ids["mortar_fill"] != 3
+                       or "mortar" not in config["material"]):
+            raise ValueError("A mortar fill must be Elmer Body 3, after the foundation, with material.mortar")
         assignments = [(1, 1)]
         if "foundation" in solver_ids:
             if solver_ids["foundation"] != 2:
@@ -72,14 +76,20 @@ def audit_source_materials(source_mesh: Path) -> dict:
             assignments.append((2, 1))
             if not re.search(r"Target Bodies\(1\)\s*=\s*2", block("Body", 2)):
                 raise ValueError("Reduced foundation solver body must target converted Elmer region 2")
+        if mortar:
+            # The fill is its own body with its own material and weight (Material 2 / Body Force 2).
+            assignments.append((3, 2))
+            if not re.search(r"Target Bodies\(1\)\s*=\s*3", block("Body", 3)):
+                raise ValueError("Mortar fill solver body must target converted Elmer region 3")
     else:
+        mortar = False
         assignments = [(1, 1), (2, 2), (3, 1)]
     for body, material in assignments:
         value = block("Body", body)
         for key, number in (("Material", material), ("Body Force", material), ("Equation", 1)):
             if not re.search(rf"(?m)^\s*{key}\s*=\s*{number}\s*$", value):
                 raise ValueError(f"Unexpected saved {key} assignment on body {body}")
-    for number, name in ((1, "concrete"), (2, "bedrock")):
+    for number, name in ((1, "concrete"), (2, "mortar" if mortar else "bedrock")):
         if reduced and name == "bedrock":
             continue
         values = config["material"][name]

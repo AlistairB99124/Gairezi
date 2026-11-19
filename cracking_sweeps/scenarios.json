@@ -1,202 +1,196 @@
-{
-  "schema_version": 1,
-  "target_peak_normal_opening_m": 0.002,
-  "required_load_factor": 1.0,
-  "description": "Hypothetical sensitivity study, not calibrated concrete or engineering acceptance. Factors are keyed by block: lift_joints (tensile_strength_pa and cohesive_fracture_energy_j_m2 multiply the baseline weak lift-plane values; alpha is the absolute JOINT_MECA_RUPT tangential-damage parameter in [0, 2]; friction_coefficient is the absolute JOINT_MECA_FROT coefficient and needs a baseline with that law) and damaged_element_properties (youngs_modulus, tensile_strength_pa and cohesive_fracture_energy_j_m2 multiply the degraded material of the selected band; its other facets take that material's CZM). A weaker bond is also more brittle: each strength factor s comes with an energy factor of s squared or less, which keeps the full-separation opening 2 Gf / ft from growing and keeps the JOINT_MECA_RUPT joint at least as stiff as its neighbouring elements (its K_N is ft^2 * 11 / (2 Gf); a strength cut alone would soften the joint until it sheds its load). All other configuration fields and the selected band are fixed.",
-  "cases": [
+[
     {
-      "id": "A00-baseline",
-      "factors": {}
-    },
-    {
-      "id": "B01-ft075",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.75,
-          "cohesive_fracture_energy_j_m2": 0.5625
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 78.0,
+                "downstream_radius_m": 76.0,
+                "thickness_steps": []
+            }
         }
-      }
     },
     {
-      "id": "B02-ft050",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.5,
-          "cohesive_fracture_energy_j_m2": 0.25
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.5,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 77.75,
+                "downstream_radius_m": 75.5,
+                "thickness_steps": []
+            }
         }
-      }
     },
     {
-      "id": "B03-ft025",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.25,
-          "cohesive_fracture_energy_j_m2": 0.0625
+        "geometry": {
+            "wall": {
+                "radial_width_m": 5.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 77.5,
+                "downstream_radius_m": 75.0,
+                "thickness_steps": []
+            }
         }
-      }
     },
     {
-      "id": "B04-ft010",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.1,
-          "cohesive_fracture_energy_j_m2": 0.01
+        "geometry": {
+            "wall": {
+                "radial_width_m": 5.5,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 77.25,
+                "downstream_radius_m": 74.5,
+                "thickness_steps": []
+            }
         }
-      }
     },
     {
-      "id": "B05-ft005",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.05,
-          "cohesive_fracture_energy_j_m2": 0.0025
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 78,
+                "downstream_radius_m": 76,
+                "thickness_steps": [
+                    {
+                        "top_z_m": -20.0,
+                        "radial_width_m": 4.5
+                    },
+                    {
+                        "top_z_m": -25.0,
+                        "radial_width_m": 5.0
+                    }
+                ]
+            }
         }
-      }
     },
     {
-      "id": "C01-ft050-brittle",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.5,
-          "cohesive_fracture_energy_j_m2": 0.125
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 78.0,
+                "downstream_radius_m": 76.0,
+                "thickness_steps": [
+                    {
+                        "top_z_m": -20.0,
+                        "radial_width_m": 4.5
+                    }
+                ]
+            }
         }
-      }
     },
     {
-      "id": "C02-ft025-brittle",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.25,
-          "cohesive_fracture_energy_j_m2": 0.03125
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 78.0,
+                "downstream_radius_m": 76.0,
+                "thickness_steps": [
+                    {
+                        "top_z_m": -25.0,
+                        "radial_width_m": 5.0
+                    }
+                ]
+            }
         }
-      }
     },
     {
-      "id": "C03-ft010-brittle",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.1,
-          "cohesive_fracture_energy_j_m2": 0.005
-        }
-      }
-    },
-    {
-      "id": "C04-gf050",
-      "factors": {
-        "lift_joints": {
-          "cohesive_fracture_energy_j_m2": 0.5
-        }
-      }
-    },
-    {
-      "id": "C05-gf010",
-      "factors": {
-        "lift_joints": {
-          "cohesive_fracture_energy_j_m2": 0.1
-        }
-      }
-    },
-    {
-      "id": "D01-alpha000",
-      "factors": {
-        "lift_joints": {
-          "alpha": 0.0
-        }
-      }
-    },
-    {
-      "id": "D02-alpha200",
-      "factors": {
-        "lift_joints": {
-          "alpha": 2.0
-        }
-      }
-    },
-    {
-      "id": "E01-ft025-alpha000",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.25,
-          "cohesive_fracture_energy_j_m2": 0.0625,
-          "alpha": 0.0
-        }
-      }
-    },
-    {
-      "id": "E02-ft010-alpha000",
-      "factors": {
-        "lift_joints": {
-          "tensile_strength_pa": 0.1,
-          "cohesive_fracture_energy_j_m2": 0.01,
-          "alpha": 0.0
-        }
-      }
-    },
-    {
-      "id": "F01-elem-e050",
-      "factors": {
-        "damaged_element_properties": {
-          "youngs_modulus": 0.5
-        }
-      }
-    },
-    {
-      "id": "F02-elem-e050-ft050",
-      "factors": {
-        "damaged_element_properties": {
-          "youngs_modulus": 0.5,
-          "tensile_strength_pa": 0.5
-        }
-      }
-    },
-    {
-      "id": "F03-elem-e050-ft050-gf025",
-      "factors": {
-        "damaged_element_properties": {
-          "youngs_modulus": 0.5,
-          "tensile_strength_pa": 0.5,
-          "cohesive_fracture_energy_j_m2": 0.25
-        }
-      }
-    },
-    {
-      "id": "G01-elem-e050-lift-ft050",
-      "factors": {
-        "damaged_element_properties": {
-          "youngs_modulus": 0.5
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 78,
+                "downstream_radius_m": 76,
+                "thickness_steps": [
+                    {
+                        "top_z_m": -20.0,
+                        "radial_width_m": 4.5
+                    },
+                    {
+                        "top_z_m": -25.0,
+                        "radial_width_m": 5.0
+                    }
+                ]
+            }
         },
-        "lift_joints": {
-          "tensile_strength_pa": 0.5,
-          "cohesive_fracture_energy_j_m2": 0.25
+        "material": {
+            "mortar": {
+                "density": 2200.0,
+                "youngs_modulus": 350000000.0,
+                "poisson_ratio": 0.2,
+                "bond_spring_n_per_m3": {
+                    "x": 1250000000.0,
+                    "y": 1250000000.0,
+                    "z": 1250000000.0
+                }
+            }
         }
-      }
     },
     {
-      "id": "G02-elem-e050-ft050-lift-ft025",
-      "factors": {
-        "damaged_element_properties": {
-          "youngs_modulus": 0.5,
-          "tensile_strength_pa": 0.5
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 78.0,
+                "downstream_radius_m": 76.0,
+                "thickness_steps": [
+                    {
+                        "top_z_m": -20.0,
+                        "radial_width_m": 4.5
+                    }
+                ]
+            }
         },
-        "lift_joints": {
-          "tensile_strength_pa": 0.25,
-          "cohesive_fracture_energy_j_m2": 0.0625
+        "material": {
+            "mortar": {
+                "density": 2200.0,
+                "youngs_modulus": 350000000.0,
+                "poisson_ratio": 0.2,
+                "bond_spring_n_per_m3": {
+                    "x": 1250000000.0,
+                    "y": 1250000000.0,
+                    "z": 1250000000.0
+                }
+            }
         }
-      }
     },
     {
-      "id": "G03-elem-e010-ft010-lift-ft010",
-      "factors": {
-        "damaged_element_properties": {
-          "youngs_modulus": 0.1,
-          "tensile_strength_pa": 0.1,
-          "cohesive_fracture_energy_j_m2": 0.01
+        "geometry": {
+            "wall": {
+                "radial_width_m": 4.0,
+                "height_m": 29.0,
+                "upstream_radius_m": 80.0,
+                "centerline_radius_m": 78.0,
+                "downstream_radius_m": 76.0,
+                "thickness_steps": [
+                    {
+                        "top_z_m": -25.0,
+                        "radial_width_m": 5.0
+                    }
+                ]
+            }
         },
-        "lift_joints": {
-          "tensile_strength_pa": 0.1,
-          "cohesive_fracture_energy_j_m2": 0.01
+        "material": {
+            "mortar": {
+                "density": 2200.0,
+                "youngs_modulus": 350000000.0,
+                "poisson_ratio": 0.2,
+                "bond_spring_n_per_m3": {
+                    "x": 1250000000.0,
+                    "y": 1250000000.0,
+                    "z": 1250000000.0
+                }
+            }
         }
-      }
     }
-  ]
-}
+]

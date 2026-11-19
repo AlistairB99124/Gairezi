@@ -71,6 +71,14 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
     bedrock = load_bedrock_material(config_path)
     rock_outer_spring = load_rock_outer_spring(config_path)
     loads = load_environment(config_path)
+    # Optional mortar fill on the wall's thickness steps: its own soft material and weight.
+    mortar = None
+    if mesh_manifest.get("mortar_cells"):
+        values = json.loads(config_path.read_text(encoding="utf-8"))["material"].get("mortar")
+        if values is None or not layer_mode:
+            raise ValueError("Mortar fill cells need material.mortar and the elastic-layer bedrock")
+        mortar = {"density_kg_m3": float(values["density"]), "youngs_modulus_pa": float(values["youngs_modulus"]),
+                  "poissons_ratio": float(values["poisson_ratio"])}
 
     gravity_magnitude = abs(loads.gravity_z_m_s2)
     source_pressures = mesh_manifest["source_pressures"]
@@ -151,6 +159,26 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
                     "'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST', 'ROCK_BOTTOM', 'ROCK_SIDES',")
     outer_model = "" if no_bedrock else "_F(GROUP_MA='OUTER_SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),"
     rock_assignment = "" if not has_bedrock_volume else "_F(GROUP_MA='BEDROCK', MATER=BEDROCK_MAT),"
+    mortar_material = ""
+    if mortar is not None:
+        inputs["material"]["mortar"] = mortar
+        inputs["mortar_fill"] = {
+            "cells": mesh_manifest["mortar_cells"], "volume_m3": mesh_manifest["groups"]["MORTAR"]["volume_m3"],
+            "role": "Soft fill on the wall steps, joined to the wall by the saved bond springs; "
+                    "it has its own material and weight and is not part of any concrete result.",
+        }
+        volume_groups = "('CONCRETE', 'MORTAR')"
+        model_groups = model_groups.replace("'CONCRETE',", "'CONCRETE', 'MORTAR',", 1)
+        rock_assignment += "_F(GROUP_MA='MORTAR', MATER=MORTAR_MAT),"
+        mortar_material = f'''MORTAR_MAT = DEFI_MATERIAU(
+    ELAS=_F(
+        E={mortar["youngs_modulus_pa"]:.12g},
+        NU={mortar["poissons_ratio"]:.12g},
+        RHO={mortar["density_kg_m3"]:.12g},
+    ),
+)
+# config.json material.mortar: the fill on the wall's thickness steps (group MORTAR).
+'''
     fixed_seat = ("FIXED_SEAT = AFFE_CHAR_MECA(MODELE=MODELE, DDL_IMPO="
                   "_F(GROUP_NO='FIXED_SEAT', DX=0.0, DY=0.0, DZ=0.0))\n" if no_bedrock else "")
     fixed_excitation = "_F(CHARGE=FIXED_SEAT)," if no_bedrock else ""
@@ -228,6 +256,7 @@ CONCRETE_MAT = DEFI_MATERIAU(
         RHO={concrete.density_kg_m3:.12g},
     ),
 )
+
 BEDROCK_MAT = DEFI_MATERIAU(
     ELAS=_F(
         E={bedrock["youngs_modulus_pa"]:.12g},
@@ -235,7 +264,7 @@ BEDROCK_MAT = DEFI_MATERIAU(
         RHO={bedrock["density_kg_m3"]:.12g},
     ),
 )
-# Doc u4.43.01 DEFI_MATERIAU / ELAS: config.json material.concrete (wall +
+{mortar_material}# Doc u4.43.01 DEFI_MATERIAU / ELAS: config.json material.concrete (wall +
 # foundation, both concrete) and material.bedrock (rock), matching the same
 # values Elmer.regions.combined_structure / Elmer.graded_bedrock read.
 
