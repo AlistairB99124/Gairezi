@@ -14,9 +14,11 @@ import subprocess
 import tempfile
 import time
 
-from Aster.fracture_material import ROOT, material_contract
+from Aster.fracture_material import material_contract
 from Aster.run_case import detect_installation, file_hash, run_solver
 from Elmer.model_config import CONFIG_PATH, load_config
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def sensitivity_contracts(config: dict) -> list[dict]:
@@ -31,17 +33,24 @@ def sensitivity_contracts(config: dict) -> list[dict]:
 
 
 def command_text(contracts: list[dict]) -> str:
-    parameters = [contract["parameters"] for contract in contracts]
+    inputs = [(contract["parameters"], contract["internal_parameters"]) for contract in contracts]
     return (
         "from code_aster.Commands import *\n"
         "from libaster import AsterError\n"
         "import json\n"
         "DEBUT(ERREUR=_F(ALARME='EXCEPTION'))\n"
-        f"inputs = {parameters!r}\n"
+        f"inputs = {inputs!r}\n"
         "responses = []\n"
-        "for parameters in inputs:\n"
+        "for parameters, converted in inputs:\n"
         "    try:\n"
-        "        material = DEFI_MATER_GC(ENDO_FISS_EXP=_F(**parameters))\n"
+        "        damage = {key: converted[key] for key in\n"
+        "                  ('M', 'P', 'Q', 'K', 'TAU', 'SIG0', 'BETA',\n"
+        "                   'REST_RIGIDITE', 'COEF_RIGI_MINI')}\n"
+        "        material = DEFI_MATERIAU(\n"
+        "            ELAS=_F(E=parameters['E'], NU=parameters['NU']),\n"
+        "            ENDO_FISS_EXP=_F(**damage),\n"
+        "            NON_LOCAL=_F(C_GRAD_VARI=converted['C_GRAD_VARI'],\n"
+        "                         PENA_LAGR=converted['PENA_LAGR']))\n"
         "    except AsterError as error:\n"
         "        responses.append({'parameters': parameters, 'rejected': {\n"
         "            'message_id': str(getattr(error, 'id_message', '')), 'text': str(error)}})\n"

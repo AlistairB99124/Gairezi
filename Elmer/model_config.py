@@ -84,7 +84,10 @@ FRACTURE_DEBUG_SOLVER_NUMBERS = {
     "staggered_tolerance", "mechanics_relative_tolerance", "damage_gradient_tolerance",
     "minimum_elements_per_length_scale",
 }
-FRACTURE_DEBUG_ASTER_KEYS = {"band_width_m", "softening_p"}
+FRACTURE_DEBUG_ASTER_KEYS = {
+    "band_width_m", "softening_p", "load_increment", "maximum_iterations",
+    "relative_residual_tolerance", "line_search_iterations", "subdivision_levels",
+    "adaptive_rounds", "whole_wall_tension_tolerance_pa"}
 CRACK_SEED_FACES = {"upstream", "downstream"}
 CRACK_OPENING_RANGE_M = (0.001, 0.01)
 CRACK_BUFFER_MAX_M = 2.0
@@ -470,7 +473,7 @@ class _ConfigValidator:
         expected_model, expected_material = SUPPORT_MODELS[region]
         for key, expected in (("model", expected_model), ("material", expected_material)):
             value = values.get(key)
-            if key == "model" and region == "bedrock" and value == "bonded":
+            if key == "model" and region == "bedrock" and value in ("bonded", "spring"):
                 continue
             if key in values and value != expected:
                 self.issue(f"{path}.{key}", f"must be {expected!r} for {region} support")
@@ -828,9 +831,13 @@ class _ConfigValidator:
 
     def validate_bedrock_analysis(self, value: object, root: Mapping[str, object]) -> None:
         path = "bedrock_analysis"
-        analysis = self.object(value, path, {"mode"}, optional={"spring_n_per_m3"})
+        analysis = self.object(value, path, {"mode"}, optional={"spring_n_per_m3", "wall_only_body"})
         if analysis is None or "mode" not in analysis:
             return
+        wall_only = analysis.get("wall_only_body", False)
+        if not isinstance(wall_only, bool):
+            self.issue(f"{path}.wall_only_body", "must be a boolean")
+            wall_only = False
         mode = analysis["mode"]
         if "spring_n_per_m3" in analysis:
             springs = self.object(analysis["spring_n_per_m3"], f"{path}.spring_n_per_m3", VECTOR_KEYS)
@@ -841,14 +848,17 @@ class _ConfigValidator:
         if not isinstance(mode, str) or mode not in BEDROCK_ANALYSIS_MODES:
             self.issue(f"{path}.mode", f"must be one of {sorted(BEDROCK_ANALYSIS_MODES)}")
             return
+        if wall_only and mode != "elastic_layer":
+            self.issue(f"{path}.wall_only_body", "requires bedrock_analysis.mode 'elastic_layer'")
+            return
         if mode == "elastic_layer":
             geometry = root.get("geometry")
             foundation = geometry.get("foundation") if isinstance(geometry, Mapping) else None
             bedrock = geometry.get("bedrock") if isinstance(geometry, Mapping) else None
             support = bedrock.get("support") if isinstance(bedrock, Mapping) else None
-            if not isinstance(foundation, Mapping):
+            if not wall_only and not isinstance(foundation, Mapping):
                 self.issue(f"{path}.mode", "elastic_layer requires a concrete foundation")
-            if not isinstance(support, Mapping) or support.get("model") != "bonded":
+            if not wall_only and (not isinstance(support, Mapping) or support.get("model") != "bonded"):
                 self.issue(f"{path}.mode", "elastic_layer requires the configured foundation/bedrock seat to be bonded")
             domain = bedrock.get("domain") if isinstance(bedrock, Mapping) else None
             bottom = domain.get("bottom_z_m") if isinstance(domain, Mapping) else None
@@ -1089,6 +1099,22 @@ class _ConfigValidator:
             softening = self.field_number(aster, "softening_p", f"{path}.aster", positive=True)
             if softening is not None and softening < 1:
                 self.issue(f"{path}.aster.softening_p", "must be at least 1")
+            increment = self.field_number(
+                aster, "load_increment", f"{path}.aster", positive=True)
+            if increment is not None and increment > 0.1:
+                self.issue(f"{path}.aster.load_increment", "must not exceed 0.1")
+            residual = self.field_number(
+                aster, "relative_residual_tolerance", f"{path}.aster", positive=True)
+            if residual is not None and residual > 1e-3:
+                self.issue(f"{path}.aster.relative_residual_tolerance",
+                           "must not exceed 0.001")
+            self.field_number(
+                aster, "whole_wall_tension_tolerance_pa", f"{path}.aster",
+                nonnegative=True)
+            for key in ("maximum_iterations", "line_search_iterations",
+                        "subdivision_levels", "adaptive_rounds"):
+                if key in (aster or {}):
+                    self.debug_integer(aster[key], f"{path}.aster.{key}", 1)
 
     def debug_integer(self, value: object, path: str, minimum: int) -> None:
         if (isinstance(value, bool) or not isinstance(value, (int, float))

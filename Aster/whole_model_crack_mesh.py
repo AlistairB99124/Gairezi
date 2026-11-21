@@ -321,6 +321,116 @@ def build(arrays: dict, geometry: dict, band_half_height_m: float) -> dict:
             "crack_faces": crack["faces"], "report": report}
 
 
+def build_full_wall(arrays: dict) -> dict:
+    """Elevate every wall tetrahedron for intact-start nonlocal damage.
+
+    Unlike ``build``, this path does not cut a selected plane, introduce a seed
+    layer, or apply initial damage. Foundation and bedrock cells remain linear.
+    """
+    nodes = np.asarray(arrays["nodes"], dtype=float)
+    concrete = np.asarray(arrays["tetra4_concrete"], dtype=np.int64)
+    bodies = np.asarray(arrays["concrete_body_ids"], dtype=np.int64)
+    wall = bodies == 1
+    wall_nodes = np.unique(concrete[wall])
+    bedrock = np.asarray(arrays["tetra4_bedrock"], dtype=np.int64)
+    if not wall.any() or not (~wall).any():
+        raise ValueError("Full-wall damage requires both WALL and FOUNDATION cells")
+    if np.intersect1d(wall_nodes, concrete[~wall]).size or np.intersect1d(wall_nodes, bedrock).size:
+        raise ValueError("The wall shares nodes with the foundation or bedrock")
+    faces = {name: np.asarray(arrays[name], dtype=np.int64) for name in FACE_ARRAYS}
+    faces.update({
+        "joint_slave": np.asarray(arrays["joint_slave_tri3"], dtype=np.int64),
+        "joint_master": np.asarray(arrays["joint_master_tri3"], dtype=np.int64),
+    })
+    elevated = elevate_band(nodes, concrete, wall, faces)
+    source_xyz = nodes[arrays["joint_slave_tri3"]]
+    source_areas = np.linalg.norm(np.cross(source_xyz[:, 1] - source_xyz[:, 0],
+                                          source_xyz[:, 2] - source_xyz[:, 0]), axis=1) / 2
+    origins = np.arange(len(source_xyz), dtype=np.int64)
+    from Aster.refined_interface import interface_blocks
+    joint_pairs, joint_blocks, joint_audit = interface_blocks(
+        elevated["nodes"], elevated["faces"]["joint_slave"], elevated["faces"]["joint_master"],
+        origins, origins, arrays["joint_coefficients_n_per_m3"], source_areas_m2=source_areas)
+    return {
+        **elevated,
+        "body_ids": bodies,
+        "joint_block_pairs": joint_pairs,
+        "joint_block_matrices_n_per_m": joint_blocks,
+        "report": {
+            "original_concrete_cells": int(len(concrete)),
+            "quadratic_wall_cells": int(wall.sum()),
+            "linear_foundation_cells": int((~wall).sum()),
+            "linear_bedrock_cells": int(len(bedrock)),
+            "hanging_nodes": int(len(elevated["hanging_nodes"])),
+            "nodes": int(len(elevated["nodes"])),
+            "initial_damage": 0.0,
+            "interface_integration": joint_audit,
+        },
+    }
+
+
+def build_wall_only(arrays: dict, base_stiffness_n_per_m3: np.ndarray) -> dict:
+    """Keep the wall linear and replace the removed body stack by base springs."""
+    nodes = np.asarray(arrays["nodes"], dtype=float)
+    concrete = np.asarray(arrays["tetra4_concrete"], dtype=np.int64)
+    bodies = np.asarray(arrays["concrete_body_ids"], dtype=np.int64)
+    wall = bodies == 1
+    if not wall.any():
+        raise ValueError("Wall-only damage requires WALL cells")
+    wall_cells = concrete[wall]
+    wall_nodes = np.unique(wall_cells)
+    faces = {name: np.asarray(arrays[name], dtype=np.int64) for name in FACE_ARRAYS}
+    base_faces = np.asarray(
+        arrays["joint_slave_tri3"] if len(arrays["joint_slave_tri3"])
+        else arrays["support_faces"], dtype=np.int64)
+    if not len(base_faces) or not np.isin(base_faces, wall_nodes).all():
+        raise ValueError("The source wall base faces do not belong to the WALL body")
+    faces["wall_base"] = base_faces
+    retained = np.unique(np.concatenate([wall_cells.ravel(), *[value.ravel() for value in faces.values()]]))
+    remap = np.full(len(nodes), -1, dtype=np.int64)
+    remap[retained] = np.arange(len(retained), dtype=np.int64)
+    nodes = nodes[retained]
+    wall_cells = remap[wall_cells]
+    faces = {name: remap[value] for name, value in faces.items()}
+    from Aster.quadratic_surface import surface_blocks
+    matrix = np.asarray(base_stiffness_n_per_m3, dtype=float)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all() \
+            or not np.allclose(matrix, matrix.T, rtol=1e-12, atol=1e-9):
+        raise ValueError("Wall base stiffness must be a finite symmetric 3x3 tensor")
+    if np.linalg.eigvalsh(matrix).min() <= 0.0:
+        raise ValueError("Wall base stiffness must be positive definite")
+    pairs, blocks = surface_blocks(nodes, faces["wall_base"], matrix)
+    base_corners = nodes[faces["wall_base"][:, :3]]
+    base_areas = np.linalg.norm(
+        np.cross(base_corners[:, 1] - base_corners[:, 0],
+                 base_corners[:, 2] - base_corners[:, 0]), axis=1) / 2.0
+    report = {
+        "original_concrete_cells": int(len(concrete)),
+        "quadratic_wall_cells": 0,
+        "linear_wall_cells": int(wall.sum()),
+        "linear_foundation_cells": 0,
+        "linear_bedrock_cells": 0,
+        "hanging_nodes": 0,
+        "nodes": int(len(nodes)),
+        "initial_damage": 0.0,
+        "base_faces": int(len(base_faces)),
+        "base_stiffness_n_per_m3": matrix.tolist(),
+        "base_area_m2": float(base_areas.sum()),
+        "base_face_area_median_m2": float(np.median(base_areas)),
+    }
+    return {
+        "nodes": nodes,
+        "cells": np.column_stack([wall_cells, np.full((len(wall_cells), 6), -1, dtype=np.int64)]),
+        "faces": faces,
+        "hanging_nodes": np.empty(0, dtype=np.int64),
+        "hanging_master_cells": np.empty(0, dtype=np.int64),
+        "body_ids": np.ones(len(wall_cells), dtype=np.int64),
+        "joint_block_pairs": pairs,
+        "joint_block_matrices_n_per_m": blocks,
+        "report": report,
+    }
+
+
 def archive_arrays(arrays: dict, built: dict) -> dict:
     """Arrays for convert_whole_model_to_med.py: concrete rows first, then bedrock."""
     concrete = built["cells"]
@@ -361,6 +471,65 @@ def archive_arrays(arrays: dict, built: dict) -> dict:
             built["joint_block_matrices_n_per_m"], arrays["support_matrices_n_per_m"]]),
         "hanging_nodes": np.asarray(built["hanging_nodes"], dtype=np.int64),
         **crack_node_groups(built),
+    }
+
+
+def archive_full_wall(arrays: dict, built: dict) -> dict:
+    """Archive all-wall quadratic damage with no seed or crack faces."""
+    concrete = built["cells"]
+    bedrock = np.asarray(arrays["tetra4_bedrock"], dtype=np.int64)
+    padded_bedrock = np.column_stack([bedrock, np.full((len(bedrock), 6), -1, dtype=np.int64)])
+    cells = np.vstack([concrete, padded_bedrock])
+    count = len(concrete)
+    wall = built["body_ids"] == 1
+    rock = np.zeros(len(bedrock), dtype=bool)
+    master = np.zeros(count, dtype=bool)
+    master[built["hanging_master_cells"]] = True
+
+    def concrete_mask(mask):
+        return np.concatenate([mask, rock])
+
+    def pad(triangles):
+        triangles = np.asarray(triangles, dtype=np.int64).reshape(-1, 3)
+        return np.column_stack([triangles, np.full((len(triangles), 3), -1, dtype=np.int64)])
+
+    return {
+        "nodes": built["nodes"], "cells": cells,
+        "group_wall": concrete_mask(wall),
+        "group_foundation": concrete_mask(~wall),
+        "group_bedrock": np.concatenate([np.zeros(count, dtype=bool), ~rock]),
+        "group_linear_volumes": np.concatenate([~wall, ~rock]),
+        "group_hanging_master": concrete_mask(master),
+        "faces_upstream": built["faces"]["tri3_upstream"],
+        "faces_downstream": built["faces"]["tri3_downstream"],
+        "faces_crest": built["faces"]["tri3_crest"],
+        "faces_rock_bottom": pad(arrays["tri3_rock_bottom"]),
+        "faces_rock_sides": pad(arrays["tri3_rock_sides"]),
+        "surface_block_pairs": np.vstack([
+            built["joint_block_pairs"],
+            np.repeat(np.asarray(arrays["support_nodes"], dtype=np.int64)[:, None], 2, axis=1)]),
+        "surface_block_matrices_n_per_m": np.concatenate([
+            built["joint_block_matrices_n_per_m"], arrays["support_matrices_n_per_m"]]),
+        "hanging_nodes": np.asarray(built["hanging_nodes"], dtype=np.int64),
+    }
+
+
+def archive_wall_only(built: dict) -> dict:
+    """Archive the single quadratic WALL body and its exact base spring operator."""
+    count = len(built["cells"])
+    def pad_faces(faces):
+        rows = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+        return np.column_stack([rows, np.full((len(rows), 3), -1, dtype=np.int64)])
+    return {
+        "nodes": built["nodes"], "cells": built["cells"],
+        "group_wall": np.ones(count, dtype=bool),
+        "faces_upstream": pad_faces(built["faces"]["tri3_upstream"]),
+        "faces_downstream": pad_faces(built["faces"]["tri3_downstream"]),
+        "faces_crest": pad_faces(built["faces"]["tri3_crest"]),
+        "faces_wall_base": pad_faces(built["faces"]["wall_base"]),
+        "surface_block_pairs": built["joint_block_pairs"],
+        "surface_block_matrices_n_per_m": built["joint_block_matrices_n_per_m"],
+        "hanging_nodes": np.empty(0, dtype=np.int64),
     }
 
 

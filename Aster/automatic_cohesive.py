@@ -205,10 +205,7 @@ def split_for_joints(arrays: dict, faces: np.ndarray) -> dict:
             next_id += 1
         copies[node] = node_copies
 
-    support = np.unique(np.concatenate((
-        np.asarray(arrays["support_nodes"], dtype=np.int64),
-        np.asarray(arrays.get("support_interpolation_parents", []), dtype=np.int64).ravel(),
-    )))
+    support = np.asarray(arrays["support_nodes"], dtype=np.int64)
     if np.any(np.isin(support, list(copies))):
         raise CorroborationError("A candidate facet node carries an outer support spring")
     points = np.vstack(new_points)
@@ -257,6 +254,21 @@ def split_for_joints(arrays: dict, faces: np.ndarray) -> dict:
                 raise CorroborationError(f"Loaded face {key}[{row}] is not a boundary face")
             tris[row] = remap(tris[row].tolist(), int(found[0]))
         result[key] = tris
+
+    if len(arrays.get("support_faces", [])):
+        support_faces = np.asarray(arrays["support_faces"], dtype=np.int64).copy()
+        for row in np.flatnonzero(np.isin(support_faces, list(copies)).any(axis=1)):
+            found = owners(int(_codes(support_faces[row:row + 1], base)[0]))
+            if len(found) != 1:
+                raise CorroborationError(
+                    f"Wall-base support face {row} cannot be assigned to one crack-side component")
+            support_faces[row] = remap(support_faces[row].tolist(), int(found[0]))
+        result["support_faces"] = support_faces
+        if len(arrays.get("support_interpolation_parents", [])):
+            parents = np.asarray(arrays["support_interpolation_parents"], dtype=np.int64)
+            if parents.shape != (3 * len(support_faces), 3):
+                raise CorroborationError("Wall-base support interpolation topology is inconsistent")
+            result["support_interpolation_parents"] = np.repeat(support_faces, 3, axis=0)
 
     pairs = np.asarray(arrays["seg2_wall_foundation_springs"], dtype=np.int64)
     areas = np.asarray(arrays["wall_foundation_tributary_area_m2"], dtype=float)
@@ -565,13 +577,18 @@ def load_factors(summary: dict) -> list[float]:
                 float(summary.get("maximum_overload_factor") or 1.0))
     lift = (summary.get("material_assignment") or {}).get("joint_properties") or {}
     friction = summary.get("damaged_joint_friction") is not None or lift.get("law") == "JOINT_MECA_FROT"
+    controls = summary.get("solver_controls") or {}
     if summary.get("crack_water_pressure") is True:
-        return [0.01, *[round(value * .025, 10) for value in range(1, int(round(final / .025)) + 1)
-                        if value * .025 < final - 1e-9], final]
+        configured_increment = float(controls.get("load_increment", 0.025))
+        values = [0.01]
+        while values[-1] < final - 1e-9:
+            values.append(round(min(final, values[-1] + configured_increment), 10))
+        return values
+    configured_increment = float(controls.get("load_increment", LOAD_INCREMENT))
     factors = [FRICTION_FINE_INCREMENT if friction else FIRST_LOAD_FACTOR]
     while factors[-1] < final - 1e-9:
         increment = (FRICTION_FINE_INCREMENT if friction and factors[-1] < FRICTION_FINE_LIMIT - 1e-9
-                     else LOAD_INCREMENT)
+                     else configured_increment)
         factors.append(round(min(final, factors[-1] + increment), 10))
     return factors
 
@@ -1027,23 +1044,29 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
                     "PROL_DROITE='CONSTANT')\n" if any_friction else "")
     # Softening laws (friction stick-slip, lift-joint rupture of many facets at once) need the
     # line search: a full tangent Newton step over a snap-through diverges from iteration 0.
-    line_search = ("\n        RECH_LINEAIRE=_F(METHODE='MIXTE', ITER_LINE_MAXI=3),"
-                   if any_friction or lift_law is not None else "")
+    controls = joint.get("solver_controls") or {}
+    line_iterations = int(controls.get("line_search_iterations", 8))
+    maximum_iterations = int(controls.get("maximum_iterations", 40))
+    subdivision_levels = int(controls.get("subdivision_levels", 6))
+    residual = float(controls.get("relative_residual_tolerance", 1e-6))
+    line_search = (f"\n        RECH_LINEAIRE=_F(METHODE='MIXTE', ITER_LINE_MAXI={line_iterations}),"
+                   if joint.get("has_joints", False) else "")
     # Friction and lift-joint steps empirically converge by iteration ~30 or oscillate
     # forever on toggling faces; a 100-iteration budget made every failed bite cost ~30
     # wall-clock minutes before DECOUPE was allowed to subdivide. 40 keeps margin over the
     # observed convergence tail while making failures 2.5x cheaper.
     toggling_law = friction_law if friction_law is not None else lift_law
-    convergence = (f"CONVERGENCE=_F(ITER_GLOB_MAXI=40, "
+    convergence = (f"CONVERGENCE=_F(ITER_GLOB_MAXI={maximum_iterations}, "
                    f"RESI_GLOB_MAXI={toggling_law['residual_tolerance_n']:.6g}),"
                    if toggling_law is not None else
-                   "CONVERGENCE=_F(ITER_GLOB_MAXI=30, RESI_GLOB_RELA=1.0e-6),")
+                   f"CONVERGENCE=_F(ITER_GLOB_MAXI={maximum_iterations}, RESI_GLOB_RELA={residual:.12g}),")
     comm += f'''{gravity_ramp}RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 100.0, 100.0), PROL_DROITE='LINEAIRE')
 # Every load is scaled by the load factor (= INST), as in the FEniCSx proportional ramp.
 
 STEPS_PATH = {_comm_string(steps_path)}
 STATUS_PATH = {_comm_string(status_path)}
 TARGETS = [{targets}]
+TARGET_LEVELS = [0] * len(TARGETS)
 JOINT_CELLS = list(MAIL.getCells('JOINTS')) if {has_joints!r} else []
 # Per-joint-cell mask of Mohr-Coulomb friction cells (None = all cohesive).
 FRICTION_CELLS = {friction_cells}
@@ -1114,11 +1137,14 @@ COMPORT = (
 {comport_joints})
 RESU = None
 reached = 0.0
-for target in TARGETS:
+target_index = 0
+while target_index < len(TARGETS):
+    target = TARGETS[target_index]
+    target_level = TARGET_LEVELS[target_index]
     print(f"ASTER_COHESIVE_STEP start load_factor={{target:.6g}}", flush=True)
     times = DEFI_LIST_INST(
         DEFI_LIST=_F(LIST_INST=DEFI_LIST_REEL(DEBUT=reached, INTERVALLE=_F(JUSQU_A=target, NOMBRE=1))),
-        ECHEC=_F(EVENEMENT='ERREUR', ACTION='DECOUPE', SUBD_METHODE='MANUEL', SUBD_PAS=4, SUBD_NIVEAU=4),
+        ECHEC=_F(EVENEMENT='ERREUR', ACTION='DECOUPE', SUBD_METHODE='MANUEL', SUBD_PAS=4, SUBD_NIVEAU={subdivision_levels}),
     )
     options = dict(
         MODELE=MODELE, CHAM_MATER=CHMAT, CARA_ELEM=CARA_ROCK, EXCIT=EXCIT, COMPORTEMENT=COMPORT,
@@ -1193,6 +1219,7 @@ for target in TARGETS:
             (history["normal_jump_m"][-1] > {opening_threshold})):
         save({{"overload_stopped_on_opening": True}})
         break
+    target_index += 1
 
 if history["load_factor"]:
     final_depl = nodal_displacement(RESU.getField('DEPL', RESU.getLastIndex()))
@@ -1222,6 +1249,7 @@ FIN()
         comm = comm.replace("RESU = None\n", (
             f"exec(compile({runtime_source!r}, 'hydraulic_loads.py', 'exec'))\n"
             f"hydraulic_settings = {settings!r}\n"
+            f"hydraulic_subdivision_levels = {hydraulic_loads.MAX_LOAD_INTERVAL_BISECTIONS}\n"
             f"with np.load({_comm_string(archive.resolve())}, allow_pickle=False) as stored:\n"
             "    hydraulic_arrays = {key: stored[key] for key in stored.files}\n"
             f"crack_water = CrackWater(hydraulic_arrays, {metadata['upstream_z_m']!r}, "
@@ -1393,6 +1421,7 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     joint["has_joints"] = bool(len(faces))
     joint["stop_overload_on_opening"] = summary.get("status") == "prepared_aster_candidates"
     joint["material_assignment"] = assignment
+    joint["solver_controls"] = summary.get("solver_controls") or {}
     if "hydraulic_loads" in base_inputs:
         joint["hydraulic_loads"] = {
             **base_inputs["hydraulic_loads"],
@@ -1724,6 +1753,7 @@ def unjointed_overstress(points, wall, stress, joints, strength_pa) -> dict:
         "volume_m3": float(volumes[over].sum()),
         "peak_principal_stress_pa": None,
         "peak_centroid_xyz_m": None,
+        "wall_cell_indices": np.flatnonzero(over).tolist(),
     }
     if (~jointed).any():
         candidates = np.flatnonzero(~jointed)
@@ -2068,7 +2098,6 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                  "for each assigned cohesive law. Lower peak wall displacement is not evidence of "
                  "greater strength; inspect matched locations, stress redistribution and separation."),
     }
-
     displacement_path = run_dir / STEPS_NAME.replace(".npz", "_displacement.npz")
     if displacement_path.is_file():
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=True) as arrays:
@@ -2132,7 +2161,12 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         # Where the model cannot crack although the stress says it would.
         intact_strength = (joint["intact_joint"]["tensile_strength_pa"] if "intact_joint" in joint
                            else joint["tensile_strength_pa"])
-        report["unjointed_overstress"] = unjointed_overstress(nodes, wall, final_stress, joint_lips, intact_strength)
+        report["unjointed_overstress"] = unjointed_overstress(
+            nodes, wall, final_stress, joint_lips, intact_strength)
+        with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=False) as stored:
+            source_rows = np.asarray(stored["source_cell_rows"], dtype=np.int64)
+        indices = report["unjointed_overstress"].get("wall_cell_indices", [])
+        report["growth_source_rows"] = source_rows[np.asarray(indices, dtype=np.int64)].tolist()
         # How much of the displacement change is elastic softening and how much is cracking.
         sources = []
         degradation = inputs.get("support_degradation") or {}
@@ -2161,7 +2195,7 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
             "tensile_peak_centroid_xyz_m": cracked["tensile_peak_centroid_xyz_m"],
             "compressive_peak_centroid_xyz_m": cracked["compressive_peak_centroid_xyz_m"],
         }
-        from Aster.export_paraview import export_mesh
+        from Aster.export_paraview import export_joint_series, export_mesh
         # Preserve all bodies in the view, while assessments use only wall nodes.
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=True) as stored:
             export_arrays = {key: stored[key] for key in stored.files}
@@ -2185,6 +2219,9 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         paraview = export_mesh(export_arrays, final_u, output_dir / "paraview", damage[-1], jump[-1],
                                concrete_cell_stress=concrete_cell_stress)
         report["paraview"] = paraview
+        report["paraview"]["joint_history"] = export_joint_series(
+            export_arrays, factors, damage, jump,
+            output_dir / "paraview")
         report["paraview"]["stress_arrays"] = {
             "names": sorted(concrete_cell_stress),
             "scope": "concrete (wall + foundation) cells; rock cells are NaN",

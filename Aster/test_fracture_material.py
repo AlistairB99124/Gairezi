@@ -9,7 +9,7 @@ from unittest.mock import patch
 import subprocess
 
 from Aster.check_fracture_material import check, command_text, sensitivity_contracts, validate_responses
-from Aster.fracture_material import FENICSX_DEFAULTS, material_contract
+from Aster.fracture_material import material_contract
 from Elmer.model_config import load_config
 
 
@@ -26,7 +26,7 @@ class FractureMaterialTests(unittest.TestCase):
         self.assertEqual(p["FC"], 30e6)
         self.assertEqual(p["FT"], self.config["material"]["concrete"]["tensile_strength_pa"])
         self.assertEqual(p["E"], self.config["material"]["concrete"]["youngs_modulus"])
-        self.assertEqual(p["GF"], json.loads(FENICSX_DEFAULTS.read_text())["critical_energy_release_rate_j_m2"])
+        self.assertEqual(p["GF"], self.config["material"]["concrete"]["cohesive_fracture_energy_j_m2"])
         self.assertEqual((p["LARG_BANDE"], p["P"], p["Q"]), (.5, 5., 0.))
         self.assertEqual(contract["derived"]["half_band_width_m"], .25)
         self.assertEqual(contract["calibration_status"], "provisional_not_test_calibrated")
@@ -41,7 +41,7 @@ class FractureMaterialTests(unittest.TestCase):
 
     def test_native_strength_ratio_and_poisson_constraints(self):
         for key, value, message in (
-            ("compressive_strength_pa", 10e6, "ratio"),
+            ("compressive_strength_pa", .5e6, "ratio"),
             ("poisson_ratio", -.1, "poisson_ratio"),
         ):
             config = copy.deepcopy(self.config)
@@ -56,22 +56,20 @@ class FractureMaterialTests(unittest.TestCase):
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                     material_contract(self.config, **{key: value})
 
-    def test_energy_is_read_from_the_shared_source_not_a_second_copy(self):
-        with tempfile.TemporaryDirectory() as directory:
-            defaults = Path(directory) / "defaults.json"
-            defaults.write_text('{"critical_energy_release_rate_j_m2": 150}')
-            contract = material_contract(self.config, fenicsx_defaults_path=defaults)
-        self.assertEqual(contract["parameters"]["GF"], 150)
+    def test_energy_is_read_from_the_concrete_material_not_a_solver_copy(self):
+        self.config["material"]["concrete"]["cohesive_fracture_energy_j_m2"] = 175.
+        contract = material_contract(self.config)
+        self.assertEqual(contract["parameters"]["GF"], 175.)
 
-    def test_fracture_debug_overrides_energy_band_and_softening(self):
+    def test_aster_debug_overrides_regularisation_but_not_concrete_energy(self):
         self.config["fracture_debug"] = {
             "critical_energy_release_rate_j_m2": 2700.0,
             "aster": {"band_width_m": 0.25, "softening_p": 2.0},
         }
         contract = material_contract(self.config)
         p = contract["parameters"]
-        self.assertEqual((p["GF"], p["LARG_BANDE"], p["P"]), (2700.0, 0.25, 2.0))
-        self.assertIn("fracture_debug", contract["provenance"]["fracture_energy"])
+        self.assertEqual((p["GF"], p["LARG_BANDE"], p["P"]), (150.0, 0.25, 2.0))
+        self.assertIn("material.concrete", contract["provenance"]["fracture_energy"])
         self.assertIn("fracture_debug", contract["provenance"]["regularisation_and_softening"])
         # Explicit sensitivity arguments still win over the debug block.
         self.assertEqual(material_contract(self.config, band_width_m=1.0)["parameters"]["LARG_BANDE"], 1.0)

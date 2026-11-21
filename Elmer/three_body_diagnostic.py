@@ -265,7 +265,8 @@ def prepare(
         ),
     }
     joint_list = wall_joints(config) if concrete.wall_joint_levels_m else []
-    foundation_present = "foundation" in config["geometry"]
+    wall_only_body = bool(config.get("bedrock_analysis", {}).get("wall_only_body"))
+    foundation_present = "foundation" in config["geometry"] and not wall_only_body
     bonded_foundation = foundation_present and foundation_support(config)["model"] == "bonded"
     bonded_bedrock = config["geometry"]["bedrock"]["support"]["model"] == "bonded"
     seat_pairs = (
@@ -690,8 +691,6 @@ def _prepare_elastic_layer(
     from bedrock_support import lumped_layer_support
     from .mortar_interfaces import split_planar_interfaces, expand_spring_pairs
 
-    if foundation is None:
-        raise ValueError("The elastic-layer support requires the concrete foundation")
     bedrock = config["material"]["bedrock"]
     bottom_z = config["geometry"]["bedrock"]["domain"]["bottom_z_m"]
     nodes = np.asarray(concrete.nodes, dtype=float)
@@ -731,10 +730,11 @@ def _prepare_elastic_layer(
         lambda match: f"Target Boundaries(1) = {boundary_map[int(match.group(1))]}",
         text,
     )
-    text += (
-        '\nBody 2\n    Target Bodies(1) = 2\n    Name = "FoundationBody"\n    Equation = 1\n'
-        '    Material = 1\n    Body Force = 1\nEnd\n'
-    )
+    if foundation is not None:
+        text += (
+            '\nBody 2\n    Target Bodies(1) = 2\n    Name = "FoundationBody"\n    Equation = 1\n'
+            '    Material = 1\n    Body Force = 1\nEnd\n'
+        )
     if fill is not None:
         # ElmerGrid numbers the saved bodies 1 (wall), 3 (foundation), 4 (fill) as 1, 2, 3.
         text += (
@@ -772,13 +772,19 @@ def _prepare_elastic_layer(
     mesh_sizing.update({
         "bedrock_volume": "omitted",
         "interface_policy": (
-            "Concrete wall and foundation retained; foundation-seat support triangles use "
-            "the configured elastic-layer tensor at each face centroid."
+            ("Concrete wall retained; wall-seat support triangles use the configured "
+             "elastic-layer tensor at each face centroid."
+             if foundation is None else
+             "Concrete wall and foundation retained; foundation-seat support triangles use "
+             "the configured elastic-layer tensor at each face centroid.")
         ),
     })
-    foundation.report["support"] = dict(foundation_support(config))
-    foundation_report = dict(foundation.report)
-    foundation_report["bedrock_connection"] = "elastic_layer"
+    if foundation is not None:
+        foundation.report["support"] = dict(foundation_support(config))
+        foundation_report = dict(foundation.report)
+        foundation_report["bedrock_connection"] = "elastic_layer"
+    else:
+        foundation_report = {"present": False}
     support_report = {
         "model": "elastic_layer",
         "depth_rule": "face-centroid vertical distance to geometry.bedrock.domain.bottom_z_m",
@@ -818,11 +824,17 @@ def _prepare_elastic_layer(
             if not entry.startswith("Effective depth")
         ]
     wall_foundation_note = (
+        "wall-only body; foundation compliance is not separately calculated or added to the direct seat spring"
+        if foundation is None else
         "perfectly bonded wall/foundation (shared nodes; zero relative displacement)"
         if bonded_foundation else
         "wall/foundation directional springs from geometry.foundation.support.spring_n_per_m3"
     )
-    joint_note = wall_foundation_note + "; preliminary compliant local elastic-layer foundation support"
+    joint_note = (
+        wall_foundation_note
+        if foundation is None else
+        wall_foundation_note + "; preliminary compliant local elastic-layer foundation support"
+    )
     if joint_list:
         joint_note += (
             f"; wall blocks joined at z={joint_levels_text} m by directional springs "
@@ -842,14 +854,18 @@ def _prepare_elastic_layer(
     report = {
         **fill_report,
         "foundation": foundation_report,
-        "foundation_bedrock_connection": "elastic_layer",
-        "wall_foundation_connection": "bonded" if bonded_foundation else "spring",
+        "foundation_bedrock_connection": "elastic_layer" if foundation is not None else None,
+        "wall_foundation_connection": (
+            None if foundation is None else "bonded" if bonded_foundation else "spring"
+        ),
         "assumptions": [
             wall_foundation_note,
             *(["mortar fill on the wall's thickness steps: a separate soft body joined to the wall by linear "
                "springs; its sloped face carries the tailwater pressure of the wall faces it covers"]
               if fill is not None else []),
-            "concrete foundation retained; no bedrock volume or rock self-weight settlement",
+            ("foundation and bedrock volumes omitted; direct wall-base springs retain configured compliance"
+             if foundation is None else
+             "concrete foundation retained; no bedrock volume or rock self-weight settlement"),
             *support_report["limitations"],
             "wall-only stress reporting and damage region",
             "zero uplift",
@@ -857,10 +873,10 @@ def _prepare_elastic_layer(
         ],
         "purpose": "Preliminary wall-on-compliant-bedrock elastic-layer analysis",
         "joints": "spring",
-        "interface_stiffness_n_per_m3": stiffness,
+        "interface_stiffness_n_per_m3": solver_stiffness,
         "interface_stiffness_sources": {
             **{joint["name"]: WALL_JOINT_SOURCE for joint in joint_list},
-            **({} if bonded_foundation else {
+            **({} if foundation is None or bonded_foundation else {
                 "wall_foundation": "geometry.foundation.support.spring_n_per_m3",
             }),
             **({"wall_mortar": "material.mortar.bond_spring_n_per_m3"} if fill is not None else {}),
@@ -874,16 +890,23 @@ def _prepare_elastic_layer(
         "nodes": len(nodes),
         "cells_by_body": dict(Counter(concrete.region_ids)),
         "mesh_sizing": mesh_sizing,
-        "solver_body_ids": {"wall": WALL_BODY, "foundation": 2, **({"mortar_fill": 3} if fill is not None else {})},
-        "source_body_ids": {"wall": WALL_BODY, "foundation": 3,
-                            **({"mortar_fill": MORTAR_FILL_REGION_ID} if fill is not None else {})},
+        "solver_body_ids": {
+            "wall": WALL_BODY,
+            **({"foundation": 2} if foundation is not None else {}),
+            **({"mortar_fill": 3} if fill is not None else {}),
+        },
+        "source_body_ids": {
+            "wall": WALL_BODY,
+            **({"foundation": 3} if foundation is not None else {}),
+            **({"mortar_fill": MORTAR_FILL_REGION_ID} if fill is not None else {}),
+        },
         "boundary_id_map": boundary_map,
         "rock_outer_support": {"model": "elastic_layer"},
         "elastic_layer_support": support_report,
         "wall_rock_seat_triangles": int(len(seat_faces)),
         "wall_underside": {
-            "profile": "stepped_45deg_chamfer",
-            "elevation_quantization": True,
+            "profile": "piecewise_linear_bedrock_contours" if foundation is None else "stepped_45deg_chamfer",
+            "elevation_quantization": foundation is not None,
             "radial_extent": "full_wall_thickness",
         },
         "geometry": {
@@ -894,17 +917,17 @@ def _prepare_elastic_layer(
         },
         "concrete_element_types": sorted({kind for kind, _ in concrete.cells}),
         "linear_solver": {
-            "method": "BiCGStabl", "preconditioner": "ILU2",
+            "method": "BiCGStabl", "preconditioner": "ILU2" if foundation is not None else "ILU1",
             "ilu_factor": 0.01, "convergence_tolerance": 1e-10,
         },
         "solver_input": path.name,
         "result_name": "three_body_results",
         "result": None,
-        "wall_bedrock_connection": "not_in_contact",
+        "wall_bedrock_connection": "spring" if foundation is None else "not_in_contact",
         "connection_assumption": joint_note,
         "active_support": (
-            "local elastic-layer tensor springs under concrete foundation; "
-            "wall-only stress reporting/cracking"
+            "local elastic-layer tensor springs at the wall base; "
+            "wall-only body and wall-only stress reporting/cracking"
         ),
         "stress_reporting_scope": "wall",
         "engineering_validated": False,
@@ -1144,7 +1167,9 @@ def check_spring_gaps(gaps: dict, stiffness: dict[str, dict[str, float]]) -> Non
     component ceiling is a plausibility check, not an engineering acceptance limit.
     """
     for name in stiffness:
-        joint = gaps["joints"][name]
+        joint = gaps["joints"].get(name)
+        if joint is None:
+            raise RuntimeError(f"No {name} joint locations found in the result")
         if joint["locations"] == 0:
             raise RuntimeError(f"No {name} joint locations found in the result")
         maximum = np.asarray(joint["max_abs_gap_by_axis_m"], dtype=float)

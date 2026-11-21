@@ -1,10 +1,11 @@
 {
   "bedrock_analysis": {
     "mode": "elastic_layer",
+    "wall_only_body": true,
     "spring_n_per_m3": {
-      "x": 20000000000.0,
-      "y": 20000000000.0,
-      "z": 53333333000.0
+      "x": 1250000000.0,
+      "y": 1250000000.0,
+      "z": 3000000000.0
     }
   },
   "geometry": {
@@ -22,13 +23,13 @@
     },
     "global_element_size_m": 0.5,
     "local_element_size_m": 0.1,
-    "target_wall_tetrahedral_elements": 150000,
+    "target_wall_tetrahedral_elements": 20000,
     "wall": {
-      "radial_width_m": 4.5,
-      "height_m": 29.0,
+      "radial_width_m": 4.0,
+      "height_m": 30.0,
       "upstream_radius_m": 80.0,
-      "centerline_radius_m": 77.75,
-      "downstream_radius_m": 75.5,
+      "centerline_radius_m": 78,
+      "downstream_radius_m": 76,
       "joint_support": {
         "model": "bonded",
         "spring_n_per_m3": {
@@ -202,7 +203,7 @@
         }
       ],
       "support": {
-        "model": "bonded",
+        "model": "spring",
         "material": "bedrock",
         "spring_n_per_m3": {
           "x": 1250000000.0,
@@ -217,7 +218,7 @@
       "density": 2400,
       "youngs_modulus": 35000000000.0,
       "poisson_ratio": 0.2,
-      "tensile_strength_pa": 100000.0,
+      "tensile_strength_pa": 2000000.0,
       "compressive_strength_pa": 30000000.0,
       "cohesive_fracture_energy_j_m2": 150.0
     },
@@ -248,33 +249,15 @@
   "outputs": {
     "max_displacement": true,
     "max_tensile_stress": true,
-    "cracking_risk": true
+    "cracking_risk": false
   },
   "cracking": [],
   "damage_selection": {
     "enabled": true,
     "crack_water_pressure": true,
-    "crack_base": true,
+    "crack_base": false,
     "max_damage_count": null,
-    "maximum_overload_factor": 1.0,
-    "damaged_element_properties": {
-      "density": 2400,
-      "youngs_modulus": 35000000000.0,
-      "poisson_ratio": 0.2,
-      "tensile_strength_pa": 2000000.0,
-      "compressive_strength_pa": 30000000.0,
-      "cohesive_fracture_energy_j_m2": 100.0
-    },
-    "lift_joints": {
-      "tensile_strength_pa": 200000.0,
-      "cohesive_fracture_energy_j_m2": 5.0,
-      "max_normal_deviation_deg": 15.0,
-      "include_base_contact": false,
-      "law": "JOINT_MECA_FROT",
-      "alpha": 1.0,
-      "pena_contact": 1.0,
-      "friction_coefficient": 1.0
-    }
+    "maximum_overload_factor": 1.0
   },
   "fracture_debug": {
     "model": "AT2",
@@ -297,7 +280,14 @@
     },
     "aster": {
       "band_width_m": 2.5,
-      "softening_p": 5.0
+      "softening_p": 5.0,
+      "load_increment": 0.005,
+      "maximum_iterations": 60,
+      "relative_residual_tolerance": 0.000005,
+      "line_search_iterations": 12,
+      "subdivision_levels": 8,
+      "adaptive_rounds": 5,
+      "whole_wall_tension_tolerance_pa": 1.0
     }
   }
 }

@@ -106,6 +106,43 @@ class AutomaticPreparationTests(unittest.TestCase):
             self.assertEqual(inputs["baseline_displacement_sha256"], prep.file_hash(baseline / "aster_full_displacement.npz"))
             compile(comm, "selected.comm", "exec")
 
+    def test_all_overstressed_scope_ignores_legacy_damaged_material_override(self):
+        from Aster import automatic_cohesive as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config_path = self.fixture(root)
+            config = json.loads(config_path.read_text())
+            config["damage_selection"] = {
+                "enabled": True,
+                "damaged_element_properties": {
+                    "density": 2100., "youngs_modulus": 12e9, "poisson_ratio": .23,
+                    "tensile_strength_pa": 7e4, "compressive_strength_pa": 15e6,
+                    "cohesive_fracture_energy_j_m2": 60.},
+            }
+            prep.write_json(config_path, config)
+            arrays = column_fixture()
+            arrays["source_cell_rows"] = np.arange(
+                len(arrays["tetra4_concrete"]) + len(arrays["tetra4_bedrock"]))
+            np.savez(baseline / "three_body_mesh_arrays.npz", **arrays)
+            manifest = fixture_manifest(arrays)
+            manifest.update(
+                source_mesh=str(model / "three_body.msh"), source_config=str(config_path),
+                source_hashes={name: prep.file_hash(model / name)
+                               for name in ("three_body.msh", "config.json")})
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening, prepared = root / "screening", root / "prepared"
+            prep.run(config_path, model, baseline, screening, job_id="fixture",
+                     relative_tolerance=1e-4, candidate_scope="all_overstressed")
+            result = prep.run(
+                config_path, model, baseline, prepared, job_id="fixture",
+                relative_tolerance=1e-4, screening=screening,
+                candidate_scope="all_overstressed")
+            self.assertNotIn("material_assignment", result)
+            self.assertEqual(result["tensile_strength_pa"],
+                             config["material"]["concrete"]["tensile_strength_pa"])
+            self.assertEqual(result["fracture_energy_j_m2"],
+                             config["material"]["concrete"]["cohesive_fracture_energy_j_m2"])
+
     def test_friction_joints_replace_the_damaged_cohesive_law(self):
         from Aster import automatic_cohesive as native
         with tempfile.TemporaryDirectory() as directory:

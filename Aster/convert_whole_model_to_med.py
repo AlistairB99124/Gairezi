@@ -17,7 +17,8 @@ from Aster.quadratic_surface import split_blocks  # noqa: E402
 IDS = np.int64 if mc.MEDCouplingSizeOfIDs() == 64 else np.int32
 VOLUME_GROUPS = ("CONCRETE", "BEDROCK", "WALL", "FOUNDATION", "DAMAGE_BAND", "SEED_LAYER",
                  "LINEAR_VOLUMES", "HANGING_MASTER")
-FACE_GROUPS = ("UPSTREAM", "DOWNSTREAM", "CREST", "ROCK_BOTTOM", "ROCK_SIDES", "CRACK_FACES")
+FACE_GROUPS = ("UPSTREAM", "DOWNSTREAM", "CREST", "WALL_BASE",
+               "ROCK_BOTTOM", "ROCK_SIDES", "CRACK_FACES")
 
 
 def _mixed_level(coordinates, connectivity, quadratic_type, linear_type, linear_width, dimension):
@@ -58,19 +59,25 @@ def convert(archive: Path, output: Path) -> dict:
     volume, volume_position = _mixed_level(coordinates, arrays["cells"], mc.NORM_TETRA10,
                                            mc.NORM_TETRA4, 4, 3)
     volume_groups = []
-    for name in VOLUME_GROUPS:
+    available_groups = [name for name in VOLUME_GROUPS if f"group_{name.lower()}" in arrays]
+    if "WALL" not in available_groups:
+        raise ValueError("Whole-model result requires the WALL volume group")
+    for name in available_groups:
         mask = arrays[f"group_{name.lower()}"]
         if mask.shape != (len(arrays["cells"]),) or mask.dtype != np.bool_:
             raise ValueError(f"Invalid volume group mask {name}")
         if not mask.any():
-            if name == "HANGING_MASTER":
+            if name in ("HANGING_MASTER", "BEDROCK"):
                 continue
             raise ValueError(f"Empty volume group {name}")
         volume_groups.append(_group(name, volume_position[np.flatnonzero(mask)]))
-    faces = np.vstack([arrays[f"faces_{name.lower()}"] for name in FACE_GROUPS])
+    available_faces = [name for name in FACE_GROUPS
+                       if f"faces_{name.lower()}" in arrays and len(arrays[f"faces_{name.lower()}"])]
+    face_rows = [arrays[f"faces_{name.lower()}"] for name in available_faces]
+    faces = np.vstack(face_rows) if face_rows else np.empty((0, 6), dtype=np.int64)
     face_mesh, face_position = _mixed_level(coordinates, faces, mc.NORM_TRI6, mc.NORM_TRI3, 3, 2)
     face_groups, start = [], 0
-    for name in FACE_GROUPS:
+    for name in available_faces:
         count = len(arrays[f"faces_{name.lower()}"])
         if count:
             face_groups.append(_group(name, face_position[start:start + count]))
@@ -96,7 +103,7 @@ def convert(archive: Path, output: Path) -> dict:
         med.setGroupsAtLevel(level, [_group(group, np.arange(count))])
     node_groups = [_group(name, arrays[key]) for name, key in (
         ("HANGING_NODES", "hanging_nodes"), ("CRACK_TOP", "crack_top_nodes"),
-        ("CRACK_BOTTOM", "crack_bottom_nodes")) if len(arrays[key])]
+        ("CRACK_BOTTOM", "crack_bottom_nodes")) if key in arrays and len(arrays[key])]
     med.setGroupsAtLevel(1, node_groups)
     output.parent.mkdir(parents=True, exist_ok=True)
     med.write(str(output), 2)

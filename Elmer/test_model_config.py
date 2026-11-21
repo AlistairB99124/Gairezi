@@ -125,6 +125,13 @@ class ModelConfigTests(unittest.TestCase):
             mutate(candidate)
             candidate["bedrock_analysis"] = {"mode": "elastic_layer"}
             self.assert_invalid_at(candidate, "bedrock_analysis.mode")
+
+    def test_elastic_layer_wall_only_omits_foundation_but_keeps_direct_support(self):
+        candidate = copy.deepcopy(self.payload)
+        candidate["geometry"].pop("foundation")
+        candidate["bedrock_analysis"] = {"mode": "elastic_layer", "wall_only_body": True}
+        self.assertIs(validate_config(candidate), candidate)
+
     def test_validation_does_not_rewrite_configuration_values(self):
         original = copy.deepcopy(self.payload)
         validated = validate_config(self.payload)

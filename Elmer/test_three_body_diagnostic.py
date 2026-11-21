@@ -1,5 +1,6 @@
 """Preparation checks for the bonded and spring-seated wall-on-bedrock diagnostics."""
 import json
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import tempfile
@@ -60,6 +61,42 @@ class ActiveBodyTests(unittest.TestCase):
 
 
 class ElasticLayerParallelTests(unittest.TestCase):
+    def test_wall_only_report_does_not_claim_foundation_compliance(self):
+        from Elmer.three_body_diagnostic import _prepare_elastic_layer
+
+        @dataclass
+        class Mesh:
+            nodes: list
+            boundaries: list
+            cells: list
+            region_ids: list
+
+        mesh = Mesh(
+            nodes=[(0., 0., 0.), (1., 0., 0.), (0., 1., 0.), (0., 0., 1.)],
+            boundaries=[(1, (0, 1, 2))],
+            cells=[(4, (0, 1, 2, 3))],
+            region_ids=[1],
+        )
+        config = load_config(Path(__file__).resolve().parents[1] / "config.json")
+        springs = config["bedrock_analysis"]["spring_n_per_m3"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+
+            def write_sif(_concrete, path):
+                path.write_text("Boundary Condition 2\nEnd\n", encoding="utf-8")
+
+            with patch("Elmer.three_body_diagnostic.write_combined_gmsh"), \
+                 patch("Elmer.three_body_diagnostic.write_combined_solver_input", side_effect=write_sif):
+                report = _prepare_elastic_layer(
+                    output, config, mesh, mesh, None, False, [], "", {}, {}, {})
+            text = (output / "dam_model.sif").read_text(encoding="utf-8")
+
+        self.assertIn("foundation compliance is not separately calculated",
+                      report["connection_assumption"])
+        self.assertIn(report["connection_assumption"], report["assumptions"])
+        for index, axis in enumerate(("x", "y", "z"), start=1):
+            self.assertIn(f"Spring {index}{index} = Real {springs[axis]:.12g}", text)
+
     def test_reduced_mesh_selects_serial_before_conversion_and_records_reason(self):
         from Elmer.three_body_diagnostic import solve
         with tempfile.TemporaryDirectory() as directory:
@@ -380,6 +417,8 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
         sane = {"locations": 10, "max_abs_gap_by_axis_m": [2e-6, 2e-6, 2e-6]}
         all_sane = {name: sane for name in stiffness}
         check_spring_gaps({"joints": all_sane}, stiffness)
+        with self.assertRaisesRegex(RuntimeError, "No wall_foundation"):
+            check_spring_gaps({"joints": {}}, {"wall_foundation": stiffness["wall_bedrock"]})
         with self.assertRaisesRegex(RuntimeError, "No wall_bedrock"):
             check_spring_gaps({"joints": {**all_sane, "wall_bedrock": {"locations": 0}}}, stiffness)
         with self.assertRaisesRegex(RuntimeError, "No wall_joint_2"):

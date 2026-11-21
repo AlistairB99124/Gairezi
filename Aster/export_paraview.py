@@ -51,3 +51,47 @@ def export_mesh(arrays: dict, displacement: np.ndarray, output: Path,
     return {"vtu": str(path.resolve()), "joint_vtu": str(joint_path.resolve()) if len(joints) else None, "vtm": str(collection.resolve()),
             "coordinate_convention": "undeformed",
             "displacement_units": "m"}
+
+
+def export_joint_series(arrays: dict, load_factors: np.ndarray, damage: np.ndarray,
+                        opening: np.ndarray, output: Path) -> dict | None:
+    """Write one VTP/VTU time state per converged cohesive load factor."""
+    import meshio
+
+    points = np.asarray(arrays["nodes"], dtype=float)
+    joints = np.asarray(arrays["penta6_joints"], dtype=np.int64)
+    damage = np.asarray(damage, dtype=float)
+    opening = np.asarray(opening, dtype=float)
+    factors = np.asarray(load_factors, dtype=float)
+    if not len(joints):
+        return None
+    if damage.shape != opening.shape or damage.shape != (len(factors), len(joints)):
+        raise ValueError("Cohesive time-series fields do not match joint and load-step counts")
+    output.mkdir(parents=True, exist_ok=True)
+    root = ET.Element("VTKFile", type="Collection", version="0.1", byte_order="LittleEndian")
+    collection = ET.SubElement(root, "Collection")
+    snapshots = []
+    for index, factor in enumerate(factors):
+        path = output / f"joint_state_{index:04d}.vtu"
+        meshio.write(path, meshio.Mesh(
+            points, [("triangle", joints[:, :3])],
+            cell_data={
+                "joint_damage_state": [damage[index]],
+                "normal_opening_m": [opening[index]],
+                "normal_opening_mm": [1000.0 * opening[index]],
+            }))
+        ET.SubElement(collection, "DataSet", timestep=repr(float(factor)),
+                      part="0", file=path.name)
+        snapshots.append({
+            "load_factor": float(factor),
+            "vtu": path.name,
+            "peak_opening_mm": float(1000.0 * max(0.0, opening[index].max())),
+        })
+    pvd = output / "joint_history.pvd"
+    ET.ElementTree(root).write(pvd, encoding="utf-8", xml_declaration=True)
+    return {
+        "pvd": str(pvd.resolve()),
+        "snapshots": snapshots,
+        "time_parameter": "load_factor",
+        "opening_units": "normal_opening_m and normal_opening_mm",
+    }

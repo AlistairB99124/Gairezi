@@ -9,8 +9,15 @@ DEBUT(ERREUR=_F(ALARME="EXCEPTION"))
 with open("fort.91", encoding="utf-8") as stream:
     inputs = json.load(stream)
 parameters = inputs["material"]["parameters"]
+internal = inputs["material"]["internal_parameters"]
 settings = inputs["settings"]
-MAT = DEFI_MATER_GC(ENDO_FISS_EXP=_F(**parameters))
+damage = {key: internal[key] for key in
+          ("M", "P", "Q", "K", "TAU", "SIG0", "BETA", "REST_RIGIDITE", "COEF_RIGI_MINI")}
+MAT = DEFI_MATERIAU(
+    ELAS=_F(E=parameters["E"], NU=parameters["NU"]),
+    ENDO_FISS_EXP=_F(**damage),
+    NON_LOCAL=_F(C_GRAD_VARI=internal["C_GRAD_VARI"], PENA_LAGR=internal["PENA_LAGR"]),
+)
 linear = CA.Mesh.buildCube(refine=settings["refinement"])
 MESH = CREA_MAILLAGE(MAILLAGE=linear, LINE_QUAD=_F(TOUT="OUI"))
 MESH = DEFI_GROUP(

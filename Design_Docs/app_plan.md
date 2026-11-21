@@ -2,22 +2,20 @@
 
 ## Version 1 scope (11 November 2026)
 
-Version 1 ends when the elastic baselines are complete: Elmer and FEniCSx as
-supporting solvers, Code_Aster as the authority. The crack assessment is
-descoped by agreement with the engineer.
+The supported app workflow uses Code_Aster for nonlinear wall assessment. There
+is no host solver-selection flag and no FEniCSx execution in the production
+path. After the intact baseline, the nonlinear Aster model retains only the
+concrete `WALL` as a body. Every wall element is damage-capable with
+`ENDO_FISS_EXP` / `3D_GRAD_VARI`; `FOUNDATION` and `BEDROCK` are removed. Their
+translational compliances are combined in series with the foundation slab
+compliance and applied as an exact distributed wall-base spring operator. No
+crack location, seed, contact-joint damage or crack-face water pressure is used.
 
-Since 12 November 2026 `CRACKING_ENABLED` on the analysis host adds one stage
-after the baselines: the Code_Aster contact-joint stage, which follows
-Code_Aster's own dam-joint method (bundled test SSNP142) at the contact between
-the wall and the concrete foundation. Method, results and limits are in
-[aster_dam_baseline.md](../aster_dam_baseline.md); the flag is described in the
-parent repository's README. It is a proof of concept with generic joint values,
-not an engineering assessment.
-
-The cracking sections below describe the earlier method (crack location,
-FEniCSx and Code_Aster cracking, painted cracks). That method is retired: the
-flag no longer runs it, and its code and tests stay only as a record.
-`epilogue-plan.md` in the parent repository records what its last run showed.
+The output is native regularised wall damage and a wall stress history. It
+includes a native `V1` damage threshold and a residual-tension acceptance check
+at damaged integration points; foundation/bedrock stress fields no longer exist. This is not a
+sharp-crack opening or calibrated crushing assessment. Historical FEniCSx,
+seeded, painted and joint methods are development records, not runtime options.
 
 ## Solver authority and required completion
 
@@ -64,6 +62,15 @@ unverified internal mechanical subdivisions. Reference-geometry facet pressure
 is a small-strain approximation, not transient flow or follower loading.
 Crack-water-only runs start at load factor 0.01, then 0.025, 0.05, ...;
 every accepted mechanical step must carry stable hydraulic diagnostics.
+If the coupled pressure active set does not stabilize at a requested load
+increment, the outer load interval is bisected from the last accepted state.
+Every accepted intermediate factor is retained in the mechanical and hydraulic
+histories. Bisection is bounded to four levels per failed interval; reaching
+that limit remains an explicit partial result.
+Adaptive cohesive growth compares actual prepared source-facet identities
+before solving the next round. If overstressed cells add no usable facets,
+the workflow stops rather than repeat the same model, preserves the last solved
+result, and reports the unresolved unjointed cells and growth warning.
 Requested wet results without that evidence are rejected by the API and sweep,
 not silently accepted as dry. The report and Investigation disclose the actual
 hydraulic assumptions and history. Restart the API to load these code changes
@@ -82,6 +89,10 @@ selection or its restart; Aster baseline failure explicitly blocks cracking.
 
 All three elastic-layer implementations use consistent triangular P1 face
 support. Aster uses degree-two point springs with exact trace constraints.
+With `bedrock_analysis.wall_only_body`, the baseline applies the configured
+bedrock coefficients directly at the wall seat; it does not calculate or add
+foundation/interface compliance. A precombined spring must be established
+independently, not inferred from the presence of foundation settings.
 FEniCSx force accounting sums the actual assembled load, avoiding independently
 compiled scalar-pressure quadrature differences at clipped waterlines.
 ElmerGrid compacts the concrete-only body tags to wall 1 / foundation 2. The

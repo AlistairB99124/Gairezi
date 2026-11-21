@@ -181,13 +181,16 @@ MAIL = MODI_MAILLAGE(
 MODELE = AFFE_MODELE(
     MAILLAGE=MAIL,
     AFFE=(
-        _F(GROUP_MA='WALL', PHENOMENE='MECANIQUE', MODELISATION='3D'),
         _F(
-            GROUP_MA=('UPSTREAM', 'DOWNSTREAM', 'CREST', 'FOUNDATION'),
+            GROUP_MA='WALL',
+            PHENOMENE='MECANIQUE',
+            MODELISATION='3D_GRAD_VARI',
+        ),
+        _F(
+            GROUP_MA=('FOUNDATION', 'JOINTS'),
             PHENOMENE='MECANIQUE',
             MODELISATION='3D',
         ),
-        _F(GROUP_MA='FOUNDATION_POI1', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),
     ),
 )
 # Doc u4.41.01 AFFE_MODELE: 3-D continuum mechanics on the WALL volume group,
@@ -209,14 +212,39 @@ CONCRETE = DEFI_MATERIAU(
         NU={material.poissons_ratio:.12g},
         RHO={material.density_kg_m3:.12g},
     ),
+    BETON_ECRO_LINE=_F(
+        SYT=2.0e6,
+        D_SIGM_EPSI=-3.5e9,
+    ),
+    NON_LOCAL=_F(
+        C_GRAD_VARI=0.25,
+    ),
 )
+
+FOUNDATION = DEFI_MATERIAU(
+    ELAS=_F(
+        E={material.youngs_modulus_pa:.12g},
+        NU={material.poissons_ratio:.12g},
+        RHO={material.density_kg_m3:.12g},
+    ),
+)
+
 # Doc u4.43.01 DEFI_MATERIAU / ELAS: isotropic linear elasticity, matching
 # config.json material.concrete (youngs_modulus, poisson_ratio, density) -
 # the same values Elmer.regions.combined_structure.load_material reads.
 
 CHMAT = AFFE_MATERIAU(
     MAILLAGE=MAIL,
-    AFFE=_F(GROUP_MA='WALL', MATER=CONCRETE),
+    AFFE=(
+        _F(
+            GROUP_MA='WALL',
+            MATER=CONCRETE,
+        ),
+        _F(
+            GROUP_MA='FOUNDATION',
+            MATER=FOUNDATION,
+        ),
+    ),
 )
 # Doc u4.43.03 AFFE_MATERIAU.
 
@@ -304,29 +332,41 @@ CARA_FOUNDATION = AFFE_CARA_ELEM(
 )
 
 
-RESU = MECA_STATIQUE(
+RESU = STAT_NON_LINE(
     MODELE=MODELE,
     CHAM_MATER=CHMAT,
-    CARA_ELEM=CARA_FOUNDATION,
     EXCIT=(
-        _F(CHARGE=GRAVITE),
-        _F(CHARGE=PRESSIONS),
-        _F(CHARGE=CREST_SURCHARGE),
+        _F(CHARGE=BC_ABUTMENTS),
+        _F(CHARGE=GRAVITY),
+        _F(CHARGE=HYDRO_LOAD, FONC_MULT=RAMPE),
     ),
-)
-# Doc u4.51.01 MECA_STATIQUE: single linear static load case combining
-# gravity, the two elevation-dependent pressure loads, and the crest
-# surcharge - matching the Elmer SIF's single steady-state solve.
-
-RESU = CALC_CHAMP(
-    reuse=RESU,
-    RESULTAT=RESU,
-    CONTRAINTE=('SIEF_ELGA', 'SIGM_NOEU'),
-    CRITERES=('SIEQ_NOEU',),
+    COMPORTEMENT=(
+        _F(
+            GROUP_MA='WALL',
+            RELATION='ENDO_ISOT_BETON',
+            DEFORMATION='PETIT',
+        ),
+        _F(
+            GROUP_MA='FOUNDATION',
+            RELATION='ELAS',
+            DEFORMATION='PETIT',
+        ),
+    ),
+    METHODE='IMPLEX',
+    INCREMENT=_F(LIST_INST=L_INST),
+    CONVERGENCE=_F(ITER_GLOB_MAXI=40),
 )
 # Doc u4.81.02 CALC_CHAMP: recover nodal stresses (SIGM_NOEU) and nodal
 # principal/equivalent stress invariants (SIEQ_NOEU) for comparison against
 # the Elmer nodal "stress_xx..stress_xz" / principal-stress fields.
+
+RESU = CALC_CHAMP(
+    reuse=RESU,
+    RESULTAT=RESU,
+    CONTRAINTE=('SIGM_NOEU',),
+    VARI_INTERNE=('VARI_NOEU',),
+)
+
 
 IMPR_RESU(
     FORMAT='MED',

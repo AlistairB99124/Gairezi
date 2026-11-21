@@ -10,11 +10,12 @@ import time
 
 import numpy as np
 
-from Aster.fracture_material import ROOT, material_contract
+from Aster.fracture_material import material_contract
 from Aster.run_case import bundled_python_for, detect_installation, file_hash, run_solver
 from Elmer.model_config import CONFIG_PATH, load_config
 
 CASE = Path(__file__).with_name("cases") / "damage_benchmark.comm"
+ROOT = Path(__file__).resolve().parents[1]
 SETTINGS = {
     "refinement": 1,
     "target_damage": .2,
@@ -107,7 +108,8 @@ def verify(report: dict) -> dict:
             raise ValueError("NEAR: near-complete initial damage was not retained throughout the history")
         if label == "NEARLOC":
             seeded = np.isclose(damage[0], initial, atol=1e-7, rtol=0.)
-            if not np.allclose(damage[:, seeded], initial, atol=1e-7, rtol=0.):
+            if not (np.all(damage[:, seeded] >= initial - 1e-7)
+                    and np.all(damage[:, seeded] <= 1.0 + 1e-7)):
                 raise ValueError("NEARLOC: near-complete localized damage was not retained")
         if label != "NEAR" and not np.any(damage[-1] > damage[peak] + 1e-5):
             raise ValueError(f"{label}: damage did not grow on further loading")

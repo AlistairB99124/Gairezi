@@ -67,7 +67,8 @@ def baseline_inventory(baseline: Path, configuration: Path, model: Path):
 
 
 def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
-        job_id: str, relative_tolerance: float, screening: Path | None = None) -> dict:
+        job_id: str, relative_tolerance: float, screening: Path | None = None,
+        candidate_scope: str = "configured") -> dict:
     if not job_id.strip():
         raise ValueError("An explicit source job ID is required")
     output.mkdir(parents=True, exist_ok=False)
@@ -83,9 +84,15 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
             result = screen_cells(stress, regions, rows, coordinates, cells,
                                   float(concrete["tensile_strength_pa"]),
-                                  relative_tolerance=relative_tolerance, max_damage_count=max_damage_count(config),
-                                  crack_base=crack_base(config), selection_enabled=selection_enabled(config),
-                                  crack_thickness=crack_thickness(config), lift_joints=lift_joints(config))
+                                  relative_tolerance=relative_tolerance,
+                                  max_damage_count=(max_damage_count(config)
+                                                    if candidate_scope == "configured" else None),
+                                  crack_base=(crack_base(config) if candidate_scope == "configured" else False),
+                                  selection_enabled=selection_enabled(config),
+                                  crack_thickness=(crack_thickness(config)
+                                                   if candidate_scope == "configured" else None),
+                                  lift_joints=(lift_joints(config)
+                                               if candidate_scope == "configured" else None))
             result.update(source_job_id=job_id, config_digest=manifest["config_digest"],
                           solver="code_aster", stress_association="raw P1 cell stress from accepted Aster displacement",
                           verified_baseline_source_sha256=hashes,
@@ -102,15 +109,17 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                     lift_joint_parameters(recorded, JOINT_PENALTY_FACTOR * neighbour, neighbour)
                 except CorroborationError as error:
                     raise ValueError(str(error)) from error
-            properties = (config.get("damage_selection") or {}).get("damaged_element_properties")
-            if properties is not None or lift_joints(config) is not None:
+            properties = ((config.get("damage_selection") or {}).get("damaged_element_properties")
+                          if candidate_scope == "configured" else None)
+            joints = lift_joints(config) if candidate_scope == "configured" else None
+            if properties is not None or joints is not None:
                 assignment = {"selected_source_rows": result["selection"]["selected_source_rows"]}
                 scope = []
                 if properties is not None:
                     assignment["properties"] = properties
                     scope.append("degraded material on the exact selected wall/foundation volume cells "
                                  "(baseline and unselected cells unchanged)")
-                if lift_joints(config) is not None:
+                if joints is not None:
                     assignment["joint_properties"] = result["selection"]["lift_joints"]
                     scope.append("weak construction-joint law on the selected band's near-horizontal facets")
                 if properties is None:
@@ -128,7 +137,12 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                     or result.get("solver") != "code_aster"
                     or result.get("verified_baseline_source_sha256") != hashes):
                 raise ValueError("Candidate preparation requires this exact current Aster screening")
-            selected_rows = np.asarray(result["selection"]["selected_source_rows"], dtype=np.int64)
+            if candidate_scope == "all_overstressed":
+                selected_rows = np.asarray(result["overstressed_source_rows"], dtype=np.int64)
+            elif candidate_scope == "configured":
+                selected_rows = np.asarray(result["selection"]["selected_source_rows"], dtype=np.int64)
+            else:
+                raise ValueError(f"Unsupported Aster candidate scope: {candidate_scope}")
             overload_factor = maximum_overload_factor(config)
             # A disabled selection is an intentional control run: no candidates regardless
             # of facet stress, so neither overload screening nor empty-selection errors apply.
@@ -167,8 +181,9 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             split = (split_interior_wall_faces(coordinates, cells, regions, faces, drop_fully_tied=True)
                      if len(faces) else None)
             energy = concrete.get("cohesive_fracture_energy_j_m2")
-            properties = (config.get("damage_selection") or {}).get("damaged_element_properties")
-            joints = lift_joints(config)
+            properties = ((config.get("damage_selection") or {}).get("damaged_element_properties")
+                          if candidate_scope == "configured" else None)
+            joints = lift_joints(config) if candidate_scope == "configured" else None
             if properties is not None:
                 energy = properties["cohesive_fracture_energy_j_m2"]
             if (isinstance(energy, bool) or not isinstance(energy, (int, float))
@@ -206,12 +221,21 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                       "maximum_overload_factor": overload_factor,
                       "tensile_strength_pa": float(concrete["tensile_strength_pa"]),
                       "fracture_energy_j_m2": float(energy), "candidate_faces": len(split.source_faces) if split is not None else 0,
-                      "candidate_basis": ("design-load screening, with neighbour rings where uncapped"
+                      "candidate_basis": ("all wall cells exceeding the configured concrete tensile strength"
+                                          if candidate_scope == "all_overstressed" else
+                                          ("design-load screening, with neighbour rings where uncapped"
                                           if len(result["selection"]["selected_source_rows"]) else
                                           ("damage selection disabled: control preparation with no candidates"
                                            if result["selection"].get("enabled") is False else
-                                           "proportional maximum-overload screening; no eligible facets means native elastic steps")),
+                                           "proportional maximum-overload screening; no eligible facets means native elastic steps"))),
                       "outcome_basis": "Preparation only; native Aster nonlinear equilibrium is still required"}
+            result["solver_controls"] = {
+                key: value for key, value in (config.get("fracture_debug", {}).get("aster") or {}).items()
+                if key in {
+                    "load_increment", "maximum_iterations", "relative_residual_tolerance",
+                    "line_search_iterations", "subdivision_levels", "adaptive_rounds",
+                    "whole_wall_tension_tolerance_pa"}
+            }
             if properties is not None or joints is not None:
                 assignment = {"selected_source_rows": selected_rows.tolist()}
                 scope = []
@@ -259,9 +283,12 @@ def main():
     parser.add_argument("--screening", type=Path)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--relative-tolerance", type=float, required=True)
+    parser.add_argument("--candidate-scope", choices=("configured", "all_overstressed"),
+                        default="configured")
     args = parser.parse_args()
     run(args.config, args.model, args.baseline, args.output, job_id=args.job_id,
-        relative_tolerance=args.relative_tolerance, screening=args.screening)
+        relative_tolerance=args.relative_tolerance, screening=args.screening,
+        candidate_scope=args.candidate_scope)
 
 
 if __name__ == "__main__":

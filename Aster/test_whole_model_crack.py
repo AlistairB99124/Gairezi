@@ -8,7 +8,9 @@ import unittest
 import numpy as np
 
 from Aster import whole_model_crack as wm
-from Aster.whole_model_crack_mesh import archive_arrays, build, signed_volumes, slice_plane
+from Elmer.model_config import load_config
+from Aster.whole_model_crack_mesh import (archive_arrays, archive_full_wall, archive_wall_only, build,
+                                          build_full_wall, build_wall_only, signed_volumes, slice_plane)
 
 KUHN = ((0, 1, 3, 7), (0, 3, 2, 7), (0, 2, 6, 7), (0, 6, 4, 7), (0, 4, 5, 7), (0, 5, 1, 7))
 THETA = (1.30, 1.37)
@@ -188,8 +190,42 @@ class BuildTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "thicker than the seed"):
             build(self.arrays, SEED, 0.0005)
 
+    def test_full_wall_archive_is_quadratic_and_intact_without_a_seed(self):
+        built = build_full_wall(self.arrays)
+        archive = archive_full_wall(self.arrays, built)
+        self.assertTrue(np.all(built["cells"][built["body_ids"] == 1, 4:] >= 0))
+        self.assertTrue(np.all(built["cells"][built["body_ids"] == 3, 4:] == -1))
+        self.assertEqual(int(archive["group_wall"].sum()), int(np.count_nonzero(built["body_ids"] == 1)))
+        self.assertEqual(int(archive["group_foundation"].sum()),
+                         int(np.count_nonzero(built["body_ids"] == 3)))
+        self.assertNotIn("group_seed_layer", archive)
+        self.assertNotIn("faces_crack_faces", archive)
+        self.assertEqual(built["report"]["initial_damage"], 0.0)
+
+    def test_wall_only_archive_removes_foundation_and_bedrock_bodies(self):
+        stiffness = np.diag((1.1e9, 1.1e9, 2.8e9))
+        built = build_wall_only(self.arrays, stiffness)
+        archive = archive_wall_only(built)
+        self.assertEqual(archive["cells"].shape[0], int((self.arrays["concrete_body_ids"] == 1).sum()))
+        self.assertTrue(archive["group_wall"].all())
+        self.assertNotIn("group_foundation", archive)
+        self.assertNotIn("group_bedrock", archive)
+        self.assertIn("faces_wall_base", archive)
+        self.assertEqual(built["report"]["linear_wall_cells"], len(archive["cells"]))
+        self.assertEqual(built["report"]["quadratic_wall_cells"], 0)
+        self.assertTrue(np.all(built["cells"][:, 4:] == -1))
+
 
 class OrchestrationTest(unittest.TestCase):
+    def test_equivalent_wall_support_uses_direct_bedrock_layer(self):
+        support = wm.equivalent_wall_base_support(load_config())
+        matrix = support["matrix_n_per_m3"]
+        self.assertTrue(np.allclose(matrix, np.diag(np.diag(matrix))))
+        self.assertTrue(np.all(np.diag(matrix) > 0))
+        self.assertEqual([item["name"] for item in support["components"]],
+                         ["bedrock_support"])
+        np.testing.assert_allclose(matrix, np.diag((20e9, 20e9, 53.333333e9)))
+
     def test_wsl_path_and_linux_command(self):
         self.assertEqual(wm.wsl_path(Path("C:/Users/a b/x.med")), "/mnt/c/Users/a b/x.med")
         command = wm.linux_command("Ubuntu", "/opt/ca", Path("D:/run"), ["/opt/ca/bin/run_aster", "c.export"], 6)
@@ -205,7 +241,8 @@ class OrchestrationTest(unittest.TestCase):
 
         def prepare(directory, *_):
             (directory / "whole_model_mesh.npz").write_bytes(b"x")
-            return {"prepared_sha256": "s", "generation": {}, "mesh": {}, "inputs": {"times": [0.0]}}
+            return {"source_config_sha256": "s", "mesh": {}, "radius_m": 78.,
+                    "material": {}, "inputs": {"times": [0.0]}}
 
         def run(command, **_):
             if "rm" in command:
@@ -227,7 +264,7 @@ class OrchestrationTest(unittest.TestCase):
                     mock.patch.object(wm, "find_linux_installation", side_effect=located), \
                     mock.patch.object(wm.subprocess, "run", side_effect=run) as launched, \
                     mock.patch("Aster.run_case.run_solver", side_effect=OSError("solver died")) as solver:
-                manifest = wm.run(source, source, source, Path(root) / "out")
+                manifest = wm.run(source, source, Path(root) / "out")
         self.assertEqual(manifest["status"], "failed")
         work = manifest["linux_work_directory"]
         self.assertTrue(work.startswith("/var/tmp/") and not work.startswith("/tmp"))
@@ -256,71 +293,49 @@ class OrchestrationTest(unittest.TestCase):
         for unit in ("D 1", "D 91", "D 20", "D 92", "R 90", "R 89", "R 80"):
             self.assertRegex(text, rf"F \w+ /mnt/\S+ {unit}\n" if wm.os.name == "nt" else rf"F \w+ /\S+ {unit}\n")
 
-    def test_crack_metrics_count_new_damage_outside_the_seed(self):
+    def test_full_wall_metrics_count_native_damage_without_a_seed(self):
         xyz = np.array([[78 * np.sin(1.33), 78 * np.cos(1.33), -10.3],
                         [77 * np.sin(1.34), 77 * np.cos(1.34), -10.3],
                         [79.5 * np.sin(1.35), 79.5 * np.cos(1.35), -10.0]])
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "history.npz"
-            np.savez(path, coordinates_m=xyz, initial_damage=np.array([0.999, 0, 0]),
-                     damage=np.array([[0.999, 0, 0], [0.999, 0.97, 0.6]]), times=np.array([0.0, 1.0]))
-            metrics = wm.crack_metrics(path, SEED, {}, 78.0, 4.0)
+            np.savez(path, coordinates_m=xyz, damage=np.array([[0, 0, 0], [0.99, 0.97, 0.6]]),
+                     damage_point_ids=np.array([[4, 0, 0], [5, 0, 0], [6, 0, 0]]),
+                     times=np.array([0.0, 1.0]))
+            metrics = wm.full_wall_damage_metrics(path, 78.0)
         final = metrics["final"]
-        self.assertEqual((final["new_points_above_0_95"], final["new_points_above_0_5"]), (1, 2))
-        self.assertAlmostEqual(final["cracked_radial_extent_m"], 1.0)
-        self.assertAlmostEqual(final["cracked_through_thickness_fraction"], 0.25)
-        self.assertEqual(metrics["seeded_gauss_points"], 1)
-        self.assertEqual(metrics["history"][0]["cracked_radial_extent_m"], 0.0)
+        self.assertEqual((final["points_above_threshold"], final["cells_above_threshold"]), (2, 2))
+        self.assertAlmostEqual(final["cracked_radial_extent_m"][1] -
+                               final["cracked_radial_extent_m"][0], 1.0)
+        self.assertNotIn("seeded_gauss_points", metrics)
+        self.assertNotIn("cracked_elevation_extent_m", metrics["history"][0])
 
-    def test_case_seeds_band_only_and_keeps_other_cells_elastic(self):
+    def test_case_uses_local_newton_damage_on_the_wall_only(self):
         case = wm.CASE.read_text(encoding="utf-8")
-        self.assertIn('wall_group="DAMAGE_BAND", volume_group="DAMAGE_BAND"', case)
-        self.assertIn("elastic_elsewhere=True", case)
-        self.assertIn('_F(GROUP_MA="DAMAGE_BAND", RELATION="ENDO_FISS_EXP"', case)
-        self.assertIn("LIAISON_MAIL", case)
+        self.assertIn('_F(GROUP_MA="WALL", RELATION="ENDO_ISOT_BETON"', case)
+        self.assertIn('RELATION="ENDO_ISOT_BETON"', case)
+        self.assertIn('NEWTON=_F(MATRICE="TANGENTE"', case)
+        self.assertIn('D_SIGM_EPSI=parameters["D_SIGM_EPSI"]', case)
+        self.assertIn('DEFI_LIST_REEL(VALE=inputs["solver_times"])', case)
+        self.assertIn('_F(GROUP_MA="WALL", MATER=WALL_DAMAGE)', case)
+        self.assertIn('if inputs["has_foundation"]', case)
+        self.assertNotIn("DAMAGE_BAND", case)
+        self.assertNotIn("native_seed", case)
 
-    def test_case_reference_tolerance_stays_above_round_off_floor(self):
-        # 1e-6 stagnated at 2-5e-6 with RESI_GLOB_RELA ~1e-14 on the full dam model.
+    def test_case_uses_concrete_tension_compression_strengths_and_equilibrium_audit(self):
         case = wm.CASE.read_text(encoding="utf-8")
-        self.assertIn("RESI_REFE_RELA=1e-4, ITER_GLOB_MAXI=50", case)
-        self.assertNotIn("ARRET", case)
+        self.assertIn('SYT=parameters["NO_TENSION_SYT"]', case)
+        self.assertIn("SYC=parameters[\"FC\"]", case)
+        self.assertIn('RESI_REFE_RELA=1e-4', case)
+        self.assertNotIn('FORCE=("FORC_NODA", "REAC_NODA")', case)
+        self.assertIn("maximum_displacement_magnitude_m", case)
 
-    def test_case_applies_crack_water_pressure_without_reorienting_crack_faces(self):
+    def test_case_applies_only_exterior_water_pressure(self):
         case = wm.CASE.read_text(encoding="utf-8")
-        self.assertIn('PRES_REP=_F(GROUP_MA="CRACK_FACES"', case)
-        self.assertIn('PRES=loads["crack_pressure_pa"]', case)
+        self.assertNotIn("CRACK_FACES", case)
+        self.assertNotIn('loads["crack_pressure_pa"]', case)
         orientation = case[case.index("ORIE_PEAU_3D"):case.index("MODEL = AFFE_MODELE")]
         self.assertNotIn("CRACK_FACES", orientation)
-        self.assertIn("mean_crack_face_separation_m", case)
-
-    def test_crack_water_pressure_matches_the_seeded_face_head(self):
-        loads = {"upstream_water_surface_z_m": 3.0, "tailwater_elevation_m": -26.0,
-                 "water_pressure_gradient_pa_per_m": 9810.0}
-
-        def shared(face, pressure, z=-10.3):
-            return {"payload": {"seed_face": face, "geometry": {"elevation_m": z},
-                                "loading": {"internal_pressure_pa": pressure}}}
-
-        water = wm.crack_water_pressure(shared("upstream", 9810.0 * 13.3), loads)
-        self.assertAlmostEqual(water["pressure_pa"], 130473.0)
-        self.assertEqual(water["water_surface_z_m"], 3.0)
-        self.assertEqual(wm.crack_water_pressure(shared("downstream", 0.0), loads)["pressure_pa"], 0.0)
-        self.assertAlmostEqual(wm.crack_water_pressure(shared("downstream", 9810.0, -27.0), loads)["pressure_pa"],
-                               9810.0)
-        with self.assertRaisesRegex(ValueError, "select the crack location again"):
-            wm.crack_water_pressure(shared("upstream", 0.0), loads)
-        half = wm.crack_water_pressure(shared("upstream", 0.5 * 9810.0 * 13.3), loads, 0.5)
-        self.assertAlmostEqual(half["pressure_pa"], 0.5 * 130473.0)
-        self.assertEqual(half["factor"], 0.5)
-        dry = wm.crack_water_pressure(shared("upstream", 0.0), loads, 0.0)
-        self.assertEqual(dry["pressure_pa"], 0.0)
-
-    def test_wall_thickness_follows_steps(self):
-        wall = {"radial_width_m": 6.0, "thickness_steps": [{"top_z_m": -5.0, "radial_width_m": 5.0},
-                                                            {"top_z_m": -20.0, "radial_width_m": 4.0}]}
-        self.assertEqual(wm.wall_thickness(wall, -2.0), 6.0)
-        self.assertEqual(wm.wall_thickness(wall, -10.0), 5.0)
-
 
 if __name__ == "__main__":
     unittest.main()

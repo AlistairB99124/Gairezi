@@ -17,6 +17,12 @@ class HydraulicTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 water.validate_settings(dict(water.CRACK_WATER_SETTINGS, opening_tolerance_m=value))
 
+    def test_failed_hydraulic_load_target_is_bisected_with_a_bounded_depth(self):
+        self.assertEqual(water.bisect_load_interval(.15, .16, 0, 8), (.155, 1))
+        self.assertEqual(water.bisect_load_interval(.15, .16, 8, 8), None)
+        with self.assertRaises(ValueError):
+            water.bisect_load_interval(.16, .15, 0, 8)
+
     def test_linear_pressure_resultant_and_moment(self):
         vertices = np.array([[0., 0, 0], [2., 0, 0], [0., 1, 0]])
         pressure = np.array([300., 100., 300.])
@@ -169,6 +175,11 @@ class HydraulicTests(unittest.TestCase):
         self.assertEqual(factors[-1], 1.)
         self.assertTrue(np.all(np.diff(factors) > 0))
         self.assertLessEqual(max(np.diff(factors)), .025 + 1e-9)
+        finer = cohesive.load_factors({
+            "crack_water_pressure": True, "solver_controls": {"load_increment": .005}})
+        self.assertEqual(finer[:3], [.01, .015, .02])
+        self.assertEqual(finer[-1], 1.)
+        self.assertLessEqual(max(np.diff(finer)), .005 + 1e-9)
 
     def test_uplift_on_wall_only_using_measured_heel_to_toe(self):
         arrays = column_fixture()
@@ -209,6 +220,9 @@ class HydraulicTests(unittest.TestCase):
         self.assertIn("ACTION='DECOUPE'", comm)
         self.assertIn("hydraulic_open_faces(trial)", comm)
         self.assertIn("(damage >= 1. - 1e-9) & (jump > HYDRAULIC_OPENING_LIMIT)", comm)
+        self.assertIn("TARGET_LEVELS[target_index:target_index + 1]", comm)
+        self.assertIn("hydraulic_subdivision_levels = 4", comm)
+        self.assertIn("ASTER_HYDRAULIC_SUBDIVIDE", comm)
 
     def test_uplift_is_invariant_under_cohesive_and_relief_node_splitting(self):
         arrays = column_fixture()

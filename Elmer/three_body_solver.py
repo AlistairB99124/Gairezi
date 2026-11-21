@@ -58,7 +58,12 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
     compression = -max(entry["peak_compression_mpa"] for entry in concrete) * 1e6
     strength = config["material"]["concrete"]["tensile_strength_pa"]
     diagnostic = json.loads((output / "model" / "diagnostic.json").read_text())
-    if wall_only:
+    if wall_only and diagnostic.get("foundation", {}).get("present") is False:
+        connection_assumption = "Wall-only body on configured elastic-layer bedrock springs"
+        active_support = (
+            "direct local tensor springs at the wall base; foundation and bedrock volumes omitted"
+        )
+    elif wall_only:
         connection_assumption = (
             ("Bonded" if diagnostic.get("wall_foundation_connection") == "bonded" else "Spring-connected")
             + " wall/foundation interface; preliminary local elastic-layer support under the foundation"

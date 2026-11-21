@@ -154,6 +154,13 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
         f"VALE={entry['vale']!r})"
         for entry in outer_entries
     )
+    all_discret_entries = ",\n        ".join(
+        value for value in (wall_foundation_discret_entries, outer_discret_entries) if value
+    )
+    wall_foundation_model = (
+        f"_F(GROUP_MA='{wall_foundation_spring_group_all}', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),"
+        if wall_foundation_discret_entries else ""
+    )
     volume_groups = "('CONCRETE',)" if not has_bedrock_volume else "('CONCRETE', 'BEDROCK')"
     model_groups = ("'CONCRETE', 'UPSTREAM', 'DOWNSTREAM', 'CREST'," if not has_bedrock_volume else
                     "'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST', 'ROCK_BOTTOM', 'ROCK_SIDES',")
@@ -243,7 +250,7 @@ MODELE = AFFE_MODELE(
             MODELISATION='3D',
         ),
         {outer_model}
-        _F(GROUP_MA='{wall_foundation_spring_group_all}', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),
+        {wall_foundation_model}
     ),
 )
 # DIS_T covers both wall joints, the wall/foundation interface and all
@@ -312,8 +319,7 @@ CREST_SURCHARGE = AFFE_CHAR_MECA(
 CARA_ROCK = AFFE_CARA_ELEM(
     MODELE=MODELE,
     DISCRET=(
-        {wall_foundation_discret_entries},
-        {outer_discret_entries}
+        {all_discret_entries}
     ),
 )
 # K_T_D_L: saved per-axis interface coefficient times tributary area.

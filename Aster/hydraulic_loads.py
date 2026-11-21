@@ -10,6 +10,7 @@ SETTINGS = {
     "maximum_iterations": 20,
 }
 CRACK_WATER_SETTINGS = dict(SETTINGS, base_uplift="none")
+MAX_LOAD_INTERVAL_BISECTIONS = 4
 TET_FACES = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
 
 
@@ -26,6 +27,20 @@ def validate_settings(settings: dict) -> dict:
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 2:
         raise ValueError("Hydraulic iterations must be an integer >= 2")
     return dict(settings)
+
+
+def bisect_load_interval(start: float, target: float, level: int,
+                         maximum_levels: int) -> tuple[float, int] | None:
+    if (not np.isfinite(start) or not np.isfinite(target) or target <= start
+            or isinstance(level, bool) or not isinstance(level, int) or level < 0
+            or isinstance(maximum_levels, bool) or not isinstance(maximum_levels, int)
+            or maximum_levels < 0):
+        raise ValueError("Invalid hydraulic load-interval subdivision")
+    midpoint = (start + target) / 2.0
+    minimum_interval = 1e-12 * max(1.0, abs(start), abs(target))
+    if level >= maximum_levels or midpoint <= start + minimum_interval:
+        return None
+    return midpoint, level + 1
 
 
 def boundary_faces(cells: np.ndarray, nodes: np.ndarray,
@@ -326,8 +341,24 @@ COUPLED_SOLVE = '''    try:
             raise RuntimeError("Crack-water active set did not converge; no hydraulic step accepted")
     except (CA.AsterError, RuntimeError) as error:
         detail = str(error).strip() or type(error).__name__
+        retry = bisect_load_interval(reached, target, target_level, hydraulic_subdivision_levels)
+        if retry is not None:
+            midpoint, next_level = retry
+            TARGETS[target_index:target_index + 1] = [midpoint, target]
+            TARGET_LEVELS[target_index:target_index + 1] = [next_level, next_level]
+            status["targets"] = TARGETS
+            status.setdefault("hydraulic_subdivisions", []).append({
+                "from_load_factor": reached, "failed_target": target,
+                "retry_target": midpoint, "level": next_level,
+                "reason": detail,
+            })
+            save()
+            print(f"ASTER_HYDRAULIC_SUBDIVIDE from={reached:.6g} target={target:.6g} "
+                  f"retry={midpoint:.6g} level={next_level}: {detail}", flush=True)
+            continue
         save({"status": "stopped", "stopped_at_load_factor": target,
-              "message": f"Coupled Code_Aster step failed from {reached:.6g} to {target:.6g}: {detail}"})
+              "message": (f"Coupled Code_Aster step failed from {reached:.6g} to {target:.6g} after "
+                          f"{target_level} hydraulic load-step subdivisions: {detail}")})
         print(f"ASTER_COHESIVE_STEP failed load_factor={target:.6g}", flush=True)
         break
 '''

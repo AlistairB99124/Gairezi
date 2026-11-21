@@ -3,43 +3,32 @@
 ## Current objective amendment
 
 Current production authority supersedes the historical sequence below:
-Code_Aster is the primary assessment source. Accepted Aster displacement feeds
-`Aster.automatic_preparation`, then native whole-wall cohesive cracking; failed
-supporting FEniCSx verification is not a preparation prerequisite. Candidate
-preparation is not a nonlinear result. Elastic-layer support now uses exact
-triangular P1 integration in all three solvers, including Aster quadrature trace
-constraints. ElmerGrid's concrete-only body renumbering requires foundation
-body 2 in the SIF; sources targeting body 3 must be regenerated. The source
-producer groups only exactly identical support tensors, preserving face
-integration while avoiding thousands of redundant boundary conditions.
+Code_Aster is the only supported nonlinear solver. The current app path runs an
+intact-start `ENDO_FISS_EXP` / `3D_GRAD_VARI` analysis with the complete `WALL`
+damage-capable; `FOUNDATION` and `BEDROCK` stay linear elastic. It does not
+select or seed a crack, damage the wall/foundation contact, launch FEniCSx, or
+apply pressure to newly damaged surfaces.
 
-The user has accepted the current elastic discrepancies for proceeding with
-the multi-solver cracking comparison. The historical baseline-only scope below
-is not a prohibition on developing that next stage. The primary goal is
-comparing FEniCSx cracking with Aster cracking at the **same UI-selected crack**,
-with separate wall/foundation reporting.
+The result is reported separately for wall, foundation and bedrock. Native wall
+damage `V1` is used for regularised extent metrics and a small residual-tension
+gate is applied at points above the configured damage threshold. This is
+continuum damage, not a measured sharp-crack opening. The earlier selected-seed,
+joint, cohesive and FEniCSx flows remain historical implementation evidence
+only; they are not production app stages.
 
-Cracking execution is now **sequential**: FEniCSx cracking runs first and
-native Aster cracking starts when it (and the Aster elastic baseline) ends.
-The earlier parallel-only policy was reversed after a real job ran out of
-memory: FEniCSx cracking held about 10 GB while the whole-model Aster crack
-reached its 18 GB limit, inside a 24 GB WSL VM. Installed RAM remains an
-advisory diagnostic and does not establish that a solver fits.
-Paired execution is implemented for three-body app jobs through the native
-Aster whole-model crack (see "Native whole-model crack" below). Future VM/cloud
-hosting is deferred. See `Design_Docs/app_plan.md` for the current workflow boundary.
-
-App jobs also run the full-dam linear elastic Aster pipeline
-(`Aster.run_three_body_pipeline`) per job on that job's own Elmer mesh, in
-parallel with the FEniCSx baseline, for the Comparison table's Aster baseline
-column. It is still unverified (exit 2, `requires_verification`). The Aster
-cracked column is the submodel peak, so no Aster crack difference is reported
-until an uncracked submodel of the same scope exists.
+Elastic-layer support still uses exact triangular P1 integration, and the
+source-pinned directional wall/foundation operator is retained for the full-wall
+quadratic mesh. See `Design_Docs/app_plan.md` for the app workflow boundary.
 
 The user approved a native Aster concrete-damage formulation, explicitly
 different from FEniCSx AT2 phase field. Installed Aster 17.4 provides
 `ENDO_FISS_EXP` with `3D_GRAD_VARI`; see the installed behaviour catalogue,
-`Cata/Commands/defi_mater_gc.py` and 3-D example `ssnv234b.comm`.
+`Cata/Commands/defi_mater_gc.py` and 3-D example `ssnv234b.comm`. The installed
+17.4 `DEFI_MATER_GC` conversion overflows for this dam's very high `FC/FT`
+ratio, so `Aster.fracture_material` performs the documented internal-parameter
+conversion with a bracketed root and supplies `DEFI_MATERIAU` directly. The
+native material-admissibility and damage benchmarks exercise those direct
+parameters, including compression-side stiffness recovery.
 This is nonlocal scalar damage, not a direct AT2 port or automatically a
 physical crack-opening field.
 

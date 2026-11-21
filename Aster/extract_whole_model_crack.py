@@ -1,8 +1,8 @@
-"""Export the whole-model crack MED result to a ParaView series (bundled MED runtime).
+"""Export the wall-only Code_Aster damage result to a ParaView series.
 
-Damage exists only in the quadratic wall band, and stress only on volume nodes;
-both are placed on the full mesh so one series shows the wall, foundation and
-bedrock response together. Damage is zero outside the band by construction.
+The complete wall carries native scalar damage. Foundation and bedrock are
+represented only by the wall-base spring operator, so no volume bodies or stress
+fields exist for them.
 """
 from __future__ import annotations
 
@@ -73,12 +73,18 @@ def export(result_path: Path, output: Path, label: str = "CRACK") -> dict:
         computed = stress_scalars(tensor[known])
         for name in scalars:
             scalars[name][known] = computed[name]
-        band_damage = damage[index][1][:, 0]
-        in_band = np.isfinite(band_damage)
-        if not np.isfinite(band_damage[in_band]).all():
+        wall_damage = damage[index][1][:, 0]
+        in_wall = np.isfinite(wall_damage)
+        if not np.isfinite(wall_damage[in_wall]).all():
             raise ValueError("Nonfinite recovered damage")
-        band_damage = np.where(in_band, band_damage, 0.0)
-        values = {"displacement_m": moved, "damage_recovered_nodal": band_damage.reshape(-1, 1),
+        wall_damage = np.where(in_wall, wall_damage, 0.0)
+        displacement_magnitude_m = np.linalg.norm(moved, axis=1)
+        damage_mask = (wall_damage >= 0.95).astype(np.float64)
+        values = {"displacement_m": moved,
+                  "displacement_magnitude_m": displacement_magnitude_m.reshape(-1, 1),
+                  "displacement_magnitude_mm": (1000.0 * displacement_magnitude_m).reshape(-1, 1),
+                  "damage_recovered_nodal": wall_damage.reshape(-1, 1),
+                  "damage_above_0_95": damage_mask.reshape(-1, 1),
                   **{name: data.reshape(-1, 1) for name, data in scalars.items()}}
         fields = []
         for name, array in values.items():
@@ -95,14 +101,20 @@ def export(result_path: Path, output: Path, label: str = "CRACK") -> dict:
             raise RuntimeError("Whole-model crack VTU export produced no file")
         ET.SubElement(collection, "DataSet", timestep=repr(instant), part="0", file=written.name)
         snapshots.append({"time": instant, "vtu": written.name,
-                          "damage_min": float(band_damage[in_band].min()),
-                          "damage_max": float(band_damage[in_band].max()),
-                          "maximum_principal_stress_pa": float(np.nanmax(scalars["principal_max_pa"]))})
+                          "damage_min": float(wall_damage[in_wall].min()),
+                          "damage_max": float(wall_damage[in_wall].max()),
+                          "maximum_principal_stress_pa": float(np.nanmax(scalars["principal_max_pa"])),
+                          "maximum_displacement_magnitude_m": float(displacement_magnitude_m.max()),
+                          "maximum_displacement_magnitude_mm": float(1000.0 * displacement_magnitude_m.max()),
+                          "damaged_nodes_above_0_95": int(damage_mask.sum())})
     pvd_path = output / f"{label.lower()}.pvd"
     ET.ElementTree(pvd).write(pvd_path, encoding="utf-8", xml_declaration=True)
     report = {label: {"pvd": pvd_path.name, "snapshots": snapshots, "damage_field": "damage_recovered_nodal",
                       "damage_association": "nodes", "damage_recovery": "native_VARI_NOEU_unclipped",
-                      "damage_outside_band": "zero (linear elastic cells carry no damage)"}}
+                      "damage_display": "Threshold damage_recovered_nodal or damage_above_0_95 above 0.5",
+                      "displacement_display": "Warp By Vector with displacement_m or colour displacement_magnitude_mm",
+                      "damage_outside_wall": "zero (linear elastic cells carry no damage)",
+                      "crack_opening": "not defined by continuum ENDO_ISOT_BETON V1 damage"}}
     (output / "damage_series.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
