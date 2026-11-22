@@ -1060,6 +1060,14 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
                    f"RESI_GLOB_MAXI={toggling_law['residual_tolerance_n']:.6g}),"
                    if toggling_law is not None else
                    f"CONVERGENCE=_F(ITER_GLOB_MAXI={maximum_iterations}, RESI_GLOB_RELA={residual:.12g}),")
+    inactive_displacements = ""
+    if interpolation is not None and "condensed_active_nodes" in interpolation:
+        active = np.asarray(interpolation["condensed_active_nodes"], dtype=np.int64)
+        inactive_displacements = (
+            f"    active = np.asarray({active.tolist()!r}, dtype=np.int64)\n"
+            "    inactive = np.ones(len(result), dtype=bool)\n"
+            "    inactive[active] = False\n"
+            "    result[inactive] = 0.0\n")
     comm += f'''{gravity_ramp}RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 100.0, 100.0), PROL_DROITE='LINEAIRE')
 # Every load is scaled by the load factor (= INST), as in the FEniCSx proportional ramp.
 
@@ -1109,6 +1117,7 @@ def nodal_displacement(field):
     for column, component in enumerate(('DX', 'DY', 'DZ')):
         values, description = field.getValuesWithDescription([component])
         result[np.asarray(description[0], dtype=np.int64), column] = np.asarray(values, dtype=float)
+{inactive_displacements}\
     return result
 
 
@@ -1116,13 +1125,16 @@ history = {{"load_factor": [], "damage_state": [], "normal_jump_m": [], "normal_
            "dissipated_energy_j_m2": [], "mean_normal_traction_pa": [], "mean_tangential_traction_pa": [],
            "sliding": [], "cumulative_slip_m": []}}
 status = {{"schema_version": 1, "status": "running", "targets": TARGETS, "converged_load_factors": [],
-          "joint_cells": len(JOINT_CELLS), "started_at": time.time()}}
+          "joint_cells": len(JOINT_CELLS), "started_at": time.time(), "step_timings": []}}
 
 
-def save(final=None):
+def save(final=None, record_timing=False):
     if final is not None:
         status.update(final)
+    archive_started = time.perf_counter()
     np.savez(STEPS_PATH, **{{key: np.asarray(value, dtype=float) for key, value in history.items()}})
+    if record_timing:
+        status["step_timings"][-1]["archive_s"] = time.perf_counter() - archive_started
     with open(STATUS_PATH, 'w', encoding='utf-8') as stream:
         json.dump(status, stream, indent=2)
 
@@ -1141,6 +1153,8 @@ target_index = 0
 while target_index < len(TARGETS):
     target = TARGETS[target_index]
     target_level = TARGET_LEVELS[target_index]
+    step_started = time.perf_counter()
+    mechanical_s = 0.0
     print(f"ASTER_COHESIVE_STEP start load_factor={{target:.6g}}", flush=True)
     times = DEFI_LIST_INST(
         DEFI_LIST=_F(LIST_INST=DEFI_LIST_REEL(DEBUT=reached, INTERVALLE=_F(JUSQU_A=target, NOMBRE=1))),
@@ -1153,10 +1167,12 @@ while target_index < len(TARGETS):
         SOLVEUR=_F(METHODE='MULT_FRONT'),
     )
     try:
+        mechanical_started = time.perf_counter()
         if RESU is None:
             RESU = STAT_NON_LINE(**options)
         else:
             RESU = STAT_NON_LINE(reuse=RESU, ETAT_INIT=_F(EVOL_NOLI=RESU), **options)
+        mechanical_s += time.perf_counter() - mechanical_started
     except CA.AsterError as error:
         detail = str(error).strip() or type(error).__name__
         save({{"status": "stopped", "stopped_at_load_factor": target,
@@ -1210,8 +1226,10 @@ while target_index < len(TARGETS):
     history["cumulative_slip_m"].append(slip)
     if len(history["load_factor"]) == 1:
         first_depl = nodal_displacement(RESU.getField('DEPL', last))
+    status["step_timings"].append({{"load_factor": target, "mechanical_s": mechanical_s,
+                                  "step_s": time.perf_counter() - step_started}})
     status["converged_load_factors"].append(target)
-    save()
+    save(record_timing=True)
     print(f"ASTER_COHESIVE_STEP done load_factor={{target:.6g}} damaged_joints="
           f"{{int(np.sum(history['damage_state'][-1] >= 1.0))}}", flush=True)
     if {joint.get("stop_overload_on_opening", False)!r} and target >= 1.0 and np.any(
@@ -1270,7 +1288,7 @@ FIN()
             "        damage = np.where(FRICTION_CELLS, np.where(opened > 0.5, 2., 0.), damage)\n"
             "    return ((damage >= 1. - 1e-9) & (jump > HYDRAULIC_OPENING_LIMIT)).reshape(-1, 3).any(axis=1)\n"
             "hydraulic_history = []\nhydraulic_masks = []\nRESU = None\n"))
-        start = comm.index("    try:\n        if RESU is None:")
+        start = comm.index("    try:\n        mechanical_started = time.perf_counter()\n        if RESU is None:")
         end = comm.index("    reached = target\n", start)
         comm = comm[:start] + hydraulic_loads.COUPLED_SOLVE + comm[end:]
         # The hydraulic trials keep the DEFI_LIST_INST / DECOUPE sub-stepping: each trial is a
@@ -1467,6 +1485,26 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         joint["vertical_joint_count"] = int(vertical.sum())
         split["arrays"]["vertical_joint_faces"] = vertical
         save_split_arrays(output_dir, split)
+    source_config = json.loads(Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))
+    condense = source_config.get("bedrock_analysis", {}).get("condense_foundation", False)
+    if condense:
+        if degradation is not None:
+            raise CorroborationError("Condensed foundation does not support support-degradation scenarios")
+        hydraulic = manifest.get("hydraulic_loads", {})
+        if hydraulic.get("base_uplift", "none") != "none":
+            raise CorroborationError("Condensed foundation does not support base uplift")
+        from Aster.foundation_condensation import prepare_condensed_support
+        split["arrays"], condensation = prepare_condensed_support(
+            split["arrays"], joint_cells=split["joints"],
+            youngs_modulus=concrete["youngs_modulus_pa"],
+            poisson_ratio=concrete["poissons_ratio"],
+            density=concrete["density_kg_m3"],
+            gravity_m_s2=-float(base_inputs["gravity_m_s2"]), max_links=20000,
+        )
+        save_split_arrays(output_dir, split)
+        manifest["condensed_foundation"] = condensation
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        base_comm, base_inputs = render_comm(mesh_manifest_path=manifest_path)
     factors = load_factors(summary)
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
@@ -1495,6 +1533,8 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         "baseline_manifest_sha256": file_hash(baseline_dir / MESH_MANIFEST_NAME),
         "source_configuration_sha256": file_hash(Path(baseline_manifest["source_config"])),
     }
+    if condense:
+        inputs["condensed_foundation"] = condensation
     if assignment is not None:
         baseline_fields = baseline_dir / "aster_full_displacement.npz"
         inputs.update(material_assignment=assignment, baseline_displacement_path=str(baseline_fields.resolve()),
@@ -1511,6 +1551,8 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
 
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
+    with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=False) as stored:
+        condensed = "condensed_gravity_load_n" in stored.files
     if runtime == "wsl" and os.name == "nt":
         from Aster.whole_model_crack import (
             DEFAULT_WSL_DISTRIBUTION, DISTRIBUTION_ENVIRONMENT,
@@ -1535,6 +1577,8 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
             text = text.replace(_comm_string(path), repr(wsl_path(path)))
         arrays_path = (output_dir / SPLIT_ARRAYS_NAME).resolve()
         text = text.replace(_comm_string(arrays_path), repr(wsl_path(arrays_path)))
+        if condensed:
+            text = text.replace(_comm_string(ROOT.resolve()), repr(wsl_path(ROOT.resolve())))
         text = text.replace("SOLVEUR=_F(METHODE='MULT_FRONT')", "SOLVEUR=_F(METHODE='MUMPS', NPREC=12)")
         text = text.replace("SOLVEUR=_F(METHODE='MUMPS')", "SOLVEUR=_F(METHODE='MUMPS', NPREC=12)")
         case.write_text(text, encoding="utf-8")
@@ -1554,6 +1598,9 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
 
     export_path = run_dir / "aster_cohesive.export"
     cpu_time_limit_s = max(int(time_limit_s) * max(1, int(SOLVER_THREADS)), 3600) if time_limit_s is not None else 7200
+    archive_path = ((wsl_path((output_dir / SPLIT_ARRAYS_NAME).resolve())
+                     if runtime == "wsl" and os.name == "nt"
+                     else str((output_dir / SPLIT_ARRAYS_NAME).resolve())) if condensed else None)
     export_path.write_text("\n".join([
         f"P time_limit {int(cpu_time_limit_s)}",
         f"P memory_limit {int(memory_limit_mb)}",
@@ -1564,6 +1611,7 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
         f"P ncpus {SOLVER_THREADS}",
         f"F comm {case_path} D 1",
         f"F libr {mesh_path} D {MESH_UNIT}",
+        *([f"F libr {archive_path} D 92"] if archive_path else []),
         "",
     ]), encoding="utf-8")
     if runtime == "wsl" and os.name == "nt":
@@ -1646,6 +1694,45 @@ def _jaccard(a: np.ndarray, b: np.ndarray) -> float | None:
 
 def _ratio(a: float, b: float) -> float | None:
     return None if b == 0 else float(a) / float(b)
+
+
+def open_face_traction_summary(areas, opened, peak_traction, mean_traction) -> dict:
+    """Describe effective normal traction on open cohesive faces at one load state."""
+    areas = np.asarray(areas, dtype=float)
+    opened = np.asarray(opened, dtype=bool)
+    peak_traction = np.asarray(peak_traction, dtype=float)
+    if (areas.ndim != 1 or opened.shape != areas.shape or peak_traction.shape != areas.shape
+            or not np.isfinite(areas).all() or np.any(areas <= 0)
+            or not np.isfinite(peak_traction).all()):
+        raise CorroborationError("Invalid open-face traction fields or facet areas")
+    if mean_traction is not None:
+        mean_traction = np.asarray(mean_traction, dtype=float)
+        if mean_traction.shape != areas.shape or not np.isfinite(mean_traction).all():
+            raise CorroborationError("Invalid mean open-face traction field")
+    result = {
+        "scope": "all candidate facets open beyond the elastic cohesive branch",
+        "definition": ("Effective cohesive normal traction, tension positive; water pressure is an "
+                       "external face load and is not included in this traction. The maximum is a "
+                       "patch/Gauss-point peak; weighted statistics use positive facet-mean traction. "
+                       "An opened facet is touched by opening, not necessarily open over its entire area."),
+        "opened_faces": int(opened.sum()),
+        "opened_area_m2": float(areas[opened].sum()),
+        "maximum_tension_pa": None,
+        "area_weighted_mean_tension_pa": None,
+        "area_weighted_p95_tension_pa": None,
+    }
+    if not opened.any():
+        return result
+    result["maximum_tension_pa"] = float(max(0.0, peak_traction[opened].max()))
+    if mean_traction is not None:
+        values = np.maximum(mean_traction[opened], 0.0)
+        weights = areas[opened]
+        order = np.argsort(values)
+        cumulative = np.cumsum(weights[order])
+        index = min(int(np.searchsorted(cumulative, 0.95 * cumulative[-1], side="left")), len(order) - 1)
+        result["area_weighted_mean_tension_pa"] = float(np.average(values, weights=weights))
+        result["area_weighted_p95_tension_pa"] = float(values[order[index]])
+    return result
 
 
 def joint_class_summary(mask, areas, initiated, opened, separated, traction, jump, strength_pa, law) -> dict:
@@ -1907,6 +1994,8 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         "native_joint_cells": inputs.get("native_joint_cells", inputs["candidate_faces"]),
         "tangent_update_interval": inputs.get("tangent_update_interval", 1),
     }
+    if "step_timings" in status:
+        report["step_timings"] = status["step_timings"]
     if "hydraulic_loads" in joint:
         report["hydraulic_loads"] = joint["hydraulic_loads"]
         report["hydraulic_steps"] = status.get("hydraulic_steps", [])
@@ -2098,6 +2187,9 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                  "for each assigned cohesive law. Lower peak wall displacement is not evidence of "
                  "greater strength; inspect matched locations, stress redistribution and separation."),
     }
+    report["open_face_traction"] = open_face_traction_summary(
+        areas, opened[-1], traction[-1],
+        None if extras["mean_normal_traction_pa"] is None else extras["mean_normal_traction_pa"][-1])
     displacement_path = run_dir / STEPS_NAME.replace(".npz", "_displacement.npz")
     if displacement_path.is_file():
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=True) as arrays:

@@ -173,11 +173,13 @@ def convert(npz_path: Path, med_path: Path) -> None:
     ]
     face_mesh, face_group_arrays = _build_level(MESH_NAME, 2, coords, face_blocks)
 
-    poi1_nodes = data["support_nodes"]
-    point_blocks = [(mc.NORM_POINT1, poi1_nodes.reshape(-1, 1), "OUTER_SPRINGS")]
+    condensed = "condensed_gravity_load_n" in data
+    poi1_nodes = data["point_node_ids"] if condensed else data["support_nodes"]
+    point_blocks = [(mc.NORM_POINT1, poi1_nodes.reshape(-1, 1),
+                     "QS_POINTS" if condensed else "OUTER_SPRINGS")]
     point_mesh, point_group_arrays = _build_level(MESH_NAME, 0, coords, point_blocks)
     compact = bool(data.get("compact_spring_groups", False))
-    if compact:
+    if compact and not condensed:
         tensors = data["support_matrices_n_per_m"]
         groups = {}
         for row, tensor in enumerate(tensors):
@@ -187,15 +189,19 @@ def convert(npz_path: Path, med_path: Path) -> None:
             group = mc.DataArrayInt.New(rows)
             group.setName(f"K_OUT_{index:05d}")
             point_group_arrays.append(group)
-    else:
+    elif not condensed:
         for i in range(len(poi1_nodes)):
             group = mc.DataArrayInt.New([i])
             group.setName(f"SPR_OUT_{i:05d}")
             point_group_arrays.append(group)
 
-    spring_pairs = data["seg2_wall_foundation_springs"]
-    spring_mesh, spring_group_arrays = _build_seg2_spring_level(MESH_NAME, coords, spring_pairs)
-    if compact:
+    spring_pairs = data["link_node_ids"] if condensed else data["seg2_wall_foundation_springs"]
+    if condensed:
+        spring_mesh, spring_group_arrays = _build_level(
+            MESH_NAME, 1, coords, [(mc.NORM_SEG2, spring_pairs, "QS_LINKS")])
+    else:
+        spring_mesh, spring_group_arrays = _build_seg2_spring_level(MESH_NAME, coords, spring_pairs)
+    if compact and not condensed:
         # The per-element groups already preserve the MED sort permutation.
         sorted_ids = [int(group[0]) for group in spring_group_arrays[1:]]
         groups = {}

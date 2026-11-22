@@ -119,6 +119,15 @@ def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
                 report.get("maximum_principal_tensile_stress_pa"),
         }
         maximum_tension = report.get("maximum_principal_tensile_stress_pa")
+        report["near_base_crack_assessment"] = {
+            "target_pa": 500000.0,
+            "status": ("scenario_not_specified" if report["engineering_goal"]["full_load"]
+                       else "incomplete"),
+            "full_load": report["engineering_goal"]["full_load"],
+            "message": ("A near-base crack's location, extent and face identities have not been "
+                        "specified; all open candidate facets are reported separately and cannot "
+                        "be treated as the requested near-base scenario."),
+        }
         report["engineering_goal"]["zero_tension_reached"] = (
             isinstance(maximum_tension, (int, float))
             and math.isfinite(maximum_tension)

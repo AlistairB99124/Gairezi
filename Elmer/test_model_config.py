@@ -132,6 +132,23 @@ class ModelConfigTests(unittest.TestCase):
         candidate["bedrock_analysis"] = {"mode": "elastic_layer", "wall_only_body": True}
         self.assertIs(validate_config(candidate), candidate)
 
+    def test_foundation_condensation_requires_a_spring_connected_baseline(self):
+        candidate = copy.deepcopy(self.payload)
+        candidate["bedrock_analysis"] = {"mode": "elastic_layer", "condense_foundation": True}
+        candidate["geometry"]["foundation"]["support"]["model"] = "spring"
+        candidate["geometry"]["bedrock"]["support"]["model"] = "bonded"
+        self.assertIs(validate_config(candidate), candidate)
+        for change in (
+            lambda value: value["bedrock_analysis"].update(condense_foundation="yes"),
+            lambda value: value["bedrock_analysis"].update(wall_only_body=True),
+            lambda value: value["bedrock_analysis"].update(mode="full_volume"),
+            lambda value: value["geometry"]["foundation"]["support"].update(model="bonded"),
+        ):
+            invalid = copy.deepcopy(candidate)
+            change(invalid)
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigurationValidationError):
+                validate_config(invalid)
+
     def test_validation_does_not_rewrite_configuration_values(self):
         original = copy.deepcopy(self.payload)
         validated = validate_config(self.payload)

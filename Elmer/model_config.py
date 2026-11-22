@@ -831,10 +831,15 @@ class _ConfigValidator:
 
     def validate_bedrock_analysis(self, value: object, root: Mapping[str, object]) -> None:
         path = "bedrock_analysis"
-        analysis = self.object(value, path, {"mode"}, optional={"spring_n_per_m3", "wall_only_body"})
+        analysis = self.object(value, path, {"mode"},
+                               optional={"spring_n_per_m3", "wall_only_body", "condense_foundation"})
         if analysis is None or "mode" not in analysis:
             return
         wall_only = analysis.get("wall_only_body", False)
+        condense = analysis.get("condense_foundation", False)
+        if not isinstance(condense, bool):
+            self.issue(f"{path}.condense_foundation", "must be a boolean")
+            condense = False
         if not isinstance(wall_only, bool):
             self.issue(f"{path}.wall_only_body", "must be a boolean")
             wall_only = False
@@ -851,6 +856,15 @@ class _ConfigValidator:
         if wall_only and mode != "elastic_layer":
             self.issue(f"{path}.wall_only_body", "requires bedrock_analysis.mode 'elastic_layer'")
             return
+        if condense and (wall_only or mode != "elastic_layer"):
+            self.issue(f"{path}.condense_foundation",
+                       "requires an elastic-layer model with the concrete foundation retained in the baseline")
+        if condense:
+            geometry = root.get("geometry")
+            foundation = geometry.get("foundation") if isinstance(geometry, Mapping) else None
+            seat = foundation.get("support") if isinstance(foundation, Mapping) else None
+            if not isinstance(seat, Mapping) or seat.get("model") != "spring":
+                self.issue(f"{path}.condense_foundation", "requires spring-connected wall/foundation support")
         if mode == "elastic_layer":
             geometry = root.get("geometry")
             foundation = geometry.get("foundation") if isinstance(geometry, Mapping) else None

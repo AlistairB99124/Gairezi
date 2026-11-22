@@ -250,7 +250,16 @@ class NativeCrackWaterTests(unittest.TestCase):
     def test_native_jointless_control_remains_dry_with_stable_hydraulic_history(self):
         self.solve_section(with_joints=False)
 
-    def solve_section(self, *, with_joints):
+    def test_wet_fine_and_coarse_increments_agree_for_column_fixture(self):
+        coarse = self.solve_section(with_joints=True)
+        fine = self.solve_section(with_joints=True, factors=[i / 20 for i in range(1, 21)])
+        np.testing.assert_array_equal(coarse["damage"], fine["damage"])
+        np.testing.assert_allclose(coarse["jump"], fine["jump"], rtol=0.02, atol=1e-8)
+        np.testing.assert_allclose(coarse["traction"], fine["traction"], rtol=0.02, atol=100.)
+        np.testing.assert_allclose(coarse["displacement"], fine["displacement"], rtol=0.02, atol=1e-8)
+        np.testing.assert_array_equal(coarse["wet_faces"], fine["wet_faces"])
+
+    def solve_section(self, *, with_joints, factors=None):
         from Aster.test_automatic_cohesive import _aster_launcher
         if not _aster_launcher():
             self.skipTest("Code_Aster is not installed")
@@ -264,7 +273,8 @@ class NativeCrackWaterTests(unittest.TestCase):
         joint["hydraulic_loads"] = {
             "settings": water.CRACK_WATER_SETTINGS, "upstream_z_m": 3.,
             "gradient_pa_per_m": 4e5, "uplift": {"mode": "none", "resultant_n": [0., 0., 0.]}}
-        factors = [.1, .2, .3, .4, .5, .6, .7, .8, .9, 1.] if with_joints else [.5, 1.]
+        if factors is None:
+            factors = [.1, .2, .3, .4, .5, .6, .7, .8, .9, 1.] if with_joints else [.5, 1.]
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             (root / "run").mkdir()
@@ -274,12 +284,18 @@ class NativeCrackWaterTests(unittest.TestCase):
                 joint, factors, root / "run" / cohesive.STEPS_NAME, root / "run" / cohesive.STATUS_NAME,
                 tie_pairs=len(split["arrays"]["tie_node_pairs"]), interpolation=split["arrays"])
             (root / cohesive.CASE_NAME).write_text(comm, encoding="utf-8")
-            status = cohesive.solve(root, time_limit_s=450, memory_limit_mb=2048)
+            status = cohesive.solve(root, time_limit_s=240, memory_limit_mb=2048)
             log = (root / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
             self.assertEqual(status["status"], "completed", f"{status}\n{log[-6000:]}")
             self.assertEqual(status["returncode"], 0)
             history = status["hydraulic_steps"]
             self.assertEqual(len(history), len(factors))
+            self.assertEqual(len(status["step_timings"]), len(factors))
+            for timing, factor in zip(status["step_timings"], factors):
+                self.assertEqual(timing["load_factor"], factor)
+                self.assertGreater(timing["mechanical_s"], 0.)
+                self.assertGreaterEqual(timing["step_s"], timing["mechanical_s"])
+                self.assertGreater(timing["archive_s"], 0.)
             self.assertEqual(history[0]["wet_faces"], 0)
             if with_joints:
                 self.assertGreater(history[-1]["wet_faces"], 0, status)
@@ -296,6 +312,14 @@ class NativeCrackWaterTests(unittest.TestCase):
                 np.testing.assert_allclose(step["uplift_resultant_n"], 0.)
             with np.load(root / "run" / cohesive.STEPS_NAME.replace(".npz", "_hydraulic.npz")) as stored:
                 self.assertEqual(stored["wet_faces"].shape, (len(factors), len(faces)))
+                wet_faces = stored["wet_faces"][-1].copy()
+            with np.load(root / "run" / cohesive.STEPS_NAME.replace(".npz", "_displacement.npz")) as fields:
+                displacement = fields["final"].copy()
+            with np.load(root / "run" / cohesive.STEPS_NAME) as fields:
+                return {"damage": fields["damage_state"][-1].copy(),
+                        "jump": fields["normal_jump_m"][-1].copy(),
+                        "traction": fields["normal_traction_pa"][-1].copy(),
+                        "displacement": displacement, "wet_faces": wet_faces}
 
 
 if __name__ == "__main__":

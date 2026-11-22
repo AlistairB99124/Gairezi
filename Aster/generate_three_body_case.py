@@ -61,6 +61,7 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
     mesh_manifest = json.loads(mesh_manifest_path.read_text(encoding="utf-8"))
     no_bedrock = mesh_manifest.get("rigid_seat_sensitivity") is True
     layer_mode = mesh_manifest.get("bedrock_analysis_mode") == "elastic_layer"
+    condensed = mesh_manifest.get("condensed_foundation") is not None
     has_bedrock_volume = not no_bedrock and not layer_mode
     config_path = Path(mesh_manifest["source_config"])
     if file_hash(config_path) != mesh_manifest["source_hashes"]["config.json"]:
@@ -165,6 +166,38 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
     model_groups = ("'CONCRETE', 'UPSTREAM', 'DOWNSTREAM', 'CREST'," if not has_bedrock_volume else
                     "'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST', 'ROCK_BOTTOM', 'ROCK_SIDES',")
     outer_model = "" if no_bedrock else "_F(GROUP_MA='OUTER_SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),"
+    mesh_read = "MAIL = LIRE_MAILLAGE(FORMAT='MED', UNITE=20, NOM_MED='THREE_BODY', VERI_MAIL=_F(VERIF='NON'))"
+    discrete_assignment = f"""CARA_ROCK = AFFE_CARA_ELEM(
+    MODELE=MODELE,
+    DISCRET=(
+        {all_discret_entries}
+    ),
+)"""
+    condensed_gravity = ""
+    condensed_excitation = ""
+    if condensed:
+        if not layer_mode or no_bedrock:
+            raise ValueError("Condensed foundation requires the elastic-layer source model")
+        mesh_read = f"""import sys
+import numpy as np
+sys.path.insert(0, {str(ROOT.resolve())!r})
+from Aster.native_discrete import read_mesh, characteristics
+MAIL = read_mesh('fort.20', 'fort.92')"""
+        outer_model = "_F(GROUP_MA=('QS_POINTS', 'QS_LINKS'), PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),"
+        wall_foundation_model = ""
+        discrete_assignment = "CARA_ROCK = characteristics(MAIL, MODELE, 'fort.92')"
+        condensed_gravity = """with np.load('fort.92', allow_pickle=False) as support:
+    support_nodes = np.asarray(support['point_node_ids'], dtype=int)
+    support_forces = np.asarray(support['condensed_gravity_load_n'], dtype=float)
+if support_forces.shape != (len(support_nodes), 3) or not np.isfinite(support_forces).all():
+    raise ValueError('Invalid condensed foundation gravity load')
+CONDENSED_GRAVITY = AFFE_CHAR_MECA(
+    MODELE=MODELE, FORCE_NODALE=tuple(
+        _F(NOEUD=f'N{node + 1}', FX=float(force[0]), FY=float(force[1]), FZ=float(force[2]))
+        for node, force in zip(support_nodes, support_forces)))
+"""
+        condensed_excitation = "_F(CHARGE=CONDENSED_GRAVITY),"
+        inputs["condensed_foundation"] = mesh_manifest["condensed_foundation"]
     rock_assignment = "" if not has_bedrock_volume else "_F(GROUP_MA='BEDROCK', MATER=BEDROCK_MAT),"
     mortar_material = ""
     if mortar is not None:
@@ -224,7 +257,7 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
 
 DEBUT(LANG='EN')
 
-MAIL = LIRE_MAILLAGE(FORMAT='MED', UNITE=20, NOM_MED='THREE_BODY', VERI_MAIL=_F(VERIF='NON'))
+{mesh_read}
 # Doc u4.21.01 LIRE_MAILLAGE / FORMAT='MED'. GROUP_MA names CONCRETE,
 # BEDROCK (volumes); UPSTREAM, DOWNSTREAM, CREST, ROCK_BOTTOM, ROCK_SIDES
 # (faces); OUTER_SPRINGS (points). VERI_MAIL disabled for the same reason
@@ -316,16 +349,12 @@ CREST_SURCHARGE = AFFE_CHAR_MECA(
     PRES_REP=_F(GROUP_MA='CREST', PRES={overflow_surcharge_pa:.12g}),
 )
 
-CARA_ROCK = AFFE_CARA_ELEM(
-    MODELE=MODELE,
-    DISCRET=(
-        {all_discret_entries}
-    ),
-)
+{discrete_assignment}
 # K_T_D_L: saved per-axis interface coefficient times tributary area.
 # K_T_N: global k*n*n.T matrices, preserving free tangential directions.
 # Nine-entry SYME='NON' encoding is column-major (installed zzzz274f test).
 
+{condensed_gravity}
 {fixed_seat}
 {trace}
 {uplift_code}
@@ -335,6 +364,7 @@ RESU = MECA_STATIQUE(
     CARA_ELEM=CARA_ROCK,
     EXCIT=(
         _F(CHARGE=GRAVITE),
+        {condensed_excitation}
         _F(CHARGE=PRESSIONS),
         _F(CHARGE=CREST_SURCHARGE),
         {fixed_excitation}

@@ -117,6 +117,54 @@ condition would ground an internal interface instead of bonding two deformable
 bodies. The historical spring-case results below are not results for the
 checked-in bonded-interface configuration.
 
+#### Condensed foundation for wall cracking
+
+Set `bedrock_analysis.condense_foundation` to `true` to replace the linear
+foundation volume in the Code_Aster cohesive solve with an equivalent coupled
+spring network and its gravity load. The elastic baseline still contains the
+foundation. The network is derived from that baseline after crack nodes are
+split; it is not a set of independent fitted springs. Some foundation nodes
+remain as linear support degrees of freedom to keep the network sparse.
+
+This requires `bedrock_analysis.mode: "elastic_layer"`, `wall_only_body: false`,
+a spring-connected wall/foundation interface and a bonded foundation/bedrock
+seat. The spring coefficients are unchanged. Bedrock or mortar volumes, bonded
+wall/foundation nodes, foundation cracking, support degradation and base uplift
+are not supported by this reduction and are rejected. The native network has a
+20,000-link limit; larger meshes can fail preparation rather than silently
+substituting a different support. The reduction can add substantial preparation
+and solver startup time. It preserves the linear foundation response of the
+discretized Code_Aster model, but is not an engineering validation or a guarantee
+that nonlinear cracking converges.
+
+The cohesive report includes `open_face_traction` for all candidate facets
+that have opened beyond their elastic branch. It reports the maximum positive
+effective normal traction and, when facet means are available, area-weighted
+mean and 95th-percentile positive facet-mean traction. A facet counted as open
+may only be partly open; water pressure is an external load, not included in
+the cohesive traction. Empty open-face sets have null traction values.
+These diagnostics do not identify a near-base crack or establish dam safety.
+The separate 0.5 MPa near-base assessment is `incomplete` before full load and
+otherwise `scenario_not_specified`: no crack geometry or face identities are
+inferred. The existing whole-wall zero-tension acceptance gate remains
+unchanged.
+
+For an explicitly specified pre-existing crack, Code_Aster's
+[cohesive-model guidance](https://code-aster.org/doc/v17/manuals/man_u/u2/u2.05.07/Conseils_sur_le_maillage.html)
+describes distinct initial-crack and potential-growth facets and an initial
+internal-variable field. It also recommends resolving the cohesive zone with
+several elements. The current automatic wall workflow does not implement that
+initial state; placing intact cohesive candidates alone is not a pre-existing
+crack. A base-interface scenario additionally needs a support/contact and
+uplift formulation that permits the intended motion.
+
+New cohesive solver status files also record `step_timings` for accepted load
+factors. `mechanical_s` covers the Code_Aster nonlinear calls, including wet
+active-set trials; `step_s` covers the step up to completion of field extraction.
+`archive_s` measures writing the accumulated mechanical history after that step.
+The remaining difference is not a breakdown of assembly and factorization.
+Historical runs do not have these timings.
+
 Place this optional block under `geometry`. Dimensions must be finite, positive
 and at most 5 m. The trench follows the complete valley-floor and abutment seat,
 with **constant width** derived from the largest `geometry.wall.radial_width_m`

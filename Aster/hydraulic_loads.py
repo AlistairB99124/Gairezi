@@ -308,7 +308,9 @@ COUPLED_SOLVE = '''    try:
             trial_options['EXCIT'] = EXCIT + ((_F(CHARGE=water_load, FONC_MULT=RAMP),) if entries else ())
             if previous is not None:
                 trial_options['ETAT_INIT'] = _F(EVOL_NOLI=previous, INST=reached)
+            mechanical_started = time.perf_counter()
             trial = STAT_NON_LINE(**trial_options)
+            mechanical_s += time.perf_counter() - mechanical_started
             trial_displacement = nodal_displacement(trial.getField('DEPL', trial.getLastIndex()))
             updated_wet, updated_forces = crack_water.evaluate(trial_displacement, hydraulic_open_faces(trial))
             print(f"ASTER_HYDRAULIC_UPDATE load_factor={target:.6g} iteration={hydraulic_iteration} "

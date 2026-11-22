@@ -73,6 +73,8 @@ class AdaptiveGrowthTests(unittest.TestCase):
         self.assertIn("Newton did not converge", manifest["warning"])
         self.assertIn("no new usable cohesive facets", manifest["warning"])
         self.assertIn("no new usable cohesive facets", report["adaptive_growth_warning"])
+        self.assertEqual(report["near_base_crack_assessment"]["target_pa"], 500000.)
+        self.assertEqual(report["near_base_crack_assessment"]["status"], "incomplete")
         self.assertFalse((run_dir / "solve_round_2").exists())
 
     def test_new_facet_runs_next_round_even_when_count_is_unchanged(self):
@@ -81,6 +83,7 @@ class AdaptiveGrowthTests(unittest.TestCase):
         self.assertEqual(manifest["adaptive_round"], 2)
         self.assertEqual(report["adaptive_rounds_completed"], 2)
         self.assertEqual(manifest["reached_load_factor"], 1.)
+        self.assertEqual(report["near_base_crack_assessment"]["status"], "scenario_not_specified")
         self.assertNotIn("adaptive_growth_warning", report)
 
     def test_removing_facets_without_adding_any_is_not_growth(self):

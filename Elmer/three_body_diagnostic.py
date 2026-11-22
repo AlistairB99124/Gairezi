@@ -1167,7 +1167,10 @@ def check_spring_gaps(gaps: dict, stiffness: dict[str, dict[str, float]]) -> Non
     component ceiling is a plausibility check, not an engineering acceptance limit.
     """
     for name in stiffness:
-        joint = gaps["joints"].get(name)
+        interface, separator, face = name.partition("/")
+        joint = gaps["joints"].get(interface)
+        if separator and joint is not None:
+            joint = joint.get("faces", {}).get(face)
         if joint is None:
             raise RuntimeError(f"No {name} joint locations found in the result")
         if joint["locations"] == 0:

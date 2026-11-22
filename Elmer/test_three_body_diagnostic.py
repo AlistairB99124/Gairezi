@@ -414,6 +414,7 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
 
     def test_gap_check_rejects_missing_joints_and_runaway_openings(self):
         stiffness = interface_stiffness(self.config)
+        stiffness["wall_joint_2"] = dict(stiffness["wall_bedrock"])
         sane = {"locations": 10, "max_abs_gap_by_axis_m": [2e-6, 2e-6, 2e-6]}
         all_sane = {name: sane for name in stiffness}
         check_spring_gaps({"joints": all_sane}, stiffness)
@@ -427,6 +428,25 @@ class ThreeBodyDiagnosticTests(unittest.TestCase):
             check_spring_gaps({"joints": {**all_sane, "wall_bedrock": {"locations": 10,
                                                          "max_abs_gap_by_axis_m": [0., 0., 1e10]}}},
                               stiffness)
+
+    def test_gap_check_validates_each_partitioned_interface_face(self):
+        stiffness = {
+            "wall_foundation/tread_0000": {"x": 1e9, "y": 2e9, "z": 3e9},
+            "wall_foundation/chamfer_0001": {"x": 1e9, "y": 2e9, "z": 3e9},
+        }
+        sane = {"locations": 8, "max_abs_gap_by_axis_m": [2e-6, 2e-6, 2e-6]}
+        faces = {"tread_0000": sane, "chamfer_0001": sane}
+        check_spring_gaps({"joints": {"wall_foundation": {**sane, "faces": faces}}}, stiffness)
+        for invalid_faces in (
+            {"tread_0000": sane},
+            {"tread_0000": sane, "chamfer_0001": {"locations": 0}},
+        ):
+            with self.subTest(faces=invalid_faces), self.assertRaisesRegex(RuntimeError, "chamfer_0001"):
+                check_spring_gaps({"joints": {"wall_foundation": {**sane, "faces": invalid_faces}}}, stiffness)
+        with self.assertRaisesRegex(RuntimeError, "chamfer_0001.*100 MPa"):
+            check_spring_gaps({"joints": {"wall_foundation": {"faces": {
+                **faces, "chamfer_0001": {"locations": 1, "max_abs_gap_by_axis_m": [0., 0., .1]},
+            }}}}, stiffness)
 
     def test_directional_springs_use_snapshot_values_in_axis_order(self):
         root = Path(__file__).resolve().parents[1]

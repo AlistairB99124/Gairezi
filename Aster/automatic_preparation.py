@@ -174,8 +174,6 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 rings -= 1
                 membership = candidate_region(cells, regions, selected, rings)
                 faces = region_candidate_faces(cells, regions, membership)
-            if len(faces) > 20000:
-                raise ValueError("Selected region exceeds the existing 20000-facet preparation limit")
             if not len(faces) and len(selected):
                 raise ValueError("Selected wall cells have no interior candidate facets")
             split = (split_interior_wall_faces(coordinates, cells, regions, faces, drop_fully_tied=True)

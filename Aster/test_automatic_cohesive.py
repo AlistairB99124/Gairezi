@@ -343,6 +343,21 @@ class NeighbourhoodTests(unittest.TestCase):
 
 
 class CaseTests(unittest.TestCase):
+    def test_condensed_gravity_uses_the_same_ramp_and_ignores_only_inactive_nodes(self):
+        base = (ROOT / "Aster" / "cases" / "01_three_body_baseline.comm").read_text(encoding="utf-8")
+        base = base.replace("RESU = MECA_STATIQUE(",
+                            "CONDENSED_GRAVITY = AFFE_CHAR_MECA(MODELE=MODELE)\nRESU = MECA_STATIQUE(")
+        interpolation = {"interpolation_nodes": np.empty(0, dtype=int),
+                         "condensed_active_nodes": np.array([0, 2])}
+        for friction, ramp in ((None, "RAMP"), ({"residual_tolerance_n": 1.}, "GRAVITY_RAMP")):
+            joint = {"has_joints": False, "damaged_friction": friction}
+            comm = ac.render_cohesive_comm(base, joint, [.5, 1.], Path("s.npz"), Path("s.json"),
+                                           interpolation=interpolation)
+            self.assertIn(f"_F(CHARGE=GRAVITE, FONC_MULT={ramp})", comm)
+            self.assertIn(f"_F(CHARGE=CONDENSED_GRAVITY, FONC_MULT={ramp})", comm)
+            self.assertIn("inactive[active] = False", comm)
+            compile(comm, "condensed.comm", "exec")
+
     def test_reduced_case_does_not_require_a_bedrock_assignment(self):
         base = (ROOT / "Aster" / "cases" / "01_three_body_baseline.comm").read_text(encoding="utf-8")
         base = base.replace("        _F(GROUP_MA='BEDROCK', MATER=BEDROCK_MAT),\n", "")
@@ -492,12 +507,36 @@ def fake_fenicsx(directory: Path, faces_count: int, *, initiated=None, opened=No
 
 
 class PostprocessTests(unittest.TestCase):
+    def test_open_face_traction_uses_only_opened_faces_and_area_weights(self):
+        result = ac.open_face_traction_summary(
+            [1., 9., 100.], [True, True, False], [800000., 400000., 2e6],
+            [600000., 300000., 2e6])
+        self.assertEqual(result["opened_faces"], 2)
+        self.assertEqual(result["opened_area_m2"], 10.)
+        self.assertEqual(result["maximum_tension_pa"], 800000.)
+        self.assertEqual(result["area_weighted_mean_tension_pa"], 330000.)
+        self.assertEqual(result["area_weighted_p95_tension_pa"], 600000.)
+
+    def test_open_face_traction_does_not_invent_zero_for_missing_faces_or_means(self):
+        empty = ac.open_face_traction_summary([], [], [], None)
+        self.assertEqual(empty["opened_faces"], 0)
+        self.assertIsNone(empty["maximum_tension_pa"])
+        self.assertIsNone(empty["area_weighted_mean_tension_pa"])
+        result = ac.open_face_traction_summary([1.], [True], [-10.], None)
+        self.assertEqual(result["maximum_tension_pa"], 0.)
+        self.assertIsNone(result["area_weighted_p95_tension_pa"])
+        with self.assertRaises(ac.CorroborationError):
+            ac.open_face_traction_summary([0.], [True], [0.], [0.])
+        with self.assertRaises(ac.CorroborationError):
+            ac.open_face_traction_summary([1.], [True], [float("nan")], [0.])
+
     def test_wsl_launcher_failure_overrides_completed_status(self):
         import subprocess
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "run").mkdir()
             (root / ac.CASE_NAME).write_text("SOLVEUR=_F(METHODE='MULT_FRONT')")
+            np.savez(root / ac.SPLIT_ARRAYS_NAME)
             calls = []
 
             def execute(distribution, installation, directory, program, timeout, log):
@@ -531,6 +570,7 @@ class PostprocessTests(unittest.TestCase):
                 root = Path(tmp)
                 (root / "run").mkdir()
                 (root / ac.CASE_NAME).write_text("SOLVEUR=_F(METHODE='MULT_FRONT')")
+                np.savez(root / ac.SPLIT_ARRAYS_NAME)
 
                 def execute(distribution, installation, directory, program, timeout, log):
                     if "convert_three_body_to_med.py" in " ".join(program):
@@ -592,6 +632,8 @@ class PostprocessTests(unittest.TestCase):
         self.assertEqual(report["design_load"]["opened_faces"], 1)
         self.assertEqual(report["opening_assessment"]["initiated_faces"], 2)
         self.assertEqual(report["opening_assessment"]["separated_faces"], 0)
+        self.assertEqual(report["open_face_traction"]["maximum_tension_pa"], 800000.)
+        self.assertIsNone(report["open_face_traction"]["area_weighted_mean_tension_pa"])
         self.assertIn("not full separation", report["opening_assessment"]["note"])
         corroboration = report["corroboration"]
         self.assertEqual(corroboration["verdict"], "corroborated")
@@ -799,6 +841,114 @@ class ReportDiagnosticsTests(unittest.TestCase):
 
 class AsterFixtureRun(unittest.TestCase):
     """Real Code_Aster run of the column with a partial cohesive section (about a minute)."""
+
+    def test_condensed_foundation_with_cohesive_joints_and_postprocessing(self):
+        from Aster.support_trace import add_consistent_support
+
+        arrays = column_fixture()
+        foundation = arrays["tetra4_concrete"][arrays["concrete_body_ids"] == 3]
+        faces = np.sort(foundation[:, ac._TET_FACES].reshape(-1, 3), axis=1)
+        unique, counts = np.unique(faces, axis=0, return_counts=True)
+        faces = unique[counts == 1]
+        support_faces = faces[np.isclose(arrays["nodes"][faces][:, :, 2], 0.).all(axis=1)]
+        wall_nodes = np.unique(arrays["tetra4_concrete"][arrays["concrete_body_ids"] == 1])
+        for key in ("tri3_upstream", "tri3_downstream", "tri3_crest"):
+            arrays[key] = arrays[key][np.isin(arrays[key], wall_nodes).all(axis=1)]
+        arrays["tetra4_bedrock"] = np.empty((0, 4), dtype=int)
+        arrays["tri3_rock_bottom"] = np.empty((0, 3), dtype=int)
+        arrays["tri3_rock_sides"] = np.empty((0, 3), dtype=int)
+        arrays["source_cell_rows"] = np.arange(len(arrays["tetra4_concrete"]))
+        tensors = np.repeat((np.eye(3) * 1e13)[None], len(support_faces), axis=0)
+        add_consistent_support(arrays, support_faces, tensors)
+        candidates = np.vstack((
+            crack_faces(arrays),
+            plane_faces(arrays, 0, .5, lambda points: points[:, 2].min() >= 1. and
+                        points[:, 2].max() <= 2.),
+        ))
+        split = ac.split_for_joints(arrays, candidates)
+        self.assertTrue(split["spring_shares"])
+        parents = split["arrays"]["source_node_ids"].copy()
+        keep = np.ones(len(parents), dtype=bool)
+        keep[arrays["support_interpolation_nodes"]] = False
+        keep[split["arrays"]["tie_node_pairs"][:, 1]] = False
+        parents = parents[keep]
+        ac.integrate_joint_faces(split)
+        manifest = ac.split_manifest(fixture_manifest(arrays), split)
+        base = fixture_base_comm(manifest, 4e5)
+        base = base.replace(
+            "MAIL = LIRE_MAILLAGE(FORMAT='MED', UNITE=20, NOM_MED='THREE_BODY', VERI_MAIL=_F(VERIF='NON'))",
+            f"import sys\nsys.path.insert(0, {str(ROOT.resolve())!r})\n"
+            "from Aster.native_discrete import read_mesh, characteristics\n"
+            "MAIL = read_mesh('fort.20', 'fort.92')")
+        base = base.replace("'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST', 'ROCK_BOTTOM', 'ROCK_SIDES'",
+                            "'CONCRETE', 'UPSTREAM', 'DOWNSTREAM', 'CREST'")
+        base = base.replace("_F(GROUP_MA='OUTER_SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),",
+                            "_F(GROUP_MA=('QS_POINTS', 'QS_LINKS'), PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),")
+        base = base.replace("_F(GROUP_MA='WALL_FOUNDATION_SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),", "")
+        base = base.replace("        _F(GROUP_MA='BEDROCK', MATER=BEDROCK_MAT),\n", "")
+        start, end = base.index("CARA_ROCK = AFFE_CARA_ELEM("), base.index("RESU = MECA_STATIQUE(")
+        base = base[:start] + """CARA_ROCK = characteristics(MAIL, MODELE, 'fort.92')
+with np.load('fort.92') as support:
+    points = support['point_node_ids']
+    forces = support['condensed_gravity_load_n']
+CONDENSED_GRAVITY = AFFE_CHAR_MECA(MODELE=MODELE, FORCE_NODALE=tuple(
+    _F(NOEUD=f'N{node + 1}', FX=float(force[0]), FY=float(force[1]), FZ=float(force[2]))
+    for node, force in zip(points, forces)))
+
+""" + base[end:]
+        summary = {"tensile_strength_pa": 3e5, "fracture_energy_j_m2": 100., "load_factor": 1.0}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline, candidate, output = root / "baseline", root / "candidate", root / "output"
+            baseline.mkdir()
+            candidate.mkdir()
+            config = root / "config.json"
+            config.write_text(json.dumps({
+                "bedrock_analysis": {"condense_foundation": True},
+                "material": {"concrete": {"density": 2400.}}}), encoding="utf-8")
+            source_manifest = fixture_manifest(arrays)
+            source_manifest["source_config"] = str(config)
+            (baseline / ac.MESH_MANIFEST_NAME).write_text(json.dumps(source_manifest), encoding="utf-8")
+            np.savez(baseline / ac.SPLIT_ARRAYS_NAME, **arrays)
+            np.savez(candidate / "cohesive_state.npz", parent_node_ids=parents,
+                     coordinates_m=arrays["nodes"][parents], minus=candidates, plus=candidates)
+            (candidate / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            inputs = {"material": {"concrete": {"youngs_modulus_pa": 30e9,
+                                                "poissons_ratio": .2, "density_kg_m3": 2400.}},
+                      "gravity_m_s2": 9.81}
+            with patch("Aster.generate_three_body_case.render_comm", return_value=(base, inputs)):
+                prepared = ac.prepare(baseline, candidate, output)
+            self.assertGreater(prepared["condensed_foundation"]["eliminated_foundation_nodes"], 0)
+            self.assertGreater(prepared["shared_interface_springs"], 0)
+            self.assertEqual(prepared["case_sha256"], ac.file_hash(output / ac.CASE_NAME))
+            status = ac.solve(output, time_limit_s=300, memory_limit_mb=2048)
+            log = (output / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
+            self.assertEqual(status["status"], "completed", f"{status}\n{log[-4000:]}")
+            self.assertEqual(len(status["step_timings"]), len(status["converged_load_factors"]))
+            self.assertTrue(all(row["step_s"] >= row["mechanical_s"] > 0.
+                                for row in status["step_timings"]))
+            result = ac.postprocess(output, fake_fenicsx(root / "f", len(candidates)), status)
+            self.assertEqual(result["reached_load_factor"], 1.)
+            self.assertGreater(result["steps"][-1]["initiated_faces"], 0)
+            with np.load(output / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as values:
+                self.assertTrue(np.isfinite(values["final"]).all())
+
+            from Aster.hydraulic_loads import CRACK_WATER_SETTINGS
+            hydraulic = root / "hydraulic"
+            hydraulic_inputs = dict(inputs, hydraulic_loads={
+                "settings": CRACK_WATER_SETTINGS,
+                "uplift": {"mode": "none", "resultant_n": [0., 0., 0.]}},
+                upstream_water_surface_z_m=3., water_pressure_gradient_pa_per_m=4e5)
+            summary.update(crack_water_pressure=True, solver_controls={"load_increment": .2})
+            (candidate / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            with patch("Aster.generate_three_body_case.render_comm", return_value=(base, hydraulic_inputs)):
+                ac.prepare(baseline, candidate, hydraulic)
+            status = ac.solve(hydraulic, time_limit_s=300, memory_limit_mb=2048)
+            log = (hydraulic / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
+            self.assertEqual(status["status"], "completed", f"{status}\n{log[-4000:]}")
+            result = ac.postprocess(hydraulic, fake_fenicsx(root / "fh", len(candidates)), status)
+            self.assertEqual(result["reached_load_factor"], 1.)
+            self.assertGreater(result["steps"][-1]["initiated_faces"], 0)
 
     def test_no_candidate_facets_runs_real_native_equilibrium(self):
         arrays = column_fixture()
