@@ -87,7 +87,8 @@ FRACTURE_DEBUG_SOLVER_NUMBERS = {
 FRACTURE_DEBUG_ASTER_KEYS = {
     "band_width_m", "softening_p", "load_increment", "maximum_iterations",
     "relative_residual_tolerance", "line_search_iterations", "subdivision_levels",
-    "adaptive_rounds", "whole_wall_tension_tolerance_pa"}
+    "adaptive_rounds", "whole_wall_tension_tolerance_pa", "maximum_candidate_facets",
+    "maximum_condensation_memory_mb"}
 CRACK_SEED_FACES = {"upstream", "downstream"}
 CRACK_OPENING_RANGE_M = (0.001, 0.01)
 CRACK_BUFFER_MAX_M = 2.0
@@ -1126,7 +1127,8 @@ class _ConfigValidator:
                 aster, "whole_wall_tension_tolerance_pa", f"{path}.aster",
                 nonnegative=True)
             for key in ("maximum_iterations", "line_search_iterations",
-                        "subdivision_levels", "adaptive_rounds"):
+                        "subdivision_levels", "adaptive_rounds", "maximum_candidate_facets",
+                        "maximum_condensation_memory_mb"):
                 if key in (aster or {}):
                     self.debug_integer(aster[key], f"{path}.aster.{key}", 1)
 

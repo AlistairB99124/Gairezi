@@ -288,7 +288,9 @@
       "line_search_iterations": 12,
       "subdivision_levels": 8,
       "adaptive_rounds": 5,
-      "whole_wall_tension_tolerance_pa": 1.0
+      "whole_wall_tension_tolerance_pa": 500000.0,
+      "maximum_candidate_facets": 20000,
+      "maximum_condensation_memory_mb": 4096
     }
   }
 }

@@ -20,6 +20,7 @@ class AutomaticPreparationTests(unittest.TestCase):
                 root = Path(directory)
                 model, baseline, config_path = self.fixture(root)
                 config = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text())
+                config["bedrock_analysis"]["condense_foundation"] = False
                 config["damage_selection"].pop("crack_water_pressure", None)
                 if enabled:
                     config["damage_selection"]["crack_water_pressure"] = True
@@ -609,6 +610,11 @@ class AutomaticPreparationTests(unittest.TestCase):
             result = prep.run(config, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
             self.assertEqual(result["solver"], "code_aster")
             self.assertGreater(result["facet_check"]["critical_facets"], 0)
+            assessment = result["residual_tension_assessment"]
+            self.assertEqual(assessment["threshold_pa"], 1.)
+            self.assertEqual(assessment["peak_centroid_xyz_m"], result["peak_location_m"])
+            self.assertGreater(assessment["wall_cells_above_threshold"], 0)
+            self.assertGreater(assessment["maximum_wall_displacement_m"], 0)
             output = root / "prepared"
             result = prep.run(config, model, baseline, output, job_id="fixture",
                               relative_tolerance=1e-4, screening=screening)
@@ -618,6 +624,61 @@ class AutomaticPreparationTests(unittest.TestCase):
                 self.assertGreater(len(state["minus"]), 0)
                 with np.load(baseline / "three_body_mesh_arrays.npz") as arrays:
                     np.testing.assert_array_equal(state["coordinates_m"], arrays["nodes"][state["parent_node_ids"]])
+
+    def test_candidate_limit_rejects_without_truncating_or_splitting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config = self.fixture(root)
+            payload = json.loads(config.read_text())
+            payload["fracture_debug"] = {"aster": {"maximum_candidate_facets": 1}}
+            prep.write_json(config, payload)
+            manifest = json.loads((baseline / "mesh_manifest.json").read_text())
+            manifest["source_hashes"]["config.json"] = prep.file_hash(config)
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening = root / "screening"
+            prep.run(config, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
+            with patch.object(prep, "split_interior_wall_faces") as split:
+                with self.assertRaisesRegex(ValueError, "candidate resource limit"):
+                    prep.run(config, model, baseline, root / "prepared", job_id="fixture",
+                             relative_tolerance=1e-4, screening=screening)
+                split.assert_not_called()
+
+    def test_null_fracture_overrides_screen_and_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config = self.fixture(root)
+            payload = json.loads(config.read_text())
+            payload["fracture_debug"] = None
+            prep.write_json(config, payload)
+            manifest = json.loads((baseline / "mesh_manifest.json").read_text())
+            manifest["source_hashes"]["config.json"] = prep.file_hash(config)
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening = root / "screening"
+            result = prep.run(config, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
+            self.assertEqual(result["residual_tension_assessment"]["threshold_pa"], 1.)
+            result = prep.run(config, model, baseline, root / "prepared", job_id="fixture",
+                              relative_tolerance=1e-4, screening=screening)
+            self.assertEqual(result["status"], prep.PREPARED)
+            self.assertEqual(result["solver_controls"], {})
+
+    def test_disabled_all_overstressed_control_does_not_insert_cracks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, baseline, config = self.fixture(root)
+            payload = json.loads(config.read_text())
+            payload["damage_selection"] = {"enabled": False}
+            prep.write_json(config, payload)
+            manifest = json.loads((baseline / "mesh_manifest.json").read_text())
+            manifest["source_hashes"]["config.json"] = prep.file_hash(config)
+            prep.write_json(baseline / "mesh_manifest.json", manifest)
+            screening = root / "screening"
+            result = prep.run(config, model, baseline, screening, job_id="fixture",
+                              relative_tolerance=1e-4, candidate_scope="all_overstressed")
+            self.assertGreater(result["overstressed_cells"], 0)
+            result = prep.run(config, model, baseline, root / "prepared", job_id="fixture",
+                              relative_tolerance=1e-4, candidate_scope="all_overstressed",
+                              screening=screening)
+            self.assertEqual(result["candidate_faces"], 0)
 
     def test_changed_or_unaccepted_baseline_is_rejected(self):
         for changed in ("run_manifest.json", "source_mesh", "displacement_order"):

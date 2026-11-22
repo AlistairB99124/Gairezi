@@ -137,6 +137,25 @@ and solver startup time. It preserves the linear foundation response of the
 discretized Code_Aster model, but is not an engineering validation or a guarantee
 that nonlinear cracking converges.
 
+The application assesses `fracture_debug.aster.whole_wall_tension_tolerance_pa`
+as a residual wall-cell stress target, separately from the concrete tensile
+strength that governs cohesive initiation. The default configuration sets the
+target to 500,000 Pa. Reaching neither full load nor the target is reported as
+an incomplete cracking stage; it is not an engineering success.
+
+The current implementation cannot transfer cohesive damage history to a rebuilt
+mesh. If additional overstressed cells need new facets after a converged round,
+it preserves that round and stops instead of silently restarting from intact
+material. This is a known limitation, not an automated multi-round fracture
+solution. A target below intact strength does not force intact concrete to crack.
+
+`maximum_candidate_facets` (default 20,000) rejects oversized candidate sets
+without truncating them. `maximum_condensation_memory_mb` (default 4,096 MiB)
+limits a conservative estimate of dense condensation allocations. When this
+limit is exceeded, disabling condensation retains the original foundation and
+its support rather than substituting a fixed boundary. These are resource
+limits, not material parameters, and increasing them does not ensure a solve.
+
 The cohesive report includes `open_face_traction` for all candidate facets
 that have opened beyond their elastic branch. It reports the maximum positive
 effective normal traction and, when facet means are available, area-weighted

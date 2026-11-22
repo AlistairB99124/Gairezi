@@ -105,6 +105,11 @@ class FoundationCondensationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             condense_foundation(self.arrays, max_links=1, **self.properties)
 
+    def test_dense_limit_is_checked_before_matrix_allocation(self):
+        with self.assertRaisesRegex(ValueError, "condensation resource limit"):
+            condense_foundation(self.arrays, retained_foundation_nodes=np.arange(4),
+                                max_dense_bytes=100, **self.properties)
+
     def test_support_substitution_preserves_wall_and_rejects_foundation_damage(self):
         joints = np.empty((0, 6), dtype=int)
         converted, report = prepare_condensed_support(

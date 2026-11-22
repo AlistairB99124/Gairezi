@@ -99,6 +99,19 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                           cohesive_fracture_energy_j_m2=concrete.get("cohesive_fracture_energy_j_m2"),
                           cohesive_fracture_energy_provenance="user-supplied; not independently verified",
                           configuration_sha256=file_hash(configuration))
+            target = float(((config.get("fracture_debug") or {}).get("aster") or {}).get(
+                "whole_wall_tension_tolerance_pa", 1.0))
+            wall = regions == 1
+            wall_principal = np.linalg.eigvalsh(stress[wall])[:, -1]
+            wall_nodes = np.unique(cells[wall])
+            result["residual_tension_assessment"] = {
+                "threshold_pa": target,
+                "maximum_principal_tensile_stress_pa": float(wall_principal.max()),
+                "peak_centroid_xyz_m": result["peak_location_m"],
+                "wall_cells_above_threshold": int(np.count_nonzero(wall_principal > target)),
+                "maximum_wall_displacement_m": float(np.linalg.norm(displacement[wall_nodes], axis=1).max()),
+                "scope": "all wall P1 cells; accepted elastic baseline at design load",
+            }
             if lift_joints(config) is not None and result["selection"].get("lift_joints") is not None:
                 # Fail here, before any solve is spent, if the lift-joint law cannot be given a
                 # joint at least as stiff as the elements beside it (same measure as native.prepare).
@@ -137,16 +150,18 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                     or result.get("solver") != "code_aster"
                     or result.get("verified_baseline_source_sha256") != hashes):
                 raise ValueError("Candidate preparation requires this exact current Aster screening")
-            if candidate_scope == "all_overstressed":
+            if candidate_scope not in ("all_overstressed", "configured"):
+                raise ValueError(f"Unsupported Aster candidate scope: {candidate_scope}")
+            disabled = result["selection"].get("enabled") is False
+            if disabled:
+                selected_rows = np.empty(0, dtype=np.int64)
+            elif candidate_scope == "all_overstressed":
                 selected_rows = np.asarray(result["overstressed_source_rows"], dtype=np.int64)
             elif candidate_scope == "configured":
                 selected_rows = np.asarray(result["selection"]["selected_source_rows"], dtype=np.int64)
-            else:
-                raise ValueError(f"Unsupported Aster candidate scope: {candidate_scope}")
             overload_factor = maximum_overload_factor(config)
             # A disabled selection is an intentional control run: no candidates regardless
             # of facet stress, so neither overload screening nor empty-selection errors apply.
-            disabled = result["selection"].get("enabled") is False
             if (not len(selected_rows) and not disabled
                     and result["facet_check"]["critical_facets"] == 0 and overload_factor > 1):
                 stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
@@ -174,6 +189,15 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 rings -= 1
                 membership = candidate_region(cells, regions, selected, rings)
                 faces = region_candidate_faces(cells, regions, membership)
+            maximum_faces = int(((config.get("fracture_debug") or {}).get("aster") or {}).get(
+                "maximum_candidate_facets", 20000))
+            if len(faces) > maximum_faces:
+                raise ValueError(
+                    f"Cohesive candidate resource limit: {len(faces)} wall facets would generate "
+                    f"{3 * len(faces)} joint patches, exceeding the configured limit of "
+                    f"{maximum_faces} facets. No candidates were truncated; review the material "
+                    "strength and mesh or increase the limit only with sufficient resources."
+                )
             if not len(faces) and len(selected):
                 raise ValueError("Selected wall cells have no interior candidate facets")
             split = (split_interior_wall_faces(coordinates, cells, regions, faces, drop_fully_tied=True)
@@ -228,7 +252,7 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                                            "proportional maximum-overload screening; no eligible facets means native elastic steps"))),
                       "outcome_basis": "Preparation only; native Aster nonlinear equilibrium is still required"}
             result["solver_controls"] = {
-                key: value for key, value in (config.get("fracture_debug", {}).get("aster") or {}).items()
+                key: value for key, value in ((config.get("fracture_debug") or {}).get("aster") or {}).items()
                 if key in {
                     "load_increment", "maximum_iterations", "relative_residual_tolerance",
                     "line_search_iterations", "subdivision_levels", "adaptive_rounds",

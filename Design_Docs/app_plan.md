@@ -1,21 +1,22 @@
 # Dam Analysis Workbench - implementation plan
 
-## Version 1 scope (11 November 2026)
+## Current production scope
 
 The supported app workflow uses Code_Aster for nonlinear wall assessment. There
 is no host solver-selection flag and no FEniCSx execution in the production
-path. After the intact baseline, the nonlinear Aster model retains only the
-concrete `WALL` as a body. Every wall element is damage-capable with
-`ENDO_FISS_EXP` / `3D_GRAD_VARI`; `FOUNDATION` and `BEDROCK` are removed. Their
-translational compliances are combined in series with the foundation slab
-compliance and applied as an exact distributed wall-base spring operator. No
-crack location, seed, contact-joint damage or crack-face water pressure is used.
+path. After the intact baseline, Aster screens wall-cell principal stresses and
+solves cohesive joints on selected interior wall facets. The configured linear
+foundation is either retained or condensed into a coupled support; the
+condensation does not model nonlinear foundation contact. Reservoir-connected
+crack-face pressure may be enabled independently of base uplift.
 
-The output is native regularised wall damage and a wall stress history. It
-includes a native `V1` damage threshold and a residual-tension acceptance check
-at damaged integration points; foundation/bedrock stress fields no longer exist. This is not a
-sharp-crack opening or calibrated crushing assessment. Historical FEniCSx,
-seeded, painted and joint methods are development records, not runtime options.
+The residual wall tensile-stress threshold is separate from the concrete
+tensile strength. A completed stage requires a converged full-load solution and
+the configured threshold to be met. If further candidate facets would require
+rebuilding the mesh, the workflow stops: transferring accepted cohesive history
+to a rebuilt model is not implemented. Results are not engineering validated.
+Historical `ENDO_FISS_EXP`, FEniCSx, seeded and painted methods are development
+records, not the current production crack solver.
 
 ## Solver authority and required completion
 
@@ -67,10 +68,9 @@ increment, the outer load interval is bisected from the last accepted state.
 Every accepted intermediate factor is retained in the mechanical and hydraulic
 histories. Bisection is bounded to four levels per failed interval; reaching
 that limit remains an explicit partial result.
-Adaptive cohesive growth compares actual prepared source-facet identities
-before solving the next round. If overstressed cells add no usable facets,
-the workflow stops rather than repeat the same model, preserves the last solved
-result, and reports the unresolved unjointed cells and growth warning.
+If unjointed cells exceed tensile strength after the first cohesive solve, the
+workflow preserves that accepted state and stops instead of rebuilding without
+transferring fracture history. Automatic multi-round growth remains unsupported.
 Requested wet results without that evidence are rejected by the API and sweep,
 not silently accepted as dry. The report and Investigation disclose the actual
 hydraulic assumptions and history. Restart the API to load these code changes

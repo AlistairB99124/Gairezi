@@ -75,6 +75,11 @@ def _retained_nodes_for_link_budget(
         del graph[node]
         remaining.remove(node)
         edges = next_edges
+    if edges > max_links:
+        raise ValueError(
+            f"Foundation condensation resource limit: the retained support graph needs "
+            f"{edges} links, exceeding the limit of {max_links}."
+        )
     return np.array(sorted(remaining), dtype=np.int64)
 
 
@@ -83,6 +88,7 @@ def condense_foundation(
     density: float, gravity_m_s2: float,
     retained_foundation_nodes: np.ndarray | None = None,
     max_links: int | None = None,
+    max_dense_bytes: int = 4 * 1024**3,
 ) -> CondensedFoundation:
     """Reduce the source Aster P1 foundation and its linear seat springs.
 
@@ -177,6 +183,19 @@ def condense_foundation(
         retained = _retained_nodes_for_link_budget(foundation_cells, faces, foundation_pairs, max_links)
 
     wall_nodes = np.unique(foundation_pairs[:, 0])
+    if isinstance(max_dense_bytes, bool) or not isinstance(max_dense_bytes, int) or max_dense_bytes <= 0:
+        raise ValueError("Condensation dense-memory limit must be a positive number of bytes")
+    reduced_dofs = 3 * (len(wall_nodes) + len(retained))
+    # Include the dense result and temporary arrays used for symmetry and block extraction.
+    estimated_dense_bytes = 5 * reduced_dofs * reduced_dofs * np.dtype(np.float64).itemsize
+    if estimated_dense_bytes > max_dense_bytes:
+        raise ValueError(
+            f"Foundation condensation resource limit: estimated dense memory "
+            f"{estimated_dense_bytes / 1024**3:.2f} GiB for {reduced_dofs} reduced degrees of freedom "
+            f"exceeds the {max_dense_bytes / 1024**3:.2f} GiB limit. "
+            "Disable foundation condensation to retain the original foundation and supports, "
+            "or increase the limit only when sufficient memory is available."
+        )
     local = np.full(len(nodes), -1, dtype=np.int64)
     local[foundation_nodes] = np.arange(len(foundation_nodes))
     wall_local = np.full(len(nodes), -1, dtype=np.int64)
@@ -244,7 +263,7 @@ def condense_foundation(
 
 def prepare_condensed_support(
     arrays: dict, *, joint_cells: np.ndarray, youngs_modulus: float, poisson_ratio: float,
-    density: float, gravity_m_s2: float, max_links: int,
+    density: float, gravity_m_s2: float, max_links: int, max_dense_bytes: int = 4 * 1024**3,
 ) -> tuple[dict, dict]:
     """Replace supported linear foundation cells with a discrete reduced support."""
     from Aster.quadratic_surface import group_stiffness_blocks
@@ -274,6 +293,7 @@ def prepare_condensed_support(
     reduced = condense_foundation(
         arrays, youngs_modulus=youngs_modulus, poisson_ratio=poisson_ratio,
         density=density, gravity_m_s2=gravity_m_s2, max_links=max_links,
+        max_dense_bytes=max_dense_bytes,
     )
     nodes = np.r_[reduced.wall_nodes, reduced.retained_foundation_nodes]
     count = len(nodes)
@@ -281,6 +301,11 @@ def prepare_condensed_support(
     first, second = np.triu_indices(count, 1)
     selected_links = np.any(blocks[first, second] != 0, axis=(1, 2))
     links = np.column_stack((first[selected_links], second[selected_links]))
+    if len(links) > max_links:
+        raise ValueError(
+            f"Foundation condensation resource limit: the reduced support contains "
+            f"{len(links)} links, exceeding the limit of {max_links}."
+        )
     point_matrices = blocks[np.arange(count), np.arange(count)]
     link_matrices = blocks[links[:, 0], links[:, 1]]
     point_groups, point_ids, _ = group_stiffness_blocks(point_matrices)

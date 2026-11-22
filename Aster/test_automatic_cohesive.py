@@ -103,6 +103,7 @@ def column_fixture() -> dict:
         "support_matrices_n_per_m": np.repeat(np.eye(3)[None] * 1.0e13, len(support), axis=0),
         "concrete_body_ids": body,
         "source_node_ids": np.arange(len(points), dtype=np.int64),
+        "source_cell_rows": np.arange(len(concrete) + len(bedrock), dtype=np.int64),
     }
 
 
@@ -716,6 +717,23 @@ def _aster_launcher():
 
 @unittest.skipUnless(_aster_launcher(), "Code_Aster is not installed")
 class ReportDiagnosticsTests(unittest.TestCase):
+    def test_p1_principal_stress_for_tension_compression_shear_and_rotation(self):
+        points = np.array([[0., 0., 0.], [1.2, .1, .2], [.2, 1.1, .1], [.1, .2, 1.3]])
+        cells = np.array([[0, 1, 2, 3]])
+        e, nu = 35e9, .2
+        cases = (
+            (np.diag([3e6, 0., 0.]), 3e6),
+            (np.diag([-3e6, -2e6, -1e6]), -1e6),
+            (np.array([[0., 2e6, 0.], [2e6, 0., 0.], [0., 0., 0.]]), 2e6),
+            (np.array([[1e6, 1e6, 0.], [1e6, 1e6, 0.], [0., 0., -3e5]]), 2e6),
+        )
+        for stress, expected in cases:
+            with self.subTest(stress=stress):
+                strain = ((1 + nu) * stress - nu * np.trace(stress) * np.eye(3)) / e
+                reconstructed = ac.wall_cell_stress(points, cells, points @ strain.T, e, nu)[0]
+                np.testing.assert_allclose(reconstructed, stress, atol=1e-8)
+                self.assertAlmostEqual(np.linalg.eigvalsh(reconstructed)[-1], expected, places=7)
+
     """The checks that showed the first lift-joint run had not cracked where it claimed."""
 
     def test_joint_class_summary_reports_a_bypassed_weak_plane(self):

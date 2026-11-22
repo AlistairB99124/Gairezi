@@ -1040,6 +1040,10 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
     # subdividable; every solve target (the first is also 0.05) carries full self-weight.
     gravity_excit = ("    _F(CHARGE=GRAVITE, FONC_MULT=GRAVITY_RAMP),\n" if any_friction
                      else "    _F(CHARGE=GRAVITE, FONC_MULT=RAMP),\n")
+    if "CONDENSED_GRAVITY = AFFE_CHAR_MECA" in comm:
+        gravity_excit += (
+            "    _F(CHARGE=CONDENSED_GRAVITY, FONC_MULT=GRAVITY_RAMP),\n" if any_friction
+            else "    _F(CHARGE=CONDENSED_GRAVITY, FONC_MULT=RAMP),\n")
     gravity_ramp = ("GRAVITY_RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 0.05, 1.0), "
                     "PROL_DROITE='CONSTANT')\n" if any_friction else "")
     # Softening laws (friction stick-slip, lift-joint rupture of many facets at once) need the
@@ -1050,7 +1054,7 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
     subdivision_levels = int(controls.get("subdivision_levels", 6))
     residual = float(controls.get("relative_residual_tolerance", 1e-6))
     line_search = (f"\n        RECH_LINEAIRE=_F(METHODE='MIXTE', ITER_LINE_MAXI={line_iterations}),"
-                   if joint.get("has_joints", False) else "")
+                   if has_joints else "")
     # Friction and lift-joint steps empirically converge by iteration ~30 or oscillate
     # forever on toggling faces; a 100-iteration budget made every failed bite cost ~30
     # wall-clock minutes before DECOUPE was allowed to subdivide. 40 keeps margin over the
@@ -1500,6 +1504,8 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
             poisson_ratio=concrete["poissons_ratio"],
             density=concrete["density_kg_m3"],
             gravity_m_s2=-float(base_inputs["gravity_m_s2"]), max_links=20000,
+            max_dense_bytes=int(((source_config.get("fracture_debug") or {}).get("aster") or {}).get(
+                "maximum_condensation_memory_mb", 4096)) * 1024**2,
         )
         save_split_arrays(output_dir, split)
         manifest["condensed_foundation"] = condensation
@@ -2217,6 +2223,16 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
             final_stress[damaged_wall] = wall_cell_stress(
                 nodes, wall[damaged_wall], final_u, properties["youngs_modulus"], properties["poisson_ratio"])
         cracked = _stress_summary(nodes, wall, final_stress, final_u)
+        target = float((summary.get("solver_controls") or {}).get(
+            "whole_wall_tension_tolerance_pa", 1.0))
+        wall_principal = np.linalg.eigvalsh(final_stress)[:, -1]
+        report["residual_tension_assessment"] = {
+            "threshold_pa": target,
+            "maximum_principal_tensile_stress_pa": float(wall_principal.max()),
+            "peak_centroid_xyz_m": cracked["tensile_peak_centroid_xyz_m"],
+            "wall_cells_above_threshold": int(np.count_nonzero(wall_principal > target)),
+            "scope": "all wall P1 cells at the last accepted mechanical load factor",
+        }
         comparison = {"load_factor": float(factors[-1]), "scope": "wall (body 1) cells, constant P1 stress",
                       "cracked": cracked, "intact": None}
         if assignment is not None:
