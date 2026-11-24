@@ -1,6 +1,9 @@
 import unittest
 from copy import deepcopy
 import tempfile
+import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -11,6 +14,46 @@ from pathlib import Path
 
 
 class HydraulicTests(unittest.TestCase):
+    def test_reservoir_pressure_moves_waterline_and_integrates_resultants(self):
+        from Aster.reservoir_loading import ReservoirPressure
+        arrays = column_fixture()
+        pressure = ReservoirPressure(arrays, 100.)
+        upstream = ("tri3_upstream",)
+        dry = pressure.forces(-1., upstream)
+        np.testing.assert_allclose(dry, 0.)
+        # Source upstream includes foundation z=0..1 and wall z=1..3, width 1 m.
+        for surface in (.5, 1.5, 3.):
+            forces = pressure.forces(surface, upstream)
+            self.assertAlmostEqual(forces[:, 0].sum(), 50. * surface ** 2)
+            self.assertAlmostEqual(np.cross(arrays["nodes"], forces)[:, 1].sum(),
+                                   100. * surface ** 3 / 6.)
+            np.testing.assert_allclose(forces[:, 1:], 0.)
+        for surface in (1.5, 3.):
+            np.testing.assert_allclose(pressure.forces(surface, ("tri3_crest",)), 0.)
+        crest = pressure.forces(3.3, ("tri3_crest",))
+        self.assertAlmostEqual(crest[:, 2].sum(), -30.)
+        # Opposite face pressure acts into the wall, independent of upstream depth.
+        tailwater = pressure.forces(.5, ("tri3_downstream",))
+        self.assertAlmostEqual(tailwater[:, 0].sum(), -12.5)
+
+    def test_failed_mechanical_trial_releases_temporary_water_load(self):
+        load, destroy, saved = object(), MagicMock(), MagicMock()
+        scope = {
+            "np": np, "time": time, "RESU": None, "options": {}, "EXCIT": (), "RAMP": object(),
+            "MODELE": object(), "reached": 0., "target": .5, "target_level": 0, "mechanical_s": 0.,
+            "hydraulic_arrays": {"nodes": np.zeros((1, 3))},
+            "hydraulic_settings": {"maximum_iterations": 1}, "hydraulic_subdivision_levels": 4,
+            "crack_water": SimpleNamespace(evaluate=lambda *_: (np.ones(1, dtype=bool), np.ones((1, 3)))),
+            "hydraulic_open_faces": lambda _: None, "force_entries": lambda _: [{"NOEUD": "N1", "FX": 1.}],
+            "_F": lambda **kwargs: kwargs, "AFFE_CHAR_MECA": lambda **_: load,
+            "STAT_NON_LINE": MagicMock(side_effect=RuntimeError("mechanical convergence failed")),
+            "CA": SimpleNamespace(AsterError=RuntimeError), "stop_for_resource_failure": lambda _: False,
+            "DETRUIRE": destroy, "bisect_load_interval": lambda *_: None, "save": saved,
+        }
+        exec("while True:\n" + water.COUPLED_SOLVE + "    break\n", scope)
+        destroy.assert_called_once_with(CONCEPT={"NOM": load})
+        self.assertIn("mechanical convergence failed", saved.call_args.args[0]["message"])
+
     def test_crack_water_can_be_enabled_without_base_uplift(self):
         self.assertEqual(water.validate_settings(water.CRACK_WATER_SETTINGS)["base_uplift"], "none")
         for value in (True, 0, float("nan")):
@@ -73,6 +116,23 @@ class HydraulicTests(unittest.TestCase):
         displacement = np.zeros_like(arrays["nodes"])
         displacement[3, 2] = .001
         self.assertFalse(system.evaluate(displacement)[0].any())
+
+    def test_rising_crack_water_surface_recomputes_submergence_and_force_weights(self):
+        arrays = self.network()
+        system = water.CrackWater(arrays, -1., 100., 1e-9)
+        displacement = np.zeros_like(arrays["nodes"])
+        displacement[:7, 2] = .001
+        self.assertFalse(system.evaluate(displacement)[0].any())
+        system.set_surface(1.)
+        wet, force = system.evaluate(displacement)
+        np.testing.assert_array_equal(wet, [True, True, False])
+        self.assertAlmostEqual(force[:7, 2].sum(), 100.)
+        system.set_surface(2.)
+        self.assertAlmostEqual(system.evaluate(displacement)[1][:7, 2].sum(), 200.)
+        system.set_surface(-1.)
+        self.assertFalse(system.evaluate(displacement)[0].any())
+        with self.assertRaises(ValueError):
+            system.set_surface(float("nan"))
 
     def test_elastic_joint_compliance_cannot_admit_water_before_damage(self):
         arrays = self.network()

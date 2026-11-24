@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from Aster.automatic_cohesive import file_hash
+from Elmer.model_config import residual_target_tensile_stress_pa
 from FEniCSx.automatic_cracking import candidate_region, region_cell_stresses, region_candidate_faces
 from FEniCSx.automatic_cracking import maximum_overload_factor
 from FEniCSx.automatic_screening import (COMPLETED, config_digest, crack_base, crack_thickness,
@@ -68,7 +69,7 @@ def baseline_inventory(baseline: Path, configuration: Path, model: Path):
 
 def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
         job_id: str, relative_tolerance: float, screening: Path | None = None,
-        candidate_scope: str = "configured") -> dict:
+        candidate_scope: str = "configured", continuation: bool = False) -> dict:
     if not job_id.strip():
         raise ValueError("An explicit source job ID is required")
     output.mkdir(parents=True, exist_ok=False)
@@ -80,6 +81,7 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
         config, coordinates, cells, regions, displacement, physical, rows, hashes = baseline_inventory(
             baseline, configuration, model)
         concrete = config["material"]["concrete"]
+        target = residual_target_tensile_stress_pa(config)
         if screening is None:
             stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
             result = screen_cells(stress, regions, rows, coordinates, cells,
@@ -99,19 +101,28 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                           cohesive_fracture_energy_j_m2=concrete.get("cohesive_fracture_energy_j_m2"),
                           cohesive_fracture_energy_provenance="user-supplied; not independently verified",
                           configuration_sha256=file_hash(configuration))
-            target = float(((config.get("fracture_debug") or {}).get("aster") or {}).get(
-                "whole_wall_tension_tolerance_pa", 1.0))
             wall = regions == 1
             wall_principal = np.linalg.eigvalsh(stress[wall])[:, -1]
+            residual_rows = rows[wall][wall_principal > target]
             wall_nodes = np.unique(cells[wall])
             result["residual_tension_assessment"] = {
                 "threshold_pa": target,
                 "maximum_principal_tensile_stress_pa": float(wall_principal.max()),
                 "peak_centroid_xyz_m": result["peak_location_m"],
                 "wall_cells_above_threshold": int(np.count_nonzero(wall_principal > target)),
+                "source_rows_above_threshold": residual_rows.tolist(),
                 "maximum_wall_displacement_m": float(np.linalg.norm(displacement[wall_nodes], axis=1).max()),
                 "scope": "all wall P1 cells; accepted elastic baseline at design load",
             }
+            if candidate_scope == "all_overstressed" and "residual_target_tensile_stress_pa" in config:
+                selected_rows = residual_rows if selection_enabled(config) else np.empty(0, dtype=np.int64)
+                result["selection"] = {
+                    "rule": "wall-cell maximum principal tensile stress strictly exceeds the residual target",
+                    "enabled": selection_enabled(config),
+                    "selected_source_rows": selected_rows.tolist(),
+                    "selected_cells": len(selected_rows),
+                    "threshold_pa": target,
+                }
             if lift_joints(config) is not None and result["selection"].get("lift_joints") is not None:
                 # Fail here, before any solve is spent, if the lift-joint law cannot be given a
                 # joint at least as stiff as the elements beside it (same measure as native.prepare).
@@ -156,13 +167,16 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             if disabled:
                 selected_rows = np.empty(0, dtype=np.int64)
             elif candidate_scope == "all_overstressed":
-                selected_rows = np.asarray(result["overstressed_source_rows"], dtype=np.int64)
+                selected_rows = np.asarray(
+                    result["residual_tension_assessment"]["source_rows_above_threshold"]
+                    if "residual_target_tensile_stress_pa" in config else result["overstressed_source_rows"],
+                    dtype=np.int64)
             elif candidate_scope == "configured":
                 selected_rows = np.asarray(result["selection"]["selected_source_rows"], dtype=np.int64)
             overload_factor = maximum_overload_factor(config)
             # A disabled selection is an intentional control run: no candidates regardless
             # of facet stress, so neither overload screening nor empty-selection errors apply.
-            if (not len(selected_rows) and not disabled
+            if (candidate_scope == "configured" and not len(selected_rows) and not disabled
                     and result["facet_check"]["critical_facets"] == 0 and overload_factor > 1):
                 stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
                 overload = screen_cells(stress * overload_factor, regions, rows, coordinates, cells,
@@ -172,19 +186,26 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 selected_rows = np.asarray(overload["selection"]["selected_source_rows"], dtype=np.int64)
                 if not len(selected_rows) and overload["facet_check"]["critical_facets"] > 0:
                     raise ValueError(overload["selection"].get("message") or "Overload candidate selection is empty")
-            if not len(selected_rows) and not disabled and result["facet_check"]["critical_facets"] > 0:
+            if (candidate_scope == "configured" and not len(selected_rows) and not disabled
+                    and result["facet_check"]["critical_facets"] > 0):
                 raise ValueError(result["selection"].get("message") or "Aster candidate selection is empty")
             if np.any(selected_rows < 0) or np.any(selected_rows >= len(cells)):
                 raise ValueError("Aster screening selected no valid wall cells")
             inverse_rows = np.argsort(rows)
             selected = inverse_rows[selected_rows]
-            if not np.all(np.isin(regions[selected], (1, 3))):
+            eligible_regions = (1,) if candidate_scope == "all_overstressed" else (1, 3)
+            if not np.all(np.isin(regions[selected], eligible_regions)):
                 raise ValueError("Aster screening selected cells outside the wall and foundation")
             # The uncapped selection is a complete bank-to-bank band by construction;
             # capped patches are openable by construction. No neighbour rings either way.
             rings = 0
             membership = candidate_region(cells, regions, selected, rings)
             faces = region_candidate_faces(cells, regions, membership)
+            initial_faces = faces
+            if continuation:
+                if candidate_scope != "all_overstressed":
+                    raise ValueError("Fixed-mesh continuation requires wall-only production selection")
+                faces = region_candidate_faces(cells, regions, regions == 1)
             while len(faces) > 20000 and rings > 0:
                 rings -= 1
                 membership = candidate_region(cells, regions, selected, rings)
@@ -202,6 +223,14 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                 raise ValueError("Selected wall cells have no interior candidate facets")
             split = (split_interior_wall_faces(coordinates, cells, regions, faces, drop_fully_tied=True)
                      if len(faces) else None)
+            continuation_arrays = {}
+            if continuation and split is not None:
+                initial_keys = {tuple(sorted(face)) for face in initial_faces.tolist()}
+                continuation_arrays = {
+                    "continuation_active_faces": np.asarray(
+                        [tuple(sorted(face)) in initial_keys for face in split.source_faces.tolist()], dtype=bool),
+                    "continuation_face_owners": split.adjacent_cells,
+                }
             energy = concrete.get("cohesive_fracture_energy_j_m2")
             properties = ((config.get("damage_selection") or {}).get("damaged_element_properties")
                           if candidate_scope == "configured" else None)
@@ -233,6 +262,7 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                                 minus=split.faces.minus if split is not None else np.empty((0, 3), dtype=np.int64),
                                 plus=split.faces.plus if split is not None else np.empty((0, 3), dtype=np.int64),
                                 areas_m2=split.faces.areas if split is not None else np.empty(0),
+                                **continuation_arrays,
                                 **({"lift_joint_faces": lift_faces} if lift_faces is not None else {}))
             result = {"status": PREPARED, "outcome": "candidates_prepared", "accepted": False,
                       "solver": "code_aster", "source_job_id": job_id,
@@ -243,7 +273,10 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                       "maximum_overload_factor": overload_factor,
                       "tensile_strength_pa": float(concrete["tensile_strength_pa"]),
                       "fracture_energy_j_m2": float(energy), "candidate_faces": len(split.source_faces) if split is not None else 0,
-                      "candidate_basis": ("all wall cells exceeding the configured concrete tensile strength"
+                      "candidate_basis": (("all wall cells whose maximum principal tensile stress exceeds "
+                                           "residual_target_tensile_stress_pa; material strength is unchanged"
+                                           if "residual_target_tensile_stress_pa" in config else
+                                           "all wall cells exceeding the configured concrete tensile strength")
                                           if candidate_scope == "all_overstressed" else
                                           ("design-load screening, with neighbour rings where uncapped"
                                           if len(result["selection"]["selected_source_rows"]) else
@@ -251,13 +284,29 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                                            if result["selection"].get("enabled") is False else
                                            "proportional maximum-overload screening; no eligible facets means native elastic steps"))),
                       "outcome_basis": "Preparation only; native Aster nonlinear equilibrium is still required"}
+            if "residual_target_tensile_stress_pa" in config:
+                result["residual_target_tensile_stress_pa"] = target
+            if continuation and split is not None:
+                result["continuation"] = {
+                    "maximum_rounds": int(((config.get("fracture_debug") or {}).get("aster") or {}).get(
+                        "adaptive_rounds", 1)),
+                    "target_pa": residual_target_tensile_stress_pa(config),
+                    "initial_active_faces": int(continuation_arrays["continuation_active_faces"].sum()),
+                }
             result["solver_controls"] = {
                 key: value for key, value in ((config.get("fracture_debug") or {}).get("aster") or {}).items()
                 if key in {
-                    "load_increment", "maximum_iterations", "relative_residual_tolerance",
+                    "loading_mode", "water_depth_start_m", "water_depth_increment_m",
+                    "load_factor_start", "load_increment", "maximum_iterations", "relative_residual_tolerance",
                     "line_search_iterations", "subdivision_levels", "adaptive_rounds",
                     "whole_wall_tension_tolerance_pa"}
             }
+            from Elmer.reservoir_loading import reservoir_loading
+            loading = reservoir_loading(config)
+            if loading is not None:
+                result["reservoir_loading"] = dict(
+                    loading.metadata(), water_depth_targets_m=loading.targets(),
+                    selection_enabled=selection_enabled(config))
             if properties is not None or joints is not None:
                 assignment = {"selected_source_rows": selected_rows.tolist()}
                 scope = []

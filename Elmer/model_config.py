@@ -33,7 +33,7 @@ CONFIG_KEYS = {
 }
 OPTIONAL_CONFIG_KEYS = {
     "crack_simulations", "cracking", "fracture_debug", "damage_selection", "bedrock_analysis",
-    "custom",
+    "custom", "residual_target_tensile_stress_pa",
 }
 # The free-form "custom" section is written by the app's backend-defined Custom tab
 # (Lamb.API custom_fields.json). Solvers ignore it; it is carried for provenance.
@@ -85,7 +85,8 @@ FRACTURE_DEBUG_SOLVER_NUMBERS = {
     "minimum_elements_per_length_scale",
 }
 FRACTURE_DEBUG_ASTER_KEYS = {
-    "band_width_m", "softening_p", "load_increment", "maximum_iterations",
+    "loading_mode", "water_depth_start_m", "water_depth_increment_m",
+    "band_width_m", "softening_p", "load_factor_start", "load_increment", "maximum_iterations",
     "relative_residual_tolerance", "line_search_iterations", "subdivision_levels",
     "adaptive_rounds", "whole_wall_tension_tolerance_pa", "maximum_candidate_facets",
     "maximum_condensation_memory_mb"}
@@ -616,6 +617,9 @@ class _ConfigValidator:
         root = self.object(payload, "", set(CONFIG_KEYS), optional=OPTIONAL_CONFIG_KEYS)
         if root is None:
             return self.issues
+        if "residual_target_tensile_stress_pa" in root:
+            self.number(root["residual_target_tensile_stress_pa"],
+                        "residual_target_tensile_stress_pa", nonnegative=True)
 
         if "custom" in root:
             self.validate_custom(root["custom"])
@@ -1116,8 +1120,11 @@ class _ConfigValidator:
                 self.issue(f"{path}.aster.softening_p", "must be at least 1")
             increment = self.field_number(
                 aster, "load_increment", f"{path}.aster", positive=True)
-            if increment is not None and increment > 0.1:
-                self.issue(f"{path}.aster.load_increment", "must not exceed 0.1")
+            if increment is not None and increment > 1:
+                self.issue(f"{path}.aster.load_increment", "must not exceed 1")
+            start = self.field_number(aster, "load_factor_start", f"{path}.aster", nonnegative=True)
+            if start is not None and start > 1:
+                self.issue(f"{path}.aster.load_factor_start", "must not exceed 1")
             residual = self.field_number(
                 aster, "relative_residual_tolerance", f"{path}.aster", positive=True)
             if residual is not None and residual > 1e-3:
@@ -1175,6 +1182,24 @@ class _ConfigValidator:
                 self.warn(f"{path}.length_m", "is ignored while full_width is true")
         elif full_width is False:
             self.issue(f"{path}.length_m", "is required when full_width is false")
+
+
+def residual_target_tensile_stress_pa(config: Mapping[str, object]) -> float:
+    """Resolve the wall target, retaining the legacy assessment default when omitted."""
+    if "residual_target_tensile_stress_pa" in config:
+        value = config["residual_target_tensile_stress_pa"]
+    else:
+        debug = config.get("fracture_debug") or {}
+        if not isinstance(debug, Mapping):
+            raise ValueError("fracture_debug must be an object or null")
+        aster = debug.get("aster") or {}
+        if not isinstance(aster, Mapping):
+            raise ValueError("fracture_debug.aster must be an object or null")
+        value = aster.get("whole_wall_tension_tolerance_pa", 1.0)
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < 0):
+        raise ValueError("residual_target_tensile_stress_pa must be finite and nonnegative")
+    return float(value)
 
 
 def wall_thickness_steps(wall: Mapping[str, object]) -> list[tuple[float, float]]:
@@ -1290,6 +1315,11 @@ def validate_config(payload: object) -> dict[str, object]:
         raise ConfigurationValidationError(issues)
     if not isinstance(payload, dict):
         raise TypeError("validated configuration must be a JSON object")
+    from Elmer.reservoir_loading import ReservoirLoadingError, reservoir_loading
+    try:
+        reservoir_loading(payload)
+    except ReservoirLoadingError as error:
+        raise ConfigurationValidationError([ValidationIssue(error.path, str(error))]) from error
     return payload
 
 

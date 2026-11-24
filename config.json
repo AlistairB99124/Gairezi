@@ -1,8 +1,9 @@
 {
+  "residual_target_tensile_stress_pa": 500000.0,
   "bedrock_analysis": {
-    "mode": "elastic_layer",
+    "mode": "full_volume",
     "wall_only_body": false,
-    "condense_foundation": true,
+    "condense_foundation": false,
     "spring_n_per_m3": {
       "x": 1250000000.0,
       "y": 1250000000.0,
@@ -32,7 +33,7 @@
       "centerline_radius_m": 78,
       "downstream_radius_m": 76,
       "joint_support": {
-        "model": "bonded",
+        "model": "spring",
         "spring_n_per_m3": {
           "x": 1250000000.0,
           "y": 1250000000.0,
@@ -219,7 +220,7 @@
       "density": 2400,
       "youngs_modulus": 35000000000.0,
       "poisson_ratio": 0.2,
-      "tensile_strength_pa": 2000000.0,
+      "tensile_strength_pa": 500000.0,
       "compressive_strength_pa": 30000000.0,
       "cohesive_fracture_energy_j_m2": 150.0
     },
@@ -282,15 +283,16 @@
     "aster": {
       "band_width_m": 2.5,
       "softening_p": 5.0,
-      "load_increment": 0.005,
+      "loading_mode": "reservoir_filling",
+      "water_depth_start_m": 27.0,
+      "water_depth_increment_m": 0.5,
       "maximum_iterations": 60,
       "relative_residual_tolerance": 0.000005,
       "line_search_iterations": 12,
       "subdivision_levels": 8,
       "adaptive_rounds": 5,
-      "whole_wall_tension_tolerance_pa": 500000.0,
-      "maximum_candidate_facets": 20000,
-      "maximum_condensation_memory_mb": 4096
+      "maximum_candidate_facets": 1000000,
+      "maximum_condensation_memory_mb": 15240
     }
   }
 }

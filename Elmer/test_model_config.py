@@ -11,6 +11,7 @@ from Elmer.model_config import (
     CONFIG_PATH,
     ConfigurationValidationError,
     load_config,
+    residual_target_tensile_stress_pa,
     validate_config,
 )
 from Elmer.regions.bedrock_contours import load_contours, wall_extent
@@ -29,6 +30,87 @@ class ModelConfigTests(unittest.TestCase):
         from_file = load_config(CONFIG_PATH)
         from_object = load_config(copy.deepcopy(self.payload))
         self.assertEqual(from_file, from_object)
+
+    def test_preload_and_increment_ranges_preserve_finer_file_values(self):
+        controls = self.payload.setdefault("fracture_debug", {}).setdefault("aster", {})
+        for start, increment in ((0., .005), (.375, .002), (1., 1.)):
+            controls.update(load_factor_start=start, load_increment=increment)
+            validate_config(self.payload)
+        for key, invalid in (("load_factor_start", (-.01, 1.01, True, float("nan"), None)),
+                             ("load_increment", (0., -1., 1.01, True, float("inf")))):
+            for value in invalid:
+                with self.subTest(key=key, value=value):
+                    controls.update(load_factor_start=0., load_increment=.005)
+                    controls[key] = value
+                    self.assert_invalid_at(self.payload, "fracture_debug.aster." + key)
+
+    def test_reservoir_depth_contract_and_legacy_migration(self):
+        from Elmer.reservoir_loading import reservoir_loading
+        controls = self.payload["fracture_debug"]["aster"]
+        for key in ("loading_mode", "water_depth_start_m", "water_depth_increment_m"):
+            controls.pop(key, None)
+        self.assertIsNone(reservoir_loading(self.payload))
+        controls.update(loading_mode="reservoir_filling", water_depth_start_m=27.,
+                        water_depth_increment_m=.5)
+        validate_config(self.payload)
+        loading = reservoir_loading(self.payload)
+        self.assertIsNotNone(loading)
+        self.assertEqual(loading.targets(), [27. + .5 * i for i in range(13)])
+        self.assertEqual(loading.surface_z(27.), -3.)
+        self.assertEqual(loading.surface_z(28.), -2.)
+        self.assertEqual(loading.crest_pressure(30.), 0.)
+        self.assertEqual(loading.crest_pressure(33.), 29430.)
+        for start, increment, expected in ((32., .7, [32., 32.7, 33.]),
+                                           (33., .5, [33.]), (0., 20., [0., 20., 33.])):
+            controls.update(water_depth_start_m=start, water_depth_increment_m=increment)
+            self.assertEqual(reservoir_loading(self.payload).targets(), expected)
+        controls.update(water_depth_start_m=27., water_depth_increment_m=.5)
+        for key, values in (("water_depth_start_m", (-1., 34., True, None, float("nan"))),
+                            ("water_depth_increment_m", (0., -1., True, None, float("inf"), 1e-12)),
+                            ("loading_mode", ("filling", None, True))):
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    changed = copy.deepcopy(self.payload)
+                    changed["fracture_debug"]["aster"][key] = value
+                    self.assert_invalid_at(changed, "fracture_debug.aster." + key)
+        del controls["loading_mode"]
+        self.assert_invalid_at(self.payload, "fracture_debug.aster.loading_mode")
+
+    def test_reservoir_capacity_and_source_pressure_provenance(self):
+        from Elmer.reservoir_loading import ReservoirLoadingError, reservoir_loading
+        self.payload["fracture_debug"]["aster"].update(
+            loading_mode="reservoir_filling", water_depth_start_m=27., water_depth_increment_m=.5)
+        source = {"upstream_water_surface_z_m": 3., "water_pressure_gradient_pa_per_m": 9810.,
+                  "tailwater_elevation_m": -27., "overflow_surcharge_pa": 29430.}
+        loading = reservoir_loading(self.payload, source)
+        self.assertEqual(loading.depth_reference_z_m, -30.)
+        with self.assertRaises(ReservoirLoadingError):
+            reservoir_loading(self.payload, dict(source, upstream_water_surface_z_m=2.))
+        self.assertEqual(reservoir_loading(self.payload, dict(source, tailwater_elevation_m=-27.1075))
+                         .tailwater_surface_z_m, -27.1075)
+        self.payload["geometry"]["wall"]["height_m"] = 29.
+        self.assert_invalid_at(self.payload, "loads.water_height")
+
+    def test_residual_target_is_optional_finite_nonnegative_and_independent(self):
+        self.payload["residual_target_tensile_stress_pa"] = 500000.
+        strength = self.payload["material"]["concrete"]["tensile_strength_pa"]
+        self.assertIs(validate_config(self.payload), self.payload)
+        self.assertEqual(residual_target_tensile_stress_pa(self.payload), 500000.)
+        self.assertEqual(self.payload["material"]["concrete"]["tensile_strength_pa"], strength)
+        for bad in (-1, True, None, "500000", float("inf"), float("nan")):
+            with self.subTest(value=bad):
+                self.payload["residual_target_tensile_stress_pa"] = bad
+                self.assert_invalid_at(self.payload, "residual_target_tensile_stress_pa")
+                with self.assertRaises(ValueError):
+                    residual_target_tensile_stress_pa(self.payload)
+        self.payload["residual_target_tensile_stress_pa"] = 0.
+        validate_config(self.payload)
+        self.assertEqual(residual_target_tensile_stress_pa(self.payload), 0.)
+        del self.payload["residual_target_tensile_stress_pa"]
+        self.payload["fracture_debug"] = {"aster": {"whole_wall_tension_tolerance_pa": 750000.}}
+        self.assertEqual(residual_target_tensile_stress_pa(self.payload), 750000.)
+        self.payload["fracture_debug"] = None
+        self.assertEqual(residual_target_tensile_stress_pa(self.payload), 1.)
 
     def test_supplied_bedrock_boundary_stiffness_is_validated(self):
         self.assertEqual(self.payload["bedrock_analysis"]["spring_n_per_m3"],

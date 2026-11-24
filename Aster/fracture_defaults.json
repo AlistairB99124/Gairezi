@@ -1,5 +1,8 @@
 {
   "band_width_m": 0.5,
   "softening_p": 5.0,
+  "loading_mode": "reservoir_filling",
+  "water_depth_start_m": 27.0,
+  "water_depth_increment_m": 0.5,
   "calibration_status": "provisional_not_test_calibrated"
 }

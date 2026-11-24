@@ -38,7 +38,7 @@ def command_text(contracts: list[dict]) -> str:
         "from code_aster.Commands import *\n"
         "from libaster import AsterError\n"
         "import json\n"
-        "DEBUT(ERREUR=_F(ALARME='EXCEPTION'))\n"
+        "DEBUT(LANG='EN', ERREUR=_F(ERREUR_F='EXCEPTION'))\n"
         f"inputs = {inputs!r}\n"
         "responses = []\n"
         "for parameters, converted in inputs:\n"

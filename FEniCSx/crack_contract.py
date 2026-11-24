@@ -160,7 +160,11 @@ def default_fracture_debug(defaults: dict, aster_defaults: dict) -> dict:
         "load_steps": defaults["load_steps"],
         "solver": {field.name: defaults["solver"].get(field.name, field.default)
                    for field in dataclasses.fields(PhaseFieldSolverOptions)},
-        "aster": {key: aster_defaults[key] for key in FRACTURE_DEBUG_ASTER_KEYS},
+        "aster": {
+            **{key: aster_defaults[key] for key in FRACTURE_DEBUG_ASTER_KEYS},
+            **{key: aster_defaults[key] for key in (
+                "loading_mode", "water_depth_start_m", "water_depth_increment_m") if key in aster_defaults},
+        },
     }
 
 

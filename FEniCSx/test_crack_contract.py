@@ -125,7 +125,8 @@ class FractureDebugTests(unittest.TestCase):
         debug = default_fracture_debug(self.defaults, self.aster)
         self.assertIsNone(debug["length_scale_m"])
         self.assertEqual(debug["crack_water_pressure_factor"], 1.0)
-        self.assertEqual(debug["aster"], {"band_width_m": 0.5, "softening_p": 5.0})
+        self.assertEqual(debug["aster"], {key: self.aster[key] for key in (
+            "band_width_m", "softening_p", "loading_mode", "water_depth_start_m", "water_depth_increment_m")})
         self.assertEqual(load_config({**load_config(), "fracture_debug": debug})["fracture_debug"], debug)
         spec, options, report = locate_crack({**self.config, "fracture_debug": debug},
                                              (self.shared.y, self.shared.z), self.shared.fields)

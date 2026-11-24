@@ -47,6 +47,59 @@ MED_CONVERT_TIMEOUT_S = 120
 # OpenMP threads for Aster solves (export ncpus; run_aster overrides the caller's
 # OMP_NUM_THREADS with this value, default 1). Matches whole_model_crack.DEFAULT_THREADS.
 SOLVER_THREADS = 8
+MIN_SOLVER_SCRATCH_FREE_BYTES = 16 * 1024**3
+
+
+def resource_failure(text: str) -> dict | None:
+    """Identify fatal storage/allocation errors, preserving the first useful diagnostic."""
+    text = re.sub(r"(?m)^\[\d+,\d+\]<(?:stdout|stderr)>:\s?", "", text)
+    markers = (
+        (r"^\s*(?:\u2551\s*)?<EXCEPTION>\s*<JEVEUX_(?:40|42|57|58|63)>|"
+         r"^\s*OSError:\s*\[Errno (?:28|122)\]|"
+         r"^[^'\"\n]+:\s*(?:no space left on device|disk quota exceeded)",
+         "storage"),
+        (r"^\s*(?:\u2551\s*)?<EXCEPTION>\s*<JEVEUX_(?:60|62)>|"
+         r"^\s*MemoryError(?::|$)|^\s*OSError:\s*\[Errno 12\]|"
+         r"^\s*what\(\):\s*std::bad_alloc|"
+         r"^[^'\"\n]+:\s*(?:cannot allocate memory|out of memory)",
+         "memory"),
+    )
+    candidates = []
+    for pattern, kind in markers:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            candidates.append((match.start(), {
+                "kind": kind, "message": text[max(0, match.start() - 60):match.end() + 1200].strip(),
+            }))
+    marker = re.search(r"^LAMB_SOLVER_RESOURCE_ERROR (.+)$", text, re.MULTILINE)
+    if marker:
+        payload = json.loads(marker.group(1))
+        candidates.append((marker.start(), {"kind": payload["kind"], "message": payload["message"]}))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def create_solver_scratch(base: Path, minimum_free_bytes: int = MIN_SOLVER_SCRATCH_FREE_BYTES) -> tuple[Path, dict]:
+    """Allocate an owned per-run directory on a filesystem that is not RAM-backed."""
+    import tempfile
+
+    base = base.resolve()
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    probe = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "--target", str(base)],
+                           capture_output=True, text=True, check=True, timeout=10)
+    filesystem = probe.stdout.strip()
+    if not filesystem or filesystem in ("tmpfs", "ramfs"):
+        raise RuntimeError(f"Solver scratch resource limit: {base} is not on disk-backed storage ({filesystem})")
+    free_bytes = shutil.disk_usage(base).free
+    if free_bytes < minimum_free_bytes:
+        raise RuntimeError(
+            f"Solver scratch resource limit: {base} has {free_bytes / 1024**3:.2f} GiB free; "
+            f"at least {minimum_free_bytes / 1024**3:.2f} GiB is required. "
+            "Free disk space before retrying; increasing WSL RAM does not increase this filesystem.")
+    scratch = Path(tempfile.mkdtemp(prefix="run_aster_", dir=base))
+    return scratch, {
+        "directory": str(scratch), "filesystem": filesystem,
+        "free_bytes_at_start": free_bytes, "minimum_free_bytes": minimum_free_bytes,
+    }
 
 
 def run_solver(command: list[str], run_dir: Path, timeout: int | None,
@@ -451,12 +504,52 @@ sys.exit(child.wait())
 """
 
 
+def solver_scratch_guard() -> str:
+    from inspect import getsource
+    from textwrap import indent
+    child_guard = WSL_PROCESS_GUARD.replace(
+        "subprocess.Popen(sys.argv[1:]", "subprocess.Popen(program"
+    ).replace("sys.exit(child.wait())", "exitcode = child.wait()")
+    return (
+        "import json, shutil, subprocess, sys\nfrom pathlib import Path\n"
+        f"MIN_SOLVER_SCRATCH_FREE_BYTES = {MIN_SOLVER_SCRATCH_FREE_BYTES}\n"
+        + getsource(create_solver_scratch)
+        + """
+try:
+    scratch, metadata = create_solver_scratch(Path.home() / '.cache' / 'lamb' / 'code_aster')
+except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+    print('LAMB_SOLVER_RESOURCE_ERROR ' + json.dumps(
+        {'kind': 'scratch_preflight', 'message': str(error)}), flush=True)
+    sys.exit(73)
+print('LAMB_SOLVER_SCRATCH ' + json.dumps(metadata), flush=True)
+program = sys.argv[1:] + ['--wrkdir', str(scratch)]
+exitcode = 73
+try:
+"""
+        + indent(child_guard.strip(), "    ")
+        + """
+except OSError as error:
+    print('OSError: ' + str(error), flush=True)
+finally:
+    try:
+        shutil.rmtree(scratch)
+    except OSError as error:
+        print('LAMB_SOLVER_RESOURCE_ERROR ' + json.dumps(
+            {'kind': 'scratch_cleanup', 'message': str(error)}), flush=True)
+        sys.exit(exitcode or 73)
+    print('LAMB_SOLVER_SCRATCH_CLEANED ' + str(scratch), flush=True)
+sys.exit(exitcode)
+""")
+
+
 def run_wsl_solver(distribution: str, root: str, directory: Path, program: list[str],
                    timeout: int | None, live_log: Path) -> subprocess.CompletedProcess:
     from Aster.whole_model_crack import linux_command
+    guard = (solver_scratch_guard() if program and program[0].rsplit("/", 1)[-1] == "run_aster"
+             else WSL_PROCESS_GUARD)
     timed_program = ["timeout", "--kill-after=10", str(timeout), *program] if timeout is not None else program
     command = linux_command(distribution, root, directory, [
-        f"{root}/bin/python3", "-c", WSL_PROCESS_GUARD,
+        f"{root}/bin/python3", "-c", guard,
         *timed_program])
     return run_solver(command, directory, timeout + 30 if timeout is not None else None,
                       live_log=live_log, keep_stdin_open=True)

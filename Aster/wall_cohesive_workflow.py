@@ -11,6 +11,7 @@ import time
 import math
 
 from Aster import automatic_cohesive, automatic_preparation
+from Elmer.model_config import residual_target_tensile_stress_pa
 
 OUTPUT_ROOT = "aster_crack_submodel"
 REPORT_NAME = "crack_report.json"
@@ -27,7 +28,7 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
-        time_limit_s: int, relative_tolerance: float = 1e-3) -> dict:
+        time_limit_s: int | None, relative_tolerance: float = 1e-3) -> dict:
     submitted = json.loads(config.read_text(encoding="utf-8"))
     started = time.monotonic()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -50,27 +51,28 @@ def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
         screening = automatic_preparation.run(
             config, model, baseline, screening_dir, job_id=job_id,
             relative_tolerance=relative_tolerance, candidate_scope="all_overstressed")
-        print("[2/3] Splitting selected wall facets into cohesive interfaces ...", flush=True)
-        aster_controls = (submitted.get("fracture_debug") or {}).get("aster") or {}
-        zero_tension_tolerance_pa = float(
-            aster_controls.get("whole_wall_tension_tolerance_pa", 1.0))
+        print("[2/3] Preparing a fixed bank of interior wall cohesive interfaces ...", flush=True)
+        zero_tension_tolerance_pa = residual_target_tensile_stress_pa(submitted)
         growth_warning = None
         print("[2/3] Preparing cohesive round 1 ...", flush=True)
         candidates_dir = run_dir / "prepared_candidates_1"
         preparation = automatic_preparation.run(
             config, model, baseline, candidates_dir, job_id=job_id,
             relative_tolerance=relative_tolerance, screening=screening_dir,
-            candidate_scope="all_overstressed")
+            candidate_scope="all_overstressed", continuation=True)
         final_round_dir = run_dir / "solve_round_1"
         manifest["candidate_faces"] = int(preparation["candidate_faces"])
         manifest["adaptive_round"] = 1
         write_json(run_dir / "manifest.json", manifest)
-        print("[3/3] Solving cohesive round 1 ...", flush=True)
+        print("[3/3] Solving the load ramp and history-preserving activation rounds ...", flush=True)
         round_started = time.monotonic()
         report = automatic_cohesive.run(
             baseline.resolve(), candidates_dir.resolve(), final_round_dir.resolve(), time_limit_s)
         growth_rows = report.get("growth_source_rows", [])
         full_load = math.isclose(report.get("reached_load_factor", 0.0), 1.0, rel_tol=0.0, abs_tol=1e-12)
+        if report.get("loading_mode") == "reservoir_filling":
+            full_load = (full_load and report.get("reached_water_depth_m")
+                         == report["reservoir_loading"]["final_water_depth_m"])
         maximum_tension = report.get("maximum_principal_tensile_stress_pa")
         target_reached = (isinstance(maximum_tension, (int, float))
                           and math.isfinite(maximum_tension)
@@ -88,8 +90,20 @@ def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
             "duration_s": time.monotonic() - round_started,
             "result_directory": str(final_round_dir),
         }]
-        if report.get("accepted") is not True or report.get("status") != "completed" or not full_load:
+        continuation_rounds = report.get("continuation_rounds")
+        if continuation_rounds:
+            iterations = continuation_rounds
+            manifest["adaptive_round"] = len(iterations)
+        if report.get("resource_failure") is not None:
+            stop_reason = "resource_limit"
+        elif (report.get("preload") or {}).get("status") == "failed":
+            stop_reason = "preload_failure"
+        elif report.get("process_failure") is not None:
+            stop_reason = "process_killed"
+        elif report.get("accepted") is not True or report.get("status") != "completed" or not full_load:
             stop_reason = "solver_failure_or_incomplete_load"
+        elif continuation_rounds:
+            stop_reason = report.get("continuation_stop_reason") or "assessment_complete"
         elif growth_rows and not target_reached:
             stop_reason = "fracture_history_transfer_unavailable"
             growth_warning = (
@@ -110,8 +124,8 @@ def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
                 "Assess the maximum wall-cell principal tensile stress against the configured "
                 "residual stress target without changing the material tensile strength."),
             "whole_wall_tension_tolerance_pa": zero_tension_tolerance_pa,
-            "full_load": bool(math.isclose(
-                report.get("reached_load_factor", 0.0), 1.0, rel_tol=0.0, abs_tol=1e-12)),
+            "residual_target_tensile_stress_pa": zero_tension_tolerance_pa,
+            "full_load": full_load,
             "no_unjointed_tensile_growth": not bool(report.get("growth_source_rows")),
             "maximum_principal_tensile_stress_pa":
                 report.get("maximum_principal_tensile_stress_pa"),
@@ -137,11 +151,21 @@ def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
         if not goal_passed and stop_reason == "assessment_complete":
             report["stop_reason"] = "residual_tension_target_not_met"
         write_json(run_dir / REPORT_NAME, report)
+        manifest["preload"] = report.get("preload")
+        if (report.get("preload") or {}).get("status") == "failed":
+            raise RuntimeError("Intact preload failed: " + report["preload"].get("message", "see solver log"))
+        if report.get("resource_failure") is not None:
+            manifest["resource_failure"] = report["resource_failure"]
+            raise RuntimeError("Code_Aster resource limit: " + report["resource_failure"]["message"])
+        if report.get("process_failure") is not None:
+            manifest["process_failure"] = report["process_failure"]
+            raise RuntimeError(report["process_failure"]["message"])
         if (report.get("accepted") is not True
                 or not str(report.get("solver", "")).startswith("Code_Aster")
                 or not report.get("paraview")
                 or report.get("opening_assessment", {}).get("peak_opening_m") is None):
-            raise RuntimeError("Discrete cohesive solve did not produce an accepted crack-opening result")
+            raise RuntimeError(report.get("solve_message") or
+                               "Discrete cohesive solve did not produce an accepted crack-opening result")
         manifest.update(
             status=("completed_not_engineering_validated" if goal_passed
                     else "partial_not_engineering_validated"),
@@ -149,6 +173,7 @@ def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
             peak_opening_m=float(report["opening_assessment"]["peak_opening_m"]),
             candidate_faces=int(preparation["candidate_faces"]),
             remaining_growth_source_rows=len(report.get("growth_source_rows", [])),
+            adaptive_round=manifest["adaptive_round"],
             engineering_goal_passed=goal_passed,
             stop_reason=report["stop_reason"],
             warning=(None if goal_passed else " ".join(filter(None, (
@@ -156,10 +181,16 @@ def run(*, config: Path, model: Path, baseline: Path, output: Path, job_id: str,
                 growth_warning,
             ))) or "The crack solve has not achieved the configured residual tensile-stress target."),
         )
+        preload_warnings = (report.get("preload") or {}).get("warnings", [])
+        preload_warnings = preload_warnings + report.get("activation_warnings", [])
+        if preload_warnings:
+            manifest["warning"] = " ".join(filter(None, (manifest.get("warning"), *preload_warnings)))
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, MemoryError) as error:
         detail = str(error) or type(error).__name__
         manifest.update(status="failed", error=detail,
-                        stop_reason=("resource_limit" if isinstance(error, MemoryError)
+                        stop_reason=("preload_failure" if (manifest.get("preload") or {}).get("status") == "failed"
+                                     else "process_killed" if manifest.get("process_failure") is not None
+                                     else "resource_limit" if isinstance(error, MemoryError)
                                      or "resource limit" in detail.lower() else "execution_failure"))
         print(f"Discrete cohesive wall cracking failed: {error}", flush=True)
     manifest["runtime_s"] = time.monotonic() - started
@@ -174,9 +205,12 @@ def main() -> None:
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--job-id", required=True)
-    parser.add_argument("--time-limit-s", type=int, required=True)
+    parser.add_argument("--time-limit-s", type=int,
+                        help="Optional positive wall-clock limit in seconds; omitted means no wall-clock timeout.")
     parser.add_argument("--relative-tolerance", type=float, default=1e-3)
     args = parser.parse_args()
+    if args.time_limit_s is not None and args.time_limit_s <= 0:
+        parser.error("--time-limit-s must be positive; omit it for an unbounded user job")
     result = run(config=args.config, model=args.model, baseline=args.baseline,
                  output=args.output, job_id=args.job_id, time_limit_s=args.time_limit_s,
                  relative_tolerance=args.relative_tolerance)

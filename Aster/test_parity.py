@@ -1,6 +1,9 @@
 """Fast parity-contract tests without a solver installation."""
 from pathlib import Path
 import io
+import inspect
+import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -18,6 +21,96 @@ from Aster.source_contract import native_projector_audit, nodal_areas, real_valu
 
 
 class SourceContractTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "Linux scratch/process-group supervisor")
+    def test_scratch_guard_cleans_only_owned_directory_on_success_and_launch_failure(self):
+        from Aster.run_case import solver_scratch_guard
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            unrelated = home / ".cache" / "lamb" / "code_aster" / "unrelated"
+            unrelated.mkdir(parents=True)
+            sentinel = unrelated / "keep"
+            sentinel.touch()
+            for program in ([sys.executable, "-c", "import sys; sys.exit(0)"],
+                            [sys.executable, "-c", "import sys; sys.exit(7)"],
+                            [str(home / "missing_launcher")]):
+                with self.subTest(program=program), subprocess.Popen(
+                        [sys.executable, "-c", solver_scratch_guard(), *program],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, env={**os.environ, "HOME": str(home)}) as process:
+                    process.wait(timeout=10)
+                    stdout, stderr = process.communicate()
+                    self.assertIn("LAMB_SOLVER_SCRATCH_CLEANED ", stdout, stderr)
+                    metadata_line = next(line for line in stdout.splitlines()
+                                         if line.startswith("LAMB_SOLVER_SCRATCH "))
+                    scratch = Path(json.loads(metadata_line.split(" ", 1)[1])["directory"])
+                    self.assertFalse(scratch.exists())
+                    self.assertTrue(sentinel.exists())
+                    expected = 0 if program[-1].endswith("exit(0)") else 7 if program[-1].endswith("exit(7)") else 73
+                    self.assertEqual(process.returncode, expected, stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "Linux scratch/process-group supervisor")
+    def test_scratch_guard_cancels_children_and_cleans_owned_directory_on_host_disconnect(self):
+        from Aster.run_case import solver_scratch_guard
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            marker = home / "orphan"
+            child = f"import time; from pathlib import Path; time.sleep(3); Path({str(marker)!r}).touch()"
+            parent = (f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); "
+                      "print('ready',flush=True); time.sleep(30)")
+            with subprocess.Popen(
+                    [sys.executable, "-c", solver_scratch_guard(), sys.executable, "-c", parent],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env={**os.environ, "HOME": str(home)}) as process:
+                metadata_line = process.stdout.readline()
+                self.assertTrue(metadata_line.startswith("LAMB_SOLVER_SCRATCH "), metadata_line)
+                scratch = Path(json.loads(metadata_line.split(" ", 1)[1])["directory"])
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn("LAMB_SOLVER_SCRATCH_CLEANED ", stdout, stderr)
+            self.assertFalse(scratch.exists())
+            self.assertFalse(marker.exists())
+
+    def test_resource_classifier_ignores_echoed_source_and_handles_mpi_errors(self):
+        from Aster.run_case import resource_failure
+        source = inspect.getsource(resource_failure)
+        echoed = "\n".join("[1,0]<stdout>: " + line for line in source.splitlines())
+        self.assertIsNone(resource_failure(echoed + "\nFileNotFoundError: archive.tmp"))
+        failure = resource_failure(echoed + "\n[1,2]<stdout>: <EXCEPTION> <JEVEUX_40>\n"
+                                   "[1,2]<stdout>: Writing ./glob.1 failed\n"
+                                   "[1,2]<stderr>: fort.6: No space left on device (os error 28)\n"
+                                   "[1,2]<stdout>: <EXCEPTION> <JEVEUX_06>")
+        self.assertEqual(failure["kind"], "storage")
+        self.assertIn("JEVEUX_40", failure["message"])
+        for diagnostic in ("MemoryError: allocation failed", "OSError: [Errno 12] Cannot allocate memory",
+                           "<EXCEPTION> <JEVEUX_62>"):
+            self.assertEqual(resource_failure(diagnostic)["kind"], "memory")
+        payload = {"kind": "scratch_preflight", "message": "tmpfs is not disk-backed"}
+        self.assertEqual(resource_failure("[1,0]<stderr>: LAMB_SOLVER_RESOURCE_ERROR "
+                                         + json.dumps(payload)), payload)
+
+    def test_scratch_preflight_rejects_ram_and_checks_exact_free_space_boundary(self):
+        from Aster.run_case import create_solver_scratch, MIN_SOLVER_SCRATCH_FREE_BYTES
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch("Aster.run_case.subprocess.run") as probe, \
+                    patch("Aster.run_case.shutil.disk_usage") as usage:
+                for filesystem in ("tmpfs", "ramfs", ""):
+                    probe.return_value.stdout = filesystem
+                    with self.assertRaisesRegex(RuntimeError, "not on disk-backed"):
+                        create_solver_scratch(base)
+                probe.return_value.stdout = "ext4\n"
+                usage.return_value.free = MIN_SOLVER_SCRATCH_FREE_BYTES - 1
+                with self.assertRaisesRegex(RuntimeError, "Free disk space"):
+                    create_solver_scratch(base)
+                usage.return_value.free = MIN_SOLVER_SCRATCH_FREE_BYTES
+                first, metadata = create_solver_scratch(base)
+                second, _ = create_solver_scratch(base)
+                self.assertNotEqual(first, second)
+                self.assertEqual(first.parent, base.resolve())
+                self.assertEqual(metadata["free_bytes_at_start"], MIN_SOLVER_SCRATCH_FREE_BYTES)
+                self.assertEqual(metadata["filesystem"], "ext4")
+
     def test_windows_source_paths_are_mapped_to_wsl_on_either_host(self):
         from Aster.whole_model_crack import wsl_path
         self.assertEqual(wsl_path(Path(r"C:\Users\model\three_body.msh")),

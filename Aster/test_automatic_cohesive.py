@@ -5,6 +5,7 @@ import itertools
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -205,6 +206,15 @@ FIN()
 
 
 class SplitTests(unittest.TestCase):
+    def test_dormant_constraints_are_independent_of_permanent_ties(self):
+        from Aster.cohesive_continuation import dormant_ties
+        joints = np.array([[0, 1, 2, 3, 4, 5], [3, 4, 5, 6, 7, 8], [0, 1, 2, 6, 7, 8]])
+        ties = dormant_ties(joints, [False, False, False], [[0, 3]])
+        self.assertEqual(len(ties), 5)
+        freed = dormant_ties(joints, [False, True, True], [[0, 3]])
+        np.testing.assert_array_equal(freed, [[1, 4], [2, 5]])
+        self.assertEqual(len(dormant_ties(joints, [True, True, True], [[0, 3]])), 0)
+
     def setUp(self):
         self.arrays = column_fixture()
 
@@ -344,6 +354,58 @@ class NeighbourhoodTests(unittest.TestCase):
 
 
 class CaseTests(unittest.TestCase):
+    def test_continuation_rejects_overload_instead_of_relabelling_it(self):
+        with self.assertRaisesRegex(ac.CorroborationError, "design load factor 1.0"):
+            ac.render_cohesive_comm("unused", {"continuation": {}}, [1., 2.],
+                                    Path("steps.npz"), Path("status.json"))
+
+    def test_continuation_uses_full_symmetric_principal_stress_and_wall_owners(self):
+        from Aster.cohesive_continuation import assess_round
+        points = np.array([[0., 0., 0.], [1., .1, .2], [.2, 1., .1], [.1, .2, 1.]])
+        cells = np.array([[0, 1, 2, 3]] * 3)
+        stress = np.array([[1e6, 2e6, 0.], [2e6, 1e6, 0.], [0., 0., -1e6]])
+        strain = (1.2 * stress - .2 * np.trace(stress) * np.eye(3)) / 30e9
+        displacement = points @ strain.T
+        args = (points, cells, [True, True, False], displacement, [[0, 1], [0, 1]], [False, True])
+        assessment, eligible = assess_round(*args, 2.5e6, 30e9, .2)
+        self.assertAlmostEqual(assessment["maximum_principal_tensile_stress_pa"], 3e6)
+        np.testing.assert_array_equal(eligible, [True, False])
+        _, eligible = assess_round(*args, 3e6 + 1e-6, 30e9, .2)
+        self.assertFalse(eligible.any())
+        with self.assertRaisesRegex(ValueError, "wall-cell owners"):
+            assess_round(points, cells, [True, True, False], displacement, [[0, 2]], [False],
+                         2.5e6, 30e9, .2)
+
+    def test_unbounded_solve_disables_external_timeout_and_avoids_cpu_fallback(self):
+        from Aster import run_case
+        for limit in (None, 60):
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                np.savez(output / ac.SPLIT_ARRAYS_NAME, nodes=np.zeros((1, 3)))
+
+                def execute(command, run_dir, timeout, **kwargs):
+                    (run_dir / ac.STATUS_NAME).write_text(json.dumps({
+                        "status": "completed", "converged_load_factors": [1.]}))
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                with patch.object(run_case, "detect_installation", return_value={
+                        "available": True, "launcher_path": str(output / "run_aster")}), \
+                        patch.object(run_case, "build_med_mesh", return_value=output / "mesh.med"), \
+                        patch.object(run_case, "run_solver", side_effect=execute) as solver:
+                    result = ac.solve(output, limit, runtime="native")
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(solver.call_args.args[2], limit)
+                export = (output / "run" / "aster_cohesive.export").read_text()
+                self.assertIn("P mpi_nbcpu 1\n", export)
+                self.assertIn("P ncpus 8\n", export)
+                self.assertIn("P memory_limit 16384\n", export)
+                budget = int(next(line.split()[-1] for line in export.splitlines()
+                                  if line.startswith("P time_limit ")))
+                if limit is None:
+                    self.assertGreater(budget, 30 * 24 * 3600)
+                else:
+                    self.assertEqual(budget, max(limit * ac.SOLVER_THREADS, 3600))
+
     def test_condensed_gravity_uses_the_same_ramp_and_ignores_only_inactive_nodes(self):
         base = (ROOT / "Aster" / "cases" / "01_three_body_baseline.comm").read_text(encoding="utf-8")
         base = base.replace("RESU = MECA_STATIQUE(",
@@ -371,6 +433,26 @@ class CaseTests(unittest.TestCase):
     def test_load_factors_follow_fenicsx(self):
         self.assertEqual(ac.load_factors({"load_factor": 1.0}), [0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
         self.assertEqual(ac.load_factors({"load_factor": 1.25})[-2:], [1.2, 1.25])
+
+    def test_preload_schedule_keeps_the_same_load_first_release_and_exact_endpoint(self):
+        for start, increment, expected in (
+                (.375, .25, [.375, .625, .875, 1.]), (1., .005, [1.]),
+                (.995, 1., [.995, 1.]), (.9999999995, .005, [.9999999995, 1.])):
+            for wet in (False, True):
+                with self.subTest(start=start, increment=increment, wet=wet):
+                    factors = ac.load_factors({"crack_water_pressure": wet, "solver_controls": {
+                        "load_factor_start": start, "load_increment": increment}})
+                    self.assertEqual(factors, expected)
+                    self.assertEqual(factors, sorted(set(factors)))
+        self.assertEqual(ac.load_factors({"crack_water_pressure": True, "solver_controls": {
+            "load_factor_start": 0., "load_increment": .005}})[:3], [.01, .015, .02])
+        for start in (0., .5):
+            with self.subTest(start=start):
+                with self.assertRaisesRegex(ac.CorroborationError, "too small"):
+                    ac.load_factors({"solver_controls": {"load_factor_start": start, "load_increment": 1e-12}})
+        for start, increment in ((-.1, .005), (1.1, .005), (True, .005), (.5, 0), (.5, 1.1)):
+            with self.assertRaises(ac.CorroborationError):
+                ac.load_factors({"solver_controls": {"load_factor_start": start, "load_increment": increment}})
 
     def test_friction_load_factors_climb_in_fine_checkpointed_steps(self):
         summary = {"load_factor": 1.0, "damaged_joint_friction": {"friction_coefficient": 1.0}}
@@ -564,8 +646,9 @@ class PostprocessTests(unittest.TestCase):
         marker = f"{ac.RUN_ASTER_EXIT_MARKER}502=1\n"
         progress = ("ASTER_COHESIVE_STEP done load_factor=0.175 damaged_joints=0\n"
                     "ASTER_COHESIVE_STEP start load_factor=0.2\n")
+        killed_output = progress + "[1,0]<stdout>: Killed\n[1,0]<stdout>: EXECUTION_CODE_ASTER_EXIT_502=137\n"
         for stdout, returncode, interrupted in ((progress, 1, True), (progress + marker, 1, False),
-                                                (progress, 137, False)):
+                                                (progress, 137, False), (killed_output, 1, False)):
             with self.subTest(returncode=returncode, marker=marker in stdout), \
                     tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -590,6 +673,10 @@ class PostprocessTests(unittest.TestCase):
                 if interrupted:
                     self.assertIn("terminated from outside while solving load factor 0.2", status["message"])
                     self.assertIn("not a model result", status["message"])
+                elif stdout == killed_output:
+                    self.assertEqual(status["stop_reason"], "process_killed")
+                    self.assertEqual(status["process_failure"]["signal"], 9)
+                    self.assertIn("WSL memory exhaustion or an external kill", status["message"])
                 else:
                     self.assertIn("stopped unexpectedly", status["message"])
 
@@ -799,6 +886,12 @@ class ReportDiagnosticsTests(unittest.TestCase):
         self.assertEqual(calm["cells"], 0)
         self.assertEqual(calm["peak_principal_stress_pa"], 1.25e6)
         self.assertIn("No wall cell", calm["note"])
+        residual = ac.unjointed_overstress(
+            points, wall, stress * 0.5, joints, 2e6, residual_target_pa=500000.)
+        self.assertEqual(residual["wall_cell_indices"], [2])
+        self.assertEqual(residual["tensile_strength_pa"], 2e6)
+        self.assertEqual(residual["threshold_pa"], 500000.)
+        self.assertIn("residual tensile-stress target", residual["note"])
 
     def test_displacement_attribution_separates_softening_from_cracking(self):
         wall_nodes = np.array([0, 1])
@@ -858,9 +951,498 @@ class ReportDiagnosticsTests(unittest.TestCase):
 
 
 class AsterFixtureRun(unittest.TestCase):
+    def continuation_case(self, target=300000., wet=False, initial_active=True, maximum_rounds=3,
+                          resource_error=False, archive_error=False, start=0., preload_error=False,
+                          targets=None, release_error=False, reservoir_depths=None, pressure_surface=3.,
+                          exact_pressure=False, crest_pressure=0., tailwater_surface=0., reservoir_failure=None,
+                          selection_enabled=True):
+        arrays = column_fixture()
+        wall = arrays["tetra4_concrete"][arrays["concrete_body_ids"] == 1]
+        inventory, counts = np.unique(np.sort(wall[:, ac._TET_FACES].reshape(-1, 3), axis=1),
+                                      axis=0, return_counts=True)
+        faces = inventory[counts == 2]
+        initial = {tuple(face) for face in np.sort(crack_faces(arrays), axis=1).tolist()}
+        if not initial_active:
+            initial = set()
+        owners = []
+        for face in faces:
+            owners.append(np.flatnonzero(np.isin(arrays["tetra4_concrete"], face).sum(axis=1) == 3))
+        split = ac.split_for_joints(arrays, faces)
+        split["arrays"]["continuation_face_owners"] = np.asarray(owners, dtype=np.int64)
+        split["arrays"]["continuation_active_faces"] = np.asarray(
+            [tuple(face) in initial for face in np.sort(faces, axis=1).tolist()], dtype=bool)
+        ac.relieve_neighbourhoods(split)
+        ac.integrate_joint_faces(split)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        ac.save_split_arrays(root, split)
+        joint = ac.joint_parameters(arrays, faces,
+                                    {"tensile_strength_pa": 3e5, "fracture_energy_j_m2": 100.}, 30e9, .2)
+        joint["has_joints"] = True
+        joint["continuation"] = {
+            "arrays_path": str((root / ac.SPLIT_ARRAYS_NAME).resolve()), "maximum_rounds": maximum_rounds,
+            "target_pa": target, "youngs_modulus_pa": 30e9, "poissons_ratio": .2,
+        }
+        factors = list(targets) if targets is not None else [.5, 1.]
+        if start > 0:
+            joint["solver_controls"] = {"load_factor_start": start, "load_increment": .25}
+            factors = ac.load_factors({"solver_controls": joint["solver_controls"]})
+        if wet:
+            from Aster.hydraulic_loads import CRACK_WATER_SETTINGS
+            joint["hydraulic_loads"] = {
+                "settings": CRACK_WATER_SETTINGS, "upstream_z_m": 3., "gradient_pa_per_m": 9810.,
+                "uplift": {"mode": "none", "resultant_n": [0., 0., 0.]},
+            }
+        (root / "run").mkdir()
+        base = fixture_base_comm(ac.split_manifest(fixture_manifest(arrays), split), 4e5)
+        base = base.replace("max(3.0 - Z, 0.0)", f"max({pressure_surface!r} - Z, 0.0)")
+        base = base.replace("PRES_REP=_F(GROUP_MA='CREST', PRES=0.0)",
+                            f"PRES_REP=_F(GROUP_MA='CREST', PRES={crest_pressure!r})")
+        if exact_pressure:
+            from Aster.reservoir_loading import ReservoirPressure
+            from Aster.hydraulic_loads import force_entries
+            pressure = ReservoirPressure(split["arrays"], 4e5)
+            entries = force_entries(pressure.forces(pressure_surface, ("tri3_upstream",))
+                                    + pressure.forces(tailwater_surface, ("tri3_downstream",)))
+            base = base.replace(
+                "PRESSIONS = AFFE_CHAR_MECA_F(MODELE=MODELE, PRES_REP=_F(GROUP_MA='UPSTREAM', PRES=UPSTREAM_PRES))",
+                f"PRESSIONS = AFFE_CHAR_MECA(MODELE=MODELE, FORCE_NODALE=tuple(_F(**e) for e in {entries!r}))")
+        comm = ac.render_cohesive_comm(
+            base, joint, factors,
+            (root / "run" / ac.STEPS_NAME).resolve(), (root / "run" / ac.STATUS_NAME).resolve(),
+            tie_pairs=len(split["arrays"]["tie_node_pairs"]), interpolation=split["arrays"])
+        if reservoir_depths is not None:
+            from Aster.reservoir_continuation import render
+            metadata = {
+                "depth_reference_z_m": 0., "final_water_depth_m": reservoir_depths[-1],
+                "water_depth_start_m": reservoir_depths[0],
+                "water_depth_targets_m": reservoir_depths, "water_depth_increment_m": .5,
+                "gradient_pa_per_m": 4e5, "tailwater_surface_z_m": tailwater_surface,
+                "maximum_iterations": 60, "relative_residual_tolerance": 5e-6,
+                "line_search_iterations": 12, "crest_z_m": 3.,
+            }
+            if wet:
+                metadata["hydraulic_settings"] = joint["hydraulic_loads"]["settings"]
+                joint["hydraulic_loads"]["gradient_pa_per_m"] = 4e5
+            comm = render(comm, metadata, joint["tensile_strength_pa"], selection_enabled)
+            joint["reservoir_loading"] = metadata
+        if preload_error:
+            anchor = ("RESU = STAT_NON_LINE(**preload_options)" if reservoir_depths is None else
+                      "RESU = STAT_NON_LINE(**reservoir_options(preload_excit, -1., 0., weight))")
+            self.assertIn(anchor, comm)
+            comm = comm.replace(anchor, "raise MemoryError()" if preload_error == "memory"
+                                else "raise RuntimeError('injected intact equilibrium failure')")
+        if reservoir_failure is not None:
+            comm = comm.replace("target_index = 0\nlevel_round = 0", (
+                "injected_failure = False\ntarget_index = 0\nlevel_round = 0"))
+            if reservoir_failure == "archive":
+                anchor = "\n                            path = STEPS_PATH.replace('.npz', '_hydraulic.npz')"
+                self.assertIn(anchor, comm)
+                comm = comm.replace(anchor, (
+                    "\n                            if len(hydraulic_history) > 1:\n"
+                    "                                raise OSError(28, 'injected water archive failure')\n" + anchor))
+            else:
+                anchor = "\n            mechanical_started = time.perf_counter()"
+                self.assertIn(anchor, comm)
+                once = " and not injected_failure" if reservoir_failure == "rising_once" else ""
+                error = "MemoryError()" if reservoir_failure == "resource" else "RuntimeError('injected rising failure')"
+                comm = comm.replace(anchor, (
+                    f"\n            if trial_depth > accepted_depth{once}:\n"
+                    "                injected_failure = True\n"
+                    f"                raise {error}\n" + anchor))
+        if release_error:
+            indent = " " * (12 if wet or reservoir_depths is not None else 8)
+            anchor = "\n" + indent + "mechanical_started = time.perf_counter()"
+            self.assertIn(anchor, comm)
+            comm = comm.replace(anchor, "\n" + indent + "raise RuntimeError('injected first-release failure')"
+                                + anchor)
+        if resource_error:
+            indent = " " * (12 if wet else 8)
+            anchor = "\n" + indent + "mechanical_started = time.perf_counter()"
+            self.assertIn(anchor, comm)
+            comm = comm.replace(anchor, "\n" + indent + "if target > 0.5:\n" + indent
+                                + "    raise CA.AsterError('JEVEUX_40', ('./glob.1',), (123, -4), ())\n"
+                                + indent + "mechanical_started = time.perf_counter()")
+        if archive_error:
+            anchor = "\n            archive_started = time.perf_counter()"
+            self.assertIn(anchor, comm)
+            comm = comm.replace(anchor, "\n            if len(status['converged_load_factors']) > 1:\n"
+                                "                raise OSError(28, 'No space left on device')"
+                                + anchor)
+        compile(comm, "continuation.comm", "exec")
+        (root / ac.CASE_NAME).write_text(comm, encoding="utf-8")
+        (root / "case_inputs.json").write_text(json.dumps({
+            "joint": joint, "load_factors": factors, "candidate_faces": len(faces),
+            "split_nodes": split["split_nodes"], "added_nodes": split["added_nodes"],
+            "joint_integration": "three_HEXA8_FPG4_patches_exact_P1_trace",
+            "native_joint_cells": len(split["arrays"]["hexa8_joints"]),
+        }), encoding="utf-8")
+        candidates = root / "candidates"
+        candidates.mkdir()
+        points = arrays["nodes"][faces]
+        areas = np.linalg.norm(np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]), axis=1) / 2
+        np.savez(candidates / "cohesive_state.npz", areas_m2=areas)
+        (candidates / "summary.json").write_text(json.dumps({
+            "status": "prepared_aster_candidates", "residual_target_tensile_stress_pa": target,
+        }), encoding="utf-8")
+        status = ac.solve(root, time_limit_s=240, memory_limit_mb=2048)
+        return root, status
+
+    def test_native_reservoir_filling_keeps_gravity_and_moves_water_surface(self):
+        root, status = self.continuation_case(
+            target=1e12, initial_active=False, reservoir_depths=[1.5, 2., 2.5, 3.])
+        self.assertEqual(status["status"], "completed", status)
+        self.assertEqual(status["preload"]["water_depth_m"], 1.5)
+        self.assertEqual(status["preload"]["maximum_damage"], 0.)
+        report = ac.postprocess(root, root / "candidates", status)
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["reached_water_depth_m"], 3.)
+        self.assertIsNone(report["linear_first_initiation_estimate"])
+        self.assertIsNone(report["displacement_attribution"]["intact_peak_m"])
+        with np.load(root / "run" / ac.STEPS_NAME) as archive:
+            np.testing.assert_allclose(archive["water_depth_m"], [1.5, 2., 2.5, 3.])
+            np.testing.assert_allclose(archive["load_factor"], [.5, 2/3, 5/6, 1.])
+            np.testing.assert_allclose(archive["solver_instant"], [1., 2., 3., 4.])
+        # The same full-load endpoint on the same dormant mesh is path independent elastically.
+        cold_root, cold_status = self.continuation_case(
+            target=1e12, initial_active=False, targets=[1.])
+        self.assertEqual(cold_status["status"], "completed", cold_status)
+        with np.load(root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as filling:
+            with np.load(cold_root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as cold:
+                np.testing.assert_allclose(filling["final"], cold["final"], rtol=1e-7, atol=1e-12)
+                with np.load(cold_root / ac.SPLIT_ARRAYS_NAME) as arrays:
+                    baseline = root / "full_depth_reference.npz"
+                    np.savez(baseline, coordinates_m=arrays["nodes"], source_node_ids=arrays["source_node_ids"],
+                             displacement_m=cold["final"])
+                inputs = json.loads((root / "case_inputs.json").read_text())
+                inputs.update(baseline_displacement_path=str(baseline),
+                              baseline_displacement_sha256=ac.file_hash(baseline),
+                              intact_concrete_properties={"youngs_modulus_pa": 30e9, "poissons_ratio": .2})
+                (root / "case_inputs.json").write_text(json.dumps(inputs))
+            with np.load(root / "run" / "preload" / "accepted_state.npz") as preload:
+                np.testing.assert_allclose(filling["first"], preload["displacement_m"],
+                                           rtol=1e-7, atol=1e-12)
+            start_root, start_status = self.continuation_case(
+                target=1e12, initial_active=False, targets=[1.], pressure_surface=1.5, exact_pressure=True)
+            self.assertEqual(start_status["status"], "completed", start_status)
+            with np.load(start_root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as cold:
+                np.testing.assert_allclose(filling["first"], cold["final"], rtol=1e-7, atol=1e-12)
+        report = ac.postprocess(root, root / "candidates", status)
+        self.assertIsNotNone(report["stress_comparison"]["intact"])
+        with np.load(root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as filling:
+            np.testing.assert_allclose(filling["intact"], filling["final"], rtol=1e-7, atol=1e-12)
+
+    def test_native_reservoir_history_and_wet_pressure_follow_accepted_depths(self):
+        root, status = self.continuation_case(
+            wet=True, reservoir_depths=[0., 1., 2., 3.], maximum_rounds=2)
+        self.assertEqual(status["status"], "completed", status)
+        self.assertEqual(status["reached_water_depth_m"], 3.)
+        with np.load(root / "run" / ac.STEPS_NAME) as archive:
+            depths = archive["water_depth_m"]
+            self.assertEqual(depths[0], 0.)
+            self.assertEqual(depths[-1], 3.)
+            self.assertTrue((np.diff(depths) >= 0).all())
+            self.assertTrue((np.diff(archive["solver_instant"]) > 0).all())
+            self.assertEqual(len(status["hydraulic_steps"]), len(depths))
+            for depth, water in zip(depths, status["hydraulic_steps"]):
+                self.assertEqual(water["water_depth_m"], depth)
+                self.assertTrue(water["active_set_stable"])
+        previous = None
+        for row in status["continuation_rounds"]:
+            with np.load(root / "run" / f"round_{row['iteration']:04d}" / "accepted_state.npz") as state:
+                current = state["damage_state_gauss"], state["dissipated_energy_gauss"]
+                if previous is not None:
+                    for accepted, fresh in zip(previous, current):
+                        self.assertTrue((fresh >= accepted - 1e-9).all())
+                previous = tuple(value.copy() for value in current)
+
+    def test_native_reservoir_same_depth_release_failure_is_not_bisected(self):
+        _, status = self.continuation_case(
+            target=1e12, reservoir_depths=[1.5, 2., 3.], release_error=True)
+        self.assertEqual(status["preload"]["status"], "completed", status)
+        self.assertEqual(status["status"], "failed", status)
+        self.assertEqual(status["converged_load_factors"], [])
+        self.assertNotIn("hydraulic_subdivisions", status)
+
+    def test_native_reservoir_intermediate_activation_cap_advances_with_persistent_warning(self):
+        root, status = self.continuation_case(
+            target=1., initial_active=False, reservoir_depths=[0., 1., 2., 3.], maximum_rounds=1)
+        self.assertEqual(status["status"], "completed", status)
+        self.assertEqual(status["reached_water_depth_m"], 3.)
+        self.assertFalse(status["activation_history_complete"])
+        self.assertTrue(status["activation_warnings"])
+        with np.load(root / "run" / ac.STEPS_NAME) as archive:
+            np.testing.assert_allclose(archive["water_depth_m"], [0., 1., 2., 3.])
+        for row in status["continuation_rounds"]:
+            if row.get("warning"):
+                path = root / "run" / f"round_{row['iteration']:04d}" / "manifest.json"
+                self.assertEqual(json.loads(path.read_text())["warning"], row["warning"])
+        report = ac.postprocess(root, root / "candidates", status)
+        self.assertEqual(report["activation_warnings"], status["activation_warnings"])
+        self.assertFalse(report["activation_history_complete"])
+        if status["continuation_stop_reason"] == "iteration_limit":
+            self.assertEqual(report["status"], "partial")
+
+    def test_native_reservoir_final_surcharge_and_constant_tailwater_match_reference(self):
+        root, status = self.continuation_case(
+            target=1e12, initial_active=False, reservoir_depths=[1.5, 2.5, 3.3], tailwater_surface=.5)
+        self.assertEqual(status["status"], "completed", status)
+        cold_root, cold_status = self.continuation_case(
+            target=1e12, initial_active=False, targets=[1.], pressure_surface=3.3, exact_pressure=True,
+            crest_pressure=4e5 * .3, tailwater_surface=.5)
+        self.assertEqual(cold_status["status"], "completed", cold_status)
+        name = ac.STEPS_NAME.replace(".npz", "_displacement.npz")
+        with np.load(root / "run" / name) as filling, np.load(cold_root / "run" / name) as reference:
+            np.testing.assert_allclose(filling["final"], reference["final"], rtol=1e-7, atol=1e-12)
+
+    def test_native_reservoir_failed_rise_bisects_depth_without_losing_accepted_history(self):
+        root, status = self.continuation_case(
+            target=1e12, reservoir_depths=[1.5, 2., 3.], reservoir_failure="rising_once")
+        self.assertEqual(status["status"], "completed", status)
+        self.assertEqual(status["hydraulic_subdivisions"][0]["retry_water_depth_m"], 1.75)
+        with np.load(root / "run" / ac.STEPS_NAME) as archive:
+            np.testing.assert_allclose(archive["water_depth_m"], [1.5, 1.75, 2., 3.])
+            np.testing.assert_allclose(archive["solver_instant"], [1., 2., 3., 4.])
+
+    def test_native_reservoir_failures_preserve_only_the_last_accepted_depth(self):
+        for failure in ("rising_always", "resource", "archive"):
+            with self.subTest(failure=failure):
+                root, status = self.continuation_case(
+                    target=1e12, wet=True, reservoir_depths=[1.5, 2., 3.], reservoir_failure=failure)
+                self.assertNotEqual(status["status"], "completed", status)
+                self.assertEqual(status["reached_water_depth_m"], 1.5)
+                with np.load(root / "run" / ac.STEPS_NAME) as archive:
+                    np.testing.assert_allclose(archive["water_depth_m"], [1.5])
+                self.assertEqual(len(status["hydraulic_steps"]), 1)
+                with np.load(root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as displacement:
+                    np.testing.assert_allclose(displacement["first"], displacement["final"])
+                if failure != "rising_always":
+                    self.assertIsNotNone(status.get("resource_failure"))
+
+    def test_native_reservoir_preload_failure_prevents_all_cracking_steps(self):
+        _, status = self.continuation_case(
+            reservoir_depths=[1.5, 2., 3.], preload_error="memory")
+        self.assertEqual(status["status"], "failed", status)
+        self.assertEqual(status["preload"]["status"], "failed")
+        self.assertEqual(status["converged_load_factors"], [])
+
+    def test_native_reservoir_full_depth_start_without_selection_has_no_activated_facets(self):
+        _, status = self.continuation_case(
+            target=1., reservoir_depths=[3.3], selection_enabled=False)
+        self.assertEqual(status["status"], "completed", status)
+        self.assertEqual(len(status["continuation_rounds"]), 1)
+        row = status["continuation_rounds"][0]
+        self.assertEqual(row["water_depth_m"], 3.3)
+        self.assertAlmostEqual(row["crest_surcharge_pa"], 120000.)
+        self.assertEqual(row["active_faces"], 0)
+        self.assertEqual(row["new_eligible_faces"], 0)
+
+    def test_intact_preload_retains_same_mesh_state_for_dry_and_wet_loading(self):
+        for wet in (False, True):
+            with self.subTest(wet=wet):
+                root, status = self.continuation_case(start=.1, wet=wet, maximum_rounds=1)
+                self.assertEqual(status["status"], "completed", status)
+                self.assertEqual(status["preload"]["status"], "completed")
+                self.assertEqual(status["preload"]["load_factor"], .1)
+                self.assertEqual(status["converged_load_factors"][0], .1)
+                self.assertEqual(status["converged_load_factors"][-1], 1.)
+                self.assertNotIn("hydraulic_subdivisions", status)
+                self.assertTrue(status["preload"]["warnings"])
+                with np.load(root / "run" / "preload" / "accepted_state.npz") as state:
+                    self.assertEqual(state["damage_state_gauss"].max(), 0.)
+                    self.assertTrue(np.isfinite(state["displacement_m"]).all())
+                    with np.load(root / "run" / "round_0001" / "accepted_state.npz") as final:
+                        self.assertTrue(np.all(final["dissipated_energy_gauss"]
+                                               >= state["dissipated_energy_gauss"] - 1e-9))
+                self.assertTrue((root / "run" / "preload" / "accepted_result.med").is_file())
+                report = ac.postprocess(root, root / "candidates", status)
+                self.assertEqual(report["preload"]["status"], "completed")
+                cold, cold_status = self.continuation_case(
+                    wet=wet, maximum_rounds=1, targets=[.1, .35, .6, .85, 1.])
+                self.assertEqual(cold_status["status"], "completed", cold_status)
+                displacement_name = ac.STEPS_NAME.replace(".npz", "_displacement.npz")
+                with np.load(root / "run" / displacement_name) as preloaded, \
+                        np.load(cold / "run" / displacement_name) as reference, \
+                        np.load(root / ac.SPLIT_ARRAYS_NAME) as mesh:
+                    for field in ("first", "final"):
+                        np.testing.assert_allclose(preloaded[field], reference[field], rtol=1e-6, atol=1e-11)
+                        stress = ac.wall_cell_stress(mesh["nodes"], mesh["tetra4_concrete"],
+                                                    preloaded[field], 30e9, .2)
+                        reference_stress = ac.wall_cell_stress(mesh["nodes"], mesh["tetra4_concrete"],
+                                                              reference[field], 30e9, .2)
+                        np.testing.assert_allclose(stress, reference_stress, rtol=1e-6, atol=.01)
+
+    def test_full_load_preload_does_not_increase_physical_loading(self):
+        root, status = self.continuation_case(start=1., initial_active=False, target=1e12, maximum_rounds=1)
+        self.assertEqual(status["status"], "completed", status)
+        self.assertEqual(status["converged_load_factors"], [1.])
+        self.assertEqual(status["preload"]["load_factor"], 1.)
+        self.assertEqual(status["continuation_rounds"][0]["reached_load_factor"], 1.)
+
+    def test_first_release_failure_keeps_completed_preload_without_claiming_cracking(self):
+        root, status = self.continuation_case(start=1., initial_active=False, target=1e12,
+                                              maximum_rounds=1, resource_error=True)
+        self.assertEqual(status["status"], "failed", status)
+        self.assertEqual(status["preload"]["status"], "completed")
+        self.assertEqual(status["converged_load_factors"], [])
+        self.assertTrue((root / "run" / "preload" / "accepted_state.npz").is_file())
+
+    def test_failed_intact_preload_never_enters_cracking(self):
+        root, status = self.continuation_case(start=.5, preload_error=True)
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["preload"]["status"], "failed")
+        self.assertIn("injected intact equilibrium failure", status["preload"]["message"])
+        self.assertEqual(status["converged_load_factors"], [])
+        self.assertFalse((root / "run" / "round_0001").exists())
+
+    def test_empty_memory_error_during_preload_is_reported_as_resource_failure(self):
+        _, status = self.continuation_case(start=.5, preload_error="memory")
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["preload"]["message"], "MemoryError")
+        self.assertEqual(status["resource_failure"]["kind"], "memory")
+
+    def test_wet_first_release_failure_does_not_bisect_below_preload(self):
+        _, status = self.continuation_case(start=.5, wet=True, release_error=True)
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["preload"]["status"], "completed")
+        self.assertEqual(status["converged_load_factors"], [])
+        self.assertFalse(status.get("hydraulic_subdivisions"))
+
+    def test_native_resource_failure_stops_without_retry_and_retains_accepted_output(self):
+        for wet in (False, True):
+            with self.subTest(wet=wet):
+                root, status = self.continuation_case(wet=wet, resource_error=True)
+                self.assertEqual(status["status"], "failed", status)
+                self.assertEqual(status["stop_reason"], "resource_limit")
+                self.assertEqual(status["resource_failure"]["kind"], "storage")
+                self.assertIn("JEVEUX_40", status["message"])
+                self.assertEqual(status["converged_load_factors"], [.5])
+                self.assertNotIn("hydraulic_subdivisions", status)
+                self.assertTrue(status["solver_scratch"]["cleaned"])
+                with np.load(root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as saved:
+                    np.testing.assert_array_equal(saved["first"], saved["final"])
+                    self.assertTrue(np.isfinite(saved["final"]).all())
+                report = ac.postprocess(root, root / "candidates", status)
+                self.assertEqual(report["resource_failure"]["kind"], "storage")
+
+    def test_root_archive_failure_reaches_all_mpi_ranks_without_hanging(self):
+        root, status = self.continuation_case(archive_error=True)
+        self.assertEqual(status["status"], "failed", status)
+        self.assertEqual(status["resource_failure"]["kind"], "storage")
+        self.assertTrue(status["solver_scratch"]["cleaned"])
+        with (root / "run" / ac.STATUS_NAME).open(encoding="utf-8") as saved:
+            self.assertEqual(json.load(saved)["converged_load_factors"], [.5])
+
+    def test_fixed_mesh_rounds_preserve_native_history_and_design_load(self):
+        root, status = self.continuation_case()
+        self.assertEqual(status["status"], "completed", status)
+        rounds = status["continuation_rounds"]
+        self.assertGreaterEqual(len(rounds), 2, status)
+        self.assertTrue(all(row["reached_load_factor"] == 1. for row in rounds))
+        self.assertGreater(rounds[1]["active_faces"], rounds[0]["active_faces"])
+        self.assertEqual(rounds[1]["solver_instant"], 1.01)
+        with np.load(root / "run" / "round_0001" / "accepted_state.npz") as old, \
+                np.load(root / "run" / "round_0002" / "accepted_state.npz") as new:
+            self.assertGreater(float(old["damage_state_gauss"].max()), 0.)
+            self.assertGreater(float(np.ptp(old["dissipated_energy_gauss"])), 1e-8)
+            self.assertTrue(np.all(new["damage_state_gauss"] >= old["damage_state_gauss"] - 1e-9))
+            self.assertTrue(np.all(new["dissipated_energy_gauss"] >= old["dissipated_energy_gauss"] - 1e-9))
+            self.assertTrue(np.all(new["active_faces"][old["active_faces"]]))
+        self.assertTrue((root / "run" / "round_0002" / "accepted_result.med").is_file())
+        report = ac.postprocess(root, root / "candidates", status)
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["reached_load_factor"], 1.)
+        self.assertEqual(len(report["continuation_rounds"]), len(rounds))
+        self.assertEqual(report["active_candidate_faces"], rounds[-1]["active_faces"])
+        self.assertEqual(rounds[-1]["opening_assessment"]["opened_faces"], report["opening_assessment"]["opened_faces"])
+        self.assertAlmostEqual(rounds[-1]["crack_surface_measure_m2"], report["crack_surface_measure_m2"])
+        self.assertGreater(rounds[-1]["duration_s"], 0.)
+
+    def test_round_limit_does_not_activate_unaccepted_facets(self):
+        root, status = self.continuation_case(maximum_rounds=1)
+        self.assertEqual(status["status"], "completed", status)
+        self.assertEqual(status["continuation_stop_reason"], "iteration_limit")
+        self.assertEqual(len(status["continuation_rounds"]), 1)
+        self.assertGreater(status["continuation_rounds"][0]["new_eligible_faces"], 0)
+        self.assertFalse((root / "run" / "round_0002").exists())
+
+    def test_failed_activation_keeps_last_accepted_native_state(self):
+        root, status = self.continuation_case(target=500.)
+        self.assertEqual(status["status"], "stopped", status)
+        self.assertEqual(status["continuation_stop_reason"], "solver_failure_or_incomplete_load")
+        self.assertEqual(len(status["continuation_rounds"]), 1)
+        self.assertEqual(status["failed_continuation_instant"], 1.01)
+        with np.load(root / "run" / "round_0001" / "accepted_state.npz") as accepted, \
+                np.load(root / "run" / ac.STEPS_NAME.replace(".npz", "_displacement.npz")) as final:
+            np.testing.assert_array_equal(accepted["displacement_m"], final["final"])
+            self.assertGreater(float(accepted["damage_state_gauss"].max()), 0.)
+        self.assertFalse((root / "run" / "round_0002").exists())
+        report = ac.postprocess(root, root / "candidates", status)
+        self.assertEqual(report["status"], "partial")
+        self.assertIn("after activating", report["capacity_assessment"]["message"])
+
+    def test_hydraulic_continuation_keeps_physical_pressure_at_full_load(self):
+        from Aster.hydraulic_loads import CrackWater, CRACK_WATER_SETTINGS
+        root, status = self.continuation_case(wet=True)
+        self.assertEqual(status["status"], "completed", status)
+        rounds = status["continuation_rounds"]
+        self.assertGreaterEqual(len(rounds), 2)
+        final = status["hydraulic_steps"][-1]
+        self.assertEqual(final["load_factor"], 1.)
+        self.assertTrue(final["active_set_stable"])
+        with np.load(root / ac.SPLIT_ARRAYS_NAME) as stored:
+            arrays = {key: stored[key] for key in stored.files}
+        with np.load(root / "run" / ac.STEPS_NAME.replace(".npz", "_hydraulic.npz")) as hydraulic, \
+                np.load(root / "run" / f"round_{len(rounds):04d}" / "accepted_state.npz") as accepted:
+            water = CrackWater(arrays, 3., 9810., CRACK_WATER_SETTINGS["opening_tolerance_m"])
+            _, forces = water.evaluate(accepted["displacement_m"], hydraulic["wet_faces"][-1])
+        magnitude = float(np.linalg.norm(forces, axis=1).sum())
+        self.assertGreater(magnitude, 0.)
+        self.assertAlmostEqual(final["sum_nodal_force_magnitudes_n"], magnitude, delta=1e-8)
+        from Aster.hydraulic_loads import validate_crack_water_evidence
+        report = ac.postprocess(root, root / "candidates", status)
+        validate_crack_water_evidence(report)
+
+    def test_dormant_bank_preserves_wall_and_foundation_elastic_response(self):
+        root, status = self.continuation_case(target=1e9, initial_active=False)
+        self.assertEqual(status["status"], "completed", status)
+        with np.load(root / "run" / "round_0001" / "accepted_state.npz") as checkpoint:
+            np.testing.assert_array_equal(checkpoint["damage_state_gauss"], 0.)
+        # Native V5 can have a nonzero reference value before damage; check accumulation.
+        with np.load(root / "run" / ac.STEPS_NAME) as steps:
+            np.testing.assert_allclose(steps["dissipated_energy_j_m2"][-1],
+                                       steps["dissipated_energy_j_m2"][0], atol=1e-12, rtol=0.)
+        arrays = column_fixture()
+        empty = np.empty((0, 3), dtype=np.int64)
+        split = ac.split_for_joints(arrays, empty)
+        intact = root / "intact"
+        intact.mkdir()
+        ac.save_split_arrays(intact, split)
+        (intact / "run").mkdir()
+        joint = ac.joint_parameters(arrays, empty,
+                                    {"tensile_strength_pa": 3e5, "fracture_energy_j_m2": 100.}, 30e9, .2)
+        joint["has_joints"] = False
+        comm = ac.render_cohesive_comm(
+            fixture_base_comm(ac.split_manifest(fixture_manifest(arrays), split), 4e5), joint, [.5, 1.],
+            (intact / "run" / ac.STEPS_NAME).resolve(), (intact / "run" / ac.STATUS_NAME).resolve())
+        (intact / ac.CASE_NAME).write_text(comm, encoding="utf-8")
+        status = ac.solve(intact, time_limit_s=240, memory_limit_mb=2048)
+        self.assertEqual(status["status"], "completed", status)
+        name = ac.STEPS_NAME.replace(".npz", "_displacement.npz")
+        with np.load(root / ac.SPLIT_ARRAYS_NAME) as bank, \
+                np.load(root / "run" / name) as closed, np.load(intact / "run" / name) as elastic:
+            ids = bank["source_node_ids"]
+            valid = ids >= 0
+            np.testing.assert_allclose(closed["final"][valid], elastic["final"][ids[valid]],
+                                       atol=1e-10, rtol=1e-8)
+
     """Real Code_Aster run of the column with a partial cohesive section (about a minute)."""
 
-    def test_condensed_foundation_with_cohesive_joints_and_postprocessing(self):
+    def test_condensed_fixed_bank_field_archives(self):
+        self.test_condensed_foundation_with_cohesive_joints_and_postprocessing(continuation=True)
+
+    def test_condensed_foundation_with_cohesive_joints_and_postprocessing(self, continuation=False):
         from Aster.support_trace import add_consistent_support
 
         arrays = column_fixture()
@@ -883,6 +1465,12 @@ class AsterFixtureRun(unittest.TestCase):
             plane_faces(arrays, 0, .5, lambda points: points[:, 2].min() >= 1. and
                         points[:, 2].max() <= 2.),
         ))
+        initial_candidates = candidates
+        if continuation:
+            wall = arrays["tetra4_concrete"][arrays["concrete_body_ids"] == 1]
+            inventory, counts = np.unique(np.sort(wall[:, ac._TET_FACES].reshape(-1, 3), axis=1),
+                                          axis=0, return_counts=True)
+            candidates = inventory[counts == 2]
         split = ac.split_for_joints(arrays, candidates)
         self.assertTrue(split["spring_shares"])
         parents = split["arrays"]["source_node_ids"].copy()
@@ -915,6 +1503,17 @@ CONDENSED_GRAVITY = AFFE_CHAR_MECA(MODELE=MODELE, FORCE_NODALE=tuple(
 
 """ + base[end:]
         summary = {"tensile_strength_pa": 3e5, "fracture_energy_j_m2": 100., "load_factor": 1.0}
+        continuation_arrays = {}
+        if continuation:
+            initial = {tuple(face) for face in np.sort(initial_candidates, axis=1).tolist()}
+            continuation_arrays = {
+                "continuation_active_faces": np.array(
+                    [tuple(face) in initial for face in candidates.tolist()], dtype=bool),
+                "continuation_face_owners": np.array([
+                    np.flatnonzero(np.isin(arrays["tetra4_concrete"], face).sum(axis=1) == 3)
+                    for face in candidates], dtype=np.int64),
+            }
+            summary["continuation"] = {"maximum_rounds": 2, "target_pa": 3e6}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             baseline, candidate, output = root / "baseline", root / "candidate", root / "output"
@@ -929,7 +1528,8 @@ CONDENSED_GRAVITY = AFFE_CHAR_MECA(MODELE=MODELE, FORCE_NODALE=tuple(
             (baseline / ac.MESH_MANIFEST_NAME).write_text(json.dumps(source_manifest), encoding="utf-8")
             np.savez(baseline / ac.SPLIT_ARRAYS_NAME, **arrays)
             np.savez(candidate / "cohesive_state.npz", parent_node_ids=parents,
-                     coordinates_m=arrays["nodes"][parents], minus=candidates, plus=candidates)
+                     coordinates_m=arrays["nodes"][parents], minus=candidates, plus=candidates,
+                     **continuation_arrays)
             (candidate / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
             inputs = {"material": {"concrete": {"youngs_modulus_pa": 30e9,
                                                 "poissons_ratio": .2, "density_kg_m3": 2400.}},
@@ -942,6 +1542,9 @@ CONDENSED_GRAVITY = AFFE_CHAR_MECA(MODELE=MODELE, FORCE_NODALE=tuple(
             status = ac.solve(output, time_limit_s=300, memory_limit_mb=2048)
             log = (output / "run" / "solver.live.log").read_text(encoding="utf-8", errors="replace")
             self.assertEqual(status["status"], "completed", f"{status}\n{log[-4000:]}")
+            if continuation:
+                self.assertEqual(len(status["continuation_rounds"]), 1)
+                self.assertTrue((output / "run" / "round_0001" / "accepted_result.med").is_file())
             self.assertEqual(len(status["step_timings"]), len(status["converged_load_factors"]))
             self.assertTrue(all(row["step_s"] >= row["mechanical_s"] > 0.
                                 for row in status["step_timings"]))

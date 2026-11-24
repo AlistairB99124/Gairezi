@@ -278,6 +278,16 @@ class CrackWater:
             np.add.at(forces, plus[closed], -values)
         return wet, forces
 
+    def set_surface(self, upstream_z: float) -> None:
+        if not np.isfinite(upstream_z):
+            raise ValueError("Crack-water surface elevation must be finite")
+        if self.pore is not None:
+            raise ValueError("Moving reservoir water is not supported for lift-plane pore pressure")
+        self.head = upstream_z - self.nodes[self.faces[:, :3], 2]
+        self.weights = np.array([
+            triangle_pressure_forces(self.nodes[face[:3]], head) * self.gradient
+            for face, head in zip(self.faces, self.head)]).reshape(-1, 3)
+
 
 def force_entries(forces: np.ndarray) -> list[dict]:
     if not np.isfinite(forces).all():
@@ -296,6 +306,7 @@ def render_uplift(arrays: dict, upstream_z: float, downstream_z: float, gradient
 
 
 COUPLED_SOLVE = '''    try:
+        water_load = None
         previous = RESU
         displacement = (nodal_displacement(previous.getField('DEPL', previous.getLastIndex()))
                         if previous is not None else np.zeros_like(hydraulic_arrays['nodes']))
@@ -328,20 +339,34 @@ COUPLED_SOLVE = '''    try:
                     'pore_pressure_faces': (int((crack_water.pore & ~wet).sum())
                                             if crack_water.pore is not None else 0),
                 })
-                np.savez(STEPS_PATH.replace('.npz', '_hydraulic.npz'),
-                         load_factor=np.array([row['load_factor'] for row in hydraulic_history]),
-                         wet_faces=np.asarray(hydraulic_masks + [wet]))
+                with root_archive_write() as writer:
+                    if writer:
+                        path = STEPS_PATH.replace('.npz', '_hydraulic.npz')
+                        with open(path + '.tmp', 'wb') as stream:
+                            np.savez(stream, load_factor=np.array([row['load_factor'] for row in hydraulic_history]),
+                                     wet_faces=np.asarray(hydraulic_masks + [wet]))
+                        os.replace(path + '.tmp', path)
                 hydraulic_masks.append(wet.copy())
+                if previous is not None:
+                    DETRUIRE(CONCEPT=_F(NOM=previous))
+                if water_load is not None:
+                    DETRUIRE(CONCEPT=_F(NOM=water_load))
+                    water_load = None
                 break
             # Every trial starts from the last accepted mechanical state. Rejecting
             # a hydraulic iterate must not commit its irreversible damage.
             DETRUIRE(CONCEPT=_F(NOM=trial))
             if water_load is not None:
                 DETRUIRE(CONCEPT=_F(NOM=water_load))
+                water_load = None
             wet, water_forces = updated_wet, updated_forces
         else:
             raise RuntimeError("Crack-water active set did not converge; no hydraulic step accepted")
     except (CA.AsterError, RuntimeError) as error:
+        if stop_for_resource_failure(error):
+            break
+        if water_load is not None:
+            DETRUIRE(CONCEPT=_F(NOM=water_load))
         detail = str(error).strip() or type(error).__name__
         retry = bisect_load_interval(reached, target, target_level, hydraulic_subdivision_levels)
         if retry is not None:

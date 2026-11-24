@@ -15,17 +15,26 @@ class AutomaticPreparationTests(unittest.TestCase):
     def test_explicit_water_option_reaches_native_renderer_without_enabling_uplift(self):
         from Aster import automatic_cohesive as native
         from Aster.hydraulic_loads import CRACK_WATER_SETTINGS
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+        for enabled, continuation, filling in (
+                (False, False, False), (True, False, False), (False, True, False), (True, True, False),
+                (False, True, True), (True, True, True)):
+            with self.subTest(enabled=enabled, continuation=continuation, filling=filling), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 model, baseline, config_path = self.fixture(root)
                 config = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text())
+                if not filling:
+                    config["fracture_debug"]["aster"]["loading_mode"] = "proportional"
                 config["bedrock_analysis"]["condense_foundation"] = False
                 config["damage_selection"].pop("crack_water_pressure", None)
                 if enabled:
                     config["damage_selection"]["crack_water_pressure"] = True
                 prep.write_json(config_path, config)
                 arrays = column_fixture()
+                if filling:
+                    arrays["nodes"][:, 2] -= 3.
+                    np.savez(baseline / "aster_full_displacement.npz", coordinates_m=arrays["nodes"],
+                             source_node_ids=arrays["source_node_ids"],
+                             displacement_m=arrays["nodes"] * np.array((0., 0., .001)))
                 arrays["source_cell_rows"] = np.arange(
                     len(arrays["tetra4_concrete"]) + len(arrays["tetra4_bedrock"]))
                 np.savez(baseline / native.SPLIT_ARRAYS_NAME, **arrays)
@@ -37,7 +46,7 @@ class AutomaticPreparationTests(unittest.TestCase):
                     source_pressures={name: {"surface_z_m": level, "gradient_pa_per_m": 9810.}
                                       for name, level in (("UpstreamHydrostaticPressure", 3.),
                                                           ("DownstreamTailwater", 0.))},
-                    source_crest_pressure_pa=0.,
+                    source_crest_pressure_pa=29430. if filling else 0.,
                     groups={"CONCRETE": {"min_xyz_m": [0., 0., 0.]}, "ROCK_BOTTOM": {"area_m2": 1.}},
                     wall_foundation_spring_group_all="WALL_FOUNDATION_SPRINGS",
                     wall_foundation_spring_total_area_m2=1., simplifications_vs_elmer=[])
@@ -45,24 +54,46 @@ class AutomaticPreparationTests(unittest.TestCase):
                 screening, prepared = root / "screening", root / "prepared"
                 prep.run(config_path, model, baseline, screening, job_id="fixture", relative_tolerance=1e-4)
                 summary = prep.run(config_path, model, baseline, prepared, job_id="fixture",
-                                   relative_tolerance=1e-4, screening=screening)
+                                   relative_tolerance=1e-4, screening=screening,
+                                   candidate_scope="all_overstressed" if continuation else "configured",
+                                   continuation=continuation)
                 self.assertEqual(summary["crack_water_pressure"], enabled)
                 # Only the source-mesh audit is mocked: this fixture has synthetic source bytes.
                 with patch("Aster.source_contract.audit_source_materials"):
                     inputs = native.prepare(baseline, prepared, root / "native")
+                if continuation:
+                    with np.load(root / "native" / native.SPLIT_ARRAYS_NAME) as stored:
+                        self.assertEqual(len(stored["continuation_active_faces"]), summary["candidate_faces"])
+                        self.assertTrue((stored["concrete_body_ids"][stored["continuation_face_owners"]] == 1).all())
+                        foundation = stored["tetra4_concrete"][stored["concrete_body_ids"] == 3]
+                        np.testing.assert_array_equal(stored["nodes"][foundation],
+                                                      arrays["nodes"][arrays["tetra4_concrete"][arrays["concrete_body_ids"] == 3]])
+                    self.assertEqual(inputs["joint"]["continuation"]["maximum_rounds"], 5)
                 comm = (root / "native" / native.CASE_NAME).read_text()
+                if filling:
+                    self.assertEqual(inputs["baseline_displacement_sha256"],
+                                     prep.file_hash(baseline / "aster_full_displacement.npz"))
+                    self.assertNotIn("material_assignment", inputs)
+                    loading = inputs["joint"]["reservoir_loading"]
+                    self.assertEqual(loading["water_depth_targets_m"], [27 + .5 * i for i in range(13)])
+                    self.assertEqual(loading["tailwater_surface_z_m"], 0.)
+                    self.assertIn("water_depth_m", comm)
+                    self.assertNotIn("CHARGE=GRAVITE, FONC_MULT=RAMP", comm)
+                    self.assertNotIn("CHARGE=PRESSIONS, FONC_MULT=RAMP", comm)
                 self.assertNotIn("CHARGE=UPLIFT", comm)
                 if enabled:
                     self.assertEqual(inputs["joint"]["hydraulic_loads"]["settings"], CRACK_WATER_SETTINGS)
                     self.assertEqual(inputs["joint"]["hydraulic_loads"]["uplift"]["mode"], "none")
                     self.assertIn("hydraulic_open_faces(trial)", comm)
                     # Hydraulic trials keep the DECOUPE sub-stepping of the dry path.
-                    self.assertIn("times = DEFI_LIST_INST(", comm)
-                    self.assertIn("ACTION='DECOUPE'", comm)
+                    if not filling:
+                        self.assertIn("times = DEFI_LIST_INST(", comm)
+                        self.assertIn("ACTION='DECOUPE'", comm)
                     self.assertNotIn("    times = DEFI_LIST_REEL(DEBUT=reached", comm)
                 else:
                     self.assertNotIn("hydraulic_loads", inputs["joint"])
-                    self.assertNotIn("hydraulic_open_faces", comm)
+                    if not filling:
+                        self.assertNotIn("hydraulic_open_faces", comm)
                 compile(comm, "prepared.comm", "exec")
 
     def test_selected_material_is_saved_and_assigned_by_exact_source_rows(self):
@@ -660,6 +691,43 @@ class AutomaticPreparationTests(unittest.TestCase):
                               relative_tolerance=1e-4, screening=screening)
             self.assertEqual(result["status"], prep.PREPARED)
             self.assertEqual(result["solver_controls"], {})
+
+    def test_residual_target_selects_substrength_wall_cells_only_and_is_strict(self):
+        for target in (500000., 1600000., None):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                model, baseline, config = self.fixture(root)
+                payload = json.loads(config.read_text())
+                payload["material"]["concrete"]["tensile_strength_pa"] = 2000000.
+                if target is not None:
+                    payload["residual_target_tensile_stress_pa"] = target
+                prep.write_json(config, payload)
+                manifest = json.loads((baseline / "mesh_manifest.json").read_text())
+                manifest["source_hashes"]["config.json"] = prep.file_hash(config)
+                prep.write_json(baseline / "mesh_manifest.json", manifest)
+                original_mesh_hash = prep.file_hash(baseline / "three_body_mesh_arrays.npz")
+
+                def stress_field(_coordinates, _cells, regions, _displacement, _material):
+                    stress = np.zeros((len(regions), 3, 3))
+                    stress[:, 0, 0] = np.where(regions == 1, 1600000., 99000000.)
+                    return stress
+
+                screening = root / "screening"
+                with patch.object(prep, "region_cell_stresses", side_effect=stress_field):
+                    result = prep.run(config, model, baseline, screening, job_id="fixture",
+                                      relative_tolerance=1e-4, candidate_scope="all_overstressed")
+                    self.assertEqual(result["overstressed_cells"], 0)
+                    expected = (np.flatnonzero(column_fixture()["concrete_body_ids"] == 1).tolist()
+                                if target == 500000. else [])
+                    if target is not None:
+                        self.assertEqual(result["selection"]["selected_source_rows"], expected)
+                    prepared = prep.run(config, model, baseline, root / "prepared", job_id="fixture",
+                                        relative_tolerance=1e-4, screening=screening,
+                                        candidate_scope="all_overstressed")
+                self.assertEqual(prepared["tensile_strength_pa"], 2000000.)
+                self.assertEqual(prepared["fracture_energy_j_m2"], 80.)
+                self.assertEqual(prepared["candidate_faces"] > 0, target == 500000.)
+                self.assertEqual(prep.file_hash(baseline / "three_body_mesh_arrays.npz"), original_mesh_hash)
 
     def test_disabled_all_overstressed_control_does_not_insert_cracks(self):
         with tempfile.TemporaryDirectory() as directory:

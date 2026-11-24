@@ -75,8 +75,9 @@ def linux_environment(root: str, threads: int) -> list[str]:
     """``env`` arguments for the relocated Code_Aster runtime (not the Windows PATH)."""
     # run_aster scratches its JEVEUX bases under mkdtemp(); WSL's /tmp is a small
     # RAM-backed tmpfs that large joint models overflow, so point temporary files
-    # at the persistent disk. run_aster still removes the directory afterwards.
+    # at the persistent disk. The run_aster supervisor owns its scratch cleanup.
     return [f"PYTHONHOME={root}", f"LD_LIBRARY_PATH={root}/lib:{root}/lib64",
+             f"OPAL_PREFIX={root}", f"PRTE_PREFIX={root}", f"PMIX_PREFIX={root}",
             f"PATH={root}/bin:/usr/bin:/bin", f"OMP_NUM_THREADS={threads}",
             "PYTHONUNBUFFERED=1", "GFORTRAN_UNBUFFERED_PRECONNECTED=y",
             "TMPDIR=/var/tmp"]

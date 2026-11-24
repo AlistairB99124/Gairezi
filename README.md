@@ -137,17 +137,169 @@ and solver startup time. It preserves the linear foundation response of the
 discretized Code_Aster model, but is not an engineering validation or a guarantee
 that nonlinear cracking converges.
 
-The application assesses `fracture_debug.aster.whole_wall_tension_tolerance_pa`
-as a residual wall-cell stress target, separately from the concrete tensile
-strength that governs cohesive initiation. The default configuration sets the
-target to 500,000 Pa. Reaching neither full load nor the target is reported as
-an incomplete cracking stage; it is not an engineering success.
+The root `residual_target_tensile_stress_pa` selects production wall cells whose
+maximum principal tensile stress strictly exceeds the target, and sets the
+residual assessment criterion. The default is 500,000 Pa in `config.json`.
+WPF preserves this file-configured property on load and submission but provides
+no editor for it. The material tensile strength and fracture energy remain
+unchanged; candidate insertion does not guarantee cohesive initiation.
+Configurations without this property retain the legacy
+`fracture_debug.aster.whole_wall_tension_tolerance_pa` assessment value (1 Pa
+when omitted). Legacy configured-selection tools retain their original
+strength-based selection, as do production configurations without the new
+property. Missing full load or the residual target is reported
+as an incomplete cracking stage, not an engineering success.
 
-The current implementation cannot transfer cohesive damage history to a rebuilt
-mesh. If additional overstressed cells need new facets after a converged round,
-it preserves that round and stops instead of silently restarting from intact
-material. This is a known limitation, not an automated multi-round fracture
-solution. A target below intact strength does not force intact concrete to crack.
+`Load Default` starts with a target of 20,000 wall tetrahedra for a lower-cost
+initial check. The mesher's actual cell count may differ. Geometry, supports,
+material properties and residual target are unchanged; coarse-mesh completion
+is not mesh independence or proof that finer meshes will converge.
+
+App-submitted wall-cracking jobs have no external wall-clock timeout and can
+still be cancelled. The wall workflow CLI omits `--time-limit-s` for the same
+behaviour; supply a positive value for bounded verification runs. Code_Aster's
+launcher still requires a numeric CPU budget: unbounded jobs use
+2,147,483,647 CPU-seconds (about 68 CPU-years), rather than the former two-hour
+fallback. This is not a guarantee of convergence. Restart the API after updating
+this launcher; existing archived results are not nonlinear restart checkpoints.
+
+New wall-cracking runs prepare a fixed bank of interior wall facets. Initially
+unselected facets are held closed by independent constraints. After full load,
+updated wall-cell principal stresses select additional facets; their constraints
+are released and a fresh `STAT_NON_LINE` trial starts from the accepted native
+`EVOL_NOLI`. The mesh and cohesive integration points never change, so damage
+and dissipated energy are retained, with Gauss-point irreversibility checks.
+Foundation and bedrock are not crack candidates.
+
+### Reservoir filling and intact preload
+
+New defaults explicitly select `fracture_debug.aster.loading_mode =
+"reservoir_filling"` with `water_depth_start_m = 27` and
+`water_depth_increment_m = 0.5`. Full self-weight and the source workflow's
+configured tailwater remain constant. Upstream pressure follows the actual
+water surface, with exact clipped-triangle integration; crest pressure begins
+only above the crest. Connected open cracks use the current reservoir head,
+without an additional proportional multiplier. Neither full-load elastic
+baseline is changed.
+
+For the current surveyed wall-seat datum -30 m, the sequence is an intact
+27 m equilibrium, first release at that same depth, then 27.5, 28, ..., 33 m.
+Depth 28 m is 2 m below crest; 30 m reaches crest and 33 m includes the full
+3 m surcharge. Solver instants are independent numerical labels, not metres
+or elapsed physical time. Reports store accepted depths separately.
+The filling configuration rejects a final depth inconsistent with configured
+wall height plus surcharge or the source upstream pressure metadata.
+Tailwater retains the source workflow's existing foundation-based datum.
+At the accepted final depth, the stress comparison and Investigation use
+the unchanged full-depth Aster baseline field. The starting-depth displacement
+is never scaled into an artificial full-depth reference. Partial filling
+results without a same-depth reference explicitly report that limitation.
+
+Under **Configuration > Loads > Code_Aster cracking load steps**, starting
+depth spans zero to wall height plus surcharge with 1 m slider steps. The
+separate water-rise slider uses metres with 0.5 m steps; numeric editors
+preserve finer/off-grid file values until deliberately changed.
+Start zero still obtains full dead-load equilibrium; starting at full depth
+performs same-depth preload/release and subsequent activation only.
+
+Facet screening and activation occur at every accepted water level on the
+fixed bank, preserving native V3/V5 history. `adaptive_rounds` is the limit
+per level. Reaching that cap at an intermediate depth advances with persistent
+unresolved-activation warnings and `activation_history_complete = false`;
+an unresolved final activation cap remains partial. Failed rising intervals
+can be bisected in actual depth, but same-depth releases cannot.
+Preload always discloses omitted earlier cracking and warns when its tension
+reaches material strength. These are quasi-static numerical checks, not creep,
+material calibration, guaranteed convergence, or engineering validation.
+Small native tests cover moving-waterline equilibrium, surcharge and constant
+tailwater parity, retained damage/energy, failed-rise subdivision, preload failure
+and resource/archive failures preserving the last accepted depth.
+
+Rebuild/relaunch WPF and restart the local API before using **Load Default**.
+No existing job snapshot is changed.
+
+### Legacy proportional loading
+
+Absent `loading_mode`, or explicit `"proportional"`, preserves the old meaning.
+`fracture_debug.aster.load_factor_start` accepts 0 through 1. Its legacy default is
+0, which skips preload and preserves the existing loading sequence (first wet
+target 0.01). A positive value first establishes an explicitly intact equilibrium
+with every bank facet held closed on the prepared cohesive mesh. Initial
+candidates are then released and equilibrated **at the same physical load**,
+before `load_increment` steps advance to exactly 1. Both operations share the
+same native process and `EVOL_NOLI`; neither existing full-load elastic baseline
+is changed. Load factor scales proportional gravity, reservoir/surcharge and
+other loads, not reservoir height alone.
+
+This deliberately omits fracture history below the selected start. Screening
+warns, but allows the run, if preload wall tension reaches material strength.
+It is not an automatic crack-initiation detector or a guarantee of convergence.
+Start 1 performs intact preload and first release at full design load; subsequent
+activation rounds keep that load constant. Failed first release retains preload
+evidence without claiming a successful cracking solution.
+
+WPF provides start and increment sliders under **Configuration > Loads >
+Code_Aster cracking load steps**, and in the stage rerun editor. Tick **Enable
+fracture settings** if the controls are disabled. The increment slider spans 0.005
+through 1 with 0.005 steps; finer/off-grid positive file values are preserved
+until the slider is moved. Zero increment is invalid. The checked-in increment
+is separate from the new metre-based default. Larger increments can make nonlinear convergence harder.
+The pipeline separately displays intact preload, including skipped status at
+start 0, warnings and evidence under `solve_round_1/run/preload`. Preload cannot
+be independently restarted: rerunning cracking recreates both stages.
+Progress polling does not impose a timeout on user jobs. Restart the local API
+and rebuild/relaunch WPF before testing these changes.
+
+The existing `fracture_debug.aster.adaptive_rounds` limits the number of accepted
+activation rounds, including round one. Numerical instants above 1 are
+continuation labels: reservoir, surcharge, gravity and crack-water loads remain
+at their design levels. Accepted rounds have separate `run/round_0001`, etc.,
+directories containing stress/activation summaries, Gauss-point damage/energy
+arrays and a native MED field archive (`DEPL`, `SIEF_ELGA`, `VARI_ELGA`).
+Later solver failure preserves the previous accepted result. No new eligible
+facets, the round limit, resource limits and failure remain explicit non-success
+stops unless the residual target was achieved.
+
+The bank can be considerably larger than the initial candidate set; the facet
+resource limit applies to the entire bank without truncation. Native small
+dry/wet fixtures verify continuation, dormant-bank elastic parity and native
+field archives with condensed foundation supports; full-dam
+target achievement and mesh independence remain unverified. A target below
+intact strength does not force calibrated cohesive material to crack. Previously
+archived jobs lack the required fixed topology/native history and cannot be
+resumed by this change. Cross-process restart from the new MED archives is not
+implemented; continuation occurs within the new job's native solver process.
+
+WSL solver scratch is explicitly allocated below `~/.cache/lamb/code_aster`
+on disk-backed storage, rather than the RAM-backed `/tmp` filesystem. A 12 GiB
+`/tmp` limit is independent of a 24 GiB WSL RAM allocation. Each launch rejects
+`tmpfs`/`ramfs` scratch and requires at least 16 GiB free disk space before
+starting; this is minimum headroom, not a prediction of the full model's size.
+The launcher records the filesystem/free-space metadata and cleans only its
+owned working directory after success, failure or client disconnection.
+Job logs and accepted field archives remain in the job directory.
+
+Accepted fresh trials release superseded native results and temporary hydraulic
+loads after their replacement is accepted. This limits unnecessary JEVEUX
+database growth without resetting retained cohesive history. Native storage,
+database-capacity and allocation errors stop the workflow as resource failures,
+not hydraulic load-step subdivision or a successful result. The original
+diagnostic is retained; native resource failure after an accepted step exports
+the cached accepted displacement without accessing the damaged native database.
+Python archives have one MPI writer, with filesystem errors propagated to every
+rank; native MED exports remain collective. Relocated MPI runtimes receive
+explicit OpenMPI/PRTE/PMIx prefixes. Small four-rank native fixtures verify these
+paths, not the full-dam runtime or residual-target achievement. Restart the API
+after existing jobs have finished to use the corrected launcher in new jobs.
+
+The production cohesive solve uses one MPI rank with eight OpenMP threads and
+a 16,384 MiB Code_Aster memory budget. The budget is per rank, not a shared WSL
+limit; four ranks each requesting 24 GiB can exhaust a 24 GiB WSL allocation.
+One rank avoids that memory replication while retaining threaded factorization.
+The budget leaves headroom but does not cap total process RSS or guarantee a
+full-dam solve. Native exit 137 is reported as an OS kill, not nonconvergence;
+the WSL kernel journal is needed to distinguish OOM from an external SIGKILL.
+An OS kill cannot execute the final-output handler or create a restart archive.
 
 `maximum_candidate_facets` (default 20,000) rejects oversized candidate sets
 without truncating them. `maximum_condensation_memory_mb` (default 4,096 MiB)

@@ -10,13 +10,73 @@ foundation is either retained or condensed into a coupled support; the
 condensation does not model nonlinear foundation contact. Reservoir-connected
 crack-face pressure may be enabled independently of base uplift.
 
-The residual wall tensile-stress threshold is separate from the concrete
-tensile strength. A completed stage requires a converged full-load solution and
-the configured threshold to be met. If further candidate facets would require
-rebuilding the mesh, the workflow stops: transferring accepted cohesive history
-to a rebuilt model is not implemented. Results are not engineering validated.
+The root `residual_target_tensile_stress_pa` selects production wall cells by
+maximum principal tensile stress and sets the residual assessment threshold.
+It is configured in the authoritative JSON file, preserved by WPF, and not
+editable in the desktop. Material tensile strength remains the cohesive
+initiation parameter; selecting facets does not force their opening.
+A completed stage requires a converged full-load solution and
+the configured threshold to be met. New runs use a fixed bank of interior wall
+cohesive facets with independent dormant-facet constraints. Additional facets
+are activated from updated wall stresses without rebuilding the mesh, and
+native `EVOL_NOLI` preserves all constitutive integration-point history.
+Gauss-point damage and dissipation must not decrease between accepted rounds.
+The bank is subject to the existing facet/resource limits and increases the
+initial model size. Results are not engineering validated.
 Historical `ENDO_FISS_EXP`, FEniCSx, seeded and painted methods are development
 records, not the current production crack solver.
+
+New defaults explicitly use `fracture_debug.aster.loading_mode =
+"reservoir_filling"`, starting at `water_depth_start_m = 27` and rising by
+`water_depth_increment_m = 0.5`. Full self-weight, condensed gravity and
+source-configured tailwater remain constant. Upstream hydrostatic pressure
+follows the moving waterline with exact clipped-triangle nodal integration;
+crest surcharge starts only above crest and connected open crack pressure
+uses the current reservoir head without legacy scaling. For the surveyed
+datum -30 m, 27 m is 3 m below crest, 30 m reaches crest, and 33 m includes
+the 3 m surcharge. The upstream datum is not the foundation-volume minimum.
+Tailwater deliberately retains the source workflow's existing foundation datum.
+Full depth must agree with configured wall height plus surcharge and source
+upstream pressure metadata. Existing full-load elastic baselines are unchanged.
+
+The Loads tab and shared rerun editor expose starting reservoir depth from
+0 to wall height plus surcharge, snapping in 1 m steps, and a separate
+metre-based increment slider with 0.5 m steps. Numeric/file values are not
+silently clamped when geometry or slider bounds change. An intact full-gravity
+preload is obtained even at zero starting depth, followed by same-depth release.
+Screening/activation then occur at every accepted level on the same bank and
+native result history. `adaptive_rounds` caps activation per level; intermediate
+cap exhaustion advances with persistent warnings and incomplete-history metadata.
+Final unresolved activation is partial. Failed rises may be bisected in metres;
+same-depth constraint release cannot. Physical depths and numerical instants
+are recorded independently; completion requires accepted actual final depth,
+not a pseudo-time label or normalised fraction alone. Intact-start warnings,
+failure evidence and intermediate-cap warnings persist through API/history.
+Small native reference, moving-head, wet-history, release-failure and cap tests
+pass; full-dam convergence and crack-onset prediction remain unverified.
+
+Legacy configurations with no explicit mode retain proportional loading.
+The optional `fracture_debug.aster.load_factor_start` (0 through 1, default 0)
+adds a separately displayed intact-preload stage after both unchanged full-load
+elastic baselines and fixed-bank preparation. All bank facets are closed during
+preload; initial candidates release at the same physical load, with the accepted
+native state retained in the same process. This intentionally skips earlier
+fracture history. Warn but allow when preload screening reaches material strength.
+A zero start skips the stage and retains existing first wet/dry targets.
+Start 1 holds full design load through first release and later activation rounds.
+The increment slider is 0.005 through 1 in 0.005 steps; valid finer/off-grid file
+increments remain unchanged until edited. Default increment stays 0.005.
+Preload metadata, warnings, native timestamps and archives persist in job evidence.
+Failed/cancelled/interrupted preload prevents a successful cracking claim.
+Completed preload evidence survives later cracking failure; rerunning cracking
+recreates both, not a cross-process restart. Live worker polling has no user-job
+wall-clock limit. Historical jobs without preload metadata retain their pipeline.
+
+User-submitted wall-cracking jobs omit the external wall-clock timeout while
+retaining cancellation. Code_Aster's required numeric CPU budget is set to
+2,147,483,647 seconds for these jobs. Bounded development checks still pass
+an explicit positive `--time-limit-s`; removing a user-job timeout must not
+remove the separate development verification limit.
 
 ## Solver authority and required completion
 
@@ -61,16 +121,48 @@ Only stable pressure connectivity is accepted; rejected trials cannot commit
 irreversible damage. Hydraulic runs use explicit accepted load instants without
 unverified internal mechanical subdivisions. Reference-geometry facet pressure
 is a small-strain approximation, not transient flow or follower loading.
-Crack-water-only runs start at load factor 0.01, then 0.025, 0.05, ...;
+Legacy proportional crack-water-only runs start at load factor 0.01, then 0.025, 0.05, ...;
 every accepted mechanical step must carry stable hydraulic diagnostics.
 If the coupled pressure active set does not stabilize at a requested load
 increment, the outer load interval is bisected from the last accepted state.
 Every accepted intermediate factor is retained in the mechanical and hydraulic
 histories. Bisection is bounded to four levels per failed interval; reaching
 that limit remains an explicit partial result.
-If unjointed cells exceed tensile strength after the first cohesive solve, the
-workflow preserves that accepted state and stops instead of rebuilding without
-transferring fracture history. Automatic multi-round growth remains unsupported.
+In legacy proportional mode, at full design load, newly eligible dormant facets can be activated for up to
+`fracture_debug.aster.adaptive_rounds` accepted rounds, including round one.
+Solver instants above 1 are numerical labels, not additional reservoir loading
+or physical time; all physical loads and hydraulic diagnostics stay at factor
+1.0. Hydraulic outer bisection is restricted to the loading ramp: bisecting
+constant-load pseudo-time would not reduce the facet-constraint release.
+Each accepted round has a separate directory with activation/stress summaries,
+Gauss-point damage and dissipated energy, and a native MED field archive.
+A failed fresh trial cannot overwrite the previous accepted native state.
+No further eligible facets, the round limit and resource/convergence failure
+do not mean the residual target was achieved. Small native dry/wet continuation
+and dormant-bank elastic parity tests pass; full-dam target reduction remains
+unverified. Old job archives cannot be retroactively resumed: they do not have
+this fixed topology or the needed native history. Cross-process restart from
+the new field archives is not implemented.
+WSL `run_aster` uses a unique owned disk-backed directory below
+`~/.cache/lamb/code_aster`, rejecting RAM-backed scratch and requiring 16 GiB
+free-space headroom. This does not guarantee sufficient space for a full model.
+Scratch metadata is logged and the owned directory is removed after normal,
+failed or cancelled runs; job archives and logs are not removed.
+Superseded accepted native results and temporary hydraulic loads are destroyed
+only after their fresh replacement is accepted. Fatal JEVEUX storage/capacity
+and allocation errors bypass hydraulic bisection, preserve their original
+diagnostic and export cached accepted displacement without querying a damaged
+database. Resource failure is never a completed cracking result.
+MPI ranks share one Python archive writer, propagating filesystem errors to all
+ranks before subsequent collective commands; native MED exports remain
+collective. Relocated MPI prefix variables are supplied explicitly. Small
+four-rank native tests cover retained Gauss-point history, dry/wet continuation
+and injected resource failures; full-dam performance remains unverified.
+Production cohesive jobs use one MPI rank, eight OpenMP threads and a 16 GiB
+per-rank Code_Aster budget to leave headroom in the 24 GiB WSL allocation.
+Native exit 137 propagates as an explicit OS-kill failure, including when the
+outer launcher exits 1. It is not proof of OOM without kernel evidence, nor
+nonlinear nonconvergence. SIGKILL prevents final-output/restart handlers running.
 Requested wet results without that evidence are rejected by the API and sweep,
 not silently accepted as dry. The report and Investigation disclose the actual
 hydraulic assumptions and history. Restart the API to load these code changes

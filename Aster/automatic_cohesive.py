@@ -46,7 +46,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from Elmer.model_config import residual_target_tensile_stress_pa
+
 SCHEMA_VERSION = 1
+# run_aster needs a numeric CPU budget even when its external wall-clock timeout is disabled.
+UNBOUNDED_CPU_TIME_LIMIT_S = 2_147_483_647
 REPORT_NAME = "aster_cohesive_report.json"
 STEPS_NAME = "aster_cohesive_steps.npz"
 STATUS_NAME = "aster_cohesive_status.json"
@@ -70,10 +74,9 @@ LOAD_INCREMENT = 0.1
 # window, giving a ~10x finer minimum substep through the sliding-onset zone.
 FRICTION_FINE_INCREMENT = 0.05
 FRICTION_FINE_LIMIT = 0.3
-# Upper cap only; displacement_campaign.resource_check still bounds each solve
-# to half the available memory. 8192 starved the joint-model control case
-# (JEVEUX needed ~10.1 GB) while the machine had ~27 GB free.
-MEMORY_LIMIT_MB = 24576
+# Code_Aster's budget is per MPI rank. Leave headroom within the 24 GiB WSL
+# allocation for Python, native solver workspace and the operating system.
+MEMORY_LIMIT_MB = 16384
 LOADED_TRI_KEYS = ("tri3_upstream", "tri3_downstream", "tri3_crest", "tri3_rock_bottom", "tri3_rock_sides")
 # Code_Aster refuses joint models with any cell above 200 vertex neighbours (VOLUFINI_3);
 # the margin covers any difference in how Code_Aster counts them.
@@ -566,30 +569,63 @@ def candidate_faces(state) -> np.ndarray:
     return minus
 
 
+def preload_factor(controls: dict) -> float:
+    value = controls.get("load_factor_start", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise CorroborationError("load_factor_start must be a finite number between 0 and 1")
+    return float(value)
+
+
 def load_factors(summary: dict) -> list[float]:
-    """The proportional load factors to solve: FEniCSx's first step, then fixed increments
-    to the larger of 1 and the factor FEniCSx finished at.
+    """Schedule proportional cracking loads, optionally after same-load intact preload.
+
+    Zero start preserves the existing wet/dry first targets and overload behaviour.
 
     Friction runs instead start at FRICTION_FINE_INCREMENT and climb in fine steps up to
     FRICTION_FINE_LIMIT: the first dam-scale run stalled inside a single 0->0.5 target at
     load factor ~0.23 and lost every converged equilibrium with it."""
+    loading = summary.get("reservoir_loading")
+    if loading is not None:
+        return [depth / loading["final_water_depth_m"] for depth in loading["water_depth_targets_m"]]
+    if (summary.get("solver_controls") or {}).get("loading_mode") == "reservoir_filling":
+        raise CorroborationError("Reservoir filling requires validated physical depth metadata")
     final = max(1.0, float(summary.get("load_factor") or 1.0),
                 float(summary.get("maximum_overload_factor") or 1.0))
     lift = (summary.get("material_assignment") or {}).get("joint_properties") or {}
     friction = summary.get("damaged_joint_friction") is not None or lift.get("law") == "JOINT_MECA_FROT"
     controls = summary.get("solver_controls") or {}
+    start = preload_factor(controls)
+    increment = controls.get("load_increment", 0.025 if summary.get("crack_water_pressure") is True else LOAD_INCREMENT)
+    if isinstance(increment, bool) or not isinstance(increment, (int, float)) or not math.isfinite(increment) or not 0 < increment <= 1:
+        raise CorroborationError("load_increment must be finite, positive and no greater than 1")
+    if start > 0:
+        if final > 1:
+            raise CorroborationError("Intact preload supports design loading through factor 1, not overload")
+        values = [start]
+        while values[-1] < 1:
+            following = round(min(1., values[-1] + increment), 10)
+            if following <= values[-1]:
+                raise CorroborationError("load_increment is too small to advance the load schedule")
+            values.append(following)
+        return values
     if summary.get("crack_water_pressure") is True:
         configured_increment = float(controls.get("load_increment", 0.025))
         values = [0.01]
         while values[-1] < final - 1e-9:
-            values.append(round(min(final, values[-1] + configured_increment), 10))
+            following = round(min(final, values[-1] + configured_increment), 10)
+            if following <= values[-1]:
+                raise CorroborationError("load_increment is too small to advance the load schedule")
+            values.append(following)
         return values
     configured_increment = float(controls.get("load_increment", LOAD_INCREMENT))
     factors = [FRICTION_FINE_INCREMENT if friction else FIRST_LOAD_FACTOR]
     while factors[-1] < final - 1e-9:
         increment = (FRICTION_FINE_INCREMENT if friction and factors[-1] < FRICTION_FINE_LIMIT - 1e-9
                      else configured_increment)
-        factors.append(round(min(final, factors[-1] + increment), 10))
+        following = round(min(final, factors[-1] + increment), 10)
+        if following <= factors[-1]:
+            raise CorroborationError("load_increment is too small to advance the load schedule")
+        factors.append(following)
     return factors
 
 
@@ -842,13 +878,20 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
                          status_path: Path, tie_pairs: int = 0,
                          interpolation: dict | None = None) -> str:
     """Turn the job's linear baseline case into the stepped cohesive case."""
+    if joint.get("continuation") is not None and (
+            not factors or factors[-1] != 1.0 or any(factor > 1.0 for factor in factors)):
+        raise CorroborationError("Fixed-mesh continuation requires a ramp ending at design load factor 1.0")
     for name, anchor in _ANCHORS.items():
         if base_comm.count(anchor) != 1:
             raise CorroborationError(f"The baseline case no longer has its '{name}' section")
     comm = base_comm[:base_comm.index(_ANCHORS["solve"])]
+    from inspect import getsource
+    from Aster.run_case import resource_failure
     comm = comm.replace(_ANCHORS["debut"], (
-        "import json\nimport time\n\nimport numpy as np\n\n"
+        "import json\nimport re\nimport time\nimport os\n\nimport numpy as np\n\n"
         "from code_aster.Commands import *\nfrom code_aster import CA\n\n"
+        "from code_aster.Utilities import MPI\n\n"
+        "from contextlib import contextmanager\n\n"
         "DEBUT(LANG='EN', ERREUR=_F(ERREUR_F='EXCEPTION'))"))
     has_joints = joint.get("has_joints", True)
     if has_joints:
@@ -1072,11 +1115,13 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
             "    inactive = np.ones(len(result), dtype=bool)\n"
             "    inactive[active] = False\n"
             "    result[inactive] = 0.0\n")
+    comm += getsource(resource_failure) + "\n"
     comm += f'''{gravity_ramp}RAMP = DEFI_FONCTION(NOM_PARA='INST', VALE=(0.0, 0.0, 100.0, 100.0), PROL_DROITE='LINEAIRE')
 # Every load is scaled by the load factor (= INST), as in the FEniCSx proportional ramp.
 
 STEPS_PATH = {_comm_string(steps_path)}
 STATUS_PATH = {_comm_string(status_path)}
+IS_WRITER = MPI.ASTER_COMM_WORLD.Get_rank() == 0
 TARGETS = [{targets}]
 TARGET_LEVELS = [0] * len(TARGETS)
 JOINT_CELLS = list(MAIL.getCells('JOINTS')) if {has_joints!r} else []
@@ -1132,15 +1177,46 @@ status = {{"schema_version": 1, "status": "running", "targets": TARGETS, "conver
           "joint_cells": len(JOINT_CELLS), "started_at": time.time(), "step_timings": []}}
 
 
+@contextmanager
+def root_archive_write():
+    failure = None
+    try:
+        yield IS_WRITER
+    except OSError as error:
+        failure = (error.errno, str(error))
+    failure = MPI.ASTER_COMM_WORLD.bcast(failure, root=0)
+    if failure is not None:
+        raise OSError(failure[0], failure[1])
+
+
 def save(final=None, record_timing=False):
     if final is not None:
         status.update(final)
-    archive_started = time.perf_counter()
-    np.savez(STEPS_PATH, **{{key: np.asarray(value, dtype=float) for key, value in history.items()}})
-    if record_timing:
-        status["step_timings"][-1]["archive_s"] = time.perf_counter() - archive_started
-    with open(STATUS_PATH, 'w', encoding='utf-8') as stream:
-        json.dump(status, stream, indent=2)
+    with root_archive_write() as writer:
+        if writer:
+            archive_started = time.perf_counter()
+            with open(STEPS_PATH + '.tmp', 'wb') as stream:
+                np.savez(stream, **{{key: np.asarray(value, dtype=float) for key, value in history.items()}})
+            os.replace(STEPS_PATH + '.tmp', STEPS_PATH)
+            if record_timing:
+                status["step_timings"][-1]["archive_s"] = time.perf_counter() - archive_started
+            with open(STATUS_PATH + '.tmp', 'w', encoding='utf-8') as stream:
+                json.dump(status, stream, indent=2)
+            os.replace(STATUS_PATH + '.tmp', STATUS_PATH)
+
+
+def stop_for_resource_failure(error):
+    detail = (type(error).__name__ + ': ' + str(error) if isinstance(error, (OSError, MemoryError))
+              else str(error))
+    failure = resource_failure(detail)
+    if failure is None:
+        return False
+    status.update(status='failed', stop_reason='resource_limit', resource_failure=failure,
+                  stopped_at_load_factor=min(target, 1.0), reached_load_factor=min(reached, 1.0),
+                  message=failure['message'])
+    print('LAMB_SOLVER_RESOURCE_ERROR ' + json.dumps(failure), flush=True)
+    save()
+    return True
 
 
 save()
@@ -1153,6 +1229,8 @@ COMPORT = (
 {comport_joints})
 RESU = None
 reached = 0.0
+mesh_coordinates = np.asarray(MAIL.getCoordinates().getValues(), dtype=float).reshape(-1, 3)
+accepted_depl = None
 target_index = 0
 while target_index < len(TARGETS):
     target = TARGETS[target_index]
@@ -1178,6 +1256,8 @@ while target_index < len(TARGETS):
             RESU = STAT_NON_LINE(reuse=RESU, ETAT_INIT=_F(EVOL_NOLI=RESU), **options)
         mechanical_s += time.perf_counter() - mechanical_started
     except CA.AsterError as error:
+        if stop_for_resource_failure(error):
+            break
         detail = str(error).strip() or type(error).__name__
         save({{"status": "stopped", "stopped_at_load_factor": target,
                "message": f"Code_Aster did not converge from load factor {{reached:.6g}} to {{target:.6g}}: {{detail}}"}})
@@ -1228,8 +1308,9 @@ while target_index < len(TARGETS):
         history["mean_tangential_traction_pa"].append(np.empty(0))
     history["sliding"].append(sliding_flag)
     history["cumulative_slip_m"].append(slip)
+    accepted_depl = nodal_displacement(RESU.getField('DEPL', last))
     if len(history["load_factor"]) == 1:
-        first_depl = nodal_displacement(RESU.getField('DEPL', last))
+        first_depl = accepted_depl.copy()
     status["step_timings"].append({{"load_factor": target, "mechanical_s": mechanical_s,
                                   "step_s": time.perf_counter() - step_started}})
     status["converged_load_factors"].append(target)
@@ -1244,9 +1325,12 @@ while target_index < len(TARGETS):
     target_index += 1
 
 if history["load_factor"]:
-    final_depl = nodal_displacement(RESU.getField('DEPL', RESU.getLastIndex()))
-    np.savez(STEPS_PATH.replace('.npz', '_displacement.npz'), first=first_depl, final=final_depl,
-             coordinates=np.asarray(MAIL.getCoordinates().getValues(), dtype=float).reshape(-1, 3))
+    with root_archive_write() as writer:
+        if writer:
+            path = STEPS_PATH.replace('.npz', '_displacement.npz')
+            with open(path + '.tmp', 'wb') as stream:
+                np.savez(stream, first=first_depl, final=accepted_depl, coordinates=mesh_coordinates)
+            os.replace(path + '.tmp', path)
 if status["status"] == "running":
     save({{"status": "completed"}})
 elif not history["load_factor"]:
@@ -1254,6 +1338,8 @@ elif not history["load_factor"]:
 status["finished_at"] = time.time()
 save()
 
+if status.get('resource_failure') is not None:
+    raise SystemExit(1)
 FIN()
 '''
     if "hydraulic_loads" in joint:
@@ -1302,6 +1388,18 @@ FIN()
         comm = comm.replace('    status["converged_load_factors"].append(target)',
                             '    status["hydraulic_steps"] = hydraulic_history\n'
                             '    status["converged_load_factors"].append(target)')
+    if joint.get("continuation") is not None:
+        from Aster.cohesive_continuation import render, render_preload
+        comm = render(comm, dict(joint["continuation"], opening_limit_m=joint["elastic_limit_opening_m"]))
+        if joint.get("reservoir_loading") is not None:
+            from Aster.reservoir_continuation import render as render_reservoir
+            comm = render_reservoir(comm, joint["reservoir_loading"], joint["tensile_strength_pa"],
+                                    joint["reservoir_loading"]["selection_enabled"])
+        else:
+            comm = render_preload(comm, preload_factor(joint.get("solver_controls") or {}),
+                                  joint["tensile_strength_pa"])
+    elif preload_factor(joint.get("solver_controls") or {}) > 0:
+        raise CorroborationError("Intact preload requires the fixed wall-facet bank")
     return comm
 
 
@@ -1337,6 +1435,10 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
             or not np.allclose(arrays["nodes"][parent_nodes], fenicsx_coordinates, rtol=0., atol=1e-8)):
         raise CorroborationError("Aster source node identities/coordinates differ from the candidate mesh")
     split = split_for_joints(arrays, faces)
+    if summary.get("continuation") is not None:
+        with np.load(fenicsx_output / "cohesive_state.npz", allow_pickle=False) as state:
+            split["arrays"]["continuation_active_faces"] = state["continuation_active_faces"].copy()
+            split["arrays"]["continuation_face_owners"] = state["continuation_face_owners"].copy()
     ties = len(split["arrays"]["tie_node_pairs"])
     support_aux = len(arrays.get("support_interpolation_nodes", []))
     if len(split["arrays"]["nodes"]) - ties - support_aux != fenicsx_nodes:
@@ -1444,6 +1546,14 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     joint["stop_overload_on_opening"] = summary.get("status") == "prepared_aster_candidates"
     joint["material_assignment"] = assignment
     joint["solver_controls"] = summary.get("solver_controls") or {}
+    if summary.get("continuation") is not None:
+        joint["continuation"] = {
+            **summary["continuation"],
+            "arrays_path": str((output_dir / SPLIT_ARRAYS_NAME).resolve()),
+            "youngs_modulus_pa": concrete["youngs_modulus_pa"],
+            "poissons_ratio": concrete["poissons_ratio"],
+        }
+        joint["stop_overload_on_opening"] = False
     if "hydraulic_loads" in base_inputs:
         joint["hydraulic_loads"] = {
             **base_inputs["hydraulic_loads"],
@@ -1503,7 +1613,7 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
             youngs_modulus=concrete["youngs_modulus_pa"],
             poisson_ratio=concrete["poissons_ratio"],
             density=concrete["density_kg_m3"],
-            gravity_m_s2=-float(base_inputs["gravity_m_s2"]), max_links=20000,
+            gravity_m_s2=-float(base_inputs["gravity_m_s2"]), max_links=40000,
             max_dense_bytes=int(((source_config.get("fracture_debug") or {}).get("aster") or {}).get(
                 "maximum_condensation_memory_mb", 4096)) * 1024**2,
         )
@@ -1511,6 +1621,26 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         manifest["condensed_foundation"] = condensation
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         base_comm, base_inputs = render_comm(mesh_manifest_path=manifest_path)
+    if summary.get("reservoir_loading") is not None:
+        from Elmer.reservoir_loading import reservoir_loading
+        loading_config = dict(source_config, fracture_debug=dict(
+            source_config.get("fracture_debug") or {}, aster=joint["solver_controls"]))
+        loading = reservoir_loading(loading_config, base_inputs)
+        if loading is None:
+            raise CorroborationError("Prepared reservoir loading has no explicit source configuration mode")
+        if joint.get("continuation") is None or joint.get("damaged_friction") or joint.get("lift_joint"):
+            raise CorroborationError("Reservoir filling requires the fixed wall cohesive bank and CZM_LIN_REG")
+        controls = joint["solver_controls"]
+        joint["reservoir_loading"] = dict(
+            loading.metadata(), water_depth_targets_m=loading.targets(),
+            selection_enabled=summary["reservoir_loading"]["selection_enabled"],
+            maximum_iterations=int(controls.get("maximum_iterations", 60)),
+            relative_residual_tolerance=float(controls.get("relative_residual_tolerance", 5e-6)),
+            line_search_iterations=int(controls.get("line_search_iterations", 12)))
+        if "hydraulic_loads" in joint:
+            if joint["hydraulic_loads"]["settings"]["base_uplift"] != "none":
+                raise CorroborationError("Reservoir filling does not enable base uplift")
+            joint["reservoir_loading"]["hydraulic_settings"] = joint["hydraulic_loads"]["settings"]
     factors = load_factors(summary)
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
@@ -1541,11 +1671,13 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     }
     if condense:
         inputs["condensed_foundation"] = condensation
-    if assignment is not None:
+    if assignment is not None or joint.get("reservoir_loading") is not None:
         baseline_fields = baseline_dir / "aster_full_displacement.npz"
-        inputs.update(material_assignment=assignment, baseline_displacement_path=str(baseline_fields.resolve()),
+        inputs.update(baseline_displacement_path=str(baseline_fields.resolve()),
                       baseline_displacement_sha256=file_hash(baseline_fields),
                       intact_concrete_properties=concrete)
+        if assignment is not None:
+            inputs["material_assignment"] = assignment
     (output_dir / "case_inputs.json").write_text(json.dumps(inputs, indent=2) + "\n", encoding="utf-8")
     return inputs
 
@@ -1553,7 +1685,8 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
 def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEMORY_LIMIT_MB,
           runtime: str = "wsl") -> dict:
     """Run the prepared case with the local Code_Aster; returns the case's own status."""
-    from Aster.run_case import build_med_mesh, detect_installation, MESH_UNIT, run_solver, run_wsl_solver, native_command
+    from Aster.run_case import (build_med_mesh, detect_installation, MESH_UNIT, run_solver,
+                               run_wsl_solver, native_command, resource_failure)
 
     run_dir = output_dir / "run"
     run_dir.mkdir(exist_ok=True)
@@ -1603,7 +1736,8 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
         (run_dir / name).unlink(missing_ok=True)
 
     export_path = run_dir / "aster_cohesive.export"
-    cpu_time_limit_s = max(int(time_limit_s) * max(1, int(SOLVER_THREADS)), 3600) if time_limit_s is not None else 7200
+    cpu_time_limit_s = (max(int(time_limit_s) * max(1, int(SOLVER_THREADS)), 3600)
+                        if time_limit_s is not None else UNBOUNDED_CPU_TIME_LIMIT_S)
     archive_path = ((wsl_path((output_dir / SPLIT_ARRAYS_NAME).resolve())
                      if runtime == "wsl" and os.name == "nt"
                      else str((output_dir / SPLIT_ARRAYS_NAME).resolve())) if condensed else None)
@@ -1613,7 +1747,6 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
         "P mpi_nbcpu 1",
         # run_aster overrides OMP_NUM_THREADS with the export's ncpus (default 1);
         # without this line the whole nonlinear solve factorizes single-threaded.
-        
         f"P ncpus {SOLVER_THREADS}",
         f"F comm {case_path} D 1",
         f"F libr {mesh_path} D {MESH_UNIT}",
@@ -1630,14 +1763,21 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
                                run_dir, time_limit_s, live_log=run_dir / "solver.live.log")
     (run_dir / "stdout.log").write_text(completed.stdout, encoding="utf-8")
     (run_dir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
+    failure = resource_failure(completed.stdout + completed.stderr)
     try:
         status = json.loads((run_dir / STATUS_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        if failure is not None:
+            raise CorroborationError(f"Code_Aster resource limit: {failure['message']}") from None
         tail = (completed.stdout + completed.stderr)[-1500:]
         raise CorroborationError(f"Code_Aster exited with code {completed.returncode} before the cohesive "
                                  f"solve started:\n{tail}") from None
     status["returncode"] = completed.returncode
     status["runtime"] = "wsl" if runtime == "wsl" and os.name == "nt" else "native"
+    scratch = re.search(r"^LAMB_SOLVER_SCRATCH (.+)$", completed.stdout, re.MULTILINE)
+    if scratch:
+        status["solver_scratch"] = json.loads(scratch.group(1))
+        status["solver_scratch"]["cleaned"] = "LAMB_SOLVER_SCRATCH_CLEANED " in completed.stdout
     # A comm-handled convergence stop writes status "stopped" and exits 0; Code_Aster still
     # prints the caught exception box, so the <EXCEPTION> scan must not reclassify it.
     # run_aster always prints its exit marker, even after a solver error. A run that was still
@@ -1645,9 +1785,14 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
     # outside, e.g. its WSL session was shut down; that says nothing about the model.
     interrupted = (status.get("status") == "running" and completed.returncode not in (0, 124, 137)
                    and RUN_ASTER_EXIT_MARKER not in completed.stdout)
+    native_kill = re.search(
+        r"(?m)^(?:\[\d+,\d+\]<(?:stdout|stderr)>:\s*)?\s*EXECUTION_CODE_ASTER_EXIT_\d+=137\s*$",
+        completed.stdout + completed.stderr)
+    native_exception = re.search(
+        r"(?m)^(?:\[\d+,\d+\]<(?:stdout|stderr)>:\s*)?\s*(?:\u2551\s*)?<EXCEPTION>",
+        completed.stdout + completed.stderr)
     if (completed.returncode != 0 or status.get("status") == "running"
-            or ("<EXCEPTION>" in completed.stdout + completed.stderr
-                and status.get("status") != "stopped")):
+            or (native_exception and status.get("status") != "stopped")):
         status["status"] = "failed"
         status["message"] = f"Code_Aster stopped unexpectedly (exit code {completed.returncode})"
         if interrupted:
@@ -1659,6 +1804,21 @@ def solve(output_dir: Path, time_limit_s: int | None, memory_limit_mb: int = MEM
                 + f" (exit code {completed.returncode}): its log ends mid-solve with no solver error. "
                   "The process was killed or its WSL session was shut down or restarted (for example by "
                   "a WSL update); this is not a model result - rerun the stage")
+    if native_kill is not None:
+        started = re.findall(r"ASTER_COHESIVE_STEP start load_factor=(\S+)", completed.stdout)
+        message = (
+            "Code_Aster was killed by the operating system (SIGKILL, native exit code 137)"
+            + (f" while solving load factor {started[-1]}" if started else "")
+            + ". WSL memory exhaustion or an external kill can cause this; "
+              "the exit code alone does not prove which. This is not nonlinear nonconvergence. "
+              "Check the WSL kernel journal for an out-of-memory kill and reduce MPI memory replication.")
+        status.update(status="failed", stop_reason="process_killed", message=message,
+                      process_failure={"kind": "process_killed", "signal": 9, "message": message})
+    if failure is not None:
+        status.update(status="failed", stop_reason="resource_limit", resource_failure=failure,
+                      message=failure["message"])
+    if status.get("status") == "failed" and (status.get("preload") or {}).get("status") in ("pending", "running"):
+        status["preload"].update(status="failed", message=status["message"], finished_at=time.time())
     return status
 
 
@@ -1816,7 +1976,7 @@ def lift_plane_sliding(factors, areas, normal, shear, sliding, slip, jump, lift_
     }
 
 
-def unjointed_overstress(points, wall, stress, joints, strength_pa) -> dict:
+def unjointed_overstress(points, wall, stress, joints, strength_pa, *, residual_target_pa=None) -> dict:
     """Wall cells without any cohesive joint whose final principal tension exceeds the intact strength.
 
     A cohesive model cracks only along the joints it was given (Code_Aster U2.05.07 3.1).
@@ -1835,11 +1995,14 @@ def unjointed_overstress(points, wall, stress, joints, strength_pa) -> dict:
     faces = keys(wall[:, _TET_FACES])
     jointed = np.isin(faces, lips).reshape(len(wall), 4).any(axis=1)
     principal = np.linalg.eigvalsh(0.5 * (stress + np.transpose(stress, (0, 2, 1))))[:, 2]
-    over = ~jointed & (principal > float(strength_pa))
+    threshold = float(strength_pa if residual_target_pa is None else residual_target_pa)
+    criterion = "intact tensile strength" if residual_target_pa is None else "residual tensile-stress target"
+    over = ~jointed & (principal > threshold)
     corners = points[wall]
     volumes = np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])) / 6.
     report = {
         "tensile_strength_pa": float(strength_pa),
+        "threshold_pa": threshold,
         "jointed_wall_cells": int(jointed.sum()),
         "unjointed_wall_cells": int((~jointed).sum()),
         "cells": int(over.sum()),
@@ -1854,10 +2017,10 @@ def unjointed_overstress(points, wall, stress, joints, strength_pa) -> dict:
         report["peak_principal_stress_pa"] = float(principal[peak])
         report["peak_centroid_xyz_m"] = corners[peak].mean(axis=0).tolist()
     report["note"] = (
-        f"{report['cells']} wall cells with no cohesive joint exceed the intact tensile strength at the final "
+        f"{report['cells']} wall cells with no cohesive joint exceed the {criterion} at the final "
         "state. They cannot crack in this model, so cracking outside the selected band is not predicted."
         if report["cells"] else
-        "No wall cell without a cohesive joint exceeds the intact tensile strength at the final state.")
+        f"No wall cell without a cohesive joint exceeds the {criterion} at the final state.")
     return report
 
 
@@ -1973,6 +2136,7 @@ def assessment_notes(report: dict) -> list[str]:
 def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     inputs = json.loads((output_dir / "case_inputs.json").read_text(encoding="utf-8"))
     joint = inputs["joint"]
+    loading = joint.get("reservoir_loading")
     summary = json.loads((fenicsx_output / "summary.json").read_text(encoding="utf-8"))
     preparation_only = summary.get("status") == "prepared_aster_candidates"
     with np.load(fenicsx_output / "cohesive_state.npz") as state:
@@ -1995,11 +2159,31 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         "solve_status": status.get("status"),
         "returncode": status.get("returncode"),
         "solve_message": status.get("message"),
+        "resource_failure": status.get("resource_failure"),
+        "process_failure": status.get("process_failure"),
+        "preload": (dict(status["preload"], result_directory=str((run_dir / "preload").resolve()))
+                    if status.get("preload") is not None else None),
+        "solver_scratch": status.get("solver_scratch"),
         "differences_from_fenicsx": list(DIFFERENCES),
         "joint_integration": inputs.get("joint_integration", "PENTA6_FPG1"),
         "native_joint_cells": inputs.get("native_joint_cells", inputs["candidate_faces"]),
         "tangent_update_interval": inputs.get("tangent_update_interval", 1),
     }
+    if loading is not None:
+        report.update(
+            loading_mode="reservoir_filling", reservoir_loading=loading,
+            load_factor_definition="normalised_water_depth_not_force_multiplier",
+            reached_water_depth_m=status.get("reached_water_depth_m"),
+            water_surface_z_m=status.get("water_surface_z_m"),
+            activation_history_complete=status.get("activation_history_complete"),
+            activation_warnings=status.get("activation_warnings", []))
+    if joint.get("continuation") is not None:
+        report["continuation_rounds"] = [
+            dict(row, result_directory=str((run_dir / f"round_{row['iteration']:04d}").resolve()))
+            for row in status.get("continuation_rounds", [])]
+        report["continuation_stop_reason"] = status.get("continuation_stop_reason")
+        if status.get("failed_continuation_instant") is not None:
+            report["failed_continuation_instant"] = status["failed_continuation_instant"]
     if "step_timings" in status:
         report["step_timings"] = status["step_timings"]
     if "hydraulic_loads" in joint:
@@ -2024,6 +2208,8 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         return report
     with np.load(steps_path) as steps:
         factors = np.asarray(steps["load_factor"], dtype=float)
+        instants = np.asarray(steps["solver_instant"], dtype=float) if joint.get("continuation") is not None else factors
+        depths = np.asarray(steps["water_depth_m"], dtype=float) if loading is not None else None
         if len(factors) == 0:
             report.update(status="failed", steps=[])
             return report
@@ -2039,8 +2225,18 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     if (jump.shape != damage.shape or traction.shape != damage.shape
             or not all(np.isfinite(values).all() for values in (factors, damage, jump, traction))
             or any(values is not None and not np.isfinite(values).all() for values in extras.values())
-            or np.any(np.diff(factors) <= 0)):
+            or instants.shape != factors.shape or not np.isfinite(instants).all()
+            or np.any(np.diff(instants) <= 0)
+            or (joint.get("continuation") is not None and loading is None
+                and not np.array_equal(factors, np.minimum(instants, 1.0)))):
         raise CorroborationError("Aster converged step fields are non-finite, unordered or inconsistent")
+    if loading is not None and (
+            depths.shape != factors.shape or not np.isfinite(depths).all()
+            or np.any(np.diff(depths) < 0) or np.any(depths < 0)
+            or np.any(depths > loading["final_water_depth_m"])
+            or not np.allclose(factors, depths / loading["final_water_depth_m"], rtol=0., atol=1e-12)
+            or status.get("reached_water_depth_m") != float(depths[-1])):
+        raise CorroborationError("Reservoir steps have inconsistent accepted physical water depths")
     if inputs.get("joint_integration") == "three_HEXA8_FPG4_patches_exact_P1_trace":
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=False) as stored:
             mapping = np.asarray(stored["joint_parent_faces"], dtype=np.int64)
@@ -2127,10 +2323,17 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         "peak_opening_m": float(max(0.0, jump[i].max())) if len(areas) else 0.0,
         "peak_joint_normal_traction_pa": float(traction[i].max()) if len(areas) else 0.0,
     } for i, factor in enumerate(factors)]
+    if joint.get("continuation") is not None:
+        for row, instant in zip(step_rows, instants):
+            row["solver_instant"] = float(instant)
+    if loading is not None:
+        for row, depth in zip(step_rows, depths):
+            row.update(water_depth_m=float(depth),
+                       water_surface_z_m=loading["depth_reference_z_m"] + float(depth))
     first = next((i for i in range(len(factors)) if initiated[i].any()), None)
     bracket = None if first is None else [float(factors[first - 1]) if first else 0.0, float(factors[first])]
     linear_estimate = None
-    if len(areas) and not initiated[0].any() and traction[0].max() > 0:
+    if loading is None and len(areas) and not initiated[0].any() and traction[0].max() > 0:
         strengths = np.full(len(areas), joint["tensile_strength_pa"], dtype=float)
         if damaged_faces is not None:
             strengths[~damaged_faces & ~lift_faces] = joint["intact_joint"]["tensile_strength_pa"]
@@ -2141,13 +2344,19 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
 
     def state_at(target: float) -> int | None:
         matches = np.flatnonzero(np.isclose(factors, target, atol=1e-9, rtol=0.))
-        return int(matches[0]) if len(matches) else None
+        return int(matches[-1] if joint.get("continuation") is not None else matches[0]) if len(matches) else None
 
     design = state_at(1.0)
     final = len(factors) - 1
     complete = status.get("status") == "completed" and (
         np.isclose(factors[-1], inputs["load_factors"][-1], rtol=0., atol=1e-9)
         or (status.get("overload_stopped_on_opening") is True and factors[-1] >= 1.0))
+    if loading is not None:
+        complete = (complete and depths[-1] == loading["final_water_depth_m"]
+                    and status.get("continuation_stop_reason") != "iteration_limit")
+        report["first_initiation_water_depth_bracket_m"] = (
+            None if first is None else [float(depths[first - 1]) if first else loading["water_depth_start_m"],
+                                       float(depths[first])])
     report.update(
         status="completed" if complete else "partial",
         reached_load_factor=float(factors[-1]),
@@ -2182,6 +2391,14 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                 "reached; a capacity claim needs the sliding assessment or a force balance on the failing "
                 "surface to support it. The last converged state is archived and viewable."),
         }
+    if status.get("failed_continuation_instant") is not None and report.get("capacity_assessment") is not None:
+        report["capacity_assessment"]["message"] = (
+            "Code_Aster reached the full design load, but could not re-establish equilibrium "
+            "after activating additional wall facets. Physical loads remained at factor 1.0; "
+            f"the failed solver instant {status['failed_continuation_instant']:g} is a continuation "
+            "label, not an increased reservoir level or physical time. The previous accepted "
+            "round and its fracture history are preserved. This is a solver failure, not "
+            "evidence of dam capacity or achievement of the residual tensile-stress target.")
     report["opening_assessment"] = {
         "peak_opening_m": step_rows[-1]["peak_opening_m"],
         "initiated_faces": step_rows[-1]["initiated_faces"],
@@ -2207,6 +2424,14 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                             if "damaged_cells" in arrays else np.zeros(len(wall), dtype=bool))
             joint_lips = (np.asarray(arrays["penta6_joints"], dtype=np.int64) if "penta6_joints" in arrays
                           else np.empty((0, 6), dtype=np.int64))
+            if joint.get("continuation") is not None:
+                active_faces = arrays["continuation_active_faces"].astype(bool)
+                rounds = report["continuation_rounds"]
+                if rounds:
+                    with np.load(run_dir / f"round_{rounds[-1]['iteration']:04d}" / "accepted_state.npz") as checkpoint:
+                        active_faces = checkpoint["active_faces"].astype(bool)
+                report["active_candidate_faces"] = int(active_faces.sum())
+                joint_lips = joint_lips[active_faces]
         with np.load(displacement_path) as fields:
             coordinates, first_u, final_u = fields["coordinates"], fields["first"], fields["final"]
         if (first_u.shape != nodes.shape or final_u.shape != nodes.shape
@@ -2223,8 +2448,10 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
             final_stress[damaged_wall] = wall_cell_stress(
                 nodes, wall[damaged_wall], final_u, properties["youngs_modulus"], properties["poisson_ratio"])
         cracked = _stress_summary(nodes, wall, final_stress, final_u)
-        target = float((summary.get("solver_controls") or {}).get(
-            "whole_wall_tension_tolerance_pa", 1.0))
+        target = residual_target_tensile_stress_pa(summary) if "residual_target_tensile_stress_pa" in summary else float(
+            (summary.get("solver_controls") or {}).get("whole_wall_tension_tolerance_pa", 1.0))
+        if joint.get("continuation") is not None:
+            target = float(joint["continuation"]["target_pa"])
         wall_principal = np.linalg.eigvalsh(final_stress)[:, -1]
         report["residual_tension_assessment"] = {
             "threshold_pa": target,
@@ -2235,7 +2462,9 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         }
         comparison = {"load_factor": float(factors[-1]), "scope": "wall (body 1) cells, constant P1 stress",
                       "cracked": cracked, "intact": None}
-        if assignment is not None:
+        intact_u = None
+        has_reference = assignment is not None or (loading is not None and "baseline_displacement_path" in inputs)
+        if has_reference and (loading is None or depths[-1] == loading["final_water_depth_m"]):
             path = Path(inputs["baseline_displacement_path"])
             if file_hash(path) != inputs["baseline_displacement_sha256"]:
                 raise CorroborationError("Intact baseline displacement changed since material assignment")
@@ -2248,16 +2477,19 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                 if np.any(positions >= len(ids)) or not np.array_equal(ids[positions], source_ids[physical]):
                     raise CorroborationError("Selected-material result cannot map to intact baseline nodes")
                 intact_u = np.zeros_like(final_u)
-                intact_u[physical] = baseline["displacement_m"][valid][first][positions] * factors[-1]
+                intact_u[physical] = baseline["displacement_m"][valid][first][positions] * (
+                    factors[-1] if loading is None else 1.)
                 if not np.allclose(baseline["coordinates_m"][valid][first][positions], nodes[physical], atol=1e-9, rtol=0.):
                     raise CorroborationError("Intact baseline coordinates do not match selected-material result")
             comparison["intact"] = _stress_summary(nodes, wall, wall_cell_stress(nodes, wall, intact_u, e_pa, nu), intact_u)
             comparison["intact_definition"] = (
-                "original concrete Aster baseline scaled to final load factor; differences include "
-                + ("selected material changes and cracking" if "properties" in assignment
-                   else "lift-joint cracking only (every element keeps the intact concrete)"))
+                ("original concrete full-depth Aster baseline; differences include "
+                 if loading is not None else
+                 "original concrete Aster baseline scaled to final load factor; differences include ")
+                + ("selected material changes and cracking" if assignment is not None and "properties" in assignment
+                   else "cohesive cracking (every volume element keeps the intact concrete)"))
             np.savez(displacement_path, coordinates=coordinates, first=first_u, final=final_u, intact=intact_u)
-        elif not initiated[0].any():
+        elif loading is None and not initiated[0].any():
             # Before initiation the joints are linear, so the bonded state scales with the load.
             scale = factors[-1] / factors[0]
             intact_u = first_u * scale
@@ -2265,15 +2497,23 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                                                    intact_u)
             comparison["intact_definition"] = (
                 f"bonded joints, same mesh and loads: the elastic load-factor {factors[0]:g} state scaled linearly")
+        elif loading is not None:
+            comparison["intact_definition"] = (
+                "No same-depth intact reference is available; reservoir filling is not proportional loading.")
         report["stress_comparison"] = comparison
         # Where the model cannot crack although the stress says it would.
         intact_strength = (joint["intact_joint"]["tensile_strength_pa"] if "intact_joint" in joint
                            else joint["tensile_strength_pa"])
         report["unjointed_overstress"] = unjointed_overstress(
             nodes, wall, final_stress, joint_lips, intact_strength)
+        report["unjointed_residual_tension"] = unjointed_overstress(
+            nodes, wall, final_stress, joint_lips, intact_strength, residual_target_pa=target)
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=False) as stored:
             source_rows = np.asarray(stored["source_cell_rows"], dtype=np.int64)
-        indices = report["unjointed_overstress"].get("wall_cell_indices", [])
+        growth_assessment = (report["unjointed_residual_tension"]
+                             if "residual_target_tensile_stress_pa" in summary or joint.get("continuation") is not None
+                             else report["unjointed_overstress"])
+        indices = growth_assessment.get("wall_cell_indices", [])
         report["growth_source_rows"] = source_rows[np.asarray(indices, dtype=np.int64)].tolist()
         # How much of the displacement change is elastic softening and how much is cracking.
         sources = []
@@ -2287,10 +2527,10 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         if lift_law is not None and lift_law["k_n_pa_per_m"] < lift_law["mesh_penalty_pa_per_m"]:
             sources.append(f"lift-joint normal stiffness {lift_law['k_n_pa_per_m']:.4g} Pa/m (as compliant as "
                            f"{float(e_pa) / lift_law['k_n_pa_per_m']:.3g} m of concrete)")
-        proportional = joint.get("damaged_friction") is None and not (
+        proportional = loading is None and joint.get("damaged_friction") is None and not (
             lift_law is not None and lift_law.get("law") == "JOINT_MECA_FROT")
         report["displacement_attribution"] = displacement_attribution(
-            first_u, final_u, intact_u if assignment is not None else None, np.unique(wall), factors,
+            first_u, final_u, intact_u, np.unique(wall), factors,
             bool(initiated[0].any()), proportional, sources)
         report.update(cracked)
         report["peak_scope"] = "wall"
@@ -2328,7 +2568,7 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                                concrete_cell_stress=concrete_cell_stress)
         report["paraview"] = paraview
         report["paraview"]["joint_history"] = export_joint_series(
-            export_arrays, factors, damage, jump,
+            export_arrays, instants if loading is not None else factors, damage, jump,
             output_dir / "paraview")
         report["paraview"]["stress_arrays"] = {
             "names": sorted(concrete_cell_stress),
@@ -2395,7 +2635,7 @@ def _verdict(c: dict, complete: bool) -> tuple[str, str]:
                                       f"initiated overlap {overlap:.0%}.")
 
 
-def run(baseline_dir: Path, fenicsx_output: Path, output_dir: Path, time_limit_s: int) -> dict:
+def run(baseline_dir: Path, fenicsx_output: Path, output_dir: Path, time_limit_s: int | None) -> dict:
     started = time.time()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / REPORT_NAME).unlink(missing_ok=True)
