@@ -12,6 +12,10 @@ SETTINGS = {
 CRACK_WATER_SETTINGS = dict(SETTINGS, base_uplift="none")
 MAX_LOAD_INTERVAL_BISECTIONS = 4
 TET_FACES = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
+HEX_FACES = np.array([
+    [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
+    [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7],
+])
 
 
 def validate_settings(settings: dict) -> dict:
@@ -45,13 +49,25 @@ def bisect_load_interval(start: float, target: float, level: int,
 
 def boundary_faces(cells: np.ndarray, nodes: np.ndarray,
                    source_node_ids: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-    faces = cells[:, TET_FACES].reshape(-1, 3)
+    width = np.asarray(cells).shape[1]
+    if width == 4:
+        faces = cells[:, TET_FACES].reshape(-1, 3)
+        faces_per_cell = 4
+        owners = np.repeat(np.arange(len(cells)), faces_per_cell)
+    elif width == 8:
+        quad_faces = cells[:, HEX_FACES].reshape(-1, 4)
+        faces = np.concatenate((quad_faces[:, :3], quad_faces[:, [0, 2, 3]]))
+        faces_per_cell = 12
+        quad_owners = np.repeat(np.arange(len(cells)), 6)
+        owners = np.concatenate((quad_owners, quad_owners))
+    else:
+        raise ValueError("Hydraulic boundaries require TETRA4 or HEXA8 cells")
     identities = faces if source_node_ids is None else source_node_ids[faces]
     _, first, counts = np.unique(np.sort(identities, axis=1), axis=0, return_index=True, return_counts=True)
     rows = first[counts == 1]
     faces = faces[rows].copy()
     cross = np.cross(nodes[faces[:, 1]] - nodes[faces[:, 0]], nodes[faces[:, 2]] - nodes[faces[:, 0]])
-    outward = nodes[faces].mean(axis=1) - nodes[cells[rows // 4]].mean(axis=1)
+    outward = nodes[faces].mean(axis=1) - nodes[cells[owners[rows]]].mean(axis=1)
     flip = np.einsum("ij,ij->i", cross, outward) < 0
     faces[flip] = faces[flip][:, [0, 2, 1]]
     cross[flip] *= -1
@@ -166,18 +182,39 @@ class CrackWater:
     def __init__(self, arrays: dict, upstream_z: float, gradient: float, tolerance: float,
                  pore_faces: np.ndarray | None = None, downstream_z: float | None = None):
         self.nodes = arrays["nodes"]
-        self.faces = arrays["penta6_joints"]
-        self.head = upstream_z - self.nodes[self.faces[:, :3], 2]
+        self.faces = np.asarray(
+            arrays["quad8_joints"] if "quad8_joints" in arrays else arrays["penta6_joints"],
+            dtype=np.int64)
+        self.width = self.faces.shape[1] // 2
+        if self.width not in (3, 4):
+            raise ValueError("Crack-water joints must be TRI6 or QUAD8")
+        minus = self.faces[:, :self.width]
+        self.head = upstream_z - self.nodes[minus, 2]
         self.gradient = gradient
         self.tolerance = tolerance
-        vertices = self.nodes[self.faces[:, :3]]
-        cross = np.cross(vertices[:, 1] - vertices[:, 0], vertices[:, 2] - vertices[:, 0])
+        vertices = self.nodes[minus]
+        if self.width == 3:
+            cross = np.cross(vertices[:, 1] - vertices[:, 0], vertices[:, 2] - vertices[:, 0])
+            self._twice_area = np.linalg.norm(cross, axis=1)
+        else:
+            # Newell normal is order-independent in sign only through node ordering.
+            cross = np.empty((len(vertices), 3))
+            cross[:, 0] = np.sum(vertices[:, :, 1] * np.roll(vertices[:, :, 2], -1, axis=1)
+                                - vertices[:, :, 2] * np.roll(vertices[:, :, 1], -1, axis=1), axis=1)
+            cross[:, 1] = np.sum(vertices[:, :, 2] * np.roll(vertices[:, :, 0], -1, axis=1)
+                                - vertices[:, :, 0] * np.roll(vertices[:, :, 2], -1, axis=1), axis=1)
+            cross[:, 2] = np.sum(vertices[:, :, 0] * np.roll(vertices[:, :, 1], -1, axis=1)
+                                - vertices[:, :, 1] * np.roll(vertices[:, :, 0], -1, axis=1), axis=1)
+            first = (np.cross(vertices[:, 1] - vertices[:, 0], vertices[:, 2] - vertices[:, 0])
+                    + np.cross(vertices[:, 2] - vertices[:, 0], vertices[:, 3] - vertices[:, 0]))
+            self._twice_area = np.linalg.norm(first, axis=1)
         area = np.linalg.norm(cross, axis=1)
         if np.any(area <= 0):
             raise ValueError("Degenerate crack-water triangle")
         self.normals = cross / area[:, None]
-        self.weights = np.array([triangle_pressure_forces(v, h) * gradient
-                                 for v, h in zip(vertices, self.head)]).reshape(-1, 3)
+        self.weights = np.asarray([
+            self._pressure_forces(face, head, gradient) for face, head in zip(minus, self.head)
+        ], dtype=float)
         self.pore = None
         self.pore_report = {"mode": "none"}
         if pore_faces is not None:
@@ -188,12 +225,18 @@ class CrackWater:
                 raise ValueError("Lift-plane uplift needs the tailwater elevation")
             if not pore.any():
                 raise ValueError("Lift-plane uplift has no lift facets")
-            rows = self.faces[pore, :3]
+            rows = self.faces[pore, :self.width]
             ids = np.unique(rows)
-            edges = np.concatenate([np.linalg.norm(self.nodes[rows[:, i]] - self.nodes[rows[:, (i + 1) % 3]], axis=1)
-                                    for i in range(3)])
+            edges = np.concatenate([
+                np.linalg.norm(self.nodes[rows[:, i]] - self.nodes[rows[:, (i + 1) % self.width]], axis=1)
+                for i in range(self.width)])
             band = 0.5 * float(edges.mean())
-            upstream_nodes, downstream_nodes = np.unique(arrays["tri3_upstream"]), np.unique(arrays["tri3_downstream"])
+            upstream_nodes = np.unique(np.concatenate([
+                np.asarray(arrays.get("tri3_upstream", ()), dtype=np.int64).ravel(),
+                np.asarray(arrays.get("quad4_upstream", ()), dtype=np.int64).ravel()]))
+            downstream_nodes = np.unique(np.concatenate([
+                np.asarray(arrays.get("tri3_downstream", ()), dtype=np.int64).ravel(),
+                np.asarray(arrays.get("quad4_downstream", ()), dtype=np.int64).ravel()]))
             fraction = np.zeros(len(self.nodes))
             order = ids[np.argsort(self.nodes[ids, 2], kind="stable")]
             # One plane per elevation cluster; the wall faces are sampled at that elevation.
@@ -210,11 +253,12 @@ class CrackWater:
             linear = ((1 - fraction) * np.maximum(upstream_z - z, 0) + fraction * np.maximum(downstream_z - z, 0))
             self.pore = pore
             self.pore_weights = np.zeros_like(self.weights)
-            self.pore_weights[pore] = np.array([triangle_pressure_forces(self.nodes[face], linear[face]) * gradient
-                                                for face in rows]).reshape(-1, 3)
+            self.pore_weights[pore] = np.array([
+                self._pressure_forces(face, linear[face], gradient) for face in rows
+            ])
             self.pore_report = {
                 "mode": "linear_upstream_to_downstream",
-                "faces": int(pore.sum()), "area_m2": float(area[pore].sum() / 2),
+                "faces": int(pore.sum()), "area_m2": float(self._twice_area[pore].sum() / 2),
                 "upstream_z_m": float(upstream_z), "downstream_z_m": float(downstream_z),
                 "maximum_pressure_pa": float(gradient * linear[ids].max()),
                 "minimum_pressure_pa": float(gradient * linear[ids].min()),
@@ -225,20 +269,27 @@ class CrackWater:
                                "reservoir-connected) faces: full reservoir head"),
             }
         source = arrays["source_node_ids"]
-        upstream = source[arrays["tri3_upstream"]]
-        reservoir_edges = {tuple(sorted(edge)) for face in upstream
-                           for edge in (face[[0, 1]], face[[1, 2]], face[[2, 0]])}
+        upstream_rows = [
+            np.asarray(arrays.get(key, np.empty((0, width))), dtype=np.int64)
+            for key, width in (("tri3_upstream", 3), ("quad4_upstream", 4))
+        ]
+        reservoir_edges = {
+            tuple(sorted(map(int, (face[index], face[(index + 1) % len(face)]))))
+            for rows in upstream_rows for face in source[rows]
+            for index in range(len(face))
+        }
         self.edges = {}
         self.seeds = []
-        for row, face in enumerate(source[self.faces[:, :3]]):
-            for i, j in ((0, 1), (1, 2), (2, 0)):
+        for row, face in enumerate(source[minus]):
+            for i in range(self.width):
+                j = (i + 1) % self.width
                 edge = tuple(sorted((face[i], face[j])))
                 self.edges.setdefault(edge, []).append((row, i, j))
                 if edge in reservoir_edges:
                     self.seeds.append((row, i, j))
 
     def evaluate(self, displacement: np.ndarray, eligible_faces: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        minus, plus = self.faces[:, :3], self.faces[:, 3:]
+        minus, plus = self.faces[:, :self.width], self.faces[:, self.width:]
         opening = np.einsum("fki,fi->fk", displacement[minus] - displacement[plus], self.normals)
         available = (opening.mean(axis=1) > self.tolerance) & (self.head.max(axis=1) > 0)
         if eligible_faces is not None:
@@ -283,10 +334,20 @@ class CrackWater:
             raise ValueError("Crack-water surface elevation must be finite")
         if self.pore is not None:
             raise ValueError("Moving reservoir water is not supported for lift-plane pore pressure")
-        self.head = upstream_z - self.nodes[self.faces[:, :3], 2]
+        self.head = upstream_z - self.nodes[self.faces[:, :self.width], 2]
         self.weights = np.array([
-            triangle_pressure_forces(self.nodes[face[:3]], head) * self.gradient
-            for face, head in zip(self.faces, self.head)]).reshape(-1, 3)
+            self._pressure_forces(face[:self.width], head, self.gradient)
+            for face, head in zip(self.faces, self.head)])
+
+    def _pressure_forces(self, face: np.ndarray, head: np.ndarray, gradient: float) -> np.ndarray:
+        if self.width == 3:
+            return triangle_pressure_forces(self.nodes[np.asarray(face)], np.asarray(head)) * gradient
+        result = np.zeros(4, dtype=float)
+        for rows in ((0, 1, 2), (0, 2, 3)):
+            triangle = np.asarray(face)[list(rows)]
+            result[list(rows)] += triangle_pressure_forces(
+                self.nodes[triangle], np.asarray(head)[list(rows)]) * gradient
+        return result
 
 
 def force_entries(forces: np.ndarray) -> list[dict]:

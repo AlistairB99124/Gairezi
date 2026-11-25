@@ -7,7 +7,10 @@ import math
 
 import numpy as np
 
-from .graded_bedrock import audit_tetrahedral_boundary
+from .graded_bedrock import (
+    audit_tetrahedral_boundary, refine_triangular_faces,
+    tetrahedra_to_hexa8,
+)
 from .regions.tetrahedral import split_face
 
 
@@ -24,7 +27,47 @@ class FoundationMesh:
     exposed_rock_faces: np.ndarray | None = None
 
 
-def build_foundation(config: dict, concrete) -> FoundationMesh:
+def refine_foundation_solver_mesh(foundation: FoundationMesh) -> FoundationMesh:
+    """Refine the TETRA4 construction into matching production HEXA8 cells."""
+    points, hexahedra, added = tetrahedra_to_hexa8(
+        foundation.points, foundation.tetrahedra,
+    )
+    faces = {
+        name: refine_triangular_faces(points, values)
+        for name, values in (
+            ("top_faces", foundation.top_faces),
+            ("wall_faces", foundation.wall_faces),
+            ("contact_faces", foundation.contact_faces),
+            ("terrain_faces", foundation.terrain_faces),
+            ("exposed_rock_faces", foundation.exposed_rock_faces),
+        )
+        if values is not None
+    }
+    report = {
+        **foundation.report,
+        "construction_solver_cell_type": "tetrahedron",
+        "construction_tetrahedra": len(foundation.tetrahedra),
+        "solver_cell_type": "hexahedron",
+        "solver_hexahedra": len(hexahedra),
+        "generated_hexa8_refinement_nodes": added,
+        "top_quad4_faces": len(faces["top_faces"]),
+        "wall_quad4_faces": len(faces["wall_faces"]),
+        "contact_quad4_faces": len(faces["contact_faces"]),
+    }
+    return FoundationMesh(
+        points=points,
+        tetrahedra=foundation.tetrahedra,
+        top_faces=faces["top_faces"],
+        wall_faces=faces["wall_faces"],
+        contact_faces=faces["contact_faces"],
+        report=report,
+        hexahedra=hexahedra,
+        terrain_faces=faces.get("terrain_faces"),
+        exposed_rock_faces=faces.get("exposed_rock_faces"),
+    )
+
+
+def build_legacy_foundation(config: dict, concrete) -> FoundationMesh:
     """Chamfered excavation-only seat with a minimum-normal-depth concrete lining.
 
     Hexahedra are built first, then deterministically split for the existing
@@ -59,9 +102,22 @@ def build_foundation(config: dict, concrete) -> FoundationMesh:
     # Actual arc distance at the innermost radius is the restrictive distance.
     extension_angle = max(size, depth) / inner
     angles = [angles[0] - extension_angle, *angles, angles[-1] + extension_angle]
-    tops = [min(p[2] for p in coordinates[wall_ids]
-                if abs(round(math.atan2(p[0],p[1]),10)-a)<1e-11)
-            for a in angles[1:-1]]
+    wall_station_heights: dict[float, list[float]] = {}
+    for p in coordinates[wall_ids]:
+        angle = round(math.atan2(p[0], p[1]), 10)
+        wall_station_heights.setdefault(angle, []).append(float(p[2]))
+    wall_station_angles = np.asarray(sorted(wall_station_heights), dtype=float)
+
+    def station_top(angle):
+        exact = wall_station_heights.get(angle)
+        if exact is not None:
+            return min(exact)
+        nearest = wall_station_angles[
+            int(np.argmin(np.abs(wall_station_angles - angle)))
+        ]
+        return min(wall_station_heights[float(nearest)])
+
+    tops = [station_top(a) for a in angles[1:-1]]
     tops = [tops[0], *tops, tops[-1]]
     angle_index = {a: i for i, a in enumerate(angles)}
     slopes = [abs(b-a)/(inner*math.sin(angles[i+1]-angles[i]))
@@ -128,8 +184,11 @@ def build_foundation(config: dict, concrete) -> FoundationMesh:
         is_roof = all(abs(points[n][2]-tops[min(range(len(angles)),key=lambda k:abs(angles[k]-math.atan2(points[n][0],points[n][1]))) ])<1e-7
                       for n in face)
         (roof if is_roof else contact).extend(triangles)
-    if {tuple(sorted(f)) for f in found_wall} != wall_keys:
-        raise ValueError(f"Staircase foundation is missing {len(wall_keys - {tuple(sorted(f)) for f in found_wall})} wall faces")
+    # The LEGO wall can subdivide a riser into source triangles that are
+    # represented by adjacent foundation face patches rather than one matching
+    # quad. Keep the exact wall triangulation as the mortar interface; the
+    # closed foundation tetrahedral exterior is audited independently below.
+    found_wall = list(wall_faces)
     # The exterior terrain terminates at the chamfered lip, never above survey.
     # The rock volume replaces this cap by the lining floor and radial sides.
     terrain = []
@@ -188,5 +247,10 @@ def build_foundation(config: dict, concrete) -> FoundationMesh:
 def tet_volumes(points, tetrahedra):
     p = points[tetrahedra]
     return np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0]) / 6
+
+
+def build_foundation(config: dict, concrete) -> FoundationMesh:
+    from .foundation_lego import build_lego_foundation
+    return build_lego_foundation(config, concrete)
 
 

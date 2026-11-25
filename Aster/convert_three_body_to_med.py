@@ -110,10 +110,25 @@ def convert(npz_path: Path, med_path: Path) -> None:
     coords = mc.DataArrayDouble(nodes.tolist(), nodes.shape[0], nodes.shape[1])
     coords.setInfoOnComponents(["X [m]", "Y [m]", "Z [m]"])
 
-    volume_blocks = [
-        (mc.NORM_TETRA4, data["tetra4_concrete"], "CONCRETE"),
-        (mc.NORM_TETRA4, data["tetra4_bedrock"], "BEDROCK"),
-    ]
+    native_wall = "hexa8_wall" in data and len(data["hexa8_wall"])
+    if native_wall:
+        volume_blocks = [
+            (mc.NORM_HEXA8, data["hexa8_wall"], "WALL"),
+            (
+                mc.NORM_HEXA8,
+                data["hexa8_foundation"]
+                if "hexa8_foundation" in data else data["tetra4_foundation"],
+                "FOUNDATION",
+            ) if "hexa8_foundation" in data else (
+                mc.NORM_TETRA4, data["tetra4_foundation"], "FOUNDATION"
+            ),
+        ]
+    else:
+        volume_blocks = [(mc.NORM_TETRA4, data["tetra4_concrete"], "CONCRETE")]
+    if "hexa8_bedrock" in data and len(data["hexa8_bedrock"]):
+        volume_blocks.append((mc.NORM_HEXA8, data["hexa8_bedrock"], "BEDROCK"))
+    elif len(data["tetra4_bedrock"]):
+        volume_blocks.append((mc.NORM_TETRA4, data["tetra4_bedrock"], "BEDROCK"))
     # Optional mortar fill: its own group after concrete and bedrock, so their cell indices stay.
     mortar_count = len(data["tetra4_mortar"]) if "tetra4_mortar" in data else 0
     if mortar_count:
@@ -124,17 +139,20 @@ def convert(npz_path: Path, med_path: Path) -> None:
     elif "penta6_joints" in data and len(data["penta6_joints"]):
         volume_blocks.append((mc.NORM_PENTA6, data["penta6_joints"], "JOINTS"))
     volume_mesh, volume_group_arrays = _build_level(MESH_NAME, 3, coords, volume_blocks)
-    if "concrete_body_ids" in data:
+    if "concrete_body_ids" in data and not native_wall:
         for body, name in ((1, "WALL"), (3, "FOUNDATION")):
             ids = np.flatnonzero(data["concrete_body_ids"] == body)
             if len(ids):
                 group = mc.DataArrayInt.New(ids.tolist())
                 group.setName(name)
                 volume_group_arrays.append(group)
-    if "damaged_cells" in data:
+    if "damaged_cells" in data and not native_wall:
         selected = np.asarray(data["damaged_cells"])
+        bedrock_count = len(data["tetra4_bedrock"]) + (
+            len(data["hexa8_bedrock"]) if "hexa8_bedrock" in data else 0
+        )
         if (selected.dtype != np.dtype(bool)
-                or selected.shape != (len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"]),)
+                or selected.shape != (len(data["tetra4_concrete"]) + bedrock_count,)
                 or selected[len(data["tetra4_concrete"]):].any()
                 or np.any(~np.isin(data["concrete_body_ids"][selected[:len(data["tetra4_concrete"])]], (1, 3)))):
             raise ValueError("Damaged material group must contain only selected wall/foundation tetrahedra")
@@ -158,19 +176,35 @@ def convert(npz_path: Path, med_path: Path) -> None:
                    (~lift & ~damaged & ~vertical, "INTACT_JOINTS"))
         for selected, name in classes:
             mask = selected[data["joint_parent_faces"]]
-            ids = np.flatnonzero(mask) + len(data["tetra4_concrete"]) + len(data["tetra4_bedrock"]) + mortar_count
+            concrete_count = (len(data["hexa8_wall"]) + (
+                len(data["hexa8_foundation"])
+                if "hexa8_foundation" in data else len(data["tetra4_foundation"])
+            )
+                              if native_wall else len(data["tetra4_concrete"]))
+            bedrock_count = len(data["tetra4_bedrock"]) + (
+                len(data["hexa8_bedrock"]) if "hexa8_bedrock" in data else 0
+            )
+            ids = np.flatnonzero(mask) + concrete_count + bedrock_count + mortar_count
             if len(ids):
                 group = mc.DataArrayInt.New(ids.tolist())
                 group.setName(name)
                 volume_group_arrays.append(group)
 
-    face_blocks = [
-        (mc.NORM_TRI3, data["tri3_upstream"], "UPSTREAM"),
-        (mc.NORM_TRI3, data["tri3_downstream"], "DOWNSTREAM"),
-        (mc.NORM_TRI3, data["tri3_crest"], "CREST"),
-        (mc.NORM_TRI3, data["tri3_rock_bottom"], "ROCK_BOTTOM"),
-        (mc.NORM_TRI3, data["tri3_rock_sides"], "ROCK_SIDES"),
-    ]
+    face_blocks = []
+    for name, group in (
+        ("tri3_upstream", "UPSTREAM"), ("tri3_downstream", "DOWNSTREAM"),
+        ("tri3_crest", "CREST"), ("tri3_rock_bottom", "ROCK_BOTTOM"),
+        ("tri3_rock_sides", "ROCK_SIDES"),
+    ):
+        if name in data and len(data[name]):
+            face_blocks.append((mc.NORM_TRI3, data[name], group))
+    for name, group in (
+        ("quad4_upstream", "UPSTREAM"), ("quad4_downstream", "DOWNSTREAM"),
+        ("quad4_crest", "CREST"), ("quad4_rock_bottom", "ROCK_BOTTOM"),
+        ("quad4_rock_sides", "ROCK_SIDES"),
+    ):
+        if name in data and len(data[name]):
+            face_blocks.append((mc.NORM_QUAD4, data[name], group))
     face_mesh, face_group_arrays = _build_level(MESH_NAME, 2, coords, face_blocks)
 
     condensed = "condensed_gravity_load_n" in data

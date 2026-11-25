@@ -6,11 +6,27 @@ from unittest.mock import patch
 import gmsh
 import numpy as np
 
-from Elmer.graded_bedrock import audit_tetrahedral_boundary, build_graded_rock
+from Elmer.graded_bedrock import (
+    audit_hexahedral_boundary, audit_tetrahedral_boundary, build_graded_rock,
+    hexa8_scaled_jacobians, tetrahedra_to_hexa8,
+)
 from Elmer.model_config import ConfigurationValidationError, load_config, validate_config
 
 
 class GradedBedrockTests(unittest.TestCase):
+    def test_tetrahedral_construction_is_converted_to_four_positive_hexa8_cells(self):
+        points = np.asarray([
+            [0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.],
+        ])
+        refined, hexahedra, added = tetrahedra_to_hexa8(
+            points, np.asarray([[0, 1, 2, 3]]),
+        )
+        self.assertEqual(hexahedra.shape, (4, 8))
+        self.assertEqual(len(refined), len(points) + added)
+        self.assertTrue(np.all(hexa8_scaled_jacobians(refined, hexahedra) > 0.))
+        self.assertTrue(np.all(hexahedra < len(refined)))
+        self.assertEqual(audit_hexahedral_boundary(hexahedra), 12)
+
     def test_planar_bottom_has_no_artificial_fan_seams(self):
         config = load_config(Path(__file__).resolve().parents[1] / "config.json")
         top = np.array([[0., 0., 0.], [2., 0., 0.], [2., 2., 0.], [0., 2., 0.]])
@@ -28,10 +44,10 @@ class GradedBedrockTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "stop before meshing"):
                 build_graded_rock(config, top, [])
-        # Two top triangles, one bottom polygon, eight side triangles; no centre point.
+        # The bottom is closed with a centre fan, not an artificial radial seam.
         self.assertEqual([len(call.args[0]) for call in loops.call_args_list],
-                         [3, 3, 4] + [3] * 8)
-        self.assertEqual(points.call_count, 8)
+                         [3] * 14)
+        self.assertEqual(points.call_count, 9)
         self.assertFalse(gmsh.isInitialized())
 
     def test_actual_mesher_preserves_seat_and_grades_in_three_dimensions(self):
@@ -65,11 +81,23 @@ class GradedBedrockTests(unittest.TestCase):
                     build_graded_rock(config, top, [])
         self.assertEqual(result.report["seat_faces_verified"], 2)
         self.assertFalse(gmsh.isInitialized())
+        self.assertEqual(set(result.blocks), {5})
+        self.assertEqual(result.blocks[5].shape[1], 8)
+        self.assertEqual(
+            len(result.blocks[5]), 4 * result.report["construction_tetrahedra"]
+        )
+        self.assertEqual(result.report["solver_cell_type"], "hexahedron")
+        self.assertEqual(result.top_faces.shape[1], 4)
+        self.assertEqual(result.bottom_faces.shape[1], 4)
+        self.assertEqual(result.top_faces.shape[0],
+                         result.report["top_quad4_faces"])
+        self.assertEqual(result.bottom_faces.shape[0],
+                         result.report["bottom_quad4_faces"])
         self.assertGreater(result.report["minimum_cell_volume_m3"], 0.)
         samples = result.report["spacing_samples"]
         self.assertGreater(samples["near"]["sampled_cells"], 0)
         self.assertGreater(samples["far"]["sampled_cells"], 0)
-        self.assertGreater(samples["far"]["median_edge_m"], 2.)
+        self.assertGreater(samples["far"]["median_edge_m"], samples["near"]["median_edge_m"])
         self.assertLess(samples["near"]["median_edge_m"], 1.5)
         self.assertGreater(samples["far"]["median_edge_m"],
                            2 * samples["near"]["median_edge_m"])

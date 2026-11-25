@@ -124,7 +124,17 @@ def split_for_joints(arrays: dict, faces: np.ndarray) -> dict:
     (one PENTA6 row per face, in ``faces`` order: minus triangle then plus triangle).
     """
     nodes = np.asarray(arrays["nodes"], dtype=float)
-    concrete = np.asarray(arrays["tetra4_concrete"], dtype=np.int64)
+    faces_array = np.asarray(faces, dtype=np.int64)
+    if "hexa8_wall" in arrays and faces_array.ndim == 2 and faces_array.shape[1] == 4:
+        return _split_hexa_wall_for_joints(arrays, faces_array)
+    native_wall = "hexa8_wall" in arrays
+    if native_wall and "hexa8_foundation" in arrays:
+        concrete = np.asarray(arrays["hexa8_foundation"], dtype=np.int64)
+    else:
+        concrete = np.asarray(
+            arrays.get("hexa8_foundation", arrays["tetra4_foundation"])
+            if native_wall else arrays["tetra4_concrete"],
+            dtype=np.int64)
     bedrock = np.asarray(arrays["tetra4_bedrock"], dtype=np.int64)
     tets = np.vstack([concrete, bedrock])
     faces = np.asarray(faces, dtype=np.int64)
@@ -280,44 +290,88 @@ def split_for_joints(arrays: dict, faces: np.ndarray) -> dict:
     new_pairs, new_areas, new_stiffness, new_names, spring_shares = [pairs.copy()], [areas.copy()], \
         [stiffness.copy()], [names.copy()], []
     side_nodes = [set(pairs[:, 0].tolist()), set(pairs[:, 1].tolist())]
+    joint_slave = np.asarray(arrays.get("joint_slave_tri3", np.empty((0, 3))), dtype=np.int64).reshape(-1, 3)
+    joint_master = np.asarray(arrays.get("joint_master_tri3", np.empty((0, 3))), dtype=np.int64).reshape(-1, 3)
+    if len(joint_slave) != len(joint_master):
+        raise CorroborationError("Wall/interface spring triangulations do not have matching row counts")
     added = 0
     for row in np.flatnonzero(np.isin(pairs, list(copies)).any(axis=1)):
         split_ends = [end for end in (0, 1) if int(pairs[row, end]) in copies]
-        if len(split_ends) != 1:
-            raise CorroborationError(f"Interface spring {row} joins two split nodes")
-        end = split_ends[0]
-        node = int(pairs[row, end])
-        weights = []
-        for _, component in copies[node]:
-            weight = 0.0
-            for tet in component.tolist():
-                others = [int(v) for v in tets[tet] if v != node]
-                for drop in range(3):
-                    tri = [node] + [others[k] for k in range(3) if k != drop]
-                    code = int(_codes(np.array([tri]), base)[0])
-                    if code in loaded_codes or len(owners(code)) != 1:
-                        continue
-                    if all(v in side_nodes[end] for v in tri):
-                        weight += _tri_area(nodes, tri) / 3.0
-            weights.append(weight)
-        weights = np.asarray(weights)
-        weights = weights / weights.sum() if weights.sum() > 0 else np.full(len(weights), 1.0 / len(weights))
+        if len(split_ends) == 1:
+            end = split_ends[0]
+            node = int(pairs[row, end])
+            weights = []
+            for _, component in copies[node]:
+                weight = 0.0
+                for tet in component.tolist():
+                    others = [int(v) for v in tets[tet] if v != node]
+                    for drop in range(3):
+                        tri = [node] + [others[k] for k in range(3) if k != drop]
+                        code = int(_codes(np.array([tri]), base)[0])
+                        if code in loaded_codes or len(owners(code)) != 1:
+                            continue
+                        if all(v in side_nodes[end] for v in tri):
+                            weight += _tri_area(nodes, tri) / 3.0
+                weights.append(weight)
+            weights = np.asarray(weights)
+            weights = weights / weights.sum() if weights.sum() > 0 else np.full(
+                len(weights), 1.0 / len(weights))
+            sharing = [(copy_id, float(weight)) for (copy_id, _), weight in zip(copies[node], weights)
+                       if weight > 0]
+            replacement_pairs = []
+            for copy_id, weight in sharing:
+                pair = pairs[row].copy()
+                pair[end] = copy_id
+                replacement_pairs.append((pair, float(weight)))
+        else:
+            matching = (np.any(joint_slave == int(pairs[row, 0]), axis=1)
+                        & np.any(joint_master == int(pairs[row, 1]), axis=1))
+            if not matching.any():
+                raise CorroborationError(f"Interface spring {row} has no matching source triangles")
+            by_pair: dict[tuple[int, int], float] = {}
+            for slave_face, master_face in zip(joint_slave[matching], joint_master[matching]):
+                slave_tets = owners(int(_codes(slave_face.reshape(1, 3), base)[0]))
+                master_tets = owners(int(_codes(master_face.reshape(1, 3), base)[0]))
+                if len(slave_tets) != 1 or len(master_tets) != 1:
+                    raise CorroborationError(
+                        f"Interface spring {row} has a face that is not uniquely attached")
+                slave_remapped = remap(slave_face.tolist(), int(slave_tets[0]))
+                master_remapped = remap(master_face.tolist(), int(master_tets[0]))
+                slave_position = np.flatnonzero(slave_face == int(pairs[row, 0]))
+                master_position = np.flatnonzero(master_face == int(pairs[row, 1]))
+                if len(slave_position) != 1 or len(master_position) != 1:
+                    raise CorroborationError(
+                        f"Interface spring {row} endpoints do not match their source triangles")
+                mapped_pair = (slave_remapped[int(slave_position[0])],
+                               master_remapped[int(master_position[0])])
+                by_pair[mapped_pair] = by_pair.get(mapped_pair, 0.0) + \
+                    _tri_area(nodes, slave_face) / 3.0
+            total_area = sum(by_pair.values())
+            if total_area <= 0 or not np.isclose(total_area, areas[row]):
+                raise CorroborationError(
+                    f"Interface spring {row} split area does not match its source area")
+            replacement_pairs = [
+                (np.asarray(pair, dtype=np.int64), area / total_area)
+                for pair, area in sorted(by_pair.items())
+            ]
         # Copies with no interface area keep no spring; the original row moves to the first sharing copy.
-        sharing = [(copy_id, float(weight)) for (copy_id, _), weight in zip(copies[node], weights) if weight > 0]
-        new_pairs[0][row, end] = sharing[0][0]
+        replacement, first_fraction = replacement_pairs[0]
+        new_pairs[0][row] = replacement
         share_rows = [int(row)]
-        for copy_id, weight in sharing[1:]:
-            pair = pairs[row].copy()
-            pair[end] = copy_id
+        for pair, weight in replacement_pairs[1:]:
             new_pairs.append(pair[None, :])
             new_areas.append(np.array([areas[row] * weight]))
             new_stiffness.append(stiffness[row][None, :] * weight)
             new_names.append(names[row:row + 1])
             share_rows.append(len(pairs) + added)
             added += 1
-        new_areas[0][row] = areas[row] * sharing[0][1]
-        new_stiffness[0][row] = stiffness[row] * sharing[0][1]
-        spring_shares.append({"row": int(row), "rows": share_rows, "fractions": [w for _, w in sharing]})
+        new_areas[0][row] = areas[row] * first_fraction
+        new_stiffness[0][row] = stiffness[row] * first_fraction
+        spring_shares.append({
+            "row": int(row),
+            "rows": share_rows,
+            "fractions": [weight for _, weight in replacement_pairs],
+        })
     result["seg2_wall_foundation_springs"] = np.vstack(new_pairs)
     result["wall_foundation_tributary_area_m2"] = np.concatenate(new_areas)
     result["interface_stiffness_n_per_m"] = np.vstack(new_stiffness)
@@ -329,6 +383,119 @@ def split_for_joints(arrays: dict, faces: np.ndarray) -> dict:
         "added_nodes": next_id - len(nodes),
         "tip_ties": len(tip_copy),
         "spring_shares": spring_shares,
+    }
+
+
+def _split_hexa_wall_for_joints(arrays: dict, faces: np.ndarray) -> dict:
+    """Split native HEXA8 wall QUAD4 interfaces and retain each node star."""
+    points = np.asarray(arrays["nodes"], dtype=float)
+    wall = np.asarray(arrays["hexa8_wall"], dtype=np.int64)
+    from Aster.mixed_topology import HEX_FACES, interior_wall_faces
+    inventory, owners = interior_wall_faces(wall)
+    lookup = {tuple(face): tuple(pair) for face, pair in zip(inventory.tolist(), owners.tolist())}
+    if len(np.unique(np.sort(faces, axis=1), axis=0)) != len(faces):
+        raise CorroborationError("Candidate facets are repeated")
+    adjacent = []
+    for face in np.sort(faces, axis=1).tolist():
+        pair = lookup.get(tuple(face))
+        if pair is None:
+            raise CorroborationError("Candidate facet is not shared by exactly two native wall HEXA8 cells")
+        adjacent.append(pair)
+    adjacent = np.asarray(adjacent, dtype=np.int64).reshape(-1, 2)
+    candidate = {tuple(face) for face in np.sort(faces, axis=1).tolist()}
+    shared: dict[tuple[int, ...], tuple[int, int]] = {}
+    all_faces = np.sort(wall[:, HEX_FACES], axis=2)
+    for face_cell, pair in ((tuple(face), int(owner)) for owner, face_rows in enumerate(all_faces.tolist())
+                            for face in face_rows):
+        existing = shared.get(face_cell)
+        shared[face_cell] = (existing[0], pair) if existing else (pair, -1)
+    base = len(points)
+    changed = wall.copy()
+    source_ids = np.asarray(arrays.get("source_node_ids", np.arange(base)), dtype=np.int64)
+    copies: dict[int, list[tuple[int, np.ndarray]]] = {}
+    added_points: list[np.ndarray] = []
+    added_sources: list[int] = []
+    next_id = base
+    for node in np.unique(faces):
+        incident = np.flatnonzero(np.isin(wall, node).any(axis=1))
+        parent = {int(cell): int(cell) for cell in incident}
+
+        def root(cell):
+            while parent[cell] != cell:
+                parent[cell] = parent[parent[cell]]
+                cell = parent[cell]
+            return cell
+
+        for face_key, pair in shared.items():
+            if node not in face_key or pair[1] < 0 or face_key in candidate:
+                continue
+            left, right = pair
+            if left in parent and right in parent:
+                a, b = root(left), root(right)
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+        groups: dict[int, list[int]] = {}
+        for cell in incident:
+            groups.setdefault(root(int(cell)), []).append(int(cell))
+        components = [np.asarray(value, dtype=np.int64) for _, value in sorted(groups.items())]
+        if len(components) < 2:
+            continue
+        assignments = [(int(node), components[0])]
+        for component in components[1:]:
+            for cell in component:
+                changed[cell][wall[cell] == node] = next_id
+            assignments.append((next_id, component))
+            added_points.append(points[node])
+            added_sources.append(int(source_ids[node]))
+            next_id += 1
+        copies[int(node)] = assignments
+
+    def remap(face, cell):
+        return [int(changed[cell][list(wall[cell]).index(int(node))]) for node in face]
+
+    new_points = np.vstack([points, np.asarray(added_points, dtype=float).reshape(-1, 3)])
+    joints = np.empty((len(faces), 8), dtype=np.int64)
+    for index, (face, pair) in enumerate(zip(faces.tolist(), adjacent.tolist())):
+        normal = np.cross(points[face[1]] - points[face[0]], points[face[2]] - points[face[0]])
+        if np.dot(new_points[changed[pair[1]]].mean(0) - points[face].mean(0), normal) > 0:
+            face = [face[0], face[3], face[2], face[1]]
+        joints[index, :4] = remap(face, pair[0])
+        joints[index, 4:] = remap(face, pair[1])
+    tip_pairs = []
+    for joint in joints:
+        for column in range(4):
+            if joint[column] != joint[column + 4]:
+                continue
+            original = int(joint[column])
+            copy = len(new_points)
+            new_points = np.vstack([new_points, new_points[original][None, :]])
+            added_sources.append(int(source_ids[original] if original < len(source_ids)
+                                     else added_sources[original - len(source_ids)]))
+            joint[column + 4] = copy
+            tip_pairs.append((original, copy))
+    result = {key: np.asarray(value).copy() for key, value in arrays.items()}
+    result["nodes"] = new_points
+    result["hexa8_wall"] = changed
+    result["source_node_ids"] = np.concatenate((source_ids, np.asarray(added_sources, dtype=np.int64)))
+    result["tie_node_pairs"] = np.asarray(sorted(tip_pairs), dtype=np.int64).reshape(-1, 2)
+    for key, width in (("tri3_upstream", 3), ("tri3_downstream", 3), ("tri3_crest", 3),
+                       ("quad4_upstream", 4), ("quad4_downstream", 4), ("quad4_crest", 4)):
+        rows = np.asarray(arrays.get(key, np.empty((0, width))), dtype=np.int64).reshape(-1, width).copy()
+        for row in np.flatnonzero(np.isin(rows, list(copies)).any(axis=1)):
+            source = tuple(sorted(rows[row].tolist()))
+            cell = next((int(cell) for cell in range(len(wall))
+                         if np.isin(wall[cell], source).sum() >= min(3, width)), None)
+            if cell is not None:
+                rows[row] = remap(rows[row], cell)
+        result[key] = rows
+    return {
+        "arrays": result,
+        "joints": joints,
+        "joint_face_width": 4,
+        "split_nodes": len(copies),
+        "added_nodes": len(result["nodes"]) - len(points),
+        "tip_ties": len(tip_pairs),
+        "spring_shares": [],
     }
 
 
@@ -392,11 +559,201 @@ def apply_support_degradation(manifest: dict, arrays: dict, degradation: dict) -
     return applied
 
 
+def limit_cracking_bedrock(
+    arrays: dict, radius_m: float, spring_n_per_m3: dict[str, float],
+) -> dict:
+    """Retain bedrock within ``radius_m`` of the foundation for nonlinear cracking.
+
+    The accepted elastic baseline still uses the full bedrock volume. The local
+    nonlinear model replaces the omitted outer rock with distributed springs on
+    its newly exposed cut surface; otherwise that boundary would be traction-free
+    and the reduced model would not represent foundation restraint.
+    """
+    if (isinstance(radius_m, bool) or not np.isfinite(radius_m) or float(radius_m) < 0):
+        raise CorroborationError("Cracking bedrock radius must be finite and nonnegative")
+    coefficients = np.asarray([spring_n_per_m3[axis] for axis in ("x", "y", "z")], dtype=float)
+    if coefficients.shape != (3,) or not np.isfinite(coefficients).all() or np.any(coefficients <= 0):
+        raise CorroborationError("Cracking bedrock cut supports need positive directional stiffness")
+    native_wall = "hexa8_wall" in arrays
+    concrete = np.asarray(
+        arrays["tetra4_foundation"] if native_wall else arrays["tetra4_concrete"],
+        dtype=np.int64)
+    bodies = (np.full(len(concrete), 3, dtype=np.int64) if native_wall
+              else np.asarray(arrays["concrete_body_ids"], dtype=np.int64))
+    hexa_bedrock = np.asarray(
+        arrays.get("hexa8_bedrock", np.empty((0, 8), dtype=np.int64)),
+        dtype=np.int64,
+    )
+    bedrock = np.asarray(arrays["tetra4_bedrock"], dtype=np.int64)
+    if len(hexa_bedrock) and len(bedrock):
+        raise CorroborationError("Bedrock cannot mix HEXA8 and TETRA4 cells")
+    bedrock = hexa_bedrock if len(hexa_bedrock) else bedrock
+    points = np.asarray(arrays["nodes"], dtype=float)
+    if len(bedrock) == 0:
+        return {"enabled": False, "radius_m": float(radius_m), "reason": "no bedrock volume"}
+    foundation = concrete[bodies == 3]
+    if len(foundation) == 0:
+        raise CorroborationError("Local bedrock cracking scope requires a concrete foundation")
+    foundation_nodes = np.unique(foundation)
+    if float(radius_m) == 0:
+        if "hexa8_foundation" in arrays:
+            from Aster.mixed_topology import HEX_FACES
+            foundation_quads = np.sort(
+                foundation[:, HEX_FACES].reshape(-1, 4), axis=1
+            )
+            foundation_faces = np.asarray([
+                tuple(sorted((int(face[0]), int(face[1]), int(face[2]))))
+                for face in foundation_quads
+            ] + [
+                tuple(sorted((int(face[0]), int(face[2]), int(face[3]))))
+                for face in foundation_quads
+            ], dtype=np.int64)
+        else:
+            foundation_faces = np.sort(
+                foundation[:, _TET_FACES].reshape(-1, 3), axis=1
+            )
+        if len(hexa_bedrock):
+            from Aster.mixed_topology import HEX_FACES
+            quads = bedrock[:, HEX_FACES].reshape(-1, 4)
+            split = [
+                tuple(face[indices])
+                for face in quads
+                for indices in ((np.argmin(face) % 4,
+                                 (np.argmin(face) + 1) % 4,
+                                 (np.argmin(face) + 2) % 4),
+                                (np.argmin(face) % 4,
+                                 (np.argmin(face) + 2) % 4,
+                                 (np.argmin(face) + 3) % 4))
+            ]
+            bedrock_faces = np.sort(np.asarray(split, dtype=np.int64), axis=1)
+        else:
+            bedrock_faces = np.sort(
+                bedrock[:, _TET_FACES].reshape(-1, 3), axis=1)
+        foundation_set = {tuple(face) for face in foundation_faces.tolist()}
+        interface = np.asarray(
+            [face for face in {tuple(face) for face in bedrock_faces.tolist()}
+             if face in foundation_set], dtype=np.int64).reshape(-1, 3)
+        if len(interface) == 0:
+            raise CorroborationError(
+                "Cannot replace cracking bedrock with foundation springs: no shared foundation/bedrock faces")
+        matrices: dict[int, np.ndarray] = {}
+        for face in interface:
+            p0, p1, p2 = points[face]
+            area = 0.5 * float(np.linalg.norm(np.cross(p1 - p0, p2 - p0)))
+            addition = np.diag(coefficients) * (area / 3.0)
+            for node in face:
+                matrices[int(node)] = matrices.get(int(node), np.zeros((3, 3))) + addition
+        source_bedrock = len(bedrock)
+        arrays["tetra4_bedrock"] = np.empty((0, 4), dtype=np.int64)
+        if len(hexa_bedrock):
+            arrays["hexa8_bedrock"] = np.empty((0, 8), dtype=np.int64)
+        arrays["tri3_rock_bottom"] = np.empty((0, 3), dtype=np.int64)
+        arrays["tri3_rock_sides"] = np.empty((0, 3), dtype=np.int64)
+        arrays["poi1_rock_bottom_nodes"] = np.empty(0, dtype=np.int64)
+        arrays["support_nodes"] = np.asarray(sorted(matrices), dtype=np.int64)
+        arrays["support_matrices_n_per_m"] = np.asarray(
+            [matrices[node] for node in sorted(matrices)], dtype=float)
+        rows = np.asarray(arrays["source_cell_rows"])
+        arrays["source_cell_rows"] = rows[:-len(bedrock)] if native_wall else rows[:len(concrete)]
+        arrays["cracking_bedrock_scope"] = np.asarray([0, source_bedrock], dtype=np.int64)
+        return {
+            "enabled": True,
+            "radius_m": 0.0,
+            "foundation_nodes": int(len(foundation_nodes)),
+            "source_bedrock_cells": int(source_bedrock),
+            "retained_bedrock_cells": 0,
+            "removed_bedrock_cells": int(source_bedrock),
+            "interface_faces": int(len(interface)),
+            "cut_support_nodes": int(len(matrices)),
+            "representation": "distributed springs on the concrete foundation/bedrock interface",
+        }
+    from scipy.spatial import cKDTree
+    centroids = points[bedrock].mean(axis=1)
+    distance = cKDTree(points[foundation_nodes]).query(centroids, k=1)[0]
+    keep = distance <= float(radius_m)
+    if not keep.any() or keep.all():
+        raise CorroborationError(
+            f"Cracking bedrock radius {radius_m:g} m does not create a valid local cut")
+
+    source_bedrock = bedrock
+    if len(hexa_bedrock):
+        from Aster.mixed_topology import HEX_FACES
+        quads = source_bedrock[:, HEX_FACES].reshape(-1, 4)
+        split_faces = []
+        for face in quads:
+            start = int(np.argmin(face))
+            split_faces.extend((
+                tuple(sorted((int(face[start]), int(face[(start + 1) % 4]),
+                              int(face[(start + 2) % 4])))),
+                tuple(sorted((int(face[start]), int(face[(start + 2) % 4]),
+                              int(face[(start + 3) % 4])))),
+            ))
+        faces = np.asarray(split_faces, dtype=np.int64)
+    else:
+        faces = np.sort(source_bedrock[:, _TET_FACES].reshape(-1, 3), axis=1)
+    unique, inverse, counts = np.unique(faces, axis=0, return_inverse=True, return_counts=True)
+    repeated_keep = np.repeat(keep, 12 if len(hexa_bedrock) else 4)
+    kept_counts = np.bincount(inverse, weights=repeated_keep, minlength=len(unique)).astype(np.int64)
+    cut = (counts == 2) & (kept_counts == 1)
+    cut_faces = unique[cut]
+    if len(cut_faces) == 0:
+        raise CorroborationError("Local bedrock scope produced no supported cut surface")
+
+    retained_cells = bedrock[keep]
+    retained_nodes = set(np.unique(retained_cells).tolist())
+    old_support_nodes = np.asarray(arrays["support_nodes"], dtype=np.int64)
+    old_support_matrices = np.asarray(arrays["support_matrices_n_per_m"], dtype=float)
+    matrices: dict[int, np.ndarray] = {}
+    for node, matrix in zip(old_support_nodes, old_support_matrices):
+        if int(node) in retained_nodes:
+            matrices[int(node)] = matrices.get(int(node), np.zeros((3, 3))) + matrix
+    for face in cut_faces:
+        p0, p1, p2 = points[face]
+        area = 0.5 * float(np.linalg.norm(np.cross(p1 - p0, p2 - p0)))
+        addition = np.diag(coefficients) * (area / 3.0)
+        for node in face:
+            matrices[int(node)] = matrices.get(int(node), np.zeros((3, 3))) + addition
+
+    concrete_count = len(concrete)
+    source_rows = np.asarray(arrays["source_cell_rows"], dtype=np.int64)
+    bedrock_start = len(source_rows) - len(source_bedrock)
+    arrays["source_cell_rows"] = np.concatenate((source_rows[:bedrock_start],
+                                                source_rows[bedrock_start:][keep]))
+    if len(hexa_bedrock):
+        arrays["hexa8_bedrock"] = retained_cells
+    else:
+        arrays["tetra4_bedrock"] = retained_cells
+    arrays["support_nodes"] = np.asarray(sorted(matrices), dtype=np.int64)
+    arrays["support_matrices_n_per_m"] = np.asarray(
+        [matrices[node] for node in sorted(matrices)], dtype=float)
+    for key in ("tri3_rock_bottom", "tri3_rock_sides"):
+        faces = np.asarray(arrays.get(key, np.empty((0, 3))), dtype=np.int64).reshape(-1, 3)
+        arrays[key] = faces[np.all(np.isin(faces, list(retained_nodes)), axis=1)]
+    arrays["poi1_rock_bottom_nodes"] = np.unique(arrays["tri3_rock_bottom"]).astype(np.int64)
+    arrays["local_bedrock_cut_faces"] = cut_faces.astype(np.int64)
+    report = {
+        "enabled": True,
+        "radius_m": float(radius_m),
+        "foundation_nodes": int(len(foundation_nodes)),
+        "source_bedrock_cells": int(len(source_bedrock)),
+        "retained_bedrock_cells": int(retained_cells.shape[0]),
+        "removed_bedrock_cells": int((~keep).sum()),
+        "cut_faces": int(len(cut_faces)),
+        "cut_support_nodes": int(len(np.unique(cut_faces))),
+    }
+    arrays["cracking_bedrock_scope"] = np.asarray([len(retained_cells), len(source_bedrock)],
+                                                  dtype=np.int64)
+    return report
+
+
 def split_manifest(manifest: dict, split: dict) -> dict:
     """Mesh manifest for the split mesh: interface springs follow the split rows."""
     result = json.loads(json.dumps(manifest))
     springs = result["wall_foundation_springs"]
     arrays = split["arrays"]
+    if "hexa8_wall" in arrays:
+        split["relief_copies"] = 0
+        return 0
     if len(springs) + sum(len(share["rows"]) - 1 for share in split["spring_shares"]) != \
             len(arrays["seg2_wall_foundation_springs"]):
         raise CorroborationError("Mesh manifest springs do not match the mesh arrays")
@@ -416,6 +773,18 @@ def split_manifest(manifest: dict, split: dict) -> dict:
     result["joints"] = {"group": "JOINTS", "cells": int(len(arrays.get("hexa8_joints", split["joints"]))),
                         "candidate_faces": int(len(split["joints"])),
                         "split_nodes": split["split_nodes"], "added_nodes": split["added_nodes"]}
+    if "cracking_bedrock_scope" in arrays:
+        result["support_springs"] = [
+            {"group": f"SPR_OUT_{index:05d}", "matrix_n_per_m": matrix.tolist()}
+            for index, matrix in enumerate(arrays["support_matrices_n_per_m"])
+        ]
+        for name, key in (("ROCK_BOTTOM", "tri3_rock_bottom"), ("ROCK_SIDES", "tri3_rock_sides")):
+            if name in result["groups"]:
+                result["groups"][name]["cells"] = int(len(arrays[key]))
+                if len(arrays[key]) == 0:
+                    result["groups"][name]["area_m2"] = 0.0
+        if "BEDROCK" in result["groups"]:
+            result["groups"]["BEDROCK"]["cells"] = int(len(arrays["tetra4_bedrock"]))
     return result
 
 
@@ -427,6 +796,16 @@ def integrate_joint_faces(split: dict) -> None:
     jump energy exactly, including rotations of otherwise isolated tetrahedra.
     """
     arrays = split["arrays"]
+    joints = np.asarray(split["joints"], dtype=np.int64)
+    if joints.ndim == 2 and joints.shape[1] == 8:
+        # A native QUAD4 wall interface maps directly to one trilinear HEXA8
+        # 3D_JOINT.  No tetra P1 subdivision is introduced.
+        arrays["hexa8_joints"] = joints.copy()
+        arrays["joint_parent_faces"] = np.arange(len(joints), dtype=np.int64)
+        arrays["interpolation_nodes"] = np.empty(0, dtype=np.int64)
+        arrays["interpolation_parents"] = np.empty((0, 3), dtype=np.int64)
+        arrays["interpolation_weights"] = np.empty((0, 3), dtype=float)
+        return
     points = np.asarray(arrays["nodes"], dtype=float)
     added_points, interpolation_nodes, interpolation_parents, interpolation_weights = [], [], [], []
     node_cache: dict[tuple[int, ...], int] = {}
@@ -636,9 +1015,17 @@ def joint_parameters(arrays: dict, faces: np.ndarray, summary: dict, concrete_e_
     if not all(np.isfinite(value) and value > 0 for value in (f_t, g_f, concrete_e_pa)):
         raise CorroborationError("Cohesive strength, fracture energy and elastic modulus must be finite and positive")
     nodes = np.asarray(arrays["nodes"], dtype=float)
-    edge_faces = faces if len(faces) else np.asarray(arrays["tetra4_concrete"])[:, :3]
-    edges = np.concatenate([np.linalg.norm(nodes[edge_faces[:, i]] - nodes[edge_faces[:, (i + 1) % 3]], axis=1)
-                            for i in range(3)])
+    if len(faces):
+        edge_faces = np.asarray(faces, dtype=np.int64)
+    elif "hexa8_wall" in arrays:
+        from Aster.mixed_topology import HEX_FACES
+        edge_faces = np.asarray(arrays["hexa8_wall"], dtype=np.int64)[:, HEX_FACES].reshape(-1, 4)
+    else:
+        edge_faces = np.asarray(arrays["tetra4_concrete"])[:, :3]
+    width = edge_faces.shape[1]
+    edges = np.concatenate([
+        np.linalg.norm(nodes[edge_faces[:, i]] - nodes[edge_faces[:, (i + 1) % width]], axis=1)
+        for i in range(width)])
     h = float(edges.mean())
     stiffness = JOINT_PENALTY_FACTOR * concrete_e_pa / h
     critical = 2.0 * g_f / f_t
@@ -674,7 +1061,9 @@ def vertical_joint_strength(critical_opening_m: float, fracture_energy_j_m2: flo
 
 def save_split_arrays(output_dir: Path, split: dict) -> None:
     """Write the split mesh arrays; the MED converter reads every group flag from this file."""
-    np.savez(output_dir / SPLIT_ARRAYS_NAME, penta6_joints=split["joints"], **split["arrays"])
+    joints = np.asarray(split["joints"], dtype=np.int64)
+    key = "quad8_joints" if joints.ndim == 2 and joints.shape[1] == 8 else "penta6_joints"
+    np.savez(output_dir / SPLIT_ARRAYS_NAME, **{key: joints}, **split["arrays"])
 
 
 def vertical_crack_facets(coordinates_m: np.ndarray, faces: np.ndarray, peak_xyz_m, band_m: float,
@@ -686,12 +1075,13 @@ def vertical_crack_facets(coordinates_m: np.ndarray, faces: np.ndarray, peak_xyz
     A facet qualifies when it is near-vertical, its normal lies along that tangent, and its
     centroid is within ``band_m`` of the plane.
     """
-    from FEniCSx.lift_joints import facet_unit_normals
     if not 0 < float(max_normal_deviation_deg) < 90:
         raise CorroborationError("Vertical joint max_normal_deviation_deg must lie in (0, 90)")
     if not np.isfinite(band_m) or band_m <= 0:
         raise CorroborationError("Vertical joint band half-width must be finite and positive")
-    faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.ndim != 2 or faces.shape[1] not in (3, 4):
+        raise CorroborationError("Vertical joint faces must be TRI3 or QUAD4")
     if not len(faces):
         return np.zeros(0, dtype=bool)
     coordinates = np.asarray(coordinates_m, dtype=float)
@@ -700,7 +1090,12 @@ def vertical_crack_facets(coordinates_m: np.ndarray, faces: np.ndarray, peak_xyz
     if radius <= 0:
         raise CorroborationError("The tensile peak lies on the arch axis, so the radial plane is undefined")
     tangent = np.array([-peak[1], peak[0], 0.0]) / radius
-    normals = facet_unit_normals(coordinates, faces)
+    if faces.shape[1] == 4:
+        from Aster.mixed_topology import interior_facet_normals
+        normals = interior_facet_normals(coordinates, faces)
+    else:
+        from FEniCSx.lift_joints import facet_unit_normals
+        normals = facet_unit_normals(coordinates, faces)
     angle = math.radians(float(max_normal_deviation_deg))
     vertical = np.abs(normals[:, 2]) <= math.sin(angle) + 1e-12
     along = np.abs(normals @ tangent) >= math.cos(angle) - 1e-12
@@ -881,7 +1276,11 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
     if joint.get("continuation") is not None and (
             not factors or factors[-1] != 1.0 or any(factor > 1.0 for factor in factors)):
         raise CorroborationError("Fixed-mesh continuation requires a ramp ending at design load factor 1.0")
-    for name, anchor in _ANCHORS.items():
+    anchors = dict(_ANCHORS)
+    if base_comm.count(anchors["concrete_mat"]) == 0 and base_comm.count(
+            "        _F(GROUP_MA=('WALL', 'FOUNDATION'), MATER=CONCRETE_MAT),\n") == 1:
+        anchors["concrete_mat"] = "        _F(GROUP_MA=('WALL', 'FOUNDATION'), MATER=CONCRETE_MAT),\n"
+    for name, anchor in anchors.items():
         if base_comm.count(anchor) != 1:
             raise CorroborationError(f"The baseline case no longer has its '{name}' section")
     comm = base_comm[:base_comm.index(_ANCHORS["solve"])]
@@ -908,7 +1307,7 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
         "# opening, so the initial stiffness is SIGM_C**2 / (2 * GC * PENA_ADHERENCE).\n"
         "# ELAS carries the concrete values; the joint response is RUPT_FRAG.\n\n"
         + _ANCHORS["chmat"]))
-        comm = comm.replace(_ANCHORS["concrete_mat"], _ANCHORS["concrete_mat"] + (
+        comm = comm.replace(anchors["concrete_mat"], anchors["concrete_mat"] + (
         "        _F(GROUP_MA='JOINTS', MATER=JOINT_MAT),\n"))
     assignment = joint.get("material_assignment")
     friction_law = joint.get("damaged_friction")
@@ -1024,7 +1423,7 @@ def render_cohesive_comm(base_comm: str, joint: dict, factors: list[float], step
             f"    ELAS=_F(E={properties['youngs_modulus']:.12g}, NU={properties['poisson_ratio']:.12g}, "
             f"RHO={properties['density']:.12g}),\n"
             ")\n" + _ANCHORS["chmat"]))
-        comm = comm.replace(_ANCHORS["concrete_mat"], _ANCHORS["concrete_mat"] +
+        comm = comm.replace(anchors["concrete_mat"], anchors["concrete_mat"] +
                             "        _F(GROUP_MA='DAMAGED_ELEMENTS', MATER=DAMAGED_MAT),\n")
     targets = ", ".join(f"{value:.10g}" for value in factors)
     if not has_joints:
@@ -1365,9 +1764,10 @@ FIN()
             "status['lift_plane_uplift'] = crack_water.pore_report\n"
             f"hydraulic_uplift_resultant = np.asarray({metadata['uplift']['resultant_n']!r})\n"
             f"HYDRAULIC_OPENING_LIMIT = {opening_threshold}\n"
+            f"JOINT_PARENTS = np.asarray({np.asarray(interpolation['joint_parent_faces']).tolist()!r}, dtype=int)\n"
             "def hydraulic_open_faces(result):\n"
             "    if result is None:\n"
-            "        return np.zeros(len(hydraulic_arrays['penta6_joints']), dtype=bool)\n"
+            "        return np.zeros(int(JOINT_PARENTS.max(initial=-1)) + 1, dtype=bool)\n"
             "    if not JOINT_CELLS:\n"
             "        return np.empty(0, dtype=bool)\n"
             "    field = result.getField('VARI_ELGA', result.getLastIndex())\n"
@@ -1376,7 +1776,10 @@ FIN()
             "    if FRICTION_CELLS is not None:\n"
             "        opened = joint_component(field, 'V5')\n"
             "        damage = np.where(FRICTION_CELLS, np.where(opened > 0.5, 2., 0.), damage)\n"
-            "    return ((damage >= 1. - 1e-9) & (jump > HYDRAULIC_OPENING_LIMIT)).reshape(-1, 3).any(axis=1)\n"
+            "    patch_open = (damage >= 1. - 1e-9) & (jump > HYDRAULIC_OPENING_LIMIT)\n"
+            "    opened = np.zeros(int(JOINT_PARENTS.max(initial=-1)) + 1, dtype=bool)\n"
+            "    np.logical_or.at(opened, JOINT_PARENTS, patch_open)\n"
+            "    return opened\n"
             "hydraulic_history = []\nhydraulic_masks = []\nRESU = None\n"))
         start = comm.index("    try:\n        mechanical_started = time.perf_counter()\n        if RESU is None:")
         end = comm.index("    reached = target\n", start)
@@ -1435,6 +1838,17 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
             or not np.allclose(arrays["nodes"][parent_nodes], fenicsx_coordinates, rtol=0., atol=1e-8)):
         raise CorroborationError("Aster source node identities/coordinates differ from the candidate mesh")
     split = split_for_joints(arrays, faces)
+    bedrock_scope = None
+    baseline_manifest = json.loads((baseline_dir / MESH_MANIFEST_NAME).read_text(encoding="utf-8"))
+    source_config = json.loads(Path(baseline_manifest["source_config"]).read_text(encoding="utf-8"))
+    bedrock_analysis = source_config.get("bedrock_analysis") or {}
+    radius = bedrock_analysis.get("cracking_bedrock_radius_m")
+    from Elmer.model_config import bedrock_analysis_mode
+    if radius is not None and bedrock_analysis_mode(source_config) == "full_volume":
+        support = (bedrock_analysis.get("spring_n_per_m3")
+                   or source_config["material"]["bedrock"]["support"]["spring_n_per_m3"])
+        bedrock_scope = limit_cracking_bedrock(
+            split["arrays"], radius, support)
     if summary.get("continuation") is not None:
         with np.load(fenicsx_output / "cohesive_state.npz", allow_pickle=False) as state:
             split["arrays"]["continuation_active_faces"] = state["continuation_active_faces"].copy()
@@ -1455,10 +1869,18 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         selected_rows = np.asarray(assignment["selected_source_rows"], dtype=np.int64)
         volume_rows = split["arrays"]["source_cell_rows"]
         selected = np.isin(volume_rows, selected_rows)
-        concrete_count = len(split["arrays"]["tetra4_concrete"])
+        native_wall = "hexa8_wall" in split["arrays"]
+        concrete_count = len(
+            split["arrays"].get(
+                "hexa8_foundation",
+                split["arrays"]["tetra4_foundation"],
+            )
+        ) if native_wall else len(split["arrays"]["tetra4_concrete"])
+        body_start = len(split["arrays"]["hexa8_wall"]) + concrete_count if native_wall else concrete_count
         if (len(np.unique(selected_rows)) != len(selected_rows) or selected.sum() != len(selected_rows)
-                or selected[concrete_count:].any()
-                or np.any(~np.isin(split["arrays"]["concrete_body_ids"][selected[:concrete_count]], (1, 3)))):
+                or selected[body_start:].any()
+                or (not native_wall and np.any(~np.isin(
+                    split["arrays"]["concrete_body_ids"][selected[:concrete_count]], (1, 3))))):
             raise CorroborationError("Damaged material assignment must match exact selected wall/foundation source cells")
     # Three facet classes. Lift facets (the recorded near-horizontal planes) take JOINT_MECA_RUPT;
     # the remaining facets between degraded elements take the degraded-material CZM (or
@@ -1481,16 +1903,25 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         split["arrays"]["lift_joint_faces"] = lift_faces
         if degraded:
             split["arrays"]["damaged_cells"] = selected
-            selected_faces = {tuple(sorted(face)) for cell in arrays["tetra4_concrete"][selected[:concrete_count]]
-                              for face in (cell[[0, 1, 2]], cell[[0, 1, 3]], cell[[0, 2, 3]], cell[[1, 2, 3]])}
+            if native_wall:
+                from Aster.mixed_topology import HEX_FACES
+                wall_selected = selected[:len(arrays["hexa8_wall"])]
+                selected_faces = {
+                    tuple(sorted(cell[list(pattern)]))
+                    for cell in arrays["hexa8_wall"][wall_selected] for pattern in HEX_FACES
+                }
+            else:
+                selected_faces = {tuple(sorted(face)) for cell in arrays["tetra4_concrete"][selected[:concrete_count]]
+                                  for face in (cell[[0, 1, 2]], cell[[0, 1, 3]], cell[[0, 2, 3]], cell[[1, 2, 3]])}
             split["arrays"]["damaged_joint_faces"] = np.array(
                 [tuple(sorted(face)) in selected_faces for face in faces], dtype=bool) & ~lift_faces
         else:
             split["arrays"]["damaged_cells"] = np.zeros(len(split["arrays"]["source_cell_rows"]), dtype=bool)
             split["arrays"]["damaged_joint_faces"] = np.zeros(len(faces), dtype=bool)
     output_dir.mkdir(parents=True, exist_ok=True)
-    baseline_manifest = json.loads((baseline_dir / MESH_MANIFEST_NAME).read_text(encoding="utf-8"))
     manifest = split_manifest(baseline_manifest, split)
+    if bedrock_scope is not None:
+        manifest["cracking_bedrock_scope"] = bedrock_scope
     if summary.get("crack_water_pressure") is True:
         from Aster.hydraulic_loads import CRACK_WATER_SETTINGS
         if "hydraulic_loads" in manifest and manifest["hydraulic_loads"] != CRACK_WATER_SETTINGS:
@@ -1527,8 +1958,41 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
     # faces flip. Dam-scale runs plateau at ~1e-4 of self-weight (a 0.01% imbalance
     # localised at the toggling faces; the lift-joint run cycled at 2e-4 relative with
     # a 21 N absolute residual), so that is the acceptance level.
-    corners = np.asarray(arrays["nodes"], dtype=float)[np.asarray(arrays["tetra4_concrete"], dtype=np.int64)]
-    volume = float(np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])).sum() / 6.)
+    if "hexa8_wall" in arrays:
+        wall_points = np.asarray(arrays["nodes"], dtype=float)[arrays["hexa8_wall"]]
+        foundation_cells = arrays.get(
+            "hexa8_foundation", arrays["tetra4_foundation"]
+        )
+        foundation_points = np.asarray(
+            arrays["nodes"], dtype=float
+        )[foundation_cells]
+        # Six trilinear corner tetrahedra give the source HEXA8 volume used only
+        # as a structural residual scale; this does not recover wall stress.
+        wall_volume = np.sum(np.abs(np.linalg.det(
+            np.stack((wall_points[:, 1] - wall_points[:, 0],
+                      wall_points[:, 3] - wall_points[:, 0],
+                      wall_points[:, 4] - wall_points[:, 0]), axis=2)))) / 6.0
+        wall_volume += np.sum(np.abs(np.linalg.det(
+            np.stack((wall_points[:, 1] - wall_points[:, 6],
+                      wall_points[:, 3] - wall_points[:, 6],
+                      wall_points[:, 4] - wall_points[:, 6]), axis=2)))) / 6.0
+        if foundation_cells.shape[1] == 8:
+            foundation_volume = 0.
+            for corners in ((0, 1, 3, 4), (1, 2, 3, 6),
+                            (1, 3, 4, 6), (1, 4, 5, 6),
+                            (3, 4, 6, 7), (0, 1, 2, 6)):
+                xyz = foundation_points[:, corners]
+                foundation_volume += float(np.abs(np.linalg.det(
+                    xyz[:, 1:] - xyz[:, :1]
+                )).sum() / 6.)
+        else:
+            foundation_volume = np.abs(np.linalg.det(
+                foundation_points[:, 1:] - foundation_points[:, :1]
+            )).sum() / 6.0
+        volume = float(wall_volume + foundation_volume)
+    else:
+        corners = np.asarray(arrays["nodes"], dtype=float)[np.asarray(arrays["tetra4_concrete"], dtype=np.int64)]
+        volume = float(np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])).sum() / 6.)
     residual_tolerance_n = max(1e-4 * volume * float(source_concrete.get("density", 2400.)) * 9.81, 1.)
     if friction is not None:
         joint["damaged_friction"] = friction_joint_parameters(friction, joint["initial_stiffness_pa_per_m"])
@@ -1656,7 +2120,9 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         "added_nodes": split["added_nodes"],
         "tip_ties": split["tip_ties"],
         "neighbourhood_relief_copies": split["relief_copies"],
-        "joint_integration": "three_HEXA8_FPG4_patches_exact_P1_trace",
+        "joint_integration": ("one_HEXA8_FPG4_patch_per_native_QUAD4"
+                              if "hexa8_wall" in split["arrays"]
+                              else "three_HEXA8_FPG4_patches_exact_P1_trace"),
         "native_joint_cells": len(split["arrays"]["hexa8_joints"]),
         "interpolation_nodes": len(split["arrays"]["interpolation_nodes"]),
         "tangent_update_interval": 1,
@@ -1669,6 +2135,8 @@ def prepare(baseline_dir: Path, fenicsx_output: Path, output_dir: Path) -> dict:
         "baseline_manifest_sha256": file_hash(baseline_dir / MESH_MANIFEST_NAME),
         "source_configuration_sha256": file_hash(Path(baseline_manifest["source_config"])),
     }
+    if bedrock_scope is not None:
+        inputs["cracking_bedrock_scope"] = bedrock_scope
     if condense:
         inputs["condensed_foundation"] = condensation
     if assignment is not None or joint.get("reservoir_loading") is not None:
@@ -1984,22 +2452,28 @@ def unjointed_overstress(points, wall, stress, joints, strength_pa, *, residual_
     the structure wants lies outside the modelled one, and the result does not predict it.
     """
     wall = np.asarray(wall, dtype=np.int64)
-    scale = int(len(points)) + 1
-
-    def keys(triples):
-        ordered = np.sort(np.asarray(triples, dtype=np.int64).reshape(-1, 3), axis=1)
-        return (ordered[:, 0] * scale + ordered[:, 1]) * scale + ordered[:, 2]
-
-    joints = np.asarray(joints, dtype=np.int64).reshape(-1, 6)
-    lips = np.unique(np.concatenate((keys(joints[:, :3]), keys(joints[:, 3:])))) if len(joints) else np.empty(0, np.int64)
-    faces = keys(wall[:, _TET_FACES])
-    jointed = np.isin(faces, lips).reshape(len(wall), 4).any(axis=1)
+    joints = np.asarray(joints, dtype=np.int64)
+    if joints.ndim == 1:
+        joints = joints.reshape(-1, 6)
+    width = joints.shape[1] // 2 if len(joints) else (4 if wall.shape[1] == 8 else 3)
+    lips = {tuple(sorted(map(int, face))) for row in joints
+            for face in (row[:width], row[width:])}
+    if wall.shape[1] == 8:
+        from Aster.mixed_topology import HEX_FACES
+        source_faces = wall[:, HEX_FACES]
+        volumes = np.abs(np.linalg.det(points[wall[:, [1, 3, 4]]] - points[wall[:, :1]])) / 6.
+    else:
+        source_faces = wall[:, _TET_FACES]
+        volumes = np.abs(np.linalg.det(points[wall[:, 1:]] - points[wall[:, :1]])) / 6.
+    jointed = np.asarray([
+        any(tuple(sorted(map(int, face))) in lips for face in cell_faces)
+        for cell_faces in source_faces
+    ], dtype=bool)
     principal = np.linalg.eigvalsh(0.5 * (stress + np.transpose(stress, (0, 2, 1))))[:, 2]
     threshold = float(strength_pa if residual_target_pa is None else residual_target_pa)
     criterion = "intact tensile strength" if residual_target_pa is None else "residual tensile-stress target"
     over = ~jointed & (principal > threshold)
     corners = points[wall]
-    volumes = np.abs(np.linalg.det(corners[:, 1:] - corners[:, :1])) / 6.
     report = {
         "tensile_strength_pa": float(strength_pa),
         "threshold_pa": threshold,
@@ -2417,19 +2891,27 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
     if displacement_path.is_file():
         with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=True) as arrays:
             nodes = np.asarray(arrays["nodes"], dtype=float)
-            wall_mask = np.asarray(arrays["concrete_body_ids"]) == 1
-            wall = np.asarray(arrays["tetra4_concrete"])[wall_mask]
+            native_wall = "hexa8_wall" in arrays
+            wall_mask = (np.ones(len(arrays["hexa8_wall"]), dtype=bool) if native_wall
+                         else np.asarray(arrays["concrete_body_ids"]) == 1)
+            wall = np.asarray(arrays["hexa8_wall"] if native_wall else arrays["tetra4_concrete"])[wall_mask]
             source_ids = arrays["source_node_ids"].copy()
             damaged_wall = (arrays["damaged_cells"][:len(wall_mask)][wall_mask]
                             if "damaged_cells" in arrays else np.zeros(len(wall), dtype=bool))
-            joint_lips = (np.asarray(arrays["penta6_joints"], dtype=np.int64) if "penta6_joints" in arrays
-                          else np.empty((0, 6), dtype=np.int64))
+            if "quad8_joints" in arrays:
+                joint_lips = np.asarray(arrays["quad8_joints"], dtype=np.int64)
+            else:
+                joint_lips = np.asarray(arrays["penta6_joints"], dtype=np.int64) \
+                    if "penta6_joints" in arrays else np.empty((0, 6), dtype=np.int64)
+            native_final_stress = None
             if joint.get("continuation") is not None:
                 active_faces = arrays["continuation_active_faces"].astype(bool)
                 rounds = report["continuation_rounds"]
                 if rounds:
                     with np.load(run_dir / f"round_{rounds[-1]['iteration']:04d}" / "accepted_state.npz") as checkpoint:
                         active_faces = checkpoint["active_faces"].astype(bool)
+                        if "wall_cell_stress_pa" in checkpoint and len(checkpoint["wall_cell_stress_pa"]):
+                            native_final_stress = checkpoint["wall_cell_stress_pa"].copy()
                 report["active_candidate_faces"] = int(active_faces.sum())
                 joint_lips = joint_lips[active_faces]
         with np.load(displacement_path) as fields:
@@ -2440,11 +2922,20 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
         if coordinates.shape != nodes.shape or np.abs(coordinates - nodes).max() > 1e-6:
             raise CorroborationError("Aster node order does not match the split mesh arrays")
         e_pa, nu = joint["concrete_youngs_modulus_pa"], joint["concrete_poissons_ratio"]
-        final_stress = wall_cell_stress(nodes, wall, final_u, e_pa, nu)
+        if native_wall:
+            if native_final_stress is None or native_final_stress.shape != (len(wall), 3, 3):
+                raise CorroborationError(
+                    "Native HEXA8 post-processing requires saved Code_Aster wall Gauss stress; "
+                    "P1 tetrahedral recovery is not used")
+            final_stress = native_final_stress
+        else:
+            final_stress = wall_cell_stress(nodes, wall, final_u, e_pa, nu)
         assignment = inputs.get("material_assignment")
         if assignment is not None and "properties" in assignment:
             # Degraded elements only; lift joints leave every element intact concrete.
             properties = assignment["properties"]
+            if native_wall:
+                raise CorroborationError("Native HEXA8 damaged-element stress post-processing is not implemented")
             final_stress[damaged_wall] = wall_cell_stress(
                 nodes, wall[damaged_wall], final_u, properties["youngs_modulus"], properties["poisson_ratio"])
         cracked = _stress_summary(nodes, wall, final_stress, final_u)
@@ -2479,22 +2970,47 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
                 intact_u = np.zeros_like(final_u)
                 intact_u[physical] = baseline["displacement_m"][valid][first][positions] * (
                     factors[-1] if loading is None else 1.)
+                with np.load(output_dir / SPLIT_ARRAYS_NAME, allow_pickle=False) as split_arrays:
+                    if "interpolation_nodes" in split_arrays:
+                        auxiliary = np.asarray(split_arrays["interpolation_nodes"], dtype=np.int64)
+                        parents = np.asarray(split_arrays["interpolation_parents"], dtype=np.int64)
+                        weights = np.asarray(split_arrays["interpolation_weights"], dtype=float)
+                        intact_u[auxiliary] = np.einsum(
+                            "npi,np->ni", intact_u[parents], weights)
                 if not np.allclose(baseline["coordinates_m"][valid][first][positions], nodes[physical], atol=1e-9, rtol=0.):
                     raise CorroborationError("Intact baseline coordinates do not match selected-material result")
-            comparison["intact"] = _stress_summary(nodes, wall, wall_cell_stress(nodes, wall, intact_u, e_pa, nu), intact_u)
+            if native_wall:
+                stress_path = path.parent / "aster_result_fields.npz"
+                if not stress_path.is_file():
+                    stress_path = path.parent / "run" / "aster_result_fields.npz"
+                with np.load(stress_path) as baseline_fields_data:
+                    intact_stress = baseline_fields_data["wall_cell_stress_pa"]
+                comparison["intact"] = _stress_summary(nodes, wall, intact_stress * factors[-1], intact_u)
+            else:
+                comparison["intact"] = _stress_summary(
+                    nodes, wall, wall_cell_stress(nodes, wall, intact_u, e_pa, nu), intact_u)
+            differences = (
+                "lift-joint cracking only"
+                if joint.get("lift_joint") is not None
+                and assignment is not None and "properties" not in assignment
+                else "selected material changes and cracking"
+                if assignment is not None and "properties" in assignment
+                else "cohesive cracking (every volume element keeps the intact concrete)"
+            )
             comparison["intact_definition"] = (
                 ("original concrete full-depth Aster baseline; differences include "
                  if loading is not None else
                  "original concrete Aster baseline scaled to final load factor; differences include ")
-                + ("selected material changes and cracking" if assignment is not None and "properties" in assignment
-                   else "cohesive cracking (every volume element keeps the intact concrete)"))
+                + differences)
             np.savez(displacement_path, coordinates=coordinates, first=first_u, final=final_u, intact=intact_u)
         elif loading is None and not initiated[0].any():
             # Before initiation the joints are linear, so the bonded state scales with the load.
             scale = factors[-1] / factors[0]
             intact_u = first_u * scale
-            comparison["intact"] = _stress_summary(nodes, wall, wall_cell_stress(nodes, wall, intact_u, e_pa, nu),
-                                                   intact_u)
+            if native_wall:
+                raise CorroborationError("Native HEXA8 intact comparison requires a saved native Aster stress field")
+            comparison["intact"] = _stress_summary(
+                nodes, wall, wall_cell_stress(nodes, wall, intact_u, e_pa, nu), intact_u)
             comparison["intact_definition"] = (
                 f"bonded joints, same mesh and loads: the elastic load-factor {factors[0]:g} state scaled linearly")
         elif loading is not None:
@@ -2549,9 +3065,23 @@ def postprocess(output_dir: Path, fenicsx_output: Path, status: dict) -> dict:
             export_arrays = {key: stored[key] for key in stored.files}
         # Final-state stress for every concrete (wall + foundation) cell, with the
         # damaged cells' assigned material, so ParaView shows post-cracking stresses.
-        all_concrete = np.asarray(export_arrays["tetra4_concrete"], dtype=np.int64)
-        all_stress = wall_cell_stress(nodes, all_concrete, final_u, e_pa, nu)
+        if native_wall:
+            all_wall = np.asarray(export_arrays["hexa8_wall"], dtype=np.int64)
+            all_foundation = np.asarray(
+                export_arrays.get(
+                    "hexa8_foundation",
+                    export_arrays["tetra4_foundation"],
+                ),
+                dtype=np.int64,
+            )
+            all_stress = np.full((len(all_wall) + len(all_foundation), 3, 3), np.nan)
+            all_stress[:len(all_wall)] = native_final_stress
+        else:
+            all_concrete = np.asarray(export_arrays["tetra4_concrete"], dtype=np.int64)
+            all_stress = wall_cell_stress(nodes, all_concrete, final_u, e_pa, nu)
         if assignment is not None and "properties" in assignment and "damaged_cells" in export_arrays:
+            if native_wall:
+                raise CorroborationError("Native HEXA8 damaged-element export is not implemented")
             damaged_all = np.asarray(export_arrays["damaged_cells"], dtype=bool)[:len(all_concrete)]
             properties = assignment["properties"]
             all_stress[damaged_all] = wall_cell_stress(

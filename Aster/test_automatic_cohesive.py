@@ -320,6 +320,106 @@ def star_split(subdivisions: int = 4) -> dict:
     return {"arrays": arrays, "joints": np.zeros((0, 6), dtype=np.int64)}
 
 
+class SplitSpringTests(unittest.TestCase):
+    def test_limit_cracking_bedrock_supports_the_cut_surface(self):
+        points = np.array([
+            [0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., -1.],
+            [1., 1., -1.], [0., 0., 1.],
+        ])
+        bedrock = np.array([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=np.int64)
+        arrays = {
+            "nodes": points,
+            "tetra4_concrete": np.array([[0, 1, 2, 5]], dtype=np.int64),
+            "concrete_body_ids": np.array([3], dtype=np.int64),
+            "tetra4_bedrock": bedrock,
+            "source_cell_rows": np.arange(3, dtype=np.int64),
+            "support_nodes": np.array([0], dtype=np.int64),
+            "support_matrices_n_per_m": np.eye(3)[None] * 4.,
+            "tri3_rock_bottom": np.array([[0, 1, 2]], dtype=np.int64),
+            "tri3_rock_sides": np.empty((0, 3), dtype=np.int64),
+            "poi1_rock_bottom_nodes": np.array([0, 1, 2], dtype=np.int64),
+        }
+
+        report = ac.limit_cracking_bedrock(arrays, .6, {"x": 2., "y": 3., "z": 4.})
+
+        self.assertEqual(report["retained_bedrock_cells"], 1)
+        self.assertEqual(report["removed_bedrock_cells"], 1)
+        np.testing.assert_array_equal(arrays["tetra4_bedrock"], bedrock[:1])
+        np.testing.assert_array_equal(arrays["local_bedrock_cut_faces"], [[1, 2, 3]])
+        self.assertEqual(set(arrays["support_nodes"].tolist()), {0, 1, 2, 3})
+        self.assertTrue(np.isfinite(arrays["support_matrices_n_per_m"]).all())
+
+    def test_zero_cracking_bedrock_radius_replaces_volume_with_foundation_springs(self):
+        arrays = {
+            "nodes": np.array([
+                [0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., -1.],
+                [0., 0., 1.],
+            ]),
+            "tetra4_concrete": np.array([[0, 1, 2, 4]], dtype=np.int64),
+            "concrete_body_ids": np.array([3], dtype=np.int64),
+            "tetra4_bedrock": np.array([[0, 1, 2, 3]], dtype=np.int64),
+            "source_cell_rows": np.array([10, 11], dtype=np.int64),
+            "support_nodes": np.array([3], dtype=np.int64),
+            "support_matrices_n_per_m": np.eye(3)[None] * 99.,
+            "tri3_rock_bottom": np.array([[0, 1, 2]], dtype=np.int64),
+            "tri3_rock_sides": np.empty((0, 3), dtype=np.int64),
+            "poi1_rock_bottom_nodes": np.array([0, 1, 2], dtype=np.int64),
+        }
+
+        report = ac.limit_cracking_bedrock(arrays, 0., {"x": 2., "y": 3., "z": 4.})
+
+        self.assertEqual(report["retained_bedrock_cells"], 0)
+        self.assertEqual(report["removed_bedrock_cells"], 1)
+        self.assertEqual(len(arrays["tetra4_bedrock"]), 0)
+        np.testing.assert_array_equal(arrays["support_nodes"], [0, 1, 2])
+        np.testing.assert_allclose(arrays["support_matrices_n_per_m"], [
+            np.diag([2., 3., 4.]) / 6.,
+            np.diag([2., 3., 4.]) / 6.,
+            np.diag([2., 3., 4.]) / 6.,
+        ])
+        np.testing.assert_array_equal(arrays["source_cell_rows"], [10])
+
+    def test_split_for_joints_remaps_spring_with_two_split_endpoints(self):
+        points = np.array([
+            [0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [0., 0., -1.],
+            [0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [0., 0., -1.],
+        ])
+        concrete = np.array([
+            [0, 1, 2, 3], [0, 1, 2, 4],
+            [5, 6, 7, 8], [5, 6, 7, 9],
+        ], dtype=np.int64)
+        faces = np.array([[0, 1, 2], [5, 6, 7]], dtype=np.int64)
+        arrays = {
+            "nodes": points,
+            "tetra4_concrete": concrete,
+            "tetra4_bedrock": np.empty((0, 4), dtype=np.int64),
+            "tri3_upstream": np.empty((0, 3), dtype=np.int64),
+            "tri3_downstream": np.empty((0, 3), dtype=np.int64),
+            "tri3_crest": np.empty((0, 3), dtype=np.int64),
+            "tri3_rock_bottom": np.empty((0, 3), dtype=np.int64),
+            "tri3_rock_sides": np.empty((0, 3), dtype=np.int64),
+            "seg2_wall_foundation_springs": np.array([[0, 5]], dtype=np.int64),
+            "wall_foundation_tributary_area_m2": np.array([1.0 / 3.0]),
+            "interface_stiffness_n_per_m": np.array([[2., 3., 4.]]),
+            "interface_names": np.array(["wall_joint_1"]),
+            "joint_slave_tri3": np.array([[0, 1, 3], [0, 1, 4]], dtype=np.int64),
+            "joint_master_tri3": np.array([[5, 6, 8], [5, 6, 9]], dtype=np.int64),
+            "support_nodes": np.empty(0, dtype=np.int64),
+            "support_matrices_n_per_m": np.empty((0, 3, 3)),
+            "source_node_ids": np.arange(len(points), dtype=np.int64),
+            "concrete_body_ids": np.ones(len(concrete), dtype=np.int64),
+        }
+        split = ac.split_for_joints(arrays, faces)
+        pairs = split["arrays"]["seg2_wall_foundation_springs"]
+        expected_area = split["arrays"]["wall_foundation_tributary_area_m2"]
+        expected_stiffness = split["arrays"]["interface_stiffness_n_per_m"]
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(set(map(tuple, pairs)), {(0, 5), (10, 13)})
+        np.testing.assert_allclose(expected_area, [1.0 / 6.0, 1.0 / 6.0])
+        np.testing.assert_allclose(expected_stiffness, [[1., 1.5, 2.], [1., 1.5, 2.]])
+        self.assertEqual(split["spring_shares"][0]["fractions"], [.5, .5])
+
+
 class NeighbourhoodTests(unittest.TestCase):
     def test_high_valence_node_is_split_into_tied_copies(self):
         split = star_split()

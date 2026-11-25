@@ -126,24 +126,25 @@ class ModelConfigTests(unittest.TestCase):
         self.payload["geometry"]["local_element_size_m"] = 0.25
         validate_config(self.payload)
 
-    def test_wall_tetrahedral_target_is_an_optional_integer_of_at_least_1000(self):
-        from Elmer.mesh_sizing import wall_tetrahedral_target
+    def test_wall_hexa8_target_is_an_optional_integer_of_at_least_1000(self):
+        from Elmer.mesh_sizing import wall_element_target, wall_tetrahedral_target
 
         geometry = self.payload["geometry"]
-        self.assertEqual(geometry["target_wall_tetrahedral_elements"], 150000)
-        self.assertEqual(wall_tetrahedral_target(geometry), 150000)
-        geometry["target_wall_tetrahedral_elements"] = 300000.0
+        self.assertEqual(geometry["target_wall_elements"], 20000)
+        self.assertEqual(wall_element_target(geometry), 20000)
+        self.assertEqual(wall_tetrahedral_target(geometry), 20000)
+        geometry["target_wall_elements"] = 300000.0
         self.assertIs(validate_config(self.payload), self.payload)
-        self.assertEqual(wall_tetrahedral_target(geometry), 300000)
+        self.assertEqual(wall_element_target(geometry), 300000)
         for value in (999, 1500.5, True, None, "big", float("inf")):
             payload = copy.deepcopy(self.payload)
-            payload["geometry"]["target_wall_tetrahedral_elements"] = value
-            self.assert_invalid_at(payload, "geometry.target_wall_tetrahedral_elements")
+            payload["geometry"]["target_wall_elements"] = value
+            self.assert_invalid_at(payload, "geometry.target_wall_elements")
             with self.assertRaises(ValueError):
-                wall_tetrahedral_target(payload["geometry"])
-        del geometry["target_wall_tetrahedral_elements"]
+                wall_element_target(payload["geometry"])
+        del geometry["target_wall_elements"]
         self.assertIs(validate_config(self.payload), self.payload)
-        self.assertEqual(wall_tetrahedral_target(geometry), 150000)
+        self.assertEqual(wall_element_target(geometry), 150000)
 
     def test_concrete_compressive_strength_is_positive_and_optional_for_historical_jobs(self):
         self.assertEqual(self.payload["material"]["concrete"]["compressive_strength_pa"], 30e6)
@@ -196,6 +197,19 @@ class ModelConfigTests(unittest.TestCase):
             candidate["bedrock_analysis"] = value
             with self.subTest(value=value), self.assertRaises(ConfigurationValidationError):
                 validate_config(candidate)
+
+    def test_cracking_bedrock_radius_is_finite_and_positive(self):
+        candidate = copy.deepcopy(self.payload)
+        candidate["bedrock_analysis"]["cracking_bedrock_radius_m"] = 5.0
+        self.assertIs(validate_config(candidate), candidate)
+        self.assertIs(validate_config(candidate), candidate)
+        candidate["bedrock_analysis"]["cracking_bedrock_radius_m"] = 0.0
+        self.assertIs(validate_config(candidate), candidate)
+        for value in (-1, True, "5"):
+            invalid = copy.deepcopy(candidate)
+            invalid["bedrock_analysis"]["cracking_bedrock_radius_m"] = value
+            with self.subTest(value=value), self.assertRaises(ConfigurationValidationError):
+                validate_config(invalid)
 
     def test_elastic_layer_requires_a_bonded_concrete_foundation_and_bottom(self):
         for mutate in (

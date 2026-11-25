@@ -9,18 +9,40 @@ from math import gcd, lcm
 
 
 TARGET_WALL_TETRAHEDRAL_ELEMENTS = 150_000
+TARGET_WALL_ELEMENTS = TARGET_WALL_TETRAHEDRAL_ELEMENTS
 MINIMUM_WALL_TETRAHEDRAL_TARGET = 1_000
+MINIMUM_WALL_ELEMENT_TARGET = MINIMUM_WALL_TETRAHEDRAL_TARGET
 TETRAHEDRA_PER_SOURCE_CELL = {4: 1, 5: 6, 6: 3}
 
 
 def wall_tetrahedral_target(geometry: dict) -> int:
-    """Configured wall tetrahedron cap (geometry.target_wall_tetrahedral_elements), else the default."""
-    value = geometry.get("target_wall_tetrahedral_elements", TARGET_WALL_TETRAHEDRAL_ELEMENTS)
+    """Compatibility wrapper for the former wall-tetrahedron configuration name."""
+    value = geometry.get("target_wall_elements",
+                         geometry.get("target_wall_tetrahedral_elements", TARGET_WALL_TETRAHEDRAL_ELEMENTS))
     if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
             or not float(value).is_integer() or value < MINIMUM_WALL_TETRAHEDRAL_TARGET):
         raise ValueError("geometry.target_wall_tetrahedral_elements must be an integer of at least "
                          f"{MINIMUM_WALL_TETRAHEDRAL_TARGET:,}")
     return int(value)
+
+
+def wall_element_target(geometry: dict) -> int:
+    """Native wall-cell cap; legacy files retain the former tetrahedral key."""
+    value = geometry.get("target_wall_elements",
+                         geometry.get("target_wall_tetrahedral_elements", TARGET_WALL_ELEMENTS))
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not float(value).is_integer() or value < MINIMUM_WALL_ELEMENT_TARGET):
+        raise ValueError("geometry.target_wall_elements must be an integer of at least "
+                         f"{MINIMUM_WALL_ELEMENT_TARGET:,}")
+    return int(value)
+
+
+def wall_element_count(cells: Iterable[tuple[int, tuple[int, ...]]]) -> int:
+    """Count native source wall cells; every production wall cell is HEXA8."""
+    values = list(cells)
+    if any(element_type != 5 for element_type, _ in values):
+        raise ValueError("Production wall cells must be HEXA8")
+    return len(values)
 
 
 def config_for_wall_element_size(config: dict, size_m: float) -> dict:

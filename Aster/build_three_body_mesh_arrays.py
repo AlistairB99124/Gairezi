@@ -165,6 +165,53 @@ def _read_gmsh_ascii(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
         np.asarray(tri_rows, dtype=np.int64), np.asarray(tri_tags, dtype=np.int64)
 
 
+def _read_gmsh_mixed_ascii(path: Path):
+    """Parse Gmsh TRI3/QUAD4 boundaries and TETRA4/HEXA8 volumes."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    index = 0
+
+    def find(tag: str):
+        nonlocal index
+        while lines[index].strip() != tag:
+            index += 1
+
+    find("$Nodes")
+    index += 1
+    count = int(lines[index])
+    index += 1
+    coords = np.zeros((count + 1, 3), dtype=float)
+    for row in range(count):
+        fields = lines[index + row].split()
+        node = int(fields[0])
+        coords[node] = np.asarray(fields[1:4], dtype=float)
+    index += count
+    find("$Elements")
+    index += 1
+    count = int(lines[index])
+    index += 1
+    rows: dict[int, tuple[list, list, list]] = {
+        2: ([], [], []), 3: ([], [], []), 4: ([], [], []), 5: ([], [], []),
+    }
+    for row_number in range(count):
+        fields = lines[index + row_number].split()
+        kind = int(fields[1])
+        if kind not in rows:
+            continue
+        tag_count = int(fields[2])
+        tag = int(fields[3])
+        nodes = [int(value) for value in fields[3 + tag_count:]]
+        rows[kind][0].append(nodes)
+        rows[kind][1].append(tag)
+        rows[kind][2].append(row_number)
+
+    def packed(kind):
+        cells, tags, source = rows[kind]
+        return (np.asarray(cells, dtype=np.int64).reshape(-1, {2: 3, 3: 4, 4: 4, 5: 8}[kind]),
+                np.asarray(tags, dtype=np.int64), np.asarray(source, dtype=np.int64))
+
+    return coords, packed(5), packed(4), packed(2), packed(3)
+
+
 def _weld_coincident_nodes(
     coords: np.ndarray, used_node_ids: np.ndarray,
     touches_wall: np.ndarray | None = None, touches_foundation: np.ndarray | None = None,
@@ -315,6 +362,143 @@ def _prune_weakly_supported_free_nodes(
         bedrock_cells = bedrock_cells[~touches_weak]
 
 
+def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
+    """Export the production native HEXA8 wall/foundation/bedrock contract."""
+    coords, (hexes, hex_tags, hex_rows), (tets, tet_tags, tet_rows), \
+        (tris, tri_tags, tri_rows), (quads, quad_tags, quad_rows) = _read_gmsh_mixed_ascii(source_mesh)
+    wall = hexes[hex_tags == WALL_VOLUME_TAG]
+    hex_bedrock = hexes[hex_tags == BEDROCK_VOLUME_TAG]
+    hex_bedrock_rows = hex_rows[hex_tags == BEDROCK_VOLUME_TAG]
+    foundation = hexes[hex_tags == FOUNDATION_VOLUME_TAG]
+    foundation_rows = hex_rows[hex_tags == FOUNDATION_VOLUME_TAG]
+    legacy_foundation = tets[tet_tags == FOUNDATION_VOLUME_TAG]
+    tet_bedrock = tets[tet_tags == BEDROCK_VOLUME_TAG]
+    tet_bedrock_rows = tet_rows[tet_tags == BEDROCK_VOLUME_TAG]
+    if not len(wall) or not len(foundation) or len(legacy_foundation):
+        raise MeshExportError(
+            "Native mixed mesh requires HEXA8 WALL and FOUNDATION cells with no TETRA4 FOUNDATION"
+        )
+    if bool(len(hex_bedrock)) == bool(len(tet_bedrock)):
+        raise MeshExportError("Native mixed mesh requires exactly one bedrock cell topology")
+    unknown = hex_tags[~np.isin(
+        hex_tags, (WALL_VOLUME_TAG, FOUNDATION_VOLUME_TAG, BEDROCK_VOLUME_TAG)
+    )]
+    if len(unknown):
+        raise MeshExportError(f"Unexpected hexa tags in native mixed mesh: {sorted(set(unknown))}")
+    unknown = tet_tags[~np.isin(
+        tet_tags, (BEDROCK_VOLUME_TAG, MORTAR_FILL_VOLUME_TAG)
+    )]
+    if len(unknown):
+        raise MeshExportError(f"Unexpected tetra tags in native mixed mesh: {sorted(set(unknown))}")
+    kept = np.unique(np.concatenate((
+        wall.ravel(), foundation.ravel(),
+        (hex_bedrock if len(hex_bedrock) else tet_bedrock).ravel(),
+    ), dtype=np.int64))
+    dense = np.full(len(coords), -1, dtype=np.int64)
+    dense[kept] = np.arange(len(kept))
+    nodes = coords[kept]
+    wall = dense[wall]
+    foundation = dense[foundation]
+    hex_bedrock = dense[hex_bedrock]
+    tet_bedrock = dense[tet_bedrock]
+    tri = dense[tris] if len(tris) else np.empty((0, 3), dtype=np.int64)
+    quad = dense[quads] if len(quads) else np.empty((0, 4), dtype=np.int64)
+    face_rows = {}
+    for width, values, tags, names in (
+        (3, tri, tri_tags, ("tri3_upstream", "tri3_downstream", "tri3_crest",
+                            "tri3_rock_bottom", "tri3_rock_sides")),
+        (4, quad, quad_tags, ("quad4_upstream", "quad4_downstream", "quad4_crest",
+                              "quad4_rock_bottom", "quad4_rock_sides")),
+    ):
+        for name, selected in (
+            (names[0], tags == UPSTREAM_FACE_TAG), (names[1], tags == DOWNSTREAM_FACE_TAG),
+            (names[2], tags == CREST_FACE_TAG), (names[3], tags == ROCK_BOTTOM_FACE_TAG),
+            (names[4], np.isin(tags, ROCK_SIDE_FACE_TAGS)),
+        ):
+            face_rows[name] = values[selected] if len(values) else np.empty((0, width), dtype=np.int64)
+
+    from Aster.source_contract import source_springs
+    if len(quads):
+        quad_triangles = np.concatenate((
+            quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]
+        ))
+        spring_tris = np.concatenate((tris, quad_triangles))
+        spring_tags = np.concatenate((tri_tags, quad_tags, quad_tags))
+    else:
+        spring_tris, spring_tags = tris, tri_tags
+    contract = source_springs(source_mesh, coords, spring_tris, spring_tags)
+    pairs = dense[contract["pairs"]]
+    arrays = {
+        "nodes": nodes,
+        "hexa8_wall": wall,
+        "hexa8_foundation": foundation,
+        "tetra4_foundation": np.empty((0, 4), dtype=np.int64),
+        "hexa8_bedrock": hex_bedrock,
+        "tetra4_bedrock": tet_bedrock,
+        **face_rows,
+        "poi1_rock_bottom_nodes": np.unique(np.concatenate((
+            face_rows["tri3_rock_bottom"].ravel(), face_rows["quad4_rock_bottom"].ravel()
+        ))).astype(np.int64),
+        "seg2_wall_foundation_springs": pairs,
+        "wall_foundation_tributary_area_m2": contract["areas"],
+        "interface_stiffness_n_per_m": contract["stiffness"],
+        "interface_names": np.asarray(contract["interfaces"]),
+        "joint_slave_tri3": dense[contract["joint_slave_tri3"]],
+        "joint_master_tri3": dense[contract["joint_master_tri3"]],
+        "joint_coefficients_n_per_m3": contract["joint_coefficients_n_per_m3"],
+        "support_nodes": dense[contract["support_nodes"]],
+        "support_matrices_n_per_m": contract["support_matrices"],
+        "source_cell_rows": np.concatenate((
+            hex_rows[hex_tags == WALL_VOLUME_TAG],
+            foundation_rows,
+            hex_bedrock_rows,
+            tet_bedrock_rows,
+        )),
+        "source_node_ids": kept,
+        "compact_spring_groups": np.array(True),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_dir / "three_body_mesh_arrays.npz", **arrays)
+    manifest = {
+        "schema_version": 2,
+        "native_wall_topology": "HEXA8",
+        "native_foundation_topology": "HEXA8",
+        "native_bedrock_topology": "HEXA8" if len(hex_bedrock) else "TETRA4",
+        "bedrock_analysis_mode": contract["bedrock_analysis_mode"],
+        "bedrock_slivers_dropped": 0,
+        "source_mesh": str(source_mesh.resolve()), "source_config": contract["source_config"],
+        "source_hashes": contract["source_hashes"], "source_pressures": contract["pressures"],
+        "source_crest_pressure_pa": contract["crest_pressure_pa"],
+        "support_springs": [
+            {"group": f"SPR_OUT_{i:05d}", "matrix_n_per_m": matrix.tolist()}
+            for i, matrix in enumerate(arrays["support_matrices_n_per_m"])
+        ],
+        "simplifications_vs_elmer": [
+            f"Native HEXA8 wall/foundation and {('HEXA8 bedrock' if len(hex_bedrock) else 'TETRA4 bedrock')}; "
+            "mixed TRI/QUAD boundaries."
+        ],
+        "node_count": int(len(nodes)),
+        "wall_foundation_spring_pairs": len(pairs),
+        "wall_foundation_spring_total_area_m2": float(contract["areas"].sum()),
+        "wall_foundation_spring_group_all": WALL_FOUNDATION_SPRING_GROUP,
+        "wall_foundation_springs": [
+            {"group": f"{WALL_FOUNDATION_SPRING_PREFIX}{i:05d}", "tributary_area_m2": float(area),
+             "interface": contract["interfaces"][i], "stiffness_n_per_m": contract["stiffness"][i].tolist()}
+            for i, area in enumerate(contract["areas"])
+        ],
+        "groups": {
+            "WALL": {"cells": len(wall), "min_xyz_m": nodes[wall].min((0, 1)).tolist(),
+                     "max_xyz_m": nodes[wall].max((0, 1)).tolist()},
+            "FOUNDATION": {"cells": len(foundation)},
+            "BEDROCK": {"cells": len(hex_bedrock) + len(tet_bedrock)},
+        },
+        "coordinate_bounds": {"min_xyz_m": nodes.min(0).tolist(), "max_xyz_m": nodes.max(0).tolist()},
+    }
+    (output_dir / "mesh_manifest.json").write_text(
+        json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    return manifest
+
+
 def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = None) -> dict:
     if source_mesh is None:
         raise MeshExportError(
@@ -324,6 +508,12 @@ def export(output_dir: Path = DEFAULT_OUTPUT_DIR, source_mesh: Path | None = Non
     if not source_mesh.is_file():
         raise MeshExportError(f"Missing three-body combined mesh: {source_mesh}")
 
+    text = source_mesh.read_text(encoding="utf-8", errors="ignore")
+    native = any(line.split()[1] == "5" for line in text.splitlines()
+                 if len(line.split()) > 2 and line.split()[0].isdigit()
+                 and line.split()[1].isdigit() and line.split()[2].isdigit())
+    if native:
+        return _export_native_mixed(output_dir, source_mesh)
     coords, tet_nodes, tet_tags, tri_nodes, tri_tags = _read_gmsh_ascii(source_mesh)
     from Aster.source_contract import source_springs
     contract = source_springs(source_mesh, coords, tri_nodes, tri_tags)

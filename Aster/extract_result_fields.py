@@ -150,7 +150,11 @@ def extract(result_med_path: Path, out_path: Path) -> dict:
             mode = json.loads(manifest_path.read_text(encoding="utf-8")).get(
                 "bedrock_analysis_mode", "full_volume",
             )
-    group = "WALL" if mode == "elastic_layer" else "CONCRETE" if "CONCRETE" in groups else "WALL"
+    native_wall = False
+    if mesh_arrays_path.is_file():
+        with np.load(mesh_arrays_path) as array_file:
+            native_wall = "hexa8_wall" in array_file
+    group = "WALL" if native_wall or mode == "elastic_layer" else "CONCRETE" if "CONCRETE" in groups else "WALL"
     if group not in groups:
         raise RuntimeError("Result MED has no concrete volume group (CONCRETE or WALL)")
     scope = "wall" if mode == "elastic_layer" else "concrete" if group == "CONCRETE" else "legacy_wall"
@@ -180,10 +184,16 @@ def extract(result_med_path: Path, out_path: Path) -> dict:
     if mesh_arrays_path.is_file():
         with np.load(mesh_arrays_path) as arrays:
             if "source_node_ids" in arrays:
-                cells = np.asarray(sigm.getMesh().getNodalConnectivity().toNumPyArray()).reshape(-1, 5)[:, 1:]
-                source_cells = arrays["tetra4_concrete"]
-                cell_bodies = arrays["concrete_body_ids"]
-                if mode == "elastic_layer":
+                packed = np.asarray(sigm.getMesh().getNodalConnectivity().toNumPyArray())
+                if native_wall:
+                    cells = packed.reshape(-1, 9)[:, 1:]
+                    source_cells = np.asarray(arrays["hexa8_wall"], dtype=np.int64)
+                    cell_bodies = np.ones(len(source_cells), dtype=np.int64)
+                else:
+                    cells = packed.reshape(-1, 5)[:, 1:]
+                    source_cells = arrays["tetra4_concrete"]
+                    cell_bodies = arrays["concrete_body_ids"]
+                if mode == "elastic_layer" and not native_wall:
                     source_cells = source_cells[cell_bodies == 1]
                     cell_bodies = cell_bodies[cell_bodies == 1]
                 if cells.shape != source_cells.shape:
@@ -194,10 +204,20 @@ def extract(result_med_path: Path, out_path: Path) -> dict:
                     raise RuntimeError("Result node identity is inconsistent")
                 np.testing.assert_allclose(points[cells], arrays["nodes"][source_cells], rtol=0., atol=1e-9)
                 extra["source_node_ids"] = mapped
-                for body in ((1,) if mode == "elastic_layer" else (1, 3)):
+                for body in ((1,) if native_wall or mode == "elastic_layer" else (1, 3)):
                     mask = np.zeros(len(points), dtype=bool)
                     mask[np.unique(cells[cell_bodies == body])] = True
                     extra[f"body_{body}_mask"] = mask
+                if native_wall:
+                    six = stress[cells]
+                    tensors = np.empty((len(cells), 3, 3), dtype=float)
+                    tensors[:, 0, 0], tensors[:, 1, 1], tensors[:, 2, 2] = six[..., :3].mean(1).T
+                    tensors[:, 0, 1] = tensors[:, 1, 0] = six[..., 3].mean(1)
+                    tensors[:, 0, 2] = tensors[:, 2, 0] = six[..., 4].mean(1)
+                    tensors[:, 1, 2] = tensors[:, 2, 1] = six[..., 5].mean(1)
+                    extra["wall_cell_stress_pa"] = tensors
+                    extra["wall_source_cell_rows"] = np.asarray(
+                        arrays["source_cell_rows"][:len(source_cells)], dtype=np.int64)
     np.savez_compressed(
         out_path,
         points_m=points,

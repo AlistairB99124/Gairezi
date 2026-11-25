@@ -83,18 +83,18 @@ class BondedTopologyTests(unittest.TestCase):
         exterior = {tuple(sorted(face)) for _, face in mesh.boundaries}
         self.assertEqual(exterior, {face for face, count in faces.items() if count == 1})
 
-    def test_analysis_mesh_respects_tetrahedron_budget_and_reports_effective_size(self):
+    def test_analysis_mesh_respects_native_hexa8_budget_and_reports_effective_size(self):
         from Elmer.regions.combined_structure import build_combined_structure
         from Elmer.regions.tetrahedral import tetrahedralize_structure
-        from Elmer.mesh_sizing import TARGET_WALL_TETRAHEDRAL_ELEMENTS
-
         source = build_combined_structure(assembly.ROOT)
         converted = tetrahedralize_structure(source)
         self.assertEqual(source.suggested_global_element_size_m, 0.5)
         self.assertGreater(source.element_size_target_m, source.suggested_global_element_size_m)
-        self.assertEqual(source.wall_tetrahedral_element_count, len(converted.cells))
-        self.assertEqual(source.target_wall_tetrahedral_elements, TARGET_WALL_TETRAHEDRAL_ELEMENTS)
-        self.assertLessEqual(source.wall_tetrahedral_element_count, TARGET_WALL_TETRAHEDRAL_ELEMENTS)
+        self.assertTrue(all(kind == 5 for kind, _ in source.cells))
+        self.assertEqual(source.wall_hexa8_element_count, len(source.cells))
+        self.assertEqual(source.target_wall_elements, 20000)
+        self.assertEqual(len(converted.cells), 6 * source.wall_hexa8_element_count)
+        self.assertLessEqual(source.wall_hexa8_element_count, source.target_wall_elements)
 
 
 class ReservoirLevelTests(unittest.TestCase):

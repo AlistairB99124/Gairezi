@@ -6,9 +6,36 @@ from numpy.typing import ArrayLike
 from Aster.automatic_cohesive import wall_cell_stress
 
 
+def native_wall_tensors(field, cells):
+    """Reduce Code_Aster WALL Gauss stresses to one native tensor per HEXA8."""
+    components = ('SIXX', 'SIYY', 'SIZZ', 'SIXY', 'SIXZ', 'SIYZ')
+    values, description = field.toSimpleFieldOnCells().getValuesWithDescription(
+        list(components), ['WALL'])
+    raw = np.asarray(values, dtype=float).reshape(-1, 6)
+    ids = np.asarray(description[0], dtype=np.int64)
+    positions = {int(cell): index for index, cell in enumerate(cells)}
+    result = np.zeros((len(positions), 3, 3), dtype=float)
+    counts = np.zeros(len(positions), dtype=np.int64)
+    for row, cell in enumerate(ids.tolist()):
+        if cell not in positions:
+            continue
+        position = positions[cell]
+        x = raw[row]
+        result[position] += np.array(((x[0], x[3], x[4]),
+                                       (x[3], x[1], x[5]),
+                                       (x[4], x[5], x[2])))
+        counts[position] += 1
+    if np.any(counts == 0):
+        raise RuntimeError('Native wall stress is missing Gauss values for one or more HEXA8 cells')
+    return result / counts[:, None, None]
+
+
 def dormant_ties(joints: ArrayLike, active: ArrayLike, fixed_pairs: ArrayLike) -> np.ndarray:
     """Independent constraints closing inactive facets, without redundant node-star cycles."""
-    joints = np.asarray(joints, dtype=np.int64).reshape(-1, 6)
+    joints = np.asarray(joints, dtype=np.int64)
+    if joints.ndim != 2 or joints.shape[1] not in (6, 8):
+        raise ValueError("Cohesive facets must be TRI6 or QUAD8 joints")
+    width = joints.shape[1] // 2
     active = np.asarray(active, dtype=bool)
     if active.shape != (len(joints),):
         raise ValueError("The active mask must match the cohesive facet bank")
@@ -32,7 +59,7 @@ def dormant_ties(joints: ArrayLike, active: ArrayLike, fixed_pairs: ArrayLike) -
         join(a, b)
     pairs = []
     for face in joints[~active]:
-        for a, b in zip(face[:3], face[3:]):
+        for a, b in zip(face[:width], face[width:]):
             if join(a, b):
                 pairs.append((int(a), int(b)))
     return np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
@@ -40,7 +67,8 @@ def dormant_ties(joints: ArrayLike, active: ArrayLike, fixed_pairs: ArrayLike) -
 
 def assess_round(points: ArrayLike, cells: ArrayLike, wall_mask: ArrayLike,
                  displacement: ArrayLike, owners: ArrayLike, active: ArrayLike,
-                 target: float, young: float, poisson: float) -> tuple[dict, np.ndarray]:
+                 target: float, young: float, poisson: float,
+                 native_stress: ArrayLike | None = None) -> tuple[dict, np.ndarray]:
     """Screen updated P1 wall stresses; only two-wall-owner facets can become active."""
     points = np.asarray(points, dtype=float)
     cells = np.asarray(cells, dtype=np.int64)
@@ -52,7 +80,14 @@ def assess_round(points: ArrayLike, cells: ArrayLike, wall_mask: ArrayLike,
         raise ValueError("Continuation facets must have two wall-cell owners")
     wall = cells[wall_mask]
     x = points[wall]
-    stress = wall_cell_stress(points, wall, displacement, young, poisson)
+    if wall.shape[1] == 8:
+        if native_stress is None:
+            raise ValueError("Native HEXA8 wall screening requires Code_Aster cell stress")
+        stress = np.asarray(native_stress, dtype=float)
+        if stress.shape != (len(wall), 3, 3):
+            raise ValueError("Native wall stress must have one tensor per HEXA8 cell")
+    else:
+        stress = wall_cell_stress(points, wall, displacement, young, poisson)
     principal = np.linalg.eigvalsh(stress)[:, -1]
     over = np.zeros(len(cells), dtype=bool)
     over[wall_mask] = principal > target
@@ -75,14 +110,21 @@ def render(comm: str, settings: dict) -> str:
         if comm.count(anchor) != 1:
             raise ValueError(f"Cannot safely render fixed-mesh continuation: ambiguous/missing {anchor!r}")
     helpers = ("import numpy as np\nfrom numpy.typing import ArrayLike\n\n"
-               + getsource(wall_cell_stress) + "\n" + getsource(dormant_ties) + "\n" + getsource(assess_round))
+               + getsource(wall_cell_stress) + "\n" + getsource(native_wall_tensors)
+               + "\n" + getsource(dormant_ties) + "\n" + getsource(assess_round))
     comm = comm.replace("history = {", (
         helpers + "\n"
         f"continuation_settings = {settings!r}\n"
         f"with np.load({settings['arrays_path']!r}, allow_pickle=False) as stored:\n"
         "    continuation_arrays = {key: stored[key] for key in ("
-        "'nodes', 'tetra4_concrete', 'concrete_body_ids', 'penta6_joints', 'tie_node_pairs', "
-        "'continuation_active_faces', 'continuation_face_owners')}\n"
+        "'nodes', 'hexa8_wall', 'tetra4_concrete', 'concrete_body_ids', 'penta6_joints', "
+        "'quad8_joints', 'joint_parent_faces', 'tie_node_pairs', 'continuation_active_faces', "
+        "'continuation_face_owners') "
+        "if key in stored.files}\n"
+        "if 'hexa8_wall' in continuation_arrays:\n"
+        "    continuation_arrays['tetra4_concrete'] = continuation_arrays['hexa8_wall']\n"
+        "    continuation_arrays['concrete_body_ids'] = np.ones(len(continuation_arrays['hexa8_wall']), int)\n"
+        "    continuation_arrays['penta6_joints'] = continuation_arrays['quad8_joints']\n"
         "continuation_active = continuation_arrays['continuation_active_faces'].astype(bool)\n"
         "continuation_round = 1\n"
         "continuation_round_started = time.perf_counter()\n"
@@ -204,7 +246,10 @@ PRELOAD_RUNTIME = '''
                 continuation_arrays['concrete_body_ids'] == 1, preload_displacement,
                 continuation_arrays['continuation_face_owners'], np.zeros_like(continuation_active),
                 PRELOAD_STRENGTH, continuation_settings['youngs_modulus_pa'],
-                continuation_settings['poissons_ratio'])
+                continuation_settings['poissons_ratio'],
+                native_wall_tensors(RESU.getField('SIEF_ELGA', preload_last),
+                                    list(MAIL.getCells('WALL')))
+                if 'hexa8_wall' in continuation_arrays else None)
             warnings = ['Intact preload assumes no earlier cracking; omitted fracture history is not simulated.']
             if preload_assessment['maximum_principal_tensile_stress_pa'] >= PRELOAD_STRENGTH:
                 warnings.append('Preload wall tension reaches material strength; earlier cracking may have occurred.')
@@ -213,7 +258,11 @@ PRELOAD_RUNTIME = '''
                 if writer:
                     folder.mkdir(exist_ok=False)
                     np.savez(folder / 'accepted_state.npz', displacement_m=preload_displacement,
-                             damage_state_gauss=preload_damage, dissipated_energy_gauss=preload_dissipation)
+                             damage_state_gauss=preload_damage, dissipated_energy_gauss=preload_dissipation,
+                             wall_cell_stress_pa=(
+                                 native_wall_tensors(RESU.getField('SIEF_ELGA', preload_last),
+                                                     list(MAIL.getCells('WALL')))
+                                 if 'hexa8_wall' in continuation_arrays else np.empty((0, 3, 3))))
             DEFI_FICHIER(ACTION='ASSOCIER', UNITE=91, FICHIER=str(folder / 'accepted_result.med'))
             IMPR_RESU(FORMAT='MED', UNITE=91, RESU=_F(RESULTAT=RESU, INST=0.,
                       NOM_CHAM=('DEPL', 'SIEF_ELGA', 'VARI_ELGA')))
@@ -255,7 +304,10 @@ RUNTIME_ROUND = '''
             continuation_arrays['concrete_body_ids'] == 1, displacement,
             continuation_arrays['continuation_face_owners'], continuation_active,
             continuation_settings['target_pa'], continuation_settings['youngs_modulus_pa'],
-            continuation_settings['poissons_ratio'])
+            continuation_settings['poissons_ratio'],
+            native_wall_tensors(RESU.getField('SIEF_ELGA', last),
+                                list(MAIL.getCells('WALL')))
+            if 'hexa8_wall' in continuation_arrays else None)
         folder = Path(STEPS_PATH).parent / f'round_{continuation_round:04d}'
         with root_archive_write() as writer:
             if writer:
@@ -263,7 +315,11 @@ RUNTIME_ROUND = '''
                 np.savez(folder / 'accepted_state.npz', displacement_m=displacement,
                          active_faces=continuation_active, damage_state=history['damage_state'][-1],
                          normal_jump_m=history['normal_jump_m'][-1], damage_state_gauss=damage_gauss,
-                         dissipated_energy_gauss=dissipation_gauss)
+                         dissipated_energy_gauss=dissipation_gauss,
+                         wall_cell_stress_pa=(
+                             native_wall_tensors(RESU.getField('SIEF_ELGA', last),
+                                                 list(MAIL.getCells('WALL')))
+                             if 'hexa8_wall' in continuation_arrays else np.empty((0, 3, 3))))
         DEFI_FICHIER(ACTION='ASSOCIER', UNITE=91, FICHIER=str(folder / 'accepted_result.med'))
         IMPR_RESU(FORMAT='MED', UNITE=91, RESU=_F(RESULTAT=RESU, INST=target,
                   NOM_CHAM=('DEPL', 'SIEF_ELGA', 'VARI_ELGA')))
@@ -285,13 +341,24 @@ RUNTIME_ROUND = '''
             },
             'state_preservation': 'native EVOL_NOLI on unchanged mesh and integration points',
         }
-        facet_damage = history['damage_state'][-1].reshape(len(continuation_active), 3).max(axis=1)
-        facet_jump = history['normal_jump_m'][-1].reshape(len(continuation_active), 3).max(axis=1)
+        parents = continuation_arrays.get('joint_parent_faces')
+        if parents is None:
+            parents = np.repeat(np.arange(len(continuation_active)), len(history['damage_state'][-1]) // len(continuation_active))
+        facet_damage = np.zeros(len(continuation_active))
+        facet_jump = np.full(len(continuation_active), -np.inf)
+        np.maximum.at(facet_damage, parents, history['damage_state'][-1])
+        np.maximum.at(facet_jump, parents, history['normal_jump_m'][-1])
         initiated = facet_damage >= 1. - 1.e-9
         opened = initiated & (facet_jump > continuation_settings['opening_limit_m'] * (1. + 1.e-6))
-        corners = continuation_arrays['nodes'][continuation_arrays['penta6_joints'][:, :3]]
-        areas = .5 * np.linalg.norm(np.cross(corners[:, 1] - corners[:, 0],
-                                             corners[:, 2] - corners[:, 0]), axis=1)
+        joint_faces = continuation_arrays['penta6_joints']
+        corners = continuation_arrays['nodes'][joint_faces[:, :joint_faces.shape[1] // 2]]
+        if corners.shape[1] == 3:
+            areas = .5 * np.linalg.norm(np.cross(corners[:, 1] - corners[:, 0],
+                                                 corners[:, 2] - corners[:, 0]), axis=1)
+        else:
+            areas = .5 * (
+                np.linalg.norm(np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1)
+                + np.linalg.norm(np.cross(corners[:, 2] - corners[:, 0], corners[:, 3] - corners[:, 0]), axis=1))
         row['opening_assessment'].update(
             initiated_faces=int(initiated.sum()), opened_faces=int(opened.sum()),
             separated_faces=int((facet_damage >= 2. - 1.e-9).sum()))

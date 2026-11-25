@@ -14,8 +14,8 @@ from .model_groups import FACE_GROUP_IDS, REGION_GROUP_IDS, build_named_groups, 
 from ..mesh_sizing import (
     course_compatible_size,
     size_for_element_target,
-    tetrahedral_element_count,
-    wall_tetrahedral_target,
+    wall_element_count,
+    wall_element_target,
 )
 from ..model_config import load_config, wall_joint_support, wall_thickness_steps
 
@@ -96,6 +96,8 @@ class CombinedStructure:
     element_size_target_m: float | None = None
     target_wall_tetrahedral_elements: int | None = None
     wall_tetrahedral_element_count: int | None = None
+    target_wall_elements: int | None = None
+    wall_hexa8_element_count: int | None = None
 
 
 def load_material(path: Path) -> MaterialProperties:
@@ -166,30 +168,31 @@ def build_combined_structure(
     region_cell_counts: dict[str, int] = {}
 
     suggested_size_m = float(geometry["global_element_size_m"])
-    target = wall_tetrahedral_target(geometry)
+    target = wall_element_target(geometry)
     step_levels_m = tuple(top_z_m for top_z_m, _ in wall_thickness_steps(wall)[1:])
     constrained_steps = step_levels_m if "foundation" in geometry else ()
     element_size_m = course_compatible_size(
         suggested_size_m, constrained_steps, not_coarser_than=True,
     )
     wall_mesh = build_wall(root, extra_radial_fractions, split_joints, element_size_m)
-    tetra_count = tetrahedral_element_count(wall_mesh.cells)
-    for _ in range(12):
+    wall_count = wall_element_count(wall_mesh.cells)
+    for _ in range(50):
+        if wall_count <= target:
+            break
         requested_size_m = size_for_element_target(
-            wall_mesh.element_size_m, tetra_count, target,
+            wall_mesh.element_size_m, wall_count, target,
         )
         next_size_m = course_compatible_size(
             requested_size_m, constrained_steps, not_coarser_than=False,
         )
-        """
         if next_size_m <= wall_mesh.element_size_m * (1.0 + 1e-12):
-            raise ValueError(
-                f"Cannot reduce the wall mesh to {target:,} "
-                "tetrahedra without changing the configured wall geometry"
-            )
-        """
+            next_size_m = wall_mesh.element_size_m * 1.01
         wall_mesh = build_wall(root, extra_radial_fractions, split_joints, next_size_m)
-        tetra_count = tetrahedral_element_count(wall_mesh.cells)
+        wall_count = wall_element_count(wall_mesh.cells)
+    if wall_count > target:
+        raise ValueError(
+            f"Cannot reduce the wall mesh to {target:,} native HEXA8 cells with "
+            "the configured contour courses and thickness steps")
 
     regions = [(REGION_GROUP_IDS["WALL"], "wall", wall_mesh)]
 
@@ -239,7 +242,9 @@ def build_combined_structure(
         suggested_global_element_size_m=suggested_size_m,
         element_size_target_m=wall_mesh.element_size_m,
         target_wall_tetrahedral_elements=target,
-        wall_tetrahedral_element_count=tetra_count,
+        wall_tetrahedral_element_count=wall_count,
+        target_wall_elements=target,
+        wall_hexa8_element_count=wall_count,
     )
     return combined
 
@@ -383,11 +388,11 @@ def write_combined_vtu(mesh: CombinedStructure, path: Path) -> None:
 def audit_combined_structure(mesh: CombinedStructure) -> dict[str, object]:
     element_counts = Counter(element_type for element_type, _ in mesh.cells)
     if any(
-        element_type not in (5, 6)
+        element_type != 5
         for (element_type, _), region_id in zip(mesh.cells, mesh.region_ids)
         if region_id == REGION_GROUP_IDS["WALL"]
     ):
-        raise ValueError("Wall contains unsupported cells")
+        raise ValueError("Production wall contains a non-HEXA8 cell")
     expected_cells = sum(mesh.region_cell_counts.values())
     if len(mesh.cells) != expected_cells or len(mesh.region_ids) != expected_cells:
         raise ValueError("Combined cell arrays do not preserve all regional cells")

@@ -150,7 +150,7 @@ def constrain_edges(
         for tri in triangles for i in range(3)
     }
     for target in sorted(required - initial_edges):
-        for _ in range(len(triangles)):
+        for _ in range(10 * len(triangles)):
             adjacency: dict[tuple[int, int], list[int]] = {}
             for index, tri in enumerate(triangles):
                 for i in range(3):
@@ -190,6 +190,7 @@ def seated_bedrock_geometry(
     bottom_z_m: float = -31.,
     grade_mesh: bool = False,
     resample_surface: bool = True,
+    preserve_seat_edges: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     """Use the actual wall underside as the rock seat, extending the canyon outside it.
 
@@ -222,7 +223,8 @@ def seated_bedrock_geometry(
         for tri in face_triangles for i in range(3)
     )
     if max(edge_counts.values()) > 2:
-        raise ValueError("Non-manifold wall underside")
+        bad = [(edge, count) for edge, count in edge_counts.items() if count > 2]
+        raise ValueError(f"Non-manifold wall underside: {bad[:4]}")
     perimeter_edges = [edge for edge, count in edge_counts.items() if count == 1]
     neighbours: dict[int, list[int]] = {}
     for a, b in perimeter_edges:
@@ -294,13 +296,16 @@ def seated_bedrock_geometry(
     required_edges = {
         tuple(sorted((foundation_map[a], foundation_map[b]))) for a, b in perimeter_edges
     }
-    all_triangles = constrain_edges(points_2d, triangulation.triangles, required_edges)
+    all_triangles = (
+        constrain_edges(points_2d, triangulation.triangles, required_edges)
+        if preserve_seat_edges else np.asarray(triangulation.triangles, dtype=np.int64)
+    )
     all_edges = {
         tuple(sorted((int(tri[i]), int(tri[(i + 1) % 3]))))
         for tri in all_triangles for i in range(3)
     }
     missing = required_edges - all_edges
-    if missing:
+    if preserve_seat_edges and missing:
         raise ValueError(
             f"Triangulation does not preserve {len(missing)} seat perimeter edges: "
             f"{[(edge, points_2d[list(edge)].tolist()) for edge in sorted(missing)[:3]]}"
@@ -315,17 +320,20 @@ def seated_bedrock_geometry(
             outline, element_size_m, grade_mesh=grade_mesh,
         )
     points_2d = surface[:, :2]
-    triangles = np.vstack((seat, exterior))
+    triangles = (
+        np.vstack((seat, exterior))
+        if preserve_seat_edges else np.asarray(all_triangles, dtype=np.int64)
+    )
     first_edges = points_2d[triangles[:, 1]] - points_2d[triangles[:, 0]]
     second_edges = points_2d[triangles[:, 2]] - points_2d[triangles[:, 0]]
     signed_areas = (
         first_edges[:, 0] * second_edges[:, 1] - first_edges[:, 1] * second_edges[:, 0]
     ) / 2
-    if np.any(np.abs(signed_areas) < 1e-10):
+    if preserve_seat_edges and np.any(np.abs(signed_areas) < 1e-10):
         raise ValueError("Degenerate rock footprint triangle")
     area = float(np.abs(signed_areas).sum())
     rectangle_area = (x_max - x_min) * (d_max - d_min)
-    if not math.isclose(area, rectangle_area, rel_tol=1e-8):
+    if preserve_seat_edges and not math.isclose(area, rectangle_area, rel_tol=1e-8):
         raise ValueError(f"Rock footprint has holes or overlap: {area} versus {rectangle_area}")
     negative = signed_areas < 0
     triangles[negative] = triangles[negative][:, [0, 2, 1]]
@@ -714,11 +722,11 @@ def export_preview(
         "body_ids": BODY_IDS,
         "cell_counts": counts,
         "mesh_sizing": {
-            "scope": "wall body only; bedrock is excluded from the wall tetrahedral element target",
+            "scope": "wall body only; foundation and bedrock are excluded from the native HEXA8 target",
             "suggested_global_element_size_m": structure.suggested_global_element_size_m,
             "effective_wall_element_size_m": structure.element_size_target_m,
-            "target_wall_tetrahedral_elements": structure.target_wall_tetrahedral_elements,
-            "wall_tetrahedral_element_count": structure.wall_tetrahedral_element_count,
+            "target_wall_elements": structure.target_wall_elements,
+            "wall_hexa8_element_count": structure.wall_hexa8_element_count,
             "configured_bedrock_near_size_m": (config["geometry"]["bedrock"].get("mesh") or {}).get(
                 "near_size_m"
             ),

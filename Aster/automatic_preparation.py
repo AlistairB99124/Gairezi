@@ -55,12 +55,20 @@ def baseline_inventory(baseline: Path, configuration: Path, model: Path):
         displacement = fields["displacement_m"].copy()
     if displacement.shape != arrays["nodes"].shape or not np.isfinite(displacement).all():
         raise ValueError("Full Aster baseline displacement must be finite at every mesh node")
-    cells = np.vstack((arrays["tetra4_concrete"], arrays["tetra4_bedrock"]))
-    regions = np.concatenate((arrays["concrete_body_ids"], np.full(len(arrays["tetra4_bedrock"]), 2)))
+    native_wall = "hexa8_wall" in arrays
+    if native_wall:
+        cells = np.asarray(arrays["hexa8_wall"], dtype=np.int64)
+        regions = np.full(len(cells), 1, dtype=np.int64)
+    else:
+        cells = np.vstack((arrays["tetra4_concrete"], arrays["tetra4_bedrock"]))
+        regions = np.concatenate((arrays["concrete_body_ids"], np.full(len(arrays["tetra4_bedrock"]), 2)))
     rows = arrays["source_cell_rows"]
-    if rows.shape != (len(cells),) or not np.array_equal(np.sort(rows), np.arange(len(cells))):
+    if native_wall:
+        rows = rows[:len(cells)]
+    if rows.shape != (len(cells),) or len(np.unique(rows)) != len(rows) or (not native_wall
+            and not np.array_equal(np.sort(rows), np.arange(len(cells)))):
         raise ValueError("Aster baseline source-cell identities are incomplete or duplicated")
-    physical = np.unique(cells)
+    physical = np.arange(len(arrays["nodes"]), dtype=np.int64) if native_wall else np.unique(cells)
     inverse = np.full(len(arrays["nodes"]), -1, dtype=np.int64)
     inverse[physical] = np.arange(len(physical))
     hashes = {name: file_hash(baseline / name) for name in BASELINE_FILES}
@@ -82,9 +90,38 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             baseline, configuration, model)
         concrete = config["material"]["concrete"]
         target = residual_target_tensile_stress_pa(config)
+        native_wall = cells.ndim == 2 and cells.shape[1] == 8
+        native_stress = None
+        if native_wall:
+            stress_path = baseline / "aster_result_fields.npz"
+            if not stress_path.is_file() and (baseline / "run" / "aster_result_fields.npz").is_file():
+                stress_path = baseline / "run" / "aster_result_fields.npz"
+            if not stress_path.is_file():
+                raise ValueError(
+                    "Native HEXA8 preparation requires native Code_Aster cell stress "
+                    "(aster_result_fields.npz); P1 tetrahedral stress is not a substitute")
+            with np.load(stress_path, allow_pickle=False) as fields:
+                key = "wall_cell_stress_pa"
+                if key not in fields.files or fields[key].shape != (len(cells), 3, 3):
+                    raise ValueError("Native HEXA8 cell stress archive does not match the wall topology")
+                native_stress = fields[key].copy()
+            hashes = dict(hashes, **{
+                str(stress_path.relative_to(baseline)): file_hash(stress_path)
+            })
         if screening is None:
-            stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
-            result = screen_cells(stress, regions, rows, coordinates, cells,
+            if native_wall:
+                from Aster.mixed_topology import native_screening
+                screen = native_screening(
+                    {"nodes": coordinates, "hexa8_wall": cells}, native_stress, rows,
+                    float(concrete["tensile_strength_pa"]),
+                    relative_tolerance=relative_tolerance,
+                    max_damage_count=(max_damage_count(config)
+                                      if candidate_scope == "configured" else None))
+                result = {key: value for key, value in screen.items() if not key.startswith("_")}
+                stress = native_stress
+            else:
+                stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
+                result = screen_cells(stress, regions, rows, coordinates, cells,
                                   float(concrete["tensile_strength_pa"]),
                                   relative_tolerance=relative_tolerance,
                                   max_damage_count=(max_damage_count(config)
@@ -176,7 +213,7 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             overload_factor = maximum_overload_factor(config)
             # A disabled selection is an intentional control run: no candidates regardless
             # of facet stress, so neither overload screening nor empty-selection errors apply.
-            if (candidate_scope == "configured" and not len(selected_rows) and not disabled
+            if (not native_wall and candidate_scope == "configured" and not len(selected_rows) and not disabled
                     and result["facet_check"]["critical_facets"] == 0 and overload_factor > 1):
                 stress = region_cell_stresses(coordinates, cells, regions, displacement, config["material"])
                 overload = screen_cells(stress * overload_factor, regions, rows, coordinates, cells,
@@ -189,40 +226,59 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
             if (candidate_scope == "configured" and not len(selected_rows) and not disabled
                     and result["facet_check"]["critical_facets"] > 0):
                 raise ValueError(result["selection"].get("message") or "Aster candidate selection is empty")
-            if np.any(selected_rows < 0) or np.any(selected_rows >= len(cells)):
+            if np.any(selected_rows < 0):
                 raise ValueError("Aster screening selected no valid wall cells")
-            inverse_rows = np.argsort(rows)
-            selected = inverse_rows[selected_rows]
+            lookup = {int(row): index for index, row in enumerate(rows)}
+            if any(int(row) not in lookup for row in selected_rows):
+                raise ValueError("Aster screening selected source rows absent from the wall")
+            selected = np.asarray([lookup[int(row)] for row in selected_rows], dtype=np.int64)
             eligible_regions = (1,) if candidate_scope == "all_overstressed" else (1, 3)
             if not np.all(np.isin(regions[selected], eligible_regions)):
                 raise ValueError("Aster screening selected cells outside the wall and foundation")
             # The uncapped selection is a complete bank-to-bank band by construction;
             # capped patches are openable by construction. No neighbour rings either way.
             rings = 0
-            membership = candidate_region(cells, regions, selected, rings)
-            faces = region_candidate_faces(cells, regions, membership)
+            if native_wall:
+                from Aster.mixed_topology import candidate_faces as native_candidate_faces
+                from Aster.mixed_topology import candidate_region as native_candidate_region
+                membership = native_candidate_region(cells, selected, rings)
+                faces = native_candidate_faces(cells, membership)
+            else:
+                membership = candidate_region(cells, regions, selected, rings)
+                faces = region_candidate_faces(cells, regions, membership)
             initial_faces = faces
             if continuation:
                 if candidate_scope != "all_overstressed":
                     raise ValueError("Fixed-mesh continuation requires wall-only production selection")
-                faces = region_candidate_faces(cells, regions, regions == 1)
+                if native_wall:
+                    bank = native_candidate_region(cells, selected, 1)
+                    faces = native_candidate_faces(cells, bank)
+                else:
+                    bank = candidate_region(cells, regions, selected, 1)
+                    faces = region_candidate_faces(cells, regions, bank)
             while len(faces) > 20000 and rings > 0:
                 rings -= 1
-                membership = candidate_region(cells, regions, selected, rings)
-                faces = region_candidate_faces(cells, regions, membership)
+                membership = (native_candidate_region(cells, selected, rings) if native_wall
+                             else candidate_region(cells, regions, selected, rings))
+                faces = (native_candidate_faces(cells, membership) if native_wall
+                         else region_candidate_faces(cells, regions, membership))
             maximum_faces = int(((config.get("fracture_debug") or {}).get("aster") or {}).get(
                 "maximum_candidate_facets", 20000))
             if len(faces) > maximum_faces:
                 raise ValueError(
                     f"Cohesive candidate resource limit: {len(faces)} wall facets would generate "
-                    f"{3 * len(faces)} joint patches, exceeding the configured limit of "
+                    f"{(1 if native_wall else 3) * len(faces)} joint patches, exceeding the configured limit of "
                     f"{maximum_faces} facets. No candidates were truncated; review the material "
                     "strength and mesh or increase the limit only with sufficient resources."
                 )
             if not len(faces) and len(selected):
                 raise ValueError("Selected wall cells have no interior candidate facets")
-            split = (split_interior_wall_faces(coordinates, cells, regions, faces, drop_fully_tied=True)
-                     if len(faces) else None)
+            if native_wall:
+                from Aster.mixed_topology import split_wall_faces
+                split = split_wall_faces(coordinates, cells, faces) if len(faces) else None
+            else:
+                split = (split_interior_wall_faces(coordinates, cells, regions, faces, drop_fully_tied=True)
+                         if len(faces) else None)
             continuation_arrays = {}
             if continuation and split is not None:
                 initial_keys = {tuple(sorted(face)) for face in initial_faces.tolist()}
@@ -256,12 +312,23 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                     raise ValueError(
                         f"{int(lift_faces.sum())} candidate facets match the screening's {len(planes)} lift planes; "
                         "the prepared candidates must contain every lift-joint facet")
+            if split is None:
+                minus = plus = np.empty((0, 4 if native_wall else 3), dtype=np.int64)
+                areas = np.empty(0)
+            elif native_wall:
+                minus = plus = split.source_faces
+                xyz = coordinates[minus]
+                areas = .5 * (
+                    np.linalg.norm(np.cross(xyz[:, 1] - xyz[:, 0], xyz[:, 2] - xyz[:, 0]), axis=1)
+                    + np.linalg.norm(np.cross(xyz[:, 2] - xyz[:, 0], xyz[:, 3] - xyz[:, 0]), axis=1))
+            else:
+                minus, plus, areas = split.faces.minus, split.faces.plus, split.faces.areas
             np.savez_compressed(output / "cohesive_state.npz",
                                 coordinates_m=split.coordinates_m if split is not None else coordinates,
                                 parent_node_ids=physical[split.parent_node_ids] if split is not None else physical,
-                                minus=split.faces.minus if split is not None else np.empty((0, 3), dtype=np.int64),
-                                plus=split.faces.plus if split is not None else np.empty((0, 3), dtype=np.int64),
-                                areas_m2=split.faces.areas if split is not None else np.empty(0),
+                                minus=minus,
+                                plus=plus,
+                                areas_m2=areas,
                                 **continuation_arrays,
                                 **({"lift_joint_faces": lift_faces} if lift_faces is not None else {}))
             result = {"status": PREPARED, "outcome": "candidates_prepared", "accepted": False,
@@ -292,6 +359,8 @@ def run(configuration: Path, model: Path, baseline: Path, output: Path, *,
                         "adaptive_rounds", 1)),
                     "target_pa": residual_target_tensile_stress_pa(config),
                     "initial_active_faces": int(continuation_arrays["continuation_active_faces"].sum()),
+                    "fixed_bank_cell_rings": 1,
+                    "scope": "initially overstressed wall cells plus one vertex-neighbour halo",
                 }
             result["solver_controls"] = {
                 key: value for key, value in ((config.get("fracture_debug") or {}).get("aster") or {}).items()

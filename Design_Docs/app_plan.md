@@ -16,15 +16,28 @@ It is configured in the authoritative JSON file, preserved by WPF, and not
 editable in the desktop. Material tensile strength remains the cohesive
 initiation parameter; selecting facets does not force their opening.
 A completed stage requires a converged full-load solution and
-the configured threshold to be met. New runs use a fixed bank of interior wall
-cohesive facets with independent dormant-facet constraints. Additional facets
-are activated from updated wall stresses without rebuilding the mesh, and
+the configured threshold to be met. New runs use a fixed bank covering the
+initially overstressed wall region plus one vertex-neighbour halo, with
+independent dormant-facet constraints. Additional bank facets are activated
+from updated wall stresses without rebuilding the mesh, and
 native `EVOL_NOLI` preserves all constitutive integration-point history.
 Gauss-point damage and dissipation must not decrease between accepted rounds.
 The bank is subject to the existing facet/resource limits and increases the
 initial model size. Results are not engineering validated.
 Historical `ENDO_FISS_EXP`, FEniCSx, seeded and painted methods are development
 records, not the current production crack solver.
+
+Production wall, concrete foundation, and bedrock volumes are native HEXA8
+cells. The wall, foundation and the near-seat bedrock foundation interface
+share one LEGO/stair-step course grid:
+each chainage column uses the highest whole course at or below the surveyed
+contour, with matching foundation columns/risers and exact near-rock contact
+faces. Grading uses a deterministic tetrahedral construction topology refined
+to conforming HEXA8 solver cells; the production volume mesh contains no
+TETRA4 cells. Aster candidate
+facets are QUAD4 wall faces and native cohesive interfaces are HEXA8 joints.
+The legacy `geometry.target_wall_tetrahedral_elements` key remains readable on
+old files; new saves use `geometry.target_wall_elements` as a native-cell cap.
 
 New defaults explicitly use `fracture_debug.aster.loading_mode =
 "reservoir_filling"`, starting at `water_depth_start_m = 27` and rising by
@@ -167,6 +180,18 @@ Requested wet results without that evidence are rejected by the API and sweep,
 not silently accepted as dry. The report and Investigation disclose the actual
 hydraulic assumptions and history. Restart the API to load these code changes
 after any running jobs have finished; existing job snapshots are not modified.
+
+The accepted Aster elastic baseline retains the full bedrock volume. The
+subsequent nonlinear intact-preload/cohesive model may retain only bedrock
+around the concrete foundation when
+`bedrock_analysis.cracking_bedrock_radius_m` is positive. The production
+default is 0 m: Aster removes bedrock from the nonlinear preload/cracking mesh
+and applies the configured global-axis bedrock springs at the exposed concrete
+foundation/bedrock interface. The full-volume accepted baseline remains
+unchanged. A positive radius remains available for a deliberate local-rock
+diagnostic, with springs at its cut boundary. Wall cracking never damages
+bedrock. The nonlinear scope and original/full volumes are recorded in the
+cracking manifest for review.
 
 Elmer supplies the source mesh and elastic reference. FEniCSx and Code_Aster
 then run independent elastic baselines. A successful Elmer stage alone does
@@ -1552,8 +1577,8 @@ independent sensitivity verification. See the README for existing-run export.
 | Wall radii and radial width | Validate width and midpoint relationships; display units in metres |
 | Contour `height` | Label as signed elevation relative to crest z = 0 |
 | `geometry.wall.height_m` | Clearly identify current nominal metadata; contours control the actual height |
-| Global element size | Starting suggestion; the wall analysis mesh scales it to stay at or below `geometry.target_wall_tetrahedral_elements` (default 150,000) final tetrahedra, while the conforming foundation and near-seat bedrock adapt to the effective target size |
-| Target wall tetrahedral elements | Optional integer ≥ 1,000 (default 150,000) capping wall-body tetrahedra; a number input in the Geometry tab |
+| Global element size | Starting suggestion; the wall analysis mesh scales it to stay at or below `geometry.target_wall_elements` native HEXA8 cells, while the LEGO foundation and near-seat bedrock adapt to the effective target size |
+| Target wall elements | Optional integer ≥ 1,000 capping wall-body HEXA8 cells; shown as "Target wall HEXA8 elements" in the Geometry tab |
 | Local element size | Identify which generator uses it; do not imply it refines the current combined mesh |
 | `water_height` | Reservoir depth above the deepest wall seat; with `overflow_head` sets the water surface |
 | `overflow_head` | Depth above the crest when overflowing; adds the crest surcharge |
@@ -1561,7 +1586,7 @@ independent sensitivity verification. See the README for existing-run export.
 | Explicit directional springs | Without `geometry.foundation`, the wall/bedrock seat uses `geometry.bedrock.support.spring_n_per_m3`; with it, that setting controls foundation/bedrock and `geometry.foundation.support` controls wall/foundation. Springs act on relative displacement only (no grounded spring bypass); bonded interfaces share nodes and leave spring coefficients inactive. The legacy wall-only solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
 | Bedrock material | Active in the integrated three-body solver; the legacy wall-only solve represents the foundation with grounded springs instead |
 | `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall-only solve |
-| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: near-seat size follows the effective wall size, grading toward the configured far size by the configured distance; shared by preview and three-body preparation. Only wall tetrahedra count toward the 150,000 cap. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
+| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: near-seat LEGO courses follow the effective wall size, then transition toward the configured far size. A coarse conforming tetrahedral construction is converted one-to-four to production HEXA8, so no tetrahedral bedrock cells are exported. Only native wall HEXA8 cells count toward the target. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
 | `damage_selection.max_damage_count` | Optional automatic element selection limit on the Cracking tab: blank/`null` (default) selects every element owning a facet whose one-sided normal stress reaches `f_t`; an integer >= 2 grows a connected patch of whole node stars from the highest-tension facet up to that count, fails selection if no facet can open, and confines cracking to it |
 | `material.mortar` | Optional fill sloping the ledges of `geometry.wall.thickness_steps` so a stepped wall looks smooth (density, stiffness, Poisson ratio, bond springs to the wall, optional `slope_run_per_rise`, default 0.1). A soft body of its own (tag 4) in Elmer, both Code_Aster stages and FEniCSx; excluded from wall peaks and from the concrete volume. No editor in the desktop: the block is validated, kept and submitted unchanged, and the results list a **Mortar fill volume** row (`mortar_volume_m3`). Refused with spring wall joints, `step_end_taper_ratio`, no foundation or a bedrock mode other than `elastic_layer`; a warning and no effect on a wall without steps. Values in use are placeholders. Details: "Mortar fill on the steps" in `Gairezi/README.md`. |
 | Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |

@@ -12,7 +12,18 @@ class ReservoirPressure:
         self.nodes = arrays["nodes"]
         self.gradient = gradient
         source = arrays["source_node_ids"]
-        volumes = np.vstack((arrays["tetra4_concrete"], arrays["tetra4_bedrock"]))
+        if "hexa8_wall" in arrays:
+            volumes = np.vstack((
+                arrays["hexa8_wall"],
+                arrays["hexa8_foundation"],
+                arrays["hexa8_bedrock"],
+            ))
+            if len(arrays.get("tetra4_bedrock", ())):
+                raise ValueError("Native HEXA8 production cannot include TETRA4 bedrock")
+        else:
+            volumes = np.vstack((
+                arrays["tetra4_concrete"], arrays["tetra4_bedrock"]
+            ))
         boundary, normals = boundary_faces(volumes, self.nodes, source)
         lookup = {tuple(sorted(face)): normal for face, normal in zip(source[boundary], normals)}
         self.surfaces = {}

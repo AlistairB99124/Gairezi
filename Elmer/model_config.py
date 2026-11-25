@@ -625,8 +625,15 @@ class _ConfigValidator:
             self.validate_custom(root["custom"])
 
         geometry = self.object(root.get("geometry"), "geometry", CONFIG_KEYS["geometry"],
-                               {"foundation", "target_wall_tetrahedral_elements"})
+                               {"foundation", "target_wall_elements", "target_wall_tetrahedral_elements"})
         if geometry is not None:
+            if "target_wall_elements" in geometry and "target_wall_tetrahedral_elements" in geometry:
+                if geometry["target_wall_elements"] != geometry["target_wall_tetrahedral_elements"]:
+                    self.issue("geometry.target_wall_elements",
+                               "must agree with legacy target_wall_tetrahedral_elements when both are present")
+            if "target_wall_elements" in geometry:
+                self.debug_integer(geometry["target_wall_elements"],
+                                   "geometry.target_wall_elements", MINIMUM_WALL_TETRAHEDRAL_TARGET)
             if "target_wall_tetrahedral_elements" in geometry:
                 self.debug_integer(geometry["target_wall_tetrahedral_elements"],
                                    "geometry.target_wall_tetrahedral_elements", MINIMUM_WALL_TETRAHEDRAL_TARGET)
@@ -668,7 +675,7 @@ class _ConfigValidator:
                     "geometry.global_element_size_m",
                     f"below {GLOBAL_ELEMENT_SIZE_WARNING_M} m meshes the rock/foundation volumes extremely "
                     "finely; meshing and the solvers may take hours and exhaust memory. To refine the "
-                    "wall, raise geometry.target_wall_tetrahedral_elements instead.",
+                    "wall, raise geometry.target_wall_elements instead.",
                 )
 
             wall = self.object(
@@ -836,8 +843,10 @@ class _ConfigValidator:
 
     def validate_bedrock_analysis(self, value: object, root: Mapping[str, object]) -> None:
         path = "bedrock_analysis"
-        analysis = self.object(value, path, {"mode"},
-                               optional={"spring_n_per_m3", "wall_only_body", "condense_foundation"})
+        analysis = self.object(
+            value, path, {"mode"},
+            optional={"spring_n_per_m3", "wall_only_body", "condense_foundation",
+                      "cracking_bedrock_radius_m"})
         if analysis is None or "mode" not in analysis:
             return
         wall_only = analysis.get("wall_only_body", False)
@@ -855,6 +864,9 @@ class _ConfigValidator:
                 for axis in VECTOR_KEYS:
                     if axis in springs:
                         self.number(springs[axis], f"{path}.spring_n_per_m3.{axis}", positive=True)
+        if "cracking_bedrock_radius_m" in analysis:
+            self.number(analysis["cracking_bedrock_radius_m"],
+                            f"{path}.cracking_bedrock_radius_m", nonnegative=True)
         if not isinstance(mode, str) or mode not in BEDROCK_ANALYSIS_MODES:
             self.issue(f"{path}.mode", f"must be one of {sorted(BEDROCK_ANALYSIS_MODES)}")
             return

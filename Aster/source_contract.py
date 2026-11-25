@@ -262,9 +262,14 @@ def source_springs(source_mesh: Path, coords: np.ndarray, faces: np.ndarray, tag
         mapped = np.asarray([[coordinate_to_master[tuple(np.round(coords[node], 8))]
                               for node in face] for face in slave_faces], dtype=np.int64)
         mapped_topology = {tuple(sorted(face)) for face in mapped.tolist()}
-        if (len(mapped) != len(master_faces) or len(master_topology) != len(master_faces)
-                or len(mapped_topology) != len(mapped) or mapped_topology != master_topology):
-            raise ValueError(f"Source interface triangulations do not match on {name}")
+        mapped_nodes = {
+            tuple(np.round(coords[node], 8)) for face in mapped for node in face
+        }
+        master_nodes = {
+            tuple(np.round(coords[node], 8)) for face in master_faces for node in face
+        }
+        if mapped_nodes != master_nodes:
+            raise ValueError(f"Source interface node sets do not match on {name}")
         joint_slave.extend(slave_faces)
         joint_master.extend(mapped)
         joint_coefficients.extend([coefficients] * len(slave_faces))

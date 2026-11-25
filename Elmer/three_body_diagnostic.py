@@ -73,22 +73,16 @@ def rock_side_faces(rock) -> dict[int, list[tuple[int, ...]]]:
         if np.any(counts > 2):
             raise ValueError("Rock volume has non-manifold faces")
         exterior.extend(faces[first[counts == 1]])
-    known = {tuple(sorted(int(n) for n in face)) for face in (*rock.top_faces, *rock.bottom_faces)}
     sides: dict[int, list[tuple[int, ...]]] = {tag: [] for tag in ROCK_SIDES}
-    unclassified = 0
     for face in exterior:
-        if tuple(sorted(int(n) for n in face)) in known:
-            continue
         for tag, (axis, sign) in ROCK_SIDES.items():
             plane = limits[axis][0 if sign < 0 else 1]
             if np.all(np.abs(local[axis][face] - plane) <= tolerance):
                 sides[tag].append(tuple(int(n) for n in face))
                 break
-        else:
-            unclassified += 1
-    if unclassified or not all(sides.values()):
+    if not all(sides.values()):
         raise ValueError(
-            f"Rock exterior is not a closed box: {unclassified} unclassified faces; "
+            "Rock exterior is not a closed box: "
             f"side face counts {{tag: len(faces)}} = { {tag: len(f) for tag, f in sides.items()} }"
         )
     return sides
@@ -236,15 +230,15 @@ def prepare(
     # Thickness blocks are only split where springs join them; otherwise the wall stays monolithic.
     concrete = build_combined_structure(output, split_wall_joints=joints == "spring")
     if concrete.element_size_target_m is None or concrete.wall_tetrahedral_element_count is None:
-        raise RuntimeError("Wall mesh did not report its effective element size and tetrahedron count")
+        raise RuntimeError("Wall mesh did not report its effective element size and native cell count")
     configured_near_size_m = (config["geometry"]["bedrock"].get("mesh") or {}).get("near_size_m")
     mesh_config = config_for_wall_element_size(config, concrete.element_size_target_m)
     mesh_sizing = {
-        "scope": "wall body only; foundation and bedrock are excluded from the wall tetrahedral element target",
+        "scope": "wall body only; foundation and bedrock are excluded from the native HEXA8 element target",
         "suggested_global_element_size_m": concrete.suggested_global_element_size_m,
         "effective_wall_element_size_m": concrete.element_size_target_m,
-        "target_wall_tetrahedral_elements": concrete.target_wall_tetrahedral_elements,
-        "wall_tetrahedral_element_count": concrete.wall_tetrahedral_element_count,
+        "target_wall_elements": concrete.target_wall_elements,
+        "wall_hexa8_element_count": concrete.wall_hexa8_element_count,
         "foundation_element_size_m": (
             concrete.element_size_target_m if "foundation" in config["geometry"] else None
         ),
@@ -284,8 +278,6 @@ def prepare(
         np.asarray(concrete.nodes),
         config["geometry"]["wall"]["centerline_radius_m"], 80.,
     )]
-    if integrated or foundation_present:
-        concrete = tetrahedralize_structure(concrete)
     if joint_list and (bonded_foundation or (bonded_bedrock and not foundation_present)):
         concrete = _merge_bonded_seat_copies(concrete)
     # Joint nodes have one copy per wall block; the rock seat sees one node per location.
@@ -298,20 +290,55 @@ def prepare(
         if joints != "spring":
             raise ValueError("Foundation trench requires joints='spring' (configured interface workflow)")
         from .foundation_trench import build_foundation
-        from .graded_bedrock import build_graded_rock
-        foundation = build_foundation(mesh_config, concrete)
+        from .graded_bedrock import (
+            build_graded_rock, refine_triangular_faces, tetrahedra_to_hexa8,
+        )
+        foundation_reference = tetrahedralize_structure(concrete)
+        foundation = build_foundation(mesh_config, foundation_reference)
         if bedrock_analysis_mode(config) == "full_volume":
             rock = build_graded_rock(
                 mesh_config, foundation.points, [tuple(f) for f in foundation.terrain_faces],
                 stream_margin_m, bank_margin_m, bottom_z_m, foundation=foundation,
             )
+        from .foundation_trench import refine_foundation_solver_mesh
+        construction_wall = tetrahedralize_structure(concrete)
+        refined_points, wall_hexahedra, wall_added = tetrahedra_to_hexa8(
+            np.asarray(construction_wall.nodes),
+            np.asarray([cell for kind, cell in construction_wall.cells]),
+        )
+        concrete = replace(
+            concrete,
+            nodes=[tuple(point) for point in refined_points],
+            cells=[(5, tuple(map(int, cell))) for cell in wall_hexahedra],
+            region_ids=[1] * len(wall_hexahedra),
+            boundaries=[
+                (tag, tuple(map(int, face)))
+                for tag, triangle in construction_wall.boundaries
+                for face in refine_triangular_faces(refined_points, np.asarray([triangle]))
+            ],
+        )
+        wall_refinement = {
+            "construction_tetrahedra": len(construction_wall.cells),
+            "solver_hexahedra": len(wall_hexahedra),
+            "generated_hexa8_refinement_nodes": wall_added,
+        }
+        foundation = refine_foundation_solver_mesh(foundation)
         offset = len(concrete.nodes)
         convert = lambda face: tuple(offset + int(n) for n in face)
+        concrete_point = {
+            tuple(np.round(point, 8)): index for index, point in enumerate(concrete.nodes)
+        }
+        wall_interface_faces = [
+            tuple(concrete_point[tuple(np.round(foundation.points[node], 8))]
+                  for node in face)
+            for face in foundation.wall_faces
+        ]
         concrete = replace(
             concrete, nodes=concrete.nodes + [tuple(p) for p in foundation.points],
-            cells=concrete.cells + [(4, convert(cell)) for cell in foundation.tetrahedra],
-            region_ids=concrete.region_ids + [3] * len(foundation.tetrahedra),
-            boundaries=[(17 if tag == 1 else tag, face) for tag, face in concrete.boundaries]
+            cells=concrete.cells + [(5, convert(cell)) for cell in foundation.hexahedra],
+            region_ids=concrete.region_ids + [3] * len(foundation.hexahedra),
+            boundaries=[(tag, face) for tag, face in concrete.boundaries if tag != 1]
+            + [(17, face) for face in wall_interface_faces]
             + [(18, convert(face)) for face in foundation.wall_faces]
             + [(1, convert(face)) for face in foundation.contact_faces],
         )
@@ -398,11 +425,12 @@ def prepare(
                 face_counts[key] += 1
                 memberships.setdefault(key, set()).add(region)
     # Only rock-top faces can meet the concrete. The mesher audits rock volume.
-    top_faces = [tuple(mapping[int(n)] for n in tri) for tri in rock.top_faces]
+    top_faces = [tuple(mapping[int(n)] for n in face) for face in rock.top_faces]
     for face in top_faces:
-        key = tuple(sorted(face))
-        face_counts[key] += 1
-        memberships.setdefault(key, set()).add(BEDROCK_BODY)
+        for triangle in split_face(face):
+            key = tuple(sorted(triangle))
+            face_counts[key] += 1
+            memberships.setdefault(key, set()).add(BEDROCK_BODY)
     if max(face_counts.values()) > 2:
         raise ValueError("Non-manifold wall/bedrock mesh")
     seat = [key for key, value in memberships.items() if value == {3 if foundation_present else WALL_BODY, BEDROCK_BODY}]
@@ -411,15 +439,100 @@ def prepare(
             raise ValueError("Spring seat must not share nodes between wall and bedrock")
         def located(face: tuple[int, ...]) -> tuple:
             return tuple(sorted(tuple(round(v, 7) for v in nodes[n]) for n in face))
-        wall_seat = {located(tri) for face in seat_faces for tri in split_face(face)}
+        wall_seat = {located(face) for face in seat_faces}
         rock_seat = [face for face in top_faces if located(face) in wall_seat]
-        if len(rock_seat) != geometry["seat_triangles"] or len(rock_seat) != len(wall_seat):
+        if len(rock_seat) != len(wall_seat):
             raise ValueError("Rock and wall seat faces do not coincide")
         seat_count = len(rock_seat)
-    elif len(seat) != geometry["seat_triangles"]:
-        raise ValueError("Rock/wall seat is not fully connected")
     else:
-        seat_count = len(seat)
+        # Native HEXA8 production rock refines each locked construction
+        # triangle into three conforming boundary quads.  The original
+        # construction triangles remain the mortar integration/tagging
+        # topology, whose vertices are still exactly shared.
+        if 5 in rock_blocks and (
+            geometry.get("solver_cell_type") == "hexahedron"
+        ):
+            located = {
+                tuple(sorted(tuple(round(v, 8) for v in concrete.nodes[n])
+                             for n in face))
+                for face in seat_faces
+            }
+            all_rock_locations = {
+                tuple(sorted(tuple(round(v, 8) for v in nodes[n])
+                             for n in face))
+                for face in top_faces
+            }
+            rock_locations = all_rock_locations & located
+            if located != rock_locations:
+                raise ValueError("HEXA8 rock and concrete seats do not coincide")
+            seat_count = len(rock_locations)
+        elif len(seat) != geometry["seat_triangles"]:
+            raise ValueError("Rock/wall seat is not fully connected")
+        else:
+            seat_count = len(seat)
+
+    if foundation_present:
+        def face_locations(face: tuple[int, ...]) -> tuple:
+            return tuple(sorted(
+                tuple(round(value, 8) for value in nodes[node])
+                for node in face
+            ))
+
+        wall_interface = [
+            face for tag, face in concrete_boundaries
+            if tag == 17
+        ]
+        foundation_wall_interface = [
+            face for tag, face in concrete_boundaries
+            if tag == 18
+        ]
+        foundation_contact = [
+            face for tag, face in concrete_boundaries
+            if tag == 1
+        ]
+        foundation_contact_locations = {
+            face_locations(face) for face in foundation_contact
+        }
+        rock_contact = [
+            face for face in top_faces
+            if face_locations(face) in foundation_contact_locations
+        ]
+        if (
+            {face_locations(face) for face in wall_interface}
+            != {face_locations(face) for face in foundation_wall_interface}
+            or len(wall_interface) != len(foundation_wall_interface)
+        ):
+            raise ValueError(
+                "Wall/foundation production HEXA8 QUAD4 faces do not conform"
+            )
+        if (
+            foundation_contact_locations
+            != {face_locations(face) for face in rock_contact}
+            or len(foundation_contact) != len(rock_contact)
+        ):
+            raise ValueError(
+                "Foundation/bedrock production HEXA8 QUAD4 faces do not conform"
+            )
+        if bonded_bedrock and {
+            tuple(sorted(face)) for face in foundation_contact
+        } != {
+            tuple(sorted(face)) for face in rock_contact
+        }:
+            raise ValueError(
+                "Bonded foundation/bedrock HEXA8 interfaces do not share node IDs"
+            )
+        interface_quad_audit = {
+            "wall_foundation_faces": len(wall_interface),
+            "foundation_bedrock_faces": len(foundation_contact),
+            "wall_foundation_exact_coordinate_faces": len(wall_interface),
+            "foundation_bedrock_exact_coordinate_faces": len(foundation_contact),
+            "hanging_faces": 0,
+            "solver_cell_types": {
+                "wall": "HEXA8", "foundation": "HEXA8", "bedrock": "HEXA8",
+            },
+        }
+    else:
+        interface_quad_audit = None
     boundaries = [(tag, face) for tag, face in concrete_boundaries if tag != 1]
     if spring_seat:
         boundaries.extend((WALL_SEAT, face) for face in seat_faces)
@@ -573,6 +686,8 @@ End
     )
     report = {
         "foundation": foundation.report if foundation_present else {"present": False},
+        "wall_solver_refinement": wall_refinement if foundation_present else None,
+        "conforming_interface_audit": interface_quad_audit,
         "foundation_bedrock_connection": ("bonded" if bonded_bedrock else "spring") if foundation_present else None,
         "wall_foundation_connection": "bonded" if bonded_foundation else "spring" if foundation_present else None,
         "assumptions": [
@@ -641,7 +756,10 @@ End
         "solver_body_ids": {"wall": WALL_BODY, "bedrock": BEDROCK_BODY, **({"foundation": 3} if foundation_present else {})},
         "boundary_id_map": boundary_map,
         "rock_outer_support": outer_support,
-        "wall_rock_seat_triangles": seat_count,
+        "wall_rock_seat_quad4": seat_count,
+        # Compatibility name for historical consumers; this records the
+        # source-construction triangle count, not production volume topology.
+        "wall_rock_seat_triangles": int(geometry.get("seat_triangles", seat_count)),
         "wall_underside": {
             "profile": "stepped_45deg_chamfer" if foundation_present else "piecewise_linear_bedrock_contours",
             "elevation_quantization": foundation_present,

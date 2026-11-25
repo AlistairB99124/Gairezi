@@ -150,7 +150,7 @@ strength-based selection, as do production configurations without the new
 property. Missing full load or the residual target is reported
 as an incomplete cracking stage, not an engineering success.
 
-`Load Default` starts with a target of 20,000 wall tetrahedra for a lower-cost
+`Load Default` starts with a target of 20,000 native wall HEXA8 cells for a lower-cost
 initial check. The mesher's actual cell count may differ. Geometry, supports,
 material properties and residual target are unchanged; coarse-mesh completion
 is not mesh independence or proof that finer meshes will converge.
@@ -380,13 +380,15 @@ shaping assumption, not a change to the survey data in config.json. The maximum
 lip lowering is **0.483871 m**. The full Elmer suite after this change passed
 **119 tests and 61 subtests** in 426.99 s, under the enforced 540 s cap.
 
-To preserve the existing all-tetrahedral solver/mortar path, construction hexes
-are split deterministically without adding nodes. Thus the source/solver Gmsh
-mesh still contains tetrahedra, not native hex elements. This avoids expensive
-Gmsh foundation volume meshing and retains one-to-one, identical triangles on
-both mortar sides. It does **not** coarsen the configured rock far field or
-change partition count, materials, loads, or spring coefficients. The foundation
-uses `material.concrete`, but is separate from wall stress reporting/damage.
+Foundation construction hexes are split deterministically without adding nodes
+for the existing tetrahedral foundation/mortar path. Bedrock follows a separate
+production path: a coarser conforming tetrahedral construction is subdivided
+into four face-conforming native HEXA8 cells per construction tetrahedron. The
+saved source/solver mesh therefore exports wall and bedrock as native HEXA8;
+only foundation remains TETRA4. The original locked foundation/bedrock
+coordinates and the complete outer domain, near distance and far grading remain
+unchanged. Coarser auxiliary meshing avoids the unstable 100k-wall constrained
+tetrahedral cavity while preserving exact original interface nodes.
 
 The wall/foundation mortar springs use `geometry.wall.joint_support` (model must
 be `spring`); foundation/rock uses `geometry.bedrock.support`. The foundation
@@ -1033,7 +1035,7 @@ tensor-product grid. No terrain-smoothing filter is applied.
 The wall's computed size is also applied to the concrete foundation spacing and
 the bedrock near-seat target in both the geometry preview and solver
 preparation; exact seat facets and node coordinates are shared. Bedrock remains
-independently graded toward its configured far-field size. Only wall tetrahedra
+independently graded toward its configured far-field size. Only native wall HEXA8 cells
 count toward the 150,000-element cap.
 Fine surface nodes no longer force fine columns all the way down to the bottom.
 The volume is generated from a closed discrete shell to avoid artificial CAD
@@ -1210,8 +1212,8 @@ the deleted `Elmer/load_cases.json` is read by these workflows.
 
 | Section | Meaning |
 |---|---|
-| `geometry.global_element_size_m` | Starting size suggestion; the wall analysis mesh is adjusted to stay at or below `geometry.target_wall_tetrahedral_elements` final tetrahedra, and attached foundation/near-seat bedrock adapt to the effective size |
-| `geometry.target_wall_tetrahedral_elements` | Optional integer ≥ 1,000 (default 150,000): maximum wall-body tetrahedra. Element size scales with its cube root, so raising it refines the whole wall uniformly at higher solve time and memory |
+| `geometry.global_element_size_m` | Starting size suggestion; the wall analysis mesh is adjusted to stay at or below `geometry.target_wall_elements` native HEXA8 cells, and LEGO foundation/near-seat bedrock adapt to the effective size |
+| `geometry.target_wall_elements` | Optional integer ≥ 1,000: maximum native wall HEXA8 cells. Historical files may still contain `target_wall_tetrahedral_elements`; it is accepted only as a legacy alias. |
 | `geometry.local_element_size_m` | Corner refinement for standalone geometry generators |
 | `geometry.wall` | Wall face radii, radial width and centreline (crest section); optional downstream `thickness_steps`, `joint_support`, `step_end_taper_ratio` |
 | `geometry.bedrock` | Signed bedrock contour elevations (the wall seat) and wall/rock seat support |
@@ -1578,7 +1580,7 @@ tops. The 0.5 m global size is now a starting suggestion, not a fixed course
 spacing. With a foundation, the wall mesh selects a course spacing compatible
 with the thickness steps, estimates a coarser target from the generated
 tetrahedral count, and rebuilds until the wall body is at or below
-`geometry.target_wall_tetrahedral_elements` (default 150,000)
+`geometry.target_wall_elements`
 tetrahedra. Other bodies are not included in this limit. The current
 configuration (150,000) produces a wall target spacing of 0.833333 m and 141,846 wall
 tetrahedra. The FEniCSx run manifest records the suggestion, effective target

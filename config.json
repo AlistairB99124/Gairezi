@@ -4,6 +4,7 @@
     "mode": "full_volume",
     "wall_only_body": false,
     "condense_foundation": false,
+    "cracking_bedrock_radius_m": 0.0,
     "spring_n_per_m3": {
       "x": 1250000000.0,
       "y": 1250000000.0,
@@ -25,7 +26,7 @@
     },
     "global_element_size_m": 0.5,
     "local_element_size_m": 0.1,
-    "target_wall_tetrahedral_elements": 20000,
+    "target_wall_elements": 100000,
     "wall": {
       "radial_width_m": 4.0,
       "height_m": 30.0,

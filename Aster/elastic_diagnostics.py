@@ -6,6 +6,20 @@ from pathlib import Path
 
 import numpy as np
 
+HEX_TET_PATTERNS = (
+    (0, 1, 2, 6), (0, 2, 3, 6), (0, 4, 5, 6),
+    (0, 5, 1, 6), (0, 3, 7, 6), (0, 7, 4, 6),
+)
+
+
+def diagnostic_tetrahedra(arrays, hexa_key: str, tetra_key: str) -> np.ndarray:
+    hexa = np.asarray(arrays.get(hexa_key, np.empty((0, 8))), dtype=np.int64)
+    tetra = np.asarray(arrays.get(tetra_key, np.empty((0, 4))), dtype=np.int64)
+    if len(hexa):
+        split = np.concatenate([hexa[:, pattern] for pattern in HEX_TET_PATTERNS])
+        return np.vstack((split, tetra)) if len(tetra) else split
+    return tetra
+
 
 def cell_kinematics(points, cells, displacement):
     xyz = points[cells]
@@ -98,12 +112,30 @@ def diagnostics(mesh_dir: Path, full_displacement: np.ndarray) -> dict:
         force, moment = np.zeros(3), np.zeros(3)
         energy = 0.
         has_mortar = "tetra4_mortar" in data.files and len(data["tetra4_mortar"])
-        solids = (data["tetra4_concrete"] if not has_mortar
-                  else np.vstack((data["tetra4_concrete"], data["tetra4_mortar"])))
-        for key, material in (("tetra4_concrete", "concrete"), ("tetra4_bedrock", "bedrock"),
-                              *((("tetra4_mortar", "mortar"),) if has_mortar else ())):
+        arrays = {key: data[key] for key in data.files}
+        concrete = diagnostic_tetrahedra(arrays, "hexa8_wall", "tetra4_concrete")
+        if "hexa8_foundation" in arrays:
+            concrete = np.vstack((
+                concrete,
+                diagnostic_tetrahedra(
+                    arrays, "hexa8_foundation", "tetra4_foundation"
+                ),
+            ))
+        bedrock = diagnostic_tetrahedra(
+            arrays, "hexa8_bedrock", "tetra4_bedrock"
+        )
+        solids = concrete if not has_mortar else np.vstack((
+            concrete, data["tetra4_mortar"]
+        ))
+        material_cells = (
+            (concrete, "concrete"),
+            (bedrock, "bedrock"),
+            *(((
+                data["tetra4_mortar"], "mortar"
+            ),) if has_mortar else ()),
+        )
+        for cells, material in material_cells:
             values = config["material"][material]
-            cells = data[key]
             part, volume = volume_energy(points, cells, full_displacement,
                                          values["youngs_modulus"], values["poisson_ratio"])
             energy += part
@@ -112,11 +144,23 @@ def diagnostics(mesh_dir: Path, full_displacement: np.ndarray) -> dict:
             gravity = np.array([0., 0., config["loads"]["gravity"] * values["density"]])
             force += volume * gravity
             moment += np.cross((xyz.mean(axis=1) * vol[:, None]).sum(axis=0), gravity)
-        for key, name in (("tri3_upstream", "UpstreamHydrostaticPressure"),
-                          ("tri3_downstream", "DownstreamTailwater"), ("tri3_crest", None)):
+        for key, quad_key, name in (
+            ("tri3_upstream", "quad4_upstream", "UpstreamHydrostaticPressure"),
+            ("tri3_downstream", "quad4_downstream", "DownstreamTailwater"),
+            ("tri3_crest", "quad4_crest", None),
+        ):
             values = manifest["source_pressures"][name] if name else {}
             # With a mortar fill the downstream face is partly the fill's sloped face.
-            faces = outward_faces(points, data[key], solids)
+            quads = np.asarray(data[quad_key]) if quad_key in data.files else np.empty((0, 4), dtype=int)
+            quad_triangles = (
+                np.vstack((quads[:, :3], quads[:, [0, 2, 3]]))
+                if len(quads) else np.empty((0, 3), dtype=int)
+            )
+            faces = outward_faces(
+                points,
+                np.vstack((np.asarray(data[key]), quad_triangles)),
+                np.vstack((solids, bedrock)),
+            )
             f, m = pressure_resultant(points, faces, values.get("surface_z_m", 0.),
                                       values.get("gradient_pa_per_m", 0.),
                                       None if name else manifest["source_crest_pressure_pa"])

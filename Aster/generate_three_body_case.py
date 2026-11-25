@@ -62,7 +62,8 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
     no_bedrock = mesh_manifest.get("rigid_seat_sensitivity") is True
     layer_mode = mesh_manifest.get("bedrock_analysis_mode") == "elastic_layer"
     condensed = mesh_manifest.get("condensed_foundation") is not None
-    has_bedrock_volume = not no_bedrock and not layer_mode
+    has_bedrock_volume = (not no_bedrock and not layer_mode
+                          and mesh_manifest.get("groups", {}).get("BEDROCK", {}).get("cells", 1) > 0)
     config_path = Path(mesh_manifest["source_config"])
     if file_hash(config_path) != mesh_manifest["source_hashes"]["config.json"]:
         raise ValueError("Saved source configuration changed since mesh export")
@@ -87,11 +88,12 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
     water_gradient = source_pressures["UpstreamHydrostaticPressure"]["gradient_pa_per_m"]
     if water_gradient != source_pressures["DownstreamTailwater"]["gradient_pa_per_m"]:
         raise ValueError("Different upstream/downstream pressure gradients are not supported")
-    foundation_elevation_m = mesh_manifest["groups"]["CONCRETE"]["min_xyz_m"][2]
+    foundation_elevation_m = mesh_manifest["groups"].get(
+        "CONCRETE", mesh_manifest["groups"].get("FOUNDATION", {})).get("min_xyz_m", [0., 0., 0.])[2]
     tailwater_elevation_m = source_pressures["DownstreamTailwater"]["surface_z_m"]
     overflow_surcharge_pa = mesh_manifest["source_crest_pressure_pa"]
 
-    rock_bottom_area_m2 = mesh_manifest["groups"]["ROCK_BOTTOM"]["area_m2"]
+    rock_bottom_area_m2 = mesh_manifest["groups"].get("ROCK_BOTTOM", {}).get("area_m2", 0.0)
     rock_bottom_global_stiffness_n_per_m = rock_outer_spring["z"] * rock_bottom_area_m2
 
     wall_foundation_springs = mesh_manifest["wall_foundation_springs"]
@@ -138,9 +140,17 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
 
     arrays_path = mesh_manifest_path.parent / "three_body_mesh_arrays.npz"
     compact_groups = False
+    native_wall = False
+    rock_surface_groups = {"ROCK_BOTTOM", "ROCK_SIDES"}
     if arrays_path.is_file():
         with np.load(arrays_path, allow_pickle=False) as stored:
             compact_groups = bool(stored.get("compact_spring_groups", False))
+            native_wall = "hexa8_wall" in stored
+            rock_surface_groups = {
+                key for key in ("ROCK_BOTTOM", "ROCK_SIDES")
+                if len(stored.get("tri3_" + key.lower(), ()))
+                or len(stored.get("quad4_" + key.lower(), ()))
+            }
     wall_foundation_discret_entries = ",\n        ".join(
         f"_F(GROUP_MA={entry['group']!r}, REPERE='GLOBAL', CARA='K_T_D_L', "
         f"VALE=({entry['vale'][0]:.12g}, {entry['vale'][1]:.12g}, {entry['vale'][2]:.12g}))"
@@ -162,9 +172,20 @@ def render_comm(root: Path = ROOT, mesh_manifest_path: Path = DEFAULT_MESH_MANIF
         f"_F(GROUP_MA='{wall_foundation_spring_group_all}', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),"
         if wall_foundation_discret_entries else ""
     )
-    volume_groups = "('CONCRETE',)" if not has_bedrock_volume else "('CONCRETE', 'BEDROCK')"
-    model_groups = ("'CONCRETE', 'UPSTREAM', 'DOWNSTREAM', 'CREST'," if not has_bedrock_volume else
-                    "'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST', 'ROCK_BOTTOM', 'ROCK_SIDES',")
+    concrete_groups = "('WALL', 'FOUNDATION')" if native_wall else "('CONCRETE',)"
+    volume_groups = ("('WALL', 'FOUNDATION', 'BEDROCK')" if has_bedrock_volume and native_wall
+                     else "('CONCRETE', 'BEDROCK')" if has_bedrock_volume else concrete_groups)
+    rock_groups = "".join(f" '{name}'," for name in sorted(rock_surface_groups))
+    model_groups = (
+        "'CONCRETE', 'UPSTREAM', 'DOWNSTREAM', 'CREST',"
+        if not has_bedrock_volume
+        else "'CONCRETE', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST'," + rock_groups
+    )
+    if native_wall:
+        model_groups = (
+            "'WALL', 'FOUNDATION', 'UPSTREAM', 'DOWNSTREAM', 'CREST',"
+            if not has_bedrock_volume else
+            "'WALL', 'FOUNDATION', 'BEDROCK', 'UPSTREAM', 'DOWNSTREAM', 'CREST'," + rock_groups)
     outer_model = "" if no_bedrock else "_F(GROUP_MA='OUTER_SPRINGS', PHENOMENE='MECANIQUE', MODELISATION='DIS_T'),"
     mesh_read = "MAIL = LIRE_MAILLAGE(FORMAT='MED', UNITE=20, NOM_MED='THREE_BODY', VERI_MAIL=_F(VERIF='NON'))"
     discrete_assignment = f"""CARA_ROCK = AFFE_CARA_ELEM(
@@ -199,6 +220,8 @@ CONDENSED_GRAVITY = AFFE_CHAR_MECA(
         condensed_excitation = "_F(CHARGE=CONDENSED_GRAVITY),"
         inputs["condensed_foundation"] = mesh_manifest["condensed_foundation"]
     rock_assignment = "" if not has_bedrock_volume else "_F(GROUP_MA='BEDROCK', MATER=BEDROCK_MAT),"
+    concrete_assignment = ("_F(GROUP_MA=('WALL', 'FOUNDATION'), MATER=CONCRETE_MAT),"
+                           if native_wall else "_F(GROUP_MA='CONCRETE', MATER=CONCRETE_MAT),")
     mortar_material = ""
     if mortar is not None:
         inputs["material"]["mortar"] = mortar
@@ -207,7 +230,7 @@ CONDENSED_GRAVITY = AFFE_CHAR_MECA(
             "role": "Soft fill on the wall steps, joined to the wall by the saved bond springs; "
                     "it has its own material and weight and is not part of any concrete result.",
         }
-        volume_groups = "('CONCRETE', 'MORTAR')"
+        volume_groups = "('WALL', 'FOUNDATION', 'MORTAR')" if native_wall else "('CONCRETE', 'MORTAR')"
         model_groups = model_groups.replace("'CONCRETE',", "'CONCRETE', 'MORTAR',", 1)
         rock_assignment += "_F(GROUP_MA='MORTAR', MATER=MORTAR_MAT),"
         mortar_material = f'''MORTAR_MAT = DEFI_MATERIAU(
@@ -311,7 +334,7 @@ BEDROCK_MAT = DEFI_MATERIAU(
 CHMAT = AFFE_MATERIAU(
     MAILLAGE=MAIL,
     AFFE=(
-        _F(GROUP_MA='CONCRETE', MATER=CONCRETE_MAT),
+        {concrete_assignment}
         {rock_assignment}
     ),
 )

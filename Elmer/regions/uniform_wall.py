@@ -104,7 +104,7 @@ def vertical_levels(
     first = math.ceil((bottom_z_m + clearance_m) / element_size_m)
     last = math.floor((top_z_m - clearance_m) / element_size_m)
     levels.extend(index * element_size_m for index in range(first, last + 1))
-    levels.extend(z_m for z_m in step_levels_m if bottom_z_m + clearance_m <= z_m < top_z_m)
+    levels.extend(z_m for z_m in step_levels_m if bottom_z_m < z_m < top_z_m)
     levels.append(top_z_m)
     return sorted(set(round(level, 9) for level in levels))
 
@@ -209,87 +209,95 @@ def build_uniform_wall(
     bands = wall_thickness_steps(wall)
     step_levels_m = tuple(top_z_m for top_z_m, _ in bands[1:])
     downstream_radii_m = [upstream_radius_m - width_m for _, width_m in bands]
+    tolerance = 1.0e-6
     chainages_m = target_chainages(start_chainage_m, end_chainage_m, anchor_chainages_m, element_size_m)
     surveyed_levels_m = [min(bedrock_elevation(bedrock_rows, value), CREST_Z_M) for value in chainages_m]
-    base_levels_m = [
+    station_base_levels_m = [
         excavated_seat_level(z_m, element_size_m, step_levels_m) for z_m in surveyed_levels_m
     ]
-    radii_m = radial_node_radii(downstream_radii_m, upstream_radius_m, element_size_m, extra_radial_fractions)
-    section_levels_m = [
-        vertical_levels(base_z_m, CREST_Z_M, element_size_m, step_levels_m) for base_z_m in base_levels_m
+    interval_base_levels_m = [
+        min(left, right) for left, right in zip(station_base_levels_m, station_base_levels_m[1:])
     ]
-    staircase = "foundation" in geometry
-    tread_levels_m = [min(a, b) for a, b in zip(base_levels_m, base_levels_m[1:])]
-    if staircase:
-        """
-        if any(abs(a-b)>1e-8 and abs(abs(a-b)-element_size_m)>1e-8
-               for a,b in zip(tread_levels_m,tread_levels_m[1:])):
-            raise ValueError("Chamfered foundation requires every nonzero riser to be exactly one course")
-        """
-        base_levels_m = [min(tread_levels_m[max(0,i-1):min(len(tread_levels_m),i+1)])
-                         for i in range(len(chainages_m))]
-        section_levels_m = [vertical_levels(z, CREST_Z_M, element_size_m, step_levels_m)
-                            for z in base_levels_m]
-    tolerance = 1.0e-6
-
-    def seat_level_at(station_m: float) -> float:
-        # The seat is linear in chainage between stations, like the wall underside.
-        for index in range(len(chainages_m) - 1):
-            left_m, right_m = chainages_m[index], chainages_m[index + 1]
-            if left_m - tolerance <= station_m <= right_m + tolerance:
-                weight = min(max((station_m - left_m) / (right_m - left_m), 0.0), 1.0)
-                return base_levels_m[index] + weight * (base_levels_m[index + 1] - base_levels_m[index])
-        return math.nan
-
+    for index, (base_z_m, left_z_m, right_z_m) in enumerate(zip(
+            interval_base_levels_m, surveyed_levels_m, surveyed_levels_m[1:])):
+        if base_z_m > min(left_z_m, right_z_m) + tolerance:
+            raise ValueError(
+                f"LEGO wall interval {index} rises above the surveyed contour")
+    interval_levels_m = [
+        vertical_levels(base_z_m, CREST_Z_M, element_size_m, step_levels_m)
+        for base_z_m in interval_base_levels_m
+    ]
+    radii_m = radial_node_radii(downstream_radii_m, upstream_radius_m, element_size_m, extra_radial_fractions)
+    base_levels_m = [
+        interval_base_levels_m[0],
+        *(min(left, right) for left, right in zip(
+            interval_base_levels_m, interval_base_levels_m[1:])),
+        interval_base_levels_m[-1],
+    ]
     # Lattice coordinates; only nodes used by a wall cell are kept below.
-    lattice: dict[tuple[int, int, int], tuple[float, float, float]] = {}
-    for station_index, (chainage_m, levels_m) in enumerate(zip(chainages_m, section_levels_m)):
-        angle = chainage_m / centerline_radius_m
-        for vertical_index, z_m in enumerate(levels_m):
-            for radial_index, radius_m in enumerate(radii_m):
-                lattice[(station_index, vertical_index, radial_index)] = (
-                    radius_m * math.sin(angle), radius_m * math.cos(angle), z_m,
-                )
+    lattice: dict[tuple[int, float, int], tuple[float, float, float]] = {}
+
+    def lattice_key(station_index: int, z_m: float, radial_index: int):
+        key = (station_index, round(float(z_m), 9), radial_index)
+        if key not in lattice:
+            angle = chainages_m[station_index] / centerline_radius_m
+            radius_m = radii_m[radial_index]
+            lattice[key] = (
+                radius_m * math.sin(angle), radius_m * math.cos(angle), float(z_m),
+            )
+        return key
+
     split_joints = split_joints and bool(step_levels_m)
     # Cells reference (lattice key, block) pairs; ids are assigned once all cells exist.
-    first_touch: dict[tuple[int, int, int], int] = {}
-    keyed_cells: list[tuple[int, tuple[tuple[tuple[int, int, int], int], ...]]] = []
+    first_touch: dict[tuple[int, float, int], int] = {}
+    keyed_cells: list[tuple[int, tuple[tuple[tuple[int, float, int], int], ...]]] = []
+    keyed_base_faces: list[tuple[tuple[tuple[int, float, int], int], ...]] = []
     for station_index in range(len(chainages_m) - 1):
-        faces = top_aligned_section_faces(section_levels_m[station_index], section_levels_m[station_index + 1])
-        face_z_m = [
-            sum(section_levels_m[station_index + side][level] for side, level in face) / len(face)
-            for face in faces
-        ]
-        # Shallower end of this station interval; tapered step ends use whole columns.
-        column_seat_m = max(base_levels_m[station_index], base_levels_m[station_index + 1])
+        levels = interval_levels_m[station_index]
+        interval_seat_m = interval_base_levels_m[station_index]
+        # Taper uses the shallower endpoint, while the cell volume starts at the
+        # conservative interval-minimum LEGO course.
+        column_seat_m = max(
+            station_base_levels_m[station_index],
+            station_base_levels_m[station_index + 1],
+        )
         for radial_index in range(len(radii_m) - 1):
-            for face, z_m in zip(faces, face_z_m):
+            for lower_m, upper_m in zip(levels, levels[1:]):
+                z_m = 0.5 * (lower_m + upper_m)
                 # Keep the radial strip only where the wall at this course is thick enough.
                 if radii_m[radial_index] < tapered_wall_downstream_radius_at(wall, z_m, column_seat_m) - tolerance:
                     continue
                 block = sum(1 for level_m in step_levels_m if z_m < level_m) if split_joints else 0
-                inner = tuple((station_index + side, level, radial_index) for side, level in face)
-                outer = tuple((station_index + side, level, radial_index + 1) for side, level in face)
-                lattice_cell = inner + outer
+                left_inner = lattice_key(station_index, lower_m, radial_index)
+                right_inner = lattice_key(station_index + 1, lower_m, radial_index)
+                right_outer = lattice_key(station_index + 1, lower_m, radial_index + 1)
+                left_outer = lattice_key(station_index, lower_m, radial_index + 1)
+                left_inner_top = lattice_key(station_index, upper_m, radial_index)
+                right_inner_top = lattice_key(station_index + 1, upper_m, radial_index)
+                right_outer_top = lattice_key(station_index + 1, upper_m, radial_index + 1)
+                left_outer_top = lattice_key(station_index, upper_m, radial_index + 1)
+                lattice_cell = (
+                    left_inner, right_inner, right_outer, left_outer,
+                    left_inner_top, right_inner_top, right_outer_top, left_outer_top,
+                )
                 if split_joints:
                     # A block's cells must lie wholly within its band, or the joint would cut a cell.
                     top_m = step_levels_m[block - 1] if block else math.inf
                     bottom_m = step_levels_m[block] if block < len(step_levels_m) else -math.inf
                     if any(not bottom_m - tolerance <= lattice[key][2] <= top_m + tolerance for key in lattice_cell):
-                        raise ValueError("A wall cell crosses a thickness step; cannot split the wall into blocks")
+                        raise ValueError(
+                            "A wall cell crosses a thickness step; cannot split the wall into blocks: "
+                            f"levels={[lower_m, upper_m]}, block={block}, bounds={[bottom_m, top_m]}")
                 for key in lattice_cell:
                     first_touch.setdefault(key, len(first_touch))
                 points = [lattice[key] for key in lattice_cell]
-                if len(face) == 3:
-                    order = (0, 1, 2, 3, 4, 5) if _prism_orientation(points, tuple(range(1, 7))) >= 0.0 else (0, 2, 1, 3, 5, 4)
-                    element_type = 6
-                else:
-                    order = (
-                        (0, 1, 2, 3, 4, 5, 6, 7) if _hex_orientation(points, tuple(range(1, 9))) >= 0.0
-                        else (0, 3, 2, 1, 4, 7, 6, 5)
-                    )
-                    element_type = 5
-                keyed_cells.append((element_type, tuple((lattice_cell[i], block) for i in order)))
+                order = (
+                    (0, 1, 2, 3, 4, 5, 6, 7) if _hex_orientation(points, tuple(range(1, 9))) >= 0.0
+                    else (0, 3, 2, 1, 4, 7, 6, 5)
+                )
+                keyed_cells.append((5, tuple((lattice_cell[i], block) for i in order)))
+                if abs(lower_m - interval_seat_m) <= tolerance:
+                    keyed_base_faces.append(tuple((key, block) for key in lattice_cell[:4]))
 
     # Number nodes by first use of their lattice point, then block. Without joints this is the
     # original first-touch numbering; with joints the two copies of a node are adjacent, so
@@ -301,6 +309,9 @@ def build_uniform_wall(
     cells: list[tuple[int, tuple[int, ...]]] = [
         (element_type, tuple(node_ids[key] for key in cell)) for element_type, cell in keyed_cells
     ]
+    base_face_keys = {
+        tuple(sorted(node_ids[key] for key in face)) for face in keyed_base_faces
+    }
     # Lattice faces shared by cells of two different blocks are the joints between bands.
     lattice_face_blocks: dict[tuple[tuple[int, int, int], ...], set[int]] = {}
 
@@ -338,6 +349,9 @@ def build_uniform_wall(
         coordinates = [nodes[value - 1] for value in face]
         radii = [math.hypot(x_m, y_m) for x_m, y_m, _ in coordinates]
         stations_m = [centerline_radius_m * math.atan2(x_m, y_m) for x_m, y_m, _ in coordinates]
+        station_indices = {
+            lattice_of_node[value - 1][0] for value in face
+        }
         z_values_m = [z_m for _, _, z_m in coordinates]
         if max(abs(radius_m - upstream_radius_m) for radius_m in radii) < tolerance:
             boundary_id = UPSTREAM_BOUNDARY_ID
@@ -348,10 +362,13 @@ def build_uniform_wall(
             boundary_id = DOWNSTREAM_BOUNDARY_ID
         elif max(abs(z_m - CREST_Z_M) for z_m in z_values_m) < tolerance:
             boundary_id = CREST_BOUNDARY_ID
-        elif all(
-            abs(z_m - seat_level_at(station_m)) < tolerance
-            for station_m, z_m in zip(stations_m, z_values_m)
-        ):
+        elif key in base_face_keys:
+            boundary_id = BASE_BOUNDARY_ID
+        elif (len(station_indices) == 1
+              and 0 < next(iter(station_indices)) < len(chainages_m) - 1
+              and max(z_values_m) - min(z_values_m) > tolerance):
+            # Vertical riser where adjacent LEGO columns meet. It is part of the
+            # excavation/ground seat, not an unrelated exterior wall face.
             boundary_id = BASE_BOUNDARY_ID
         elif all(
             thickening_inner_m - tolerance <= radius_m <= crest_downstream_m + tolerance
