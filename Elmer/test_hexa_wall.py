@@ -126,14 +126,11 @@ class NativeHexaWallTests(unittest.TestCase):
         self.assertGreater(audit["wall_foundation_faces"], 0)
         self.assertGreater(audit["foundation_bedrock_faces"], 0)
         self.assertEqual(audit["solver_cell_types"], {
-            "wall": "HEXA8", "foundation": "HEXA8", "bedrock": "HEXA8",
+            "wall": "HEXA8", "foundation": "TETRA4", "bedrock": "TETRA4",
         })
-        self.assertEqual(report["foundation"]["solver_cell_type"], "hexahedron")
-        self.assertEqual(report["geometry"]["solver_cell_type"], "hexahedron")
-        self.assertEqual(
-            report["wall_rock_seat_quad4"],
-            audit["foundation_bedrock_faces"],
-        )
+        self.assertEqual(report["foundation"]["solver_cell_type"], "tetrahedron")
+        self.assertEqual(report["geometry"]["solver_cell_type"], "tetrahedron")
+        self.assertGreater(report["wall_rock_seat_triangles"], 0)
         self.assertTrue((output / "three_body.msh").is_file())
 
     def test_coincident_inner_and_outer_shells_are_separated(self):

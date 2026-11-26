@@ -128,11 +128,13 @@ def split_for_joints(arrays: dict, faces: np.ndarray) -> dict:
     if "hexa8_wall" in arrays and faces_array.ndim == 2 and faces_array.shape[1] == 4:
         return _split_hexa_wall_for_joints(arrays, faces_array)
     native_wall = "hexa8_wall" in arrays
-    if native_wall and "hexa8_foundation" in arrays:
+    if native_wall and len(arrays.get("hexa8_foundation", ())) > 0:
         concrete = np.asarray(arrays["hexa8_foundation"], dtype=np.int64)
     else:
         concrete = np.asarray(
-            arrays.get("hexa8_foundation", arrays["tetra4_foundation"])
+            arrays["hexa8_foundation"]
+            if native_wall and len(arrays.get("hexa8_foundation", ())) > 0
+            else arrays["tetra4_foundation"]
             if native_wall else arrays["tetra4_concrete"],
             dtype=np.int64)
     bedrock = np.asarray(arrays["tetra4_bedrock"], dtype=np.int64)
@@ -596,7 +598,7 @@ def limit_cracking_bedrock(
         raise CorroborationError("Local bedrock cracking scope requires a concrete foundation")
     foundation_nodes = np.unique(foundation)
     if float(radius_m) == 0:
-        if "hexa8_foundation" in arrays:
+        if len(arrays.get("hexa8_foundation", ())) > 0:
             from Aster.mixed_topology import HEX_FACES
             foundation_quads = np.sort(
                 foundation[:, HEX_FACES].reshape(-1, 4), axis=1

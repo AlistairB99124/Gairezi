@@ -56,6 +56,54 @@ class FoundationConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "changed boundary node IDs"):
                 restore_partition_boundary_tags(root, original)
 
+    def test_partition_only_coalescing_restores_triangulated_quad_labels(self):
+        from Elmer.mortar_interfaces import (
+            coalesced_partition_input, restore_partition_boundary_tags,
+        )
+        with tempfile.TemporaryDirectory(dir=ROOT / "Thickness_tests") as directory:
+            root = Path(directory)
+            source = root / "source.msh"
+            source.write_text(
+                "$Elements\n1\n1 3 2 1000 1000 1 2 3 4\n$EndElements\n"
+            )
+            original = coalesced_partition_input(
+                source, root / "partition.msh", {1000}
+            )
+            boundary = root / "mesh.boundary"
+            boundary.write_text(
+                "1 6 1 0 303 1 2 3\n"
+                "2 6 1 0 303 1 3 4\n"
+                "3 6 1 0 404 1 2 3 4\n"
+            )
+            audit = restore_partition_boundary_tags(root, original)
+            tags = [line.split()[1] for line in boundary.read_text().splitlines()]
+            self.assertEqual(tags, ["1000"] * 3)
+            self.assertEqual(audit["restored_boundary_records"], 3)
+
+    def test_partition_coalescing_keeps_two_sides_distinct(self):
+        from Elmer.mortar_interfaces import coalesced_partition_input
+        with tempfile.TemporaryDirectory(dir=ROOT / "Thickness_tests") as directory:
+            root = Path(directory)
+            source = root / "source.msh"
+            source.write_text(
+                "$Elements\n4\n"
+                "1 2 2 1000 1000 1 2 3\n"
+                "2 2 2 1001 1001 7 8 9\n"
+                "3 2 2 1002 1002 4 5 6\n"
+                "4 2 2 1003 1003 10 11 12\n"
+                "$EndElements\n"
+            )
+            destination = root / "partition.msh"
+            coalesced_partition_input(
+                source, destination, {1000: 1000, 1001: 1001,
+                                       1002: 1000, 1003: 1001},
+            )
+            tags = [
+                line.split()[3] for line in destination.read_text().splitlines()
+                if len(line.split()) >= 4 and line[:1].isdigit()
+            ]
+            self.assertEqual(tags, ["1000", "1001", "1000", "1001"])
+
     def test_absent_block_preserves_legacy_spring_pair(self):
         config = load_config(ROOT / "config.json")
         config["bedrock_analysis"] = {"mode": "full_volume"}

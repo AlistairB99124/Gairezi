@@ -363,21 +363,20 @@ def _prune_weakly_supported_free_nodes(
 
 
 def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
-    """Export the production native HEXA8 wall/foundation/bedrock contract."""
+    """Export native HEXA8 wall with conforming foundation/bedrock volumes."""
     coords, (hexes, hex_tags, hex_rows), (tets, tet_tags, tet_rows), \
         (tris, tri_tags, tri_rows), (quads, quad_tags, quad_rows) = _read_gmsh_mixed_ascii(source_mesh)
     wall = hexes[hex_tags == WALL_VOLUME_TAG]
     hex_bedrock = hexes[hex_tags == BEDROCK_VOLUME_TAG]
     hex_bedrock_rows = hex_rows[hex_tags == BEDROCK_VOLUME_TAG]
-    foundation = hexes[hex_tags == FOUNDATION_VOLUME_TAG]
-    foundation_rows = hex_rows[hex_tags == FOUNDATION_VOLUME_TAG]
-    legacy_foundation = tets[tet_tags == FOUNDATION_VOLUME_TAG]
+    hex_foundation = hexes[hex_tags == FOUNDATION_VOLUME_TAG]
+    hex_foundation_rows = hex_rows[hex_tags == FOUNDATION_VOLUME_TAG]
+    tet_foundation = tets[tet_tags == FOUNDATION_VOLUME_TAG]
+    tet_foundation_rows = tet_rows[tet_tags == FOUNDATION_VOLUME_TAG]
     tet_bedrock = tets[tet_tags == BEDROCK_VOLUME_TAG]
     tet_bedrock_rows = tet_rows[tet_tags == BEDROCK_VOLUME_TAG]
-    if not len(wall) or not len(foundation) or len(legacy_foundation):
-        raise MeshExportError(
-            "Native mixed mesh requires HEXA8 WALL and FOUNDATION cells with no TETRA4 FOUNDATION"
-        )
+    if not len(wall) or bool(len(hex_foundation)) == bool(len(tet_foundation)):
+        raise MeshExportError("Native mesh requires HEXA8 wall and one foundation topology")
     if bool(len(hex_bedrock)) == bool(len(tet_bedrock)):
         raise MeshExportError("Native mixed mesh requires exactly one bedrock cell topology")
     unknown = hex_tags[~np.isin(
@@ -386,19 +385,21 @@ def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
     if len(unknown):
         raise MeshExportError(f"Unexpected hexa tags in native mixed mesh: {sorted(set(unknown))}")
     unknown = tet_tags[~np.isin(
-        tet_tags, (BEDROCK_VOLUME_TAG, MORTAR_FILL_VOLUME_TAG)
+        tet_tags, (FOUNDATION_VOLUME_TAG, BEDROCK_VOLUME_TAG, MORTAR_FILL_VOLUME_TAG)
     )]
     if len(unknown):
         raise MeshExportError(f"Unexpected tetra tags in native mixed mesh: {sorted(set(unknown))}")
     kept = np.unique(np.concatenate((
-        wall.ravel(), foundation.ravel(),
+        wall.ravel(),
+        (hex_foundation if len(hex_foundation) else tet_foundation).ravel(),
         (hex_bedrock if len(hex_bedrock) else tet_bedrock).ravel(),
     ), dtype=np.int64))
     dense = np.full(len(coords), -1, dtype=np.int64)
     dense[kept] = np.arange(len(kept))
     nodes = coords[kept]
     wall = dense[wall]
-    foundation = dense[foundation]
+    hex_foundation = dense[hex_foundation]
+    tet_foundation = dense[tet_foundation]
     hex_bedrock = dense[hex_bedrock]
     tet_bedrock = dense[tet_bedrock]
     tri = dense[tris] if len(tris) else np.empty((0, 3), dtype=np.int64)
@@ -431,8 +432,8 @@ def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
     arrays = {
         "nodes": nodes,
         "hexa8_wall": wall,
-        "hexa8_foundation": foundation,
-        "tetra4_foundation": np.empty((0, 4), dtype=np.int64),
+        "hexa8_foundation": hex_foundation,
+        "tetra4_foundation": tet_foundation,
         "hexa8_bedrock": hex_bedrock,
         "tetra4_bedrock": tet_bedrock,
         **face_rows,
@@ -450,7 +451,8 @@ def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
         "support_matrices_n_per_m": contract["support_matrices"],
         "source_cell_rows": np.concatenate((
             hex_rows[hex_tags == WALL_VOLUME_TAG],
-            foundation_rows,
+            hex_foundation_rows,
+            tet_foundation_rows,
             hex_bedrock_rows,
             tet_bedrock_rows,
         )),
@@ -462,7 +464,7 @@ def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
     manifest = {
         "schema_version": 2,
         "native_wall_topology": "HEXA8",
-        "native_foundation_topology": "HEXA8",
+        "native_foundation_topology": "HEXA8" if len(hex_foundation) else "TETRA4",
         "native_bedrock_topology": "HEXA8" if len(hex_bedrock) else "TETRA4",
         "bedrock_analysis_mode": contract["bedrock_analysis_mode"],
         "bedrock_slivers_dropped": 0,
@@ -474,7 +476,8 @@ def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
             for i, matrix in enumerate(arrays["support_matrices_n_per_m"])
         ],
         "simplifications_vs_elmer": [
-            f"Native HEXA8 wall/foundation and {('HEXA8 bedrock' if len(hex_bedrock) else 'TETRA4 bedrock')}; "
+            f"Native HEXA8 wall, {('HEXA8' if len(hex_foundation) else 'TETRA4')} foundation, "
+            f"and {('HEXA8 bedrock' if len(hex_bedrock) else 'TETRA4 bedrock')}; "
             "mixed TRI/QUAD boundaries."
         ],
         "node_count": int(len(nodes)),
@@ -489,7 +492,7 @@ def _export_native_mixed(output_dir: Path, source_mesh: Path) -> dict:
         "groups": {
             "WALL": {"cells": len(wall), "min_xyz_m": nodes[wall].min((0, 1)).tolist(),
                      "max_xyz_m": nodes[wall].max((0, 1)).tolist()},
-            "FOUNDATION": {"cells": len(foundation)},
+            "FOUNDATION": {"cells": len(hex_foundation) + len(tet_foundation)},
             "BEDROCK": {"cells": len(hex_bedrock) + len(tet_bedrock)},
         },
         "coordinate_bounds": {"min_xyz_m": nodes.min(0).tolist(), "max_xyz_m": nodes.max(0).tolist()},

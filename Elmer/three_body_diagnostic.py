@@ -290,39 +290,41 @@ def prepare(
         if joints != "spring":
             raise ValueError("Foundation trench requires joints='spring' (configured interface workflow)")
         from .foundation_trench import build_foundation
-        from .graded_bedrock import (
-            build_graded_rock, refine_triangular_faces, tetrahedra_to_hexa8,
-        )
-        foundation_reference = tetrahedralize_structure(concrete)
-        foundation = build_foundation(mesh_config, foundation_reference)
+        from .graded_bedrock import build_graded_rock
+        foundation = build_foundation(mesh_config, concrete)
         if bedrock_analysis_mode(config) == "full_volume":
             rock = build_graded_rock(
                 mesh_config, foundation.points, [tuple(f) for f in foundation.terrain_faces],
                 stream_margin_m, bank_margin_m, bottom_z_m, foundation=foundation,
             )
-        from .foundation_trench import refine_foundation_solver_mesh
-        construction_wall = tetrahedralize_structure(concrete)
-        refined_points, wall_hexahedra, wall_added = tetrahedra_to_hexa8(
-            np.asarray(construction_wall.nodes),
-            np.asarray([cell for kind, cell in construction_wall.cells]),
-        )
-        concrete = replace(
-            concrete,
-            nodes=[tuple(point) for point in refined_points],
-            cells=[(5, tuple(map(int, cell))) for cell in wall_hexahedra],
-            region_ids=[1] * len(wall_hexahedra),
-            boundaries=[
-                (tag, tuple(map(int, face)))
-                for tag, triangle in construction_wall.boundaries
-                for face in refine_triangular_faces(refined_points, np.asarray([triangle]))
-            ],
+        native_wall_cells = sum(kind == 5 for kind, _ in concrete.cells)
+        if native_wall_cells != len(concrete.cells):
+            raise ValueError("Production wall must remain native HEXA8")
+        configured_wall_target = int(config["geometry"].get(
+            "target_wall_elements",
+            native_wall_cells,
+        ))
+        if native_wall_cells > configured_wall_target:
+            raise ValueError(
+                f"Native wall cell expansion is invalid: {native_wall_cells} "
+                f"exceeds the configured cap {configured_wall_target}"
+            )
+        print(
+            f"      Native wall preserved: {native_wall_cells:,} HEXA8 cells",
+            flush=True,
         )
         wall_refinement = {
-            "construction_tetrahedra": len(construction_wall.cells),
-            "solver_hexahedra": len(wall_hexahedra),
-            "generated_hexa8_refinement_nodes": wall_added,
+            "construction_hexahedra": native_wall_cells,
+            "solver_hexahedra": native_wall_cells,
+            "generated_hexa8_refinement_nodes": 0,
         }
-        foundation = refine_foundation_solver_mesh(foundation)
+        if len(foundation.tetrahedra) == 0:
+            raise ValueError("Production foundation must provide conforming TETRA4 cells")
+        print(
+            f"      Native foundation preserved: "
+            f"{len(foundation.tetrahedra):,} TETRA4 cells",
+            flush=True,
+        )
         offset = len(concrete.nodes)
         convert = lambda face: tuple(offset + int(n) for n in face)
         concrete_point = {
@@ -335,8 +337,8 @@ def prepare(
         ]
         concrete = replace(
             concrete, nodes=concrete.nodes + [tuple(p) for p in foundation.points],
-            cells=concrete.cells + [(5, convert(cell)) for cell in foundation.hexahedra],
-            region_ids=concrete.region_ids + [3] * len(foundation.hexahedra),
+            cells=concrete.cells + [(4, convert(cell)) for cell in foundation.tetrahedra],
+            region_ids=concrete.region_ids + [3] * len(foundation.tetrahedra),
             boundaries=[(tag, face) for tag, face in concrete.boundaries if tag != 1]
             + [(17, face) for face in wall_interface_faces]
             + [(18, convert(face)) for face in foundation.wall_faces]
@@ -503,7 +505,7 @@ def prepare(
             or len(wall_interface) != len(foundation_wall_interface)
         ):
             raise ValueError(
-                "Wall/foundation production HEXA8 QUAD4 faces do not conform"
+                "Wall/foundation production spring faces do not conform"
             )
         if (
             foundation_contact_locations
@@ -511,7 +513,7 @@ def prepare(
             or len(foundation_contact) != len(rock_contact)
         ):
             raise ValueError(
-                "Foundation/bedrock production HEXA8 QUAD4 faces do not conform"
+                "Foundation/bedrock production faces do not conform"
             )
         if bonded_bedrock and {
             tuple(sorted(face)) for face in foundation_contact
@@ -519,7 +521,7 @@ def prepare(
             tuple(sorted(face)) for face in rock_contact
         }:
             raise ValueError(
-                "Bonded foundation/bedrock HEXA8 interfaces do not share node IDs"
+                "Bonded foundation/bedrock interfaces do not share node IDs"
             )
         interface_quad_audit = {
             "wall_foundation_faces": len(wall_interface),
@@ -528,7 +530,7 @@ def prepare(
             "foundation_bedrock_exact_coordinate_faces": len(foundation_contact),
             "hanging_faces": 0,
             "solver_cell_types": {
-                "wall": "HEXA8", "foundation": "HEXA8", "bedrock": "HEXA8",
+                "wall": "HEXA8", "foundation": "TETRA4", "bedrock": "TETRA4",
             },
         }
     else:
@@ -756,10 +758,10 @@ End
         "solver_body_ids": {"wall": WALL_BODY, "bedrock": BEDROCK_BODY, **({"foundation": 3} if foundation_present else {})},
         "boundary_id_map": boundary_map,
         "rock_outer_support": outer_support,
-        "wall_rock_seat_quad4": seat_count,
+        "wall_rock_seat_quad4": int(seat_count if 5 in rock_blocks else 0),
         # Compatibility name for historical consumers; this records the
         # source-construction triangle count, not production volume topology.
-        "wall_rock_seat_triangles": int(geometry.get("seat_triangles", seat_count)),
+        "wall_rock_seat_triangles": int(seat_count),
         "wall_underside": {
             "profile": "stepped_45deg_chamfer" if foundation_present else "piecewise_linear_bedrock_contours",
             "elevation_quantization": foundation_present,
@@ -1139,6 +1141,25 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
             "reason": reason,
         }
         report_path.write_text(json.dumps(report, indent=2))
+    foundation_cell_type = (
+        report.get("foundation", {}).get("solver_cell_type")
+        if report.get("foundation")
+        else None
+    )
+    if report.get("foundation") and report.get("joints") == "spring" and partitions > 1:
+        partitions = 1
+        reason = (
+            "Foundation spring interfaces use one Elmer rank: ElmerGrid removes "
+            "the coincident two-parent mortar boundaries during multi-rank "
+            "partitioning."
+        )
+        print(f"Elmer compatibility: {reason} Requested ranks: {requested_partitions}.", flush=True)
+        report["parallel_compatibility"] = {
+            "requested_partitions": requested_partitions,
+            "effective_partitions": partitions,
+            "reason": reason,
+        }
+        report_path.write_text(json.dumps(report, indent=2))
     executable = shutil.which("ElmerSolver_mpi")
     if executable is None:
         raise RuntimeError("ElmerSolver_mpi unavailable")
@@ -1152,13 +1173,6 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
     print(f"Converting and partitioning three-body mesh ({partitions} rank(s))...", flush=True)
     partition_source = output / "three_body.msh"
     original_boundary_tags = None
-    if sum(len(pair) for pair in pairs.values()) > 128:
-        from .mortar_interfaces import coalesced_partition_input
-        partition_source = output / "partition_input.msh"
-        original_boundary_tags = coalesced_partition_input(
-            output / "three_body.msh", partition_source,
-            {boundary_map[tag] for pair in pairs.values() for tag in pair},
-        )
     if not convert_with_elmergrid(
         partition_source, output / "mesh",
         partitions if partitions > 1 else None, options if partitions > 1 else (),
@@ -1169,6 +1183,27 @@ def solve(output: Path, timeout: int | None = 480, partitions: int = 4) -> Path:
         report["partition_boundary_restoration"] = restore_partition_boundary_tags(
             output / "mesh", original_boundary_tags,
         )
+        report_path.write_text(json.dumps(report, indent=2))
+    if partitions == 1 and report.get("foundation") and spring:
+        solver_path = output / report.get("solver_input", "dam_model.sif")
+        solver_text = solver_path.read_text(encoding="utf-8")
+        replacements = {
+            "    Linear System Solver = Iterative\n":
+                "    Linear System Solver = Direct\n"
+                "    Linear System Direct Method = UMFPACK\n",
+        }
+        for old, new in replacements.items():
+            if old not in solver_text:
+                raise ValueError("Expected serial mixed-HEXA iterative solver settings are missing")
+            solver_text = solver_text.replace(old, new, 1)
+        for line in (
+            "    Linear System Iterative Method = BiCGStabl\n",
+            "    Linear System Preconditioning = ILU2\n",
+            "    Linear System ILU Factor = Real 0.01\n",
+        ):
+            solver_text = solver_text.replace(line, "", 1)
+        solver_path.write_text(solver_text, encoding="utf-8")
+        report["linear_solver"] = "UMFPACK direct (serial mixed-HEXA compatibility)"
         report_path.write_text(json.dumps(report, indent=2))
     if spring and partitions > 1:
         check_spring_partitions(output / "mesh", partitions, boundary_map, pairs)

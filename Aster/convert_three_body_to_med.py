@@ -112,14 +112,16 @@ def convert(npz_path: Path, med_path: Path) -> None:
 
     native_wall = "hexa8_wall" in data and len(data["hexa8_wall"])
     if native_wall:
+        has_hexa_foundation = (
+            "hexa8_foundation" in data and len(data["hexa8_foundation"]) > 0
+        )
         volume_blocks = [
             (mc.NORM_HEXA8, data["hexa8_wall"], "WALL"),
             (
                 mc.NORM_HEXA8,
-                data["hexa8_foundation"]
-                if "hexa8_foundation" in data else data["tetra4_foundation"],
+                data["hexa8_foundation"],
                 "FOUNDATION",
-            ) if "hexa8_foundation" in data else (
+            ) if has_hexa_foundation else (
                 mc.NORM_TETRA4, data["tetra4_foundation"], "FOUNDATION"
             ),
         ]
@@ -178,7 +180,7 @@ def convert(npz_path: Path, med_path: Path) -> None:
             mask = selected[data["joint_parent_faces"]]
             concrete_count = (len(data["hexa8_wall"]) + (
                 len(data["hexa8_foundation"])
-                if "hexa8_foundation" in data else len(data["tetra4_foundation"])
+                if has_hexa_foundation else len(data["tetra4_foundation"])
             )
                               if native_wall else len(data["tetra4_concrete"]))
             bedrock_count = len(data["tetra4_bedrock"]) + (

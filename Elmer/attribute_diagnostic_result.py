@@ -28,11 +28,19 @@ def attribute(output: Path, result: Path) -> None:
             pass
         nodes = {}
         reference_nodes = {}
+        reference_points = []
+        reference_buckets = {}
         for _ in range(int(next(stream))):
             row = next(stream).split()
             node = int(row[0])
-            location = tuple(round(float(v), 7) for v in row[1:])
-            nodes[node] = reference_nodes.setdefault(location, node)
+            location = tuple(float(v) for v in row[1:])
+            coordinate_key = tuple(round(value, 6) for value in location)
+            canonical = reference_nodes.setdefault(coordinate_key, node)
+            nodes[node] = canonical
+            if canonical == node:
+                reference_points.append((location, canonical))
+                bucket = tuple(int(value // .01) for value in location)
+                reference_buckets.setdefault(bucket, []).append(len(reference_points) - 1)
         while next(stream).strip() != "$Elements":
             pass
         bodies = {}
@@ -71,12 +79,33 @@ def attribute(output: Path, result: Path) -> None:
         displacement = mesh.GetPointData().GetArray("displacement")
         if displacement is None:
             raise ValueError("Missing solved displacement field")
-        point_nodes = [
-            reference_nodes[tuple(round(v - u, 7) for v, u in zip(
+        point_nodes = []
+        for i in range(mesh.GetNumberOfPoints()):
+            target = tuple(v - u for v, u in zip(
                 mesh.GetPoint(i), displacement.GetTuple(i), strict=True,
-            ))]
-            for i in range(mesh.GetNumberOfPoints())
-        ]
+            ))
+            bucket = tuple(int(value // .01) for value in target)
+            candidates = [
+                reference_points[index]
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+                for dz in (-1, 0, 1)
+                for index in reference_buckets.get(
+                    (bucket[0] + dx, bucket[1] + dy, bucket[2] + dz), ()
+                )
+            ]
+            if not candidates:
+                raise ValueError(f"Solved point has no nearby source node at {target}")
+            location, canonical = min(
+                candidates,
+                key=lambda item: sum((a - b) ** 2 for a, b in zip(item[0], target)),
+            )
+            if max(abs(a - b) for a, b in zip(location, target)) > .02:
+                raise ValueError(
+                    f"Solved point is not on the source mesh at {target}; "
+                    f"nearest={location}"
+                )
+            point_nodes.append(canonical)
         for i in range(mesh.GetNumberOfCells()):
             ids = mesh.GetCell(i).GetPointIds()
             members = sorted(point_nodes[ids.GetId(j)] for j in range(ids.GetNumberOfIds()))

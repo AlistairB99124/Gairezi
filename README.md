@@ -380,15 +380,13 @@ shaping assumption, not a change to the survey data in config.json. The maximum
 lip lowering is **0.483871 m**. The full Elmer suite after this change passed
 **119 tests and 61 subtests** in 426.99 s, under the enforced 540 s cap.
 
-Foundation construction hexes are split deterministically without adding nodes
-for the existing tetrahedral foundation/mortar path. Bedrock follows a separate
-production path: a coarser conforming tetrahedral construction is subdivided
-into four face-conforming native HEXA8 cells per construction tetrahedron. The
-saved source/solver mesh therefore exports wall and bedrock as native HEXA8;
-only foundation remains TETRA4. The original locked foundation/bedrock
-coordinates and the complete outer domain, near distance and far grading remain
-unchanged. Coarser auxiliary meshing avoids the unstable 100k-wall constrained
-tetrahedral cavity while preserving exact original interface nodes.
+Foundation construction and solver cells remain the same native HEXA8 blocks;
+they are not tetrahedralized and multiplied. Bedrock remains a conforming graded
+TETRA4 volume because the irregular stepped cavity cannot be converted to an
+all-HEXA mesh with the current topology without a 4x-to-24x cell explosion. The
+saved source/solver mesh exports wall and foundation as native HEXA8 and bedrock
+as graded TETRA4. The locked foundation/bedrock coordinates, complete outer
+domain, near distance and far grading remain unchanged.
 
 The wall/foundation mortar springs use `geometry.wall.joint_support` (model must
 be `spring`); foundation/rock uses `geometry.bedrock.support`. The foundation

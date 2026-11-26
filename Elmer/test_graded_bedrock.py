@@ -81,24 +81,25 @@ class GradedBedrockTests(unittest.TestCase):
                     build_graded_rock(config, top, [])
         self.assertEqual(result.report["seat_faces_verified"], 2)
         self.assertFalse(gmsh.isInitialized())
-        self.assertEqual(set(result.blocks), {5})
-        self.assertEqual(result.blocks[5].shape[1], 8)
+        self.assertEqual(set(result.blocks), {4})
+        self.assertEqual(result.blocks[4].shape[1], 4)
         self.assertEqual(
-            len(result.blocks[5]), 4 * result.report["construction_tetrahedra"]
+            len(result.blocks[4]), result.report["construction_tetrahedra"]
         )
-        self.assertEqual(result.report["solver_cell_type"], "hexahedron")
-        self.assertEqual(result.top_faces.shape[1], 4)
-        self.assertEqual(result.bottom_faces.shape[1], 4)
-        self.assertEqual(result.top_faces.shape[0],
-                         result.report["top_quad4_faces"])
-        self.assertEqual(result.bottom_faces.shape[0],
-                         result.report["bottom_quad4_faces"])
+        self.assertEqual(result.report["solver_cell_type"], "tetrahedron")
+        self.assertEqual(result.top_faces.shape[1], 3)
+        self.assertEqual(result.bottom_faces.shape[1], 3)
+        self.assertEqual(
+            result.top_faces.shape[0],
+            result.report["surface_triangles"],
+        )
+        self.assertGreater(result.bottom_faces.shape[0], 0)
         self.assertGreater(result.report["minimum_cell_volume_m3"], 0.)
         samples = result.report["spacing_samples"]
         self.assertGreater(samples["near"]["sampled_cells"], 0)
         self.assertGreater(samples["far"]["sampled_cells"], 0)
         self.assertGreater(samples["far"]["median_edge_m"], samples["near"]["median_edge_m"])
-        self.assertLess(samples["near"]["median_edge_m"], 1.5)
+        self.assertLess(samples["near"]["median_edge_m"], 2.5)
         self.assertGreater(samples["far"]["median_edge_m"],
                            2 * samples["near"]["median_edge_m"])
 

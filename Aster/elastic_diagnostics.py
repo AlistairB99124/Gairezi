@@ -114,7 +114,7 @@ def diagnostics(mesh_dir: Path, full_displacement: np.ndarray) -> dict:
         has_mortar = "tetra4_mortar" in data.files and len(data["tetra4_mortar"])
         arrays = {key: data[key] for key in data.files}
         concrete = diagnostic_tetrahedra(arrays, "hexa8_wall", "tetra4_concrete")
-        if "hexa8_foundation" in arrays:
+        if len(arrays.get("hexa8_foundation", ())) > 0:
             concrete = np.vstack((
                 concrete,
                 diagnostic_tetrahedra(

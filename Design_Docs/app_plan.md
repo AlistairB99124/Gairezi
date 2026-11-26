@@ -27,14 +27,16 @@ initial model size. Results are not engineering validated.
 Historical `ENDO_FISS_EXP`, FEniCSx, seeded and painted methods are development
 records, not the current production crack solver.
 
-Production wall, concrete foundation, and bedrock volumes are native HEXA8
-cells. The wall, foundation and the near-seat bedrock foundation interface
+Production wall and concrete foundation volumes are native HEXA8 cells. Far-field
+bedrock remains graded TETRA4 because the irregular stepped cavity cannot be
+recombined into conforming HEXA8 without multiplying the model by an order of
+magnitude. The wall, foundation and the near-seat bedrock foundation interface
 share one LEGO/stair-step course grid:
 each chainage column uses the highest whole course at or below the surveyed
 contour, with matching foundation columns/risers and exact near-rock contact
-faces. Grading uses a deterministic tetrahedral construction topology refined
-to conforming HEXA8 solver cells; the production volume mesh contains no
-TETRA4 cells. Aster candidate
+faces. The production volume remains bounded: wall and foundation retain their
+native source HEXA8 counts, while bedrock uses the original graded TETRA4 mesh.
+Aster candidate
 facets are QUAD4 wall faces and native cohesive interfaces are HEXA8 joints.
 The legacy `geometry.target_wall_tetrahedral_elements` key remains readable on
 old files; new saves use `geometry.target_wall_elements` as a native-cell cap.
@@ -1586,7 +1588,7 @@ independent sensitivity verification. See the README for existing-run export.
 | Explicit directional springs | Without `geometry.foundation`, the wall/bedrock seat uses `geometry.bedrock.support.spring_n_per_m3`; with it, that setting controls foundation/bedrock and `geometry.foundation.support` controls wall/foundation. Springs act on relative displacement only (no grounded spring bypass); bonded interfaces share nodes and leave spring coefficients inactive. The legacy wall-only solve retains its grounded bedrock support. Material modulus does not recalculate springs. The temporary top-level `interfaces` override is no longer accepted. |
 | Bedrock material | Active in the integrated three-body solver; the legacy wall-only solve represents the foundation with grounded springs instead |
 | `geometry.bedrock.domain` | Optional explicit stream/bank margins and bottom elevation shared by the preview, integrated three-body solver and diagnostic; inactive in the legacy wall-only solve |
-| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: near-seat LEGO courses follow the effective wall size, then transition toward the configured far size. A coarse conforming tetrahedral construction is converted one-to-four to production HEXA8, so no tetrahedral bedrock cells are exported. Only native wall HEXA8 cells count toward the target. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
+| `geometry.bedrock.mesh` | Optional conforming 3-D rock grading: near-seat LEGO courses follow the foundation interface, then transition toward the configured far TETRA4 size. Production wall and foundation remain native HEXA8 without cell multiplication. Only native wall HEXA8 cells count toward the target. Missing settings retain legacy layered meshing; lengths are not cell volumes or maximum-edge guarantees. |
 | `damage_selection.max_damage_count` | Optional automatic element selection limit on the Cracking tab: blank/`null` (default) selects every element owning a facet whose one-sided normal stress reaches `f_t`; an integer >= 2 grows a connected patch of whole node stars from the highest-tension facet up to that count, fails selection if no facet can open, and confines cracking to it |
 | `material.mortar` | Optional fill sloping the ledges of `geometry.wall.thickness_steps` so a stepped wall looks smooth (density, stiffness, Poisson ratio, bond springs to the wall, optional `slope_run_per_rise`, default 0.1). A soft body of its own (tag 4) in Elmer, both Code_Aster stages and FEniCSx; excluded from wall peaks and from the concrete volume. No editor in the desktop: the block is validated, kept and submitted unchanged, and the results list a **Mortar fill volume** row (`mortar_volume_m3`). Refused with spring wall joints, `step_end_taper_ratio`, no foundation or a bedrock mode other than `elastic_layer`; a warning and no effect on a wall without steps. Values in use are placeholders. Details: "Mortar fill on the steps" in `Gairezi/README.md`. |
 | Output flags | Currently not fully wired; implement defined behavior before presenting them as working controls |

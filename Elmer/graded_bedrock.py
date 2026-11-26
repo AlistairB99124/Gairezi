@@ -37,6 +37,11 @@ def tetrahedra_to_hexa8(
     cells = np.asarray(tetrahedra, dtype=np.int64)
     if not len(cells):
         raise ValueError("Cannot convert an empty tetrahedral construction mesh")
+    print(
+        f"      Refining {len(cells):,} construction tetrahedra "
+        f"into {4 * len(cells):,} HEXA8 bedrock cells ...",
+        flush=True,
+    )
     edge_patterns = np.asarray(
         ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
     )
@@ -109,6 +114,11 @@ def tetrahedra_to_hexa8(
         original[faces].mean(axis=1),
         xyz.mean(axis=1),
     ))
+    print(
+        f"      Refined bedrock: {len(result_points):,} nodes, "
+        f"{len(hexahedra):,} HEXA8 cells",
+        flush=True,
+    )
     return result_points, hexahedra, len(edges) + len(faces) + len(cells)
 
 
@@ -532,10 +542,10 @@ def build_graded_rock(
     rock = config["geometry"]["bedrock"]
     domain = rock.get("domain", {})
     settings = rock["mesh"]
-    # One TETRA4 is only a construction primitive: its four conforming HEXA8
-    # children have roughly half the edge length.  Meshing this coarser
-    # auxiliary topology is what keeps the constrained 100k-wall cavity
-    # stable while preserving the requested production grading.
+    # The constrained stepped cavity is the direct TETRA4 production volume.
+    # Keep its minimum/far target coarser than the concrete LEGO boundary:
+    # otherwise the 100k wall case creates millions of rock cells without
+    # improving the concrete-domain comparison.
     construction_settings = {
         **settings,
         "near_size_m": 2. * float(settings["near_size_m"]),
@@ -1040,29 +1050,15 @@ def build_graded_rock(
             tetrahedra, shell_faces, allow_extra_recovered_boundary=True
         )
         source_tetrahedra = len(tetrahedra)
-        points, hexahedra, refinement_nodes = tetrahedra_to_hexa8(
-            points, tetrahedra,
-        )
-        quad_top_faces = refine_triangular_faces(points, surface_faces)
-        quad_bottom_faces = refine_triangular_faces(points, bottom_faces)
-        quad_seat_faces = refine_triangular_faces(points, actual_seat)
-        exterior_hexa8_faces = audit_hexahedral_boundary(hexahedra)
         report.update(
-            mesh_method="tetrahedral_construction_to_native_hexa8",
+            mesh_method="conforming_distance_graded_tetrahedra",
             mesh_grading=dict(settings),
             construction_settings=dict(construction_settings),
             construction_tetrahedra=source_tetrahedra,
-            bedrock_cells=len(hexahedra),
-            solver_cell_type="hexahedron",
-            generated_hexa8_refinement_nodes=refinement_nodes,
-            exterior_hexa8_faces=exterior_hexa8_faces,
-            seat_quad4_faces=len(quad_seat_faces),
-            top_quad4_faces=len(quad_top_faces),
-            bottom_quad4_faces=len(quad_bottom_faces),
-            minimum_cell_volume_m3=float(signed.min() / 4.),
-            minimum_scaled_jacobian=float(np.min(
-                hexa8_scaled_jacobians(points, hexahedra)
-            )),
+            bedrock_cells=len(tetrahedra),
+            solver_cell_type="tetrahedron",
+            minimum_cell_volume_m3=float(signed.min()),
+            minimum_scaled_jacobian=float(np.min(qualities)),
             seat_faces_verified=len(actual_seat),             surface_triangles=len(surface_faces),
             seat_max_coordinate_difference_m=max(
                 report.get("seat_max_coordinate_difference_m", 0.), float(coordinate_error),
@@ -1071,21 +1067,15 @@ def build_graded_rock(
             removed_zero_volume_bedrock_cells=int((~valid_tetrahedra).sum()),
             removed_low_quality_bedrock_cells=removed_low_quality_cells,
             mesher_version=gmsh.__version__, vertical_layers=None,
-            surface_edge_size_policy=(
-                "Coarse construction triangles with a locked seat; "
-                "production exterior is conforming QUAD4"
-            ),
+            surface_edge_size_policy="Unstructured conforming triangles; locked wall seat",
             surface_row_axis=None,
             maximum_exterior_surface_edge_m=float(max(
                 np.linalg.norm(points[surface_faces[:, i]] - points[surface_faces[:, (i + 1) % 3]],
                                axis=1).max() for i in range(3)
             )),
-            conformity_audit=(
-                "Every production HEXA8 interior face is paired and the "
-                "construction seat remains locked to the original coordinates"
-            ),
+            conformity_audit="Every interior face paired; exterior equals the closed CAD shell",
             spacing_samples=spacing_summary(
-                points, hexahedra, actual_seat, settings,
+                points, tetrahedra, actual_seat, settings,
             ),
         )
         if report["minimum_scaled_jacobian"] < .01:
@@ -1095,8 +1085,8 @@ def build_graded_rock(
                 stacklevel=2,
             )
         return RockMesh(
-            points, {5: hexahedra},
-            quad_top_faces, quad_bottom_faces, report,
+            points, {4: tetrahedra},
+            surface_faces, bottom_faces, report,
         )
     finally:
         gmsh.finalize()

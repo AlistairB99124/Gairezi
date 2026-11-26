@@ -133,6 +133,27 @@ class ElasticLayerParallelTests(unittest.TestCase):
                     solve(output, partitions=4)
             self.assertEqual(convert.call_args.args[2], 4)
 
+    def test_native_foundation_spring_mesh_selects_serial(self):
+        from Elmer.three_body_diagnostic import solve
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "diagnostic.json").write_text(json.dumps({
+                "rock_outer_support": {"model": "rollers"},
+                "joints": "spring",
+                "foundation": {"solver_cell_type": "hexahedron"},
+                "boundary_id_map": {},
+            }))
+            with patch("Elmer.three_body_diagnostic.shutil.which", return_value="ElmerSolver_mpi.exe"), \
+                 patch("Elmer.three_body_diagnostic.mpi_launcher", return_value=("mpiexec", "-n")), \
+                 patch("Elmer.three_body_diagnostic.pvpython_executable", return_value="pvpython"), \
+                 patch("Elmer.three_body_diagnostic.convert_with_elmergrid",
+                       side_effect=RuntimeError("conversion probe")) as convert:
+                with self.assertRaisesRegex(RuntimeError, "conversion probe"):
+                    solve(output, partitions=4)
+            self.assertIsNone(convert.call_args.args[2])
+            saved = json.loads((output / "diagnostic.json").read_text())
+            self.assertEqual(saved["parallel_compatibility"]["effective_partitions"], 1)
+
 
 class SpringProjectorTests(unittest.TestCase):
     def test_normal_galerkin_projector_for_planar_and_grouped_springs(self):

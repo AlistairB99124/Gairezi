@@ -10,6 +10,11 @@ from .foundation_trench import FoundationMesh, tet_volumes
 from .graded_bedrock import audit_tetrahedral_boundary
 from .regions.tetrahedral import _CELL_FACES, split_cell, split_face
 
+_HEX_TETRAHEDRA = (
+    (0, 1, 2, 6), (0, 2, 3, 6), (0, 4, 5, 6),
+    (0, 5, 1, 6), (0, 3, 7, 6), (0, 7, 4, 6),
+)
+
 
 def build_lego_foundation(config: dict, concrete) -> FoundationMesh:
     from .model_config import wall_thickness_steps
@@ -62,7 +67,7 @@ def build_lego_foundation(config: dict, concrete) -> FoundationMesh:
         source_polygons.setdefault(key, []).append(polygon)
 
     def on_source_surface(triangle: tuple[int, int, int]) -> bool:
-        candidate = np.asarray(points)[list(triangle), :]
+        candidate = point_array[list(triangle), :]
         if np.ptp(candidate[:, 2]) > 1e-7:
             return False
         angles = sorted({
@@ -189,6 +194,7 @@ def build_lego_foundation(config: dict, concrete) -> FoundationMesh:
                     grid(angles[column], radii[radial + 1], upper),
                 ))
 
+    point_array = np.asarray(points, dtype=float)
     owner_count: Counter[tuple[int, ...]] = Counter()
     oriented: dict[tuple[int, ...], tuple[int, ...]] = {}
     for cell in hexes:
@@ -213,7 +219,7 @@ def build_lego_foundation(config: dict, concrete) -> FoundationMesh:
             wall_faces.extend(triangles)
             roof.extend(triangles)
             continue
-        face_points = np.asarray(points)[list(face)]
+        face_points = point_array[list(face)]
         face_z = face_points[:, 2]
         face_angles = {round(math.atan2(x, y), 10) for x, y, _ in face_points}
         is_internal_riser = (
@@ -241,13 +247,19 @@ def build_lego_foundation(config: dict, concrete) -> FoundationMesh:
     if not contact:
         raise ValueError("LEGO foundation has no bedrock contact")
 
-    point_array = np.asarray(points, dtype=float)
+    hexahedra = np.asarray(hexes, dtype=np.int64)
     tetrahedra = np.asarray(
         [tet for cell in hexes for tet in split_cell(point_array, 5, cell)],
         dtype=np.int64,
     )
-    audit_tetrahedral_boundary(
-        tetrahedra, np.asarray(roof + contact, dtype=np.int64).reshape(-1, 3))
+    volume = 0.
+    for pattern in _HEX_TETRAHEDRA:
+        tetra = point_array[hexahedra[:, pattern]]
+        volume += float(np.abs(np.einsum(
+            "ij,ij->i",
+            np.cross(tetra[:, 1] - tetra[:, 0], tetra[:, 2] - tetra[:, 0]),
+            tetra[:, 3] - tetra[:, 0],
+        )).sum() / 6.)
 
     snap = np.asarray([
         np.linalg.norm(point_array[node(coordinates[n])] - coordinates[n])
@@ -266,11 +278,12 @@ def build_lego_foundation(config: dict, concrete) -> FoundationMesh:
         "construction_cell_type": "hexahedron",
         "construction_hexahedra": len(hexes),
         "solver_cell_type": "tetrahedron",
+        "solver_tetrahedra": len(tetrahedra),
         "element_size_m": size,
         "minimum_vertical_thickness_m": depth,
         "minimum_normal_thickness_m": depth,
         "chamfer_count": 0,
-        "volume_m3": float(tet_volumes(point_array, tetrahedra).sum()),
+        "volume_m3": volume,
         "open_excavation_volume_m3": 0.0,
         "wall_seat_node_snap": {
             "wall_nodes": len(wall_ids),

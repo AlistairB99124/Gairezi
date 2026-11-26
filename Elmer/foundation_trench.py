@@ -29,6 +29,11 @@ class FoundationMesh:
 
 def refine_foundation_solver_mesh(foundation: FoundationMesh) -> FoundationMesh:
     """Refine the TETRA4 construction into matching production HEXA8 cells."""
+    print(
+        f"      Refining {len(foundation.tetrahedra):,} foundation tetrahedra "
+        f"into HEXA8 ...",
+        flush=True,
+    )
     points, hexahedra, added = tetrahedra_to_hexa8(
         foundation.points, foundation.tetrahedra,
     )
@@ -54,7 +59,7 @@ def refine_foundation_solver_mesh(foundation: FoundationMesh) -> FoundationMesh:
         "wall_quad4_faces": len(faces["wall_faces"]),
         "contact_quad4_faces": len(faces["contact_faces"]),
     }
-    return FoundationMesh(
+    result = FoundationMesh(
         points=points,
         tetrahedra=foundation.tetrahedra,
         top_faces=faces["top_faces"],
@@ -65,6 +70,12 @@ def refine_foundation_solver_mesh(foundation: FoundationMesh) -> FoundationMesh:
         terrain_faces=faces.get("terrain_faces"),
         exposed_rock_faces=faces.get("exposed_rock_faces"),
     )
+    print(
+        f"      Refined foundation: {len(result.points):,} nodes, "
+        f"{len(hexahedra):,} HEXA8 cells",
+        flush=True,
+    )
+    return result
 
 
 def build_legacy_foundation(config: dict, concrete) -> FoundationMesh:

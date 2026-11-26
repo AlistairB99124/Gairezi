@@ -140,26 +140,87 @@ def split_planar_interfaces(points, boundaries, pairs):
 
 def coalesced_partition_input(source, destination, mortar_tags):
     """Coalesce tags for ElmerGrid ONLY; retain exact original face labels."""
-    original = {}
-    connected_tag = min(mortar_tags)
+    tag_map = (
+        dict(mortar_tags) if isinstance(mortar_tags, dict)
+        else {tag: min(mortar_tags) for tag in mortar_tags}
+    )
+    original = {
+        "__partition_coalesced_tags__": frozenset(tag_map.values()),
+        "__partition_original_tags__": frozenset(tag_map),
+    }
+    source_nodes = {}
+    source_face_bodies = {}
     in_elements = False
+    in_nodes = False
     with source.open() as incoming, destination.open("w") as outgoing:
         for line in incoming:
-            if line.strip() == "$Elements":
+            if line.strip() == "$Nodes":
+                in_nodes = True
+            elif line.strip() == "$EndNodes":
+                in_nodes = False
+            elif in_nodes:
+                fields = line.split()
+                if len(fields) == 4:
+                    source_nodes[int(fields[0])] = tuple(
+                        round(float(value), 6) for value in fields[1:]
+                    )
+            elif line.strip() == "$Elements":
                 in_elements = True
             elif line.strip() == "$EndElements":
                 in_elements = False
             elif in_elements:
                 fields = line.split()
-                if len(fields) > 3 and fields[1] == "2":
+                if len(fields) > 3 and fields[1] in ("4", "5"):
                     ntags = int(fields[2])
-                    key = tuple(sorted(int(n) for n in fields[3+ntags:]))
+                    body = int(fields[3])
+                    nodes = [int(n) for n in fields[3+ntags:]]
+                    patterns = (
+                        ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
+                        if fields[1] == "4" else
+                        ((0, 1, 2, 3), (4, 7, 6, 5), (0, 1, 5, 4),
+                         (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))
+                    )
+                    for pattern in patterns:
+                        source_face_bodies[
+                            tuple(sorted(nodes[index] for index in pattern))
+                        ] = body
+                if len(fields) > 3 and fields[1] in ("2", "3"):
+                    ntags = int(fields[2])
                     tag = int(fields[3])
-                    if key in original:
-                        raise ValueError("Duplicate source boundary face")
-                    original[key] = tag
-                    if tag in mortar_tags:
-                        fields[3:3+ntags] = [str(connected_tag)] * ntags
+                    nodes = [int(n) for n in fields[3+ntags:]]
+                    keys = (
+                        [tuple(sorted(nodes))]
+                        if fields[1] == "2"
+                        else [
+                            tuple(sorted((nodes[0], nodes[1], nodes[2]))),
+                            tuple(sorted((nodes[0], nodes[2], nodes[3]))),
+                            tuple(sorted((nodes[0], nodes[1], nodes[3]))),
+                            tuple(sorted((nodes[1], nodes[2], nodes[3]))),
+                            tuple(sorted(nodes)),
+                        ]
+                    )
+                    for key in keys:
+                        if key in original:
+                            raise ValueError("Duplicate source boundary face")
+                        original[key] = tag
+                        if all(node in source_nodes for node in key):
+                            full_key = tuple(sorted(nodes))
+                            coordinate_key = (
+                                "xyz",
+                                tuple(sorted(
+                                    source_nodes[node]
+                                    for node in key
+                                )),
+                            )
+                            body = source_face_bodies.get(
+                                full_key,
+                                source_face_bodies.get(key, 0),
+                            )
+                            original.setdefault(
+                                coordinate_key, {}
+                            ).setdefault(body, set()).add(tag)
+                    if tag in tag_map:
+                        fields[3:3+ntags] = [str(tag_map[tag])] * ntags
                         line = " ".join(fields) + "\n"
             outgoing.write(line)
     return original
@@ -173,16 +234,62 @@ def restore_partition_boundary_tags(mesh, original):
         raise ValueError("No converted boundary files to restore")
     total = 0
     for path in files:
+        node_path = path.with_suffix(".nodes")
+        coordinates = {}
+        parent_bodies = {}
+        if node_path.is_file():
+            with node_path.open() as stream:
+                for line in stream:
+                    fields = line.split()
+                    if len(fields) >= 5:
+                        coordinates[int(fields[0])] = tuple(
+                            round(float(value), 6) for value in fields[2:5]
+                        )
+        element_path = path.with_suffix(".elements")
+        if element_path.is_file():
+            with element_path.open() as stream:
+                for line in stream:
+                    fields = line.split()
+                    if len(fields) >= 2:
+                        element_id = int(fields[0].split("/", 1)[0])
+                        parent_bodies[element_id] = int(fields[1])
         lines = []
         with path.open() as stream:
             for line in stream:
                 fields = line.split()
-                if int(fields[4]) != 303:
-                    raise ValueError("Planar mortar partition restoration requires triangle boundaries")
+                if int(fields[4]) not in (303, 404):
+                    raise ValueError(
+                        "Partition restoration requires triangle or quadrilateral boundaries"
+                    )
                 key = tuple(sorted(int(n) for n in fields[5:]))
-                if key not in original:
+                tag = original.get(key)
+                if tag is None and coordinates:
+                    coordinate_key = (
+                        "xyz",
+                        tuple(sorted(coordinates[int(node)] for node in fields[5:])),
+                    )
+                    candidates = original.get(coordinate_key, {})
+                    parent = int(fields[2])
+                    body = parent_bodies.get(parent, 0)
+                    choices = candidates.get(body, set())
+                    mortar_choices = choices & original[
+                        "__partition_original_tags__"
+                    ]
+                    if len(mortar_choices) == 1 and (
+                        int(fields[1])
+                        in original["__partition_coalesced_tags__"]
+                        or len(choices) > 1
+                    ):
+                        choices = mortar_choices
+                    if len(choices) == 1:
+                        tag = next(iter(choices))
+                    elif not choices and len(candidates) == 1:
+                        only = next(iter(candidates.values()))
+                        if isinstance(only, set) and len(only) == 1:
+                            tag = next(iter(only))
+                if tag is None:
                     raise ValueError(f"ElmerGrid changed boundary node IDs: {key}")
-                fields[1] = str(original[key])
+                fields[1] = str(tag)
                 lines.append(" ".join(fields) + "\n")
                 total += 1
         path.write_text("".join(lines))

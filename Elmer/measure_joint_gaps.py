@@ -58,7 +58,7 @@ def measure(result: Path, joint_levels_m: tuple[float, ...] = ()) -> dict[str, o
                 raise ValueError(f"Missing solved stress field: {name}")
             finite_stress = finite_stress and bool(np.isfinite(vtk_to_numpy(values)).all())
         # Elmer writes deformed coordinates; recover the reference position.
-        reference = np.round(vtk_to_numpy(mesh.GetPoints().GetData()) - displacement, 6)
+        reference = np.round(vtk_to_numpy(mesh.GetPoints().GetData()) - displacement, 3)
         cells = mesh.GetCells()
         offsets = vtk_to_numpy(cells.GetOffsetsArray())
         connectivity = vtk_to_numpy(cells.GetConnectivityArray())
@@ -131,7 +131,7 @@ def measure(result: Path, joint_levels_m: tuple[float, ...] = ()) -> dict[str, o
                     if line.strip() == "$Nodes":
                         for _ in range(int(next(stream))):
                             fields = next(stream).split()
-                            source_points[int(fields[0])] = tuple(round(float(x), 6) for x in fields[1:4])
+                            source_points[int(fields[0])] = tuple(round(float(x), 3) for x in fields[1:4])
                     elif line.strip() == "$Elements":
                         for _ in range(int(next(stream))):
                             fields = [int(v) for v in next(stream).split()]

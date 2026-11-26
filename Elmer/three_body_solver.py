@@ -45,7 +45,35 @@ def run_job(root: Path, output: Path, report_path: Path, *, partitions: int = 4,
         raise ValueError("API job requires fresh output and report paths")
     print("Stage: meshing", flush=True)
     geometry = audit_combined_structure(build_combined_structure(root, split_wall_joints=True))
-    prepare(root, output / "model", joints="spring", integrated=True)
+    model_dir = output / "model"
+    prepare(root, model_dir, joints="spring", integrated=True)
+    diagnostic = json.loads((model_dir / "diagnostic.json").read_text(encoding="utf-8"))
+    if diagnostic.get("foundation", {}).get("present") and diagnostic.get("joints") == "spring":
+        reason = (
+            "Native mixed wall/foundation spring interfaces are not solved by "
+            "Elmer: its mortar projector returns zero area and its serial/direct "
+            "and MPI iterative paths are not numerically reliable. The generated "
+            "mesh is preserved for the authoritative Code_Aster baseline."
+        )
+        diagnostic["elmer_support_status"] = "skipped"
+        diagnostic["elmer_support_reason"] = reason
+        (model_dir / "diagnostic.json").write_text(
+            json.dumps(diagnostic, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        report_path.write_text(json.dumps({
+            "model_kind": "three_body",
+            "elmer_support_status": "skipped",
+            "elmer_support_reason": reason,
+            "supporting_evidence_only": True,
+            "mesh": str((model_dir / "three_body.msh").resolve()),
+        }, indent=2, allow_nan=False), encoding="utf-8")
+        print(f"Stage: Elmer support skipped - {reason}", flush=True)
+        return {
+            "model": str(model_dir.resolve()),
+            "report": str(report_path.resolve()),
+            "support_skipped": True,
+        }
     print("Stage: solving", flush=True)
     result = solve(output / "model", timeout=timeout, partitions=partitions)
     print("Stage: postprocessing", flush=True)
